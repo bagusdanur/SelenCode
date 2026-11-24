@@ -1,1 +1,74 @@
-IyBTZWxlbkNvZGUgZGkgVGVybXV4IChBbmRyb2lkKQoKQ2FyYSBtZW1hc2FuZyBiaW5hcnkgYHNlbGVuYCBoYXNpbCBHaXRIdWIgQWN0aW9ucyBkaSBUZXJtdXggZGFuIG1lbmphbGFua2FuClNlbGVuYSBkaSBIUC4gU2VzdWFpIEJsdWVwcmludCBCYWdpYW4gMTE6IFRlcm11eCBtZW1ha2FpIGJpb25pYyBsaWJjLCBqYWRpCnlhbmcgZGlwYWthaSBhZGFsYWggYmluYXJ5ICoqYWFyY2g2NC1saW51eC1hbmRyb2lkKiogZGFyaSBHaXRIdWIgUmVsZWFzZXMg4oCUCmJ1a2FuIGJpbmFyeSBMaW51eCBiaWFzYS4KCiMjIDEuIFBlcnNpYXBhbiBkaSBUZXJtdXgKCmBgYGJhc2gKcGtnIHVwZGF0ZQpwa2cgaW5zdGFsbCBnaXQgcmlwZ3JlcCAgICAgICAgICAjIHRvb2wgeWFuZyBtdW5na2luIGRpcGFrYWkgYWdlbnQKYGBgCgojIyAyLiBQYXNhbmcgYmluYXJ5IGRhcmkgR2l0SHViIFJlbGVhc2VzCgoxLiBCdWthIGhhbGFtYW4gKipSZWxlYXNlcyoqIHJlcG8gU2VsZW5Db2RlIGRpIEdpdEh1YiBkYXJpIEhQLgoyLiBEb3dubG9hZCBhc2V0ICoqYHNlbGVuLXRlcm11eC1hcm02NGAqKiAoamFuZ2FuIHlhbmcgYHNlbGVuLWxpbnV4LXg2NGApLgozLiBEaSBUZXJtdXgsIGRhcmkgZm9sZGVyIHRlbXBhdCBmaWxlIGl0dSB0ZXJkb3dubG9hZCAoYmlhc2FueWEKICAgYH4vc3RvcmFnZS9kb3dubG9hZHNgIOKAlCBqYWxhbmthbiBgdGVybXV4LXNldHVwLXN0b3JhZ2VgIGR1bHUgYmlsYSBiZWx1bSk6CgpgYGBiYXNoCmNobW9kICt4IHNlbGVuLXRlcm11eC1hcm02NAptdiBzZWxlbi10ZXJtdXgtYXJtNjQgJFBSRUZJWC9iaW4vc2VsZW4Kc2VsZW4gLS12ZXJzaW9uCmBgYAoKIyMgMy4gQ29uZmlnICsgQVBJIGtleQoKU2FsaW4gY29udG9oIGNvbmZpZyBkYXJpIHJlcG8gaW5pIChgY29uZmlnLmV4YW1wbGUudG9tbGApIGtlIGNvbmZpZyBnbG9iYWw6CgpgYGBiYXNoCm1rZGlyIC1wIH4vLmNvbmZpZy9zZWxlbmNvZGUKIyBzYWxpbiBpc2kgY29uZmlnLmV4YW1wbGUudG9tbCBrZSBmaWxlIGluaSAoZWRpdCBzZXN1YWkga2VidXR1aGFuKToKbmFubyB+Ly5jb25maWcvc2VsZW5jb2RlL2NvbmZpZy50b21sCmBgYAoKQ29uZmlnIGJhd2FhbiBjb250b2ggbWVtYWthaSBwcm92aWRlciB1dGFtYSAqKnJvdXRlciAoOVJvdXRlcikqKjoKCmBgYHRvbWwKZGVmYXVsdF9wcm92aWRlciA9ICJyb3V0ZXIiCgpbcHJvdmlkZXJzLnJvdXRlcl0Ka2luZCA9ICJvcGVuYWkiCmJhc2VfdXJsID0gImh0dHBzOi8vcm91dGVyLnJ5dWtvbWlrLmNvbS92MSIKbW9kZWwgPSAiYWcvZ2VtaW5pLTMtZmxhc2giCmFwaV9rZXlfZW52ID0gIlNFTEVOQ09ERV9ST1VURVJfS0VZIgpgYGAKCkFQSSBrZXkgVElEQUsgZGl0dWxpcyBkaSBjb25maWcg4oCUIGRpYmFjYSBkYXJpIGVudmlyb25tZW50IHZhcmlhYmxlOgoKYGBgYmFzaApleHBvcnQgU0VMRU5DT0RFX1JPVVRFUl9LRVk9ImtleS1rYW11IgojIGFnYXIgcGVybWFuZW4sIHRhcnVoIGJhcmlzIHlhbmcgc2FtYSBkaSB+Ly5iYXNocmM6CmVjaG8gJ2V4cG9ydCBTRUxFTkNPREVfUk9VVEVSX0tFWT0ia2V5LWthbXUiJyA+PiB+Ly5iYXNocmMKYGBgCgojIyA0LiBQYWthaQoKYGBgYmFzaApjZCB+L2ZvbGRlci1wcm9qZWN0LWthbXUKc2VsZW4gcnVuICJqZWxhc2thbiBwcm9qZWN0IGluaSIgICAjIHNla2FsaSBqYWxhbiwgb3V0cHV0IHBvbG9zCnNlbGVuICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICMgbW9kZSBpbnRlcmFrdGlmIChUVUk7IC9leGl0IHVudHVrIGtlbHVhcikKc2VsZW4gcmVzdW1lICAgICAgICAgICAgICAgICAgICAgICAgIyBsYW5qdXRrYW4gc2VzaSB0ZXJha2hpciBmb2xkZXIgaW5pCmBgYAoKIyMgQ2F0YXRhbgoKLSBTZXNpIHRlcnNpbXBhbiBkaSBgfi8ubG9jYWwvc2hhcmUvc2VsZW5jb2RlL3NlbGVuLmRiYCAoU1FMaXRlIGxva2FsKSDigJQKICByZXN1bWUgdGV0YXAgamFsYW4gc2VzdWRhaCBUZXJtdXggZGl0dXR1cCBwYWtzYS4KLSBKYWx1ciBjYWRhbmdhbiBiaWxhIHN1YXR1IHNhYXQgYmluYXJ5IHJpbGlzIGJlcm1hc2FsYWg6IGNvbXBpbGUgZGkgZGFsYW0KICBUZXJtdXggbGFuZ3N1bmcg4oCUIGBwa2cgaW5zdGFsbCBydXN0YCBsYWx1IGBjYXJnbyBidWlsZCAtLXJlbGVhc2VgIGRpCiAgZm9sZGVyIHByb2plY3QgaW5pLiBMYW1iYXQgKGJpc2EgMjDigJM0MCBtZW5pdCBkaSBIUCksIHRhcGkgcmVhbGlzdGlzCiAga2FyZW5hIFNlbGVuQ29kZSBtZW1ha2FpIHJ1c3RscywgYnVrYW4gT3BlblNTTC4K
+# SelenCode di Termux (Android)
+
+Cara memasang binary `selen` hasil GitHub Actions di Termux dan menjalankan
+Selena di HP. Sesuai Blueprint Bagian 11: Termux memakai bionic libc, jadi
+yang dipakai adalah binary **aarch64-linux-android** dari GitHub Releases —
+bukan binary Linux biasa.
+
+## 1. Persiapan di Termux
+
+```bash
+pkg update
+pkg install git ripgrep          # tool yang mungkin dipakai agent
+```
+
+## 2. Pasang binary dari GitHub Releases
+
+1. Buka halaman **Releases** repo SelenCode di GitHub dari HP.
+2. Download aset **`selen-termux-arm64`** (jangan yang `selen-linux-x64`).
+3. Di Termux, dari folder tempat file itu terdownload (biasanya
+   `~/storage/downloads` — jalankan `termux-setup-storage` dulu bila belum):
+
+```bash
+chmod +x selen-termux-arm64
+mv selen-termux-arm64 $PREFIX/bin/selen
+selen --version
+```
+
+## 3. Config + API key
+
+Salin contoh config dari repo ini (`config.example.toml`) ke config global:
+
+```bash
+mkdir -p ~/.config/selencode
+# salin isi config.example.toml ke file ini (edit sesuai kebutuhan):
+nano ~/.config/selencode/config.toml
+```
+
+Config bawaan contoh memakai provider utama **router (9Router)**:
+
+```toml
+default_provider = "router"
+
+[providers.router]
+kind = "openai"
+base_url = "https://router.ryukomik.com/v1"
+model = "ag/gemini-3-flash"
+api_key_env = "SELENCODE_ROUTER_KEY"
+```
+
+API key TIDAK ditulis di config — dibaca dari environment variable:
+
+```bash
+export SELENCODE_ROUTER_KEY="key-kamu"
+# agar permanen, taruh baris yang sama di ~/.bashrc:
+echo 'export SELENCODE_ROUTER_KEY="key-kamu"' >> ~/.bashrc
+```
+
+## 4. Pakai
+
+```bash
+cd ~/folder-project-kamu
+selen run "jelaskan project ini"   # sekali jalan, output polos
+selen                               # mode interaktif (TUI; /exit untuk keluar)
+selen resume                        # lanjutkan sesi terakhir folder ini
+```
+
+## Catatan
+
+- Sesi tersimpan di `~/.local/share/selencode/selen.db` (SQLite lokal) —
+  resume tetap jalan sesudah Termux ditutup paksa.
+- Jalur cadangan bila suatu saat binary rilis bermasalah: compile di dalam
+  Termux langsung — `pkg install rust` lalu `cargo build --release` di
+  folder project ini. Lambat (bisa 20–40 menit di HP), tapi realistis
+  karena SelenCode memakai rustls, bukan OpenSSL.
