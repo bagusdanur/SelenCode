@@ -1,0 +1,49 @@
+[package]
+name = "selencode"
+version = "0.1.0"
+edition = "2021"
+description = "SelenCode — terminal AI coding agent (seperti Claude Code), persona Selena, full Rust, jalan di Termux Android"
+license = "MIT"
+
+[lib]
+name = "selencode"
+path = "src/lib.rs"
+
+[[bin]]
+name = "selen"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+futures = "0.3"
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+ignore = "0.4"
+globset = "0.4"
+similar = "2"
+regex = "1"
+dirs = "5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = "0.7"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = 3
