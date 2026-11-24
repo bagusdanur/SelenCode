@@ -1,0 +1,67 @@
+name: release
+
+# Blueprint Bagian 11: Termux memakai bionic libc (Android), jadi binary
+# Termux WAJIB build untuk target aarch64-linux-android dengan Android NDK.
+# Build rilis diserahkan ke GitHub Actions — laptop & HP tidak compile sendiri.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  android:
+    name: Termux (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: nttld/setup-ndk@v1
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Build rilis Termux
+        run: cargo ndk -t arm64-v8a build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selen-termux-arm64
+          path: target/aarch64-linux-android/release/selen
+
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build rilis Linux
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selen-linux-x64
+          path: target/release/selen
+
+  release:
+    name: GitHub Release
+    # Hanya untuk push tag v* — workflow_dispatch berhenti di artifact.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [android, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      # Kedua artifact berisi file bernama sama ("selen") — ganti nama per
+      # platform dulu agar aset rilis tidak saling menimpa.
+      - name: Siapkan aset rilis
+        run: |
+          mkdir -p dist
+          cp artifacts/selen-termux-arm64/selen dist/selen-termux-arm64
+          cp artifacts/selen-linux-x64/selen dist/selen-linux-x64
+          chmod +x dist/*
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*
