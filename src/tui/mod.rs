@@ -10,6 +10,7 @@
 
 pub mod app;
 pub mod diff_view;
+pub mod moonlit;
 
 use crate::agent::UiEvent;
 use crate::repl::{parse_slash_command, SlashCommand};
@@ -57,7 +58,11 @@ pub struct TuiChannels {
 // ---------- gambar ----------
 
 fn display_lines(app: &App) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
+    // Sambutan Moonlit menempel di awal transkrip & ikut bergulir.
+    let mut out: Vec<Line<'static>> = app.welcome.clone().unwrap_or_default();
+    if !out.is_empty() {
+        out.push(Line::from(""));
+    }
     for l in &app.lines {
         match l.kind {
             LineKind::User => {
@@ -68,7 +73,7 @@ fn display_lines(app: &App) -> Vec<Line<'static>> {
                         Span::styled(
                             prefix.to_string(),
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(moonlit::VIOLET)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
@@ -109,7 +114,7 @@ fn display_lines(app: &App) -> Vec<Line<'static>> {
                 for part in l.text.lines() {
                     out.push(Line::from(Span::styled(
                         part.to_string(),
-                        Style::default().fg(Color::Magenta),
+                        Style::default().fg(moonlit::LAV),
                     )));
                 }
             }
@@ -117,7 +122,7 @@ fn display_lines(app: &App) -> Vec<Line<'static>> {
                 for part in l.text.lines() {
                     out.push(Line::from(Span::styled(
                         part.to_string(),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(moonlit::DIM),
                     )));
                 }
             }
@@ -140,45 +145,34 @@ fn display_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
-fn status_text(app: &App) -> String {
-    let mut s = format!(
-        "konteks {}% · token sesi {} in / {} out · langkah {}/{}",
-        app.context_pct, app.session_in, app.session_out, app.step_current, app.step_max
-    );
-    if app.busy {
-        s.push_str(" · bekerja…");
-    }
-    s
-}
-
 /// Gambar 1 frame. Publik agar bisa dites dengan TestBackend.
+///
+/// Tata letak Moonlit (v0.1.2): TANPA header terpisah — sambutan Moonlit
+/// tinggal di awal transkrip (dibuat sekali pada frame pertama, saat
+/// lebar terminal diketahui), status bar Moonlit selalu terlihat di
+/// bawah, lalu kotak input berbingkai DEEP dengan prompt "❯".
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    if app.welcome.is_none() {
+        let info = app.welcome_info();
+        app.welcome = Some(if app.resumed {
+            moonlit::resume_lines(&info)
+        } else {
+            moonlit::welcome_lines(area.width, &info)
+        });
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Min(1),    // transkrip
+            Constraint::Min(1),    // transkrip (termasuk sambutan)
             Constraint::Length(1), // status bar
             Constraint::Length(3), // input
         ])
         .split(area);
 
-    // Header
-    let header = Paragraph::new(Line::from(Span::styled(
-        format!(
-            "SelenCode · project: {} · model: {}/{}",
-            app.cwd, app.provider, app.model
-        ),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    frame.render_widget(header, chunks[0]);
-
     // Transkrip (gulir: app.scroll = jarak dari bawah)
     let lines = display_lines(app);
-    let viewport = chunks[1].height as usize;
+    let viewport = chunks[0].height as usize;
     let total = lines.len();
     app.last_total_lines = total;
     app.last_viewport = viewport;
@@ -188,31 +182,52 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let transcript = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((y, 0));
-    frame.render_widget(transcript, chunks[1]);
+    frame.render_widget(transcript, chunks[0]);
 
-    // Status bar
-    let status = Paragraph::new(Line::from(Span::styled(
-        status_text(app),
-        Style::default().fg(Color::DarkGray),
-    )));
-    frame.render_widget(status, chunks[2]);
+    // Status bar Moonlit: fase bulan + konteks + token + langkah + cwd.
+    let status = Paragraph::new(moonlit::status_line(
+        app.context_pct,
+        app.session_in,
+        app.session_out,
+        app.step_current,
+        app.step_max,
+        &app.cwd,
+        app.busy,
+    ));
+    frame.render_widget(status, chunks[1]);
 
-    // Input
-    app.input.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" perintah — Enter kirim · Alt+Enter baris baru · Ctrl+C keluar "),
+    // Input: bingkai DEEP digambar sebagai Block luar; prompt "❯" violet
+    // tebal di sel kiri dalam bingkai; textarea tanpa bingkai di sisanya.
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(moonlit::DEEP));
+    let inner = input_block.inner(chunks[2]);
+    frame.render_widget(input_block, chunks[2]);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "❯",
+            Style::default()
+                .fg(moonlit::VIOLET)
+                .add_modifier(Modifier::BOLD),
+        )),
+        cols[0],
     );
-    frame.render_widget(&app.input, chunks[3]);
+    app.input.set_block(Block::default());
+    frame.render_widget(&app.input, cols[1]);
     // Kursor hanya relevan tanpa popup.
     if app.approval.is_none() {
         frame.set_cursor_position((
-            chunks[3].x + 1 + app.input.cursor().1 as u16,
-            chunks[3].y + 1 + app.input.cursor().0 as u16,
+            cols[1].x + app.input.cursor().1 as u16,
+            cols[1].y + app.input.cursor().0 as u16,
         ));
     }
 
-    // Popup approval (modal, di atas segalanya)
+    // Popup approval (modal, di atas segalanya) — bingkai GOLD Moonlit;
+    // warna diff di badan popup tetap hijau/merah (kode universal).
     if let Some(p) = &app.approval {
         let popup = centered_rect(70, 60, area);
         frame.render_widget(Clear, popup);
@@ -221,7 +236,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         body.push(Line::from(Span::styled(
             "[y] setuju    [n] tolak",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(moonlit::GOLD)
                 .add_modifier(Modifier::BOLD),
         )));
         let widget = Paragraph::new(body)
@@ -229,6 +244,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_style(Style::default().fg(moonlit::GOLD))
+                    .title_style(
+                        Style::default()
+                            .fg(moonlit::GOLD)
+                            .add_modifier(Modifier::BOLD),
+                    )
                     .title(format!(" Persetujuan: {} ", p.title)),
             );
         frame.render_widget(widget, popup);
