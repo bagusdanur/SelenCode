@@ -296,6 +296,48 @@ fn render_popup_approval_tampil() {
     let text: String = buf.content().iter().map(|c| c.symbol()).collect();
     assert!(text.contains("Persetujuan: edit_file a.rs"));
     assert!(text.contains("[y] setuju"));
+    assert!(text.contains("[a] selalu edit_file sesi ini"));
+    assert!(text.contains("[n] tolak"));
+}
+
+#[tokio::test]
+async fn approve_category_for_session_otomatis_loloskan_antrean_serupa() {
+    use selencode::security::{ApprovalMode, ApprovalPolicy};
+    use std::sync::{Arc, Mutex};
+
+    let policy = Arc::new(Mutex::new(ApprovalPolicy::new(ApprovalMode::Ask)));
+    let mut a = app();
+    a.approval_policy = Some(policy.clone());
+
+    let (tx1, rx1) = tokio::sync::oneshot::channel::<bool>();
+    let (tx2, rx2) = tokio::sync::oneshot::channel::<bool>();
+    let (tx3, rx3) = tokio::sync::oneshot::channel::<bool>();
+    a.receive_approval(ApprovalRequest {
+        title: "edit_file src/a.rs".into(),
+        detail: String::new(),
+        reply: tx1,
+    });
+    a.receive_approval(ApprovalRequest {
+        title: "edit_file src/b.rs".into(),
+        detail: String::new(),
+        reply: tx2,
+    });
+    a.receive_approval(ApprovalRequest {
+        title: "run_shell: cargo build".into(),
+        detail: String::new(),
+        reply: tx3,
+    });
+
+    // Tekan [a] pada edit_file -> a.rs & b.rs otomatis setuju, lalu popup lanjut ke run_shell!
+    let cat = a.approve_category_for_session().unwrap();
+    assert_eq!(cat, "edit_file");
+    assert!(rx1.await.unwrap());
+    assert!(rx2.await.unwrap());
+    assert_eq!(a.approval.as_ref().unwrap().title, "run_shell: cargo build");
+    assert!(a.answer_approval(false));
+    assert!(!rx3.await.unwrap());
+    assert!(policy.lock().unwrap().is_auto_allowed("edit_file"));
+    assert!(!policy.lock().unwrap().is_auto_allowed("run_shell"));
 }
 
 #[test]

@@ -14,7 +14,9 @@ use selencode::repl::{
     help_menu_markup, parse_model_action, parse_provider_action, parse_slash_command,
     strip_menu_markup, KeySpec, ModelAction, ProviderAction, SlashCommand, PROVIDER_PRESETS,
 };
-use selencode::security::{is_forbidden_command, redact_secrets, ApprovalRequest, Approver};
+use selencode::security::{
+    is_forbidden_command, redact_secrets, ApprovalMode, ApprovalPolicy, ApprovalRequest, Approver,
+};
 use selencode::skills::{
     export_conversation_md, init_agents_md, list_skills, load_skill, remove_skill, save_skill,
 };
@@ -194,14 +196,17 @@ impl Session {
             )
         });
 
-        let auto_yes = cfg.auto_approve(yes);
-        let mut ctx = Ctx::new(cwd, auto_yes)
+        let mode = ApprovalMode::from_config(&cfg.agent.approval, yes);
+        let policy = Arc::new(std::sync::Mutex::new(ApprovalPolicy::new(mode)));
+        let approver = match approval_tx {
+            Some(tx) => Arc::new(Approver::channel_with_policy(policy, tx)),
+            None => Arc::new(Approver::stdin_with_policy(policy)),
+        };
+        let ctx = Ctx::new(cwd, mode == ApprovalMode::AutoAll)
+            .with_approver(approver)
             .with_context_limit(cfg.agent.context_limit_tokens)
             .with_auto_skills(cfg.agent.auto_skills)
             .with_store(store.clone(), session_id.clone());
-        if let Some(tx) = approval_tx {
-            ctx = ctx.with_approver(Arc::new(Approver::channel(auto_yes, tx)));
-        }
         // Delegate (Fase 6): subagent memakai provider sesi saat build;
         // ganti provider via /model TIDAK mengganti provider subagent
         // (dicatat di HASIL-FASE-6). Registry anak selalu baca-saja.
@@ -1096,6 +1101,58 @@ impl Session {
         }
     }
 
+    fn handle_approve(&mut self, arg: Option<&str>) -> Result<String> {
+        let policy = self.ctx.approver.policy();
+        let Some(arg) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let (mode, mut cats) = {
+                let p = policy.lock().expect("approval policy poisoned");
+                let cats: Vec<String> = p.session_allowed.iter().cloned().collect();
+                (p.mode, cats)
+            };
+            cats.sort();
+            let allowed_str = if cats.is_empty() {
+                "(belum ada)".to_string()
+            } else {
+                cats.join(", ")
+            };
+            return Ok(format!(
+                "# Pengaturan Persetujuan (Approval)\n\
+                 * mode | {} | aktif sesi ini\n\
+                 > izin sesi | {allowed_str} | diizinkan via tombol [a]\n\
+                 ---\n\
+                 ! /approve edits — otomatis izinkan edit/tulis file (tetap tanya shell/git/web)\n\
+                 ! /approve auto  — otomatis izinkan semua aksi aman sesi ini (.env & perintah destruktif tetap diblokir)\n\
+                 ! /approve ask   — kembali tanya per aksi & reset izin sesi",
+                mode.label()
+            ));
+        };
+
+        let (new_mode, reset_cats) = match arg.to_ascii_lowercase().as_str() {
+            "ask" => (ApprovalMode::Ask, true),
+            "edits" | "edit" => (ApprovalMode::AutoEdits, false),
+            "auto" | "all" | "yes" => (ApprovalMode::AutoAll, false),
+            other => anyhow::bail!("mode '{other}' tidak dikenal. Pilihan: ask, edits, auto"),
+        };
+        {
+            let mut p = policy.lock().expect("approval policy poisoned");
+            p.mode = new_mode;
+            if reset_cats {
+                p.session_allowed.clear();
+            }
+        }
+        Ok(format!(
+            "# Mode Persetujuan Diubah\n\
+             * mode | {} | berlaku langsung di sesi ini\n\
+             ! Untuk permanen di config, isi `approval = \"{}\"` di bagian `[agent]` selencode.toml.",
+            new_mode.label(),
+            match new_mode {
+                ApprovalMode::Ask => "ask",
+                ApprovalMode::AutoEdits => "edits",
+                ApprovalMode::AutoAll => "auto",
+            }
+        ))
+    }
+
     fn handle_export(&self, arg: Option<&str>) -> Result<String> {
         let path = export_conversation_md(
             &self.ctx.cwd,
@@ -1404,6 +1461,14 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
+            TuiCommand::SetApproval(arg) => match s.handle_approve(arg.as_deref()) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
             TuiCommand::ShowModels => {
                 let _ = ui_tx.send(UiEvent::Menu(s.models_menu())).await;
             }
@@ -1516,6 +1581,7 @@ async fn interactive_tui(cli: Cli, resume: bool) -> Result<()> {
     app.provider_label = provider_label(&s.provider_name, &s.pcfg);
     app.tool_count = s.registry.names().len();
     app.session_id = s.session_id.clone();
+    app.approval_policy = Some(s.ctx.approver.policy());
     app.resumed = s.resumed_note.is_some();
     app.plan_next = cli.plan;
     if let Some(note) = &s.resumed_note {
@@ -1630,6 +1696,10 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                 Err(e) => eprintln!("[error] {e}"),
             },
             SlashCommand::Export(arg) => match s.handle_export(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Approve(arg) => match s.handle_approve(arg.as_deref()) {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },

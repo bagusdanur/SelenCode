@@ -31,6 +31,8 @@ pub enum SlashCommand {
     Init,
     /// /export [nama.md] — ekspor percakapan saat ini ke file Markdown.
     Export(Option<String>),
+    /// /approve [ask | edits | auto] — atur mode izin aksi sesi aktif.
+    Approve(Option<String>),
     /// /details — toggle tampilan ringkas vs detail pada baris tool di TUI.
     Details,
     /// /sessions
@@ -133,6 +135,12 @@ pub const COMMANDS: &[CommandDef] = &[
         takes_args: true,
     },
     CommandDef {
+        cmd: "/approve",
+        args: "[ask | edits | auto]",
+        desc: "atur mode persetujuan (kurangi popup izin)",
+        takes_args: true,
+    },
+    CommandDef {
         cmd: "/details",
         args: "",
         desc: "toggle tampilan ringkas / detail hasil tool",
@@ -220,6 +228,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/learn" => SlashCommand::Learn(rest),
         "/init" => SlashCommand::Init,
         "/export" => SlashCommand::Export(rest),
+        "/approve" => SlashCommand::Approve(rest),
         "/details" => SlashCommand::Details,
         "/sessions" => SlashCommand::Sessions,
         "/resume" => SlashCommand::Resume,

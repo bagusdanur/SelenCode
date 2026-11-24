@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Apakah nama file termasuk rahasia (tidak boleh dibaca/dikirim ke provider)?
 pub fn is_secret_file(path: &Path) -> bool {
@@ -70,6 +72,82 @@ pub fn resolve_in_sandbox(cwd: &Path, path: &Path) -> Result<PathBuf> {
     Ok(joined)
 }
 
+/// Mode persetujuan tool pada sesi aktif.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApprovalMode {
+    /// Tanya setiap aksi tulis/shell/web/mcp (kecuali kategori yang sudah diizinkan sesi ini).
+    #[default]
+    Ask,
+    /// Otomatis izinkan `edit_file` & `write_file`; tetap tanya untuk shell/git_commit/web/mcp.
+    AutoEdits,
+    /// Otomatis izinkan semua aksi (perintah destruktif & file rahasia `.env` tetap diblokir keras).
+    AutoAll,
+}
+
+impl ApprovalMode {
+    pub fn from_config(approval: &str, yes_flag: bool) -> Self {
+        if yes_flag || approval.eq_ignore_ascii_case("auto") {
+            Self::AutoAll
+        } else if approval.eq_ignore_ascii_case("edits") {
+            Self::AutoEdits
+        } else {
+            Self::Ask
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "ask (tanya per aksi)",
+            Self::AutoEdits => "edits (otomatis edit/tulis file, tanya shell/git/web)",
+            Self::AutoAll => "auto (otomatis semua aksi aman)",
+        }
+    }
+}
+
+/// Kebijakan persetujuan bersama antara `Approver`, UI TUI (tombol `[a]`), dan `/approve`.
+#[derive(Debug, Default)]
+pub struct ApprovalPolicy {
+    pub mode: ApprovalMode,
+    /// Kategori tool yang diizinkan user untuk seluruh sisa sesi via `[a]`.
+    pub session_allowed: HashSet<String>,
+}
+
+impl ApprovalPolicy {
+    pub fn new(mode: ApprovalMode) -> Self {
+        Self {
+            mode,
+            session_allowed: HashSet::new(),
+        }
+    }
+
+    pub fn is_auto_allowed(&self, category: &str) -> bool {
+        match self.mode {
+            ApprovalMode::AutoAll => true,
+            ApprovalMode::AutoEdits => matches!(category, "edit_file" | "write_file"),
+            ApprovalMode::Ask => false,
+        } || self.session_allowed.contains(category)
+    }
+
+    pub fn allow_category(&mut self, category: impl Into<String>) {
+        self.session_allowed.insert(category.into());
+    }
+}
+
+/// Ekstrak kategori ringkas dari judul approval (mis. `"edit_file src/a.rs"` -> `"edit_file"`,
+/// `"run_shell: cargo build"` -> `"run_shell"`, `"mcp: fs/read"` -> `"mcp:fs"`).
+pub fn tool_category_from_title(title: &str) -> String {
+    let t = title.trim();
+    if let Some(rest) = t.strip_prefix("mcp:") {
+        let server = rest.trim().split('/').next().unwrap_or("mcp").trim();
+        return format!("mcp:{server}");
+    }
+    t.split(|c: char| c.is_whitespace() || c == ':')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("tool")
+        .to_string()
+}
+
 /// Permintaan persetujuan yang dikirim ke UI (Fase 4, mode TUI):
 /// UI menampilkan popup lalu menjawab lewat `reply` (true = setuju).
 #[derive(Debug)]
@@ -79,59 +157,106 @@ pub struct ApprovalRequest {
     pub reply: tokio::sync::oneshot::Sender<bool>,
 }
 
-/// Penanya persetujuan. auto_yes = flag --yes / approval="auto" di config.
-///
-/// Dua varian (Fase 4): `Stdin` = mode polos (tanya langsung di terminal,
-/// perilaku Fase 0-3 tidak berubah) dan `Channel` = mode TUI (permintaan
-/// dikirim lewat mpsc ke UI, jawaban ditunggu via oneshot). Tool pemanggil
-/// tidak tahu varian mana yang aktif — mereka hanya memanggil `ask().await`.
+/// Penanya persetujuan dengan dukungan mode (`ask` / `edits` / `auto`) serta
+/// izin per kategori selama sesi (`[a]` — agar tidak terus-terusan minta izin).
 #[derive(Debug, Clone)]
 pub enum Approver {
-    Stdin { auto_yes: bool },
+    Stdin {
+        policy: Arc<Mutex<ApprovalPolicy>>,
+    },
     Channel {
-        auto_yes: bool,
+        policy: Arc<Mutex<ApprovalPolicy>>,
         tx: tokio::sync::mpsc::Sender<ApprovalRequest>,
     },
 }
 
 impl Approver {
     pub fn new(auto_yes: bool) -> Self {
-        Approver::Stdin { auto_yes }
+        let mode = if auto_yes {
+            ApprovalMode::AutoAll
+        } else {
+            ApprovalMode::Ask
+        };
+        Approver::Stdin {
+            policy: Arc::new(Mutex::new(ApprovalPolicy::new(mode))),
+        }
+    }
+
+    /// Varian Stdin dengan kebijakan bersama (dipakai mode polos + `/approve`).
+    pub fn stdin_with_policy(policy: Arc<Mutex<ApprovalPolicy>>) -> Self {
+        Approver::Stdin { policy }
     }
 
     /// Varian TUI: approval diminta lewat channel ke UI.
     pub fn channel(auto_yes: bool, tx: tokio::sync::mpsc::Sender<ApprovalRequest>) -> Self {
-        Approver::Channel { auto_yes, tx }
+        let mode = if auto_yes {
+            ApprovalMode::AutoAll
+        } else {
+            ApprovalMode::Ask
+        };
+        Approver::Channel {
+            policy: Arc::new(Mutex::new(ApprovalPolicy::new(mode))),
+            tx,
+        }
+    }
+
+    /// Varian TUI dengan kebijakan bersama (dipakai tombol `[a]` & `/approve`).
+    pub fn channel_with_policy(
+        policy: Arc<Mutex<ApprovalPolicy>>,
+        tx: tokio::sync::mpsc::Sender<ApprovalRequest>,
+    ) -> Self {
+        Approver::Channel { policy, tx }
+    }
+
+    pub fn policy(&self) -> Arc<Mutex<ApprovalPolicy>> {
+        match self {
+            Approver::Stdin { policy } | Approver::Channel { policy, .. } => policy.clone(),
+        }
     }
 
     pub fn auto_yes(&self) -> bool {
-        match self {
-            Approver::Stdin { auto_yes } | Approver::Channel { auto_yes, .. } => *auto_yes,
-        }
+        self.policy()
+            .lock()
+            .map(|p| p.mode == ApprovalMode::AutoAll)
+            .unwrap_or(false)
     }
 
     /// Minta persetujuan. true = disetujui.
     pub async fn ask(&self, title: &str, detail: &str) -> bool {
-        if self.auto_yes() {
-            match self {
-                Approver::Stdin { .. } => println!("[auto-approve] {title}"),
-                Approver::Channel { .. } => {}
+        let category = tool_category_from_title(title);
+        let allowed = self
+            .policy()
+            .lock()
+            .map(|p| p.is_auto_allowed(&category))
+            .unwrap_or(false);
+        if allowed {
+            if matches!(self, Approver::Stdin { .. }) {
+                println!("[auto-approve] {title}");
             }
             return true;
         }
         match self {
-            Approver::Stdin { .. } => {
+            Approver::Stdin { policy } => {
                 println!("\n--- PERLU PERSETUJUAN: {title} ---");
                 if !detail.is_empty() {
                     println!("{detail}");
                 }
-                print!("Jalankan? [y/N] ");
+                print!("Jalankan? [y] setuju / [a] selalu izinkan '{category}' sesi ini / [N] tolak: ");
                 let _ = std::io::stdout().flush();
                 let mut line = String::new();
                 if std::io::stdin().read_line(&mut line).is_err() {
                     return false;
                 }
-                matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+                match line.trim().to_lowercase().as_str() {
+                    "y" | "yes" => true,
+                    "a" | "always" => {
+                        if let Ok(mut p) = policy.lock() {
+                            p.allow_category(category);
+                        }
+                        true
+                    }
+                    _ => false,
+                }
             }
             Approver::Channel { tx, .. } => {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();

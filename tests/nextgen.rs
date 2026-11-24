@@ -179,6 +179,20 @@ fn repl_inline_shell_new_commands_and_presets() {
     assert_eq!(parse_slash_command("/init"), SlashCommand::Init);
     assert_eq!(parse_slash_command("/details"), SlashCommand::Details);
     assert_eq!(
+        parse_slash_command("/approve edits"),
+        SlashCommand::Approve(Some("edits".into()))
+    );
+    assert_eq!(
+        selencode::security::ApprovalMode::from_config("edits", false),
+        selencode::security::ApprovalMode::AutoEdits
+    );
+    let mut pol = selencode::security::ApprovalPolicy::new(selencode::security::ApprovalMode::AutoEdits);
+    assert!(pol.is_auto_allowed("edit_file"));
+    assert!(pol.is_auto_allowed("write_file"));
+    assert!(!pol.is_auto_allowed("run_shell"));
+    pol.allow_category("run_shell");
+    assert!(pol.is_auto_allowed("run_shell"));
+    assert_eq!(
         parse_slash_command("/memory add selalu ringkas"),
         SlashCommand::Memory(Some("add selalu ringkas".into()))
     );

@@ -15,7 +15,7 @@ pub mod moonlit;
 
 use crate::agent::UiEvent;
 use crate::repl::{filter_commands, help_menu_markup, parse_slash_command, SlashCommand};
-use crate::security::ApprovalRequest;
+use crate::security::{tool_category_from_title, ApprovalRequest};
 use anyhow::Result;
 use app::{App, LineKind, ToolState};
 use crossterm::event::{
@@ -28,7 +28,7 @@ use crossterm::ExecutableCommand;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io::stdout;
 use std::sync::Arc;
@@ -60,6 +60,8 @@ pub enum TuiCommand {
     LearnSkill(Option<String>),
     InitAgents,
     ExportChat(Option<String>),
+    /// /approve [ask | edits | auto]: atur mode izin sesi aktif.
+    SetApproval(Option<String>),
     /// /new: mulai sesi baru yang bersih.
     NewSession,
     /// /compact: ringkas riwayat konteks secara manual.
@@ -544,33 +546,126 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    // Popup approval (modal, di atas segalanya) — bingkai GOLD Moonlit;
-    // warna diff di badan popup tetap hijau/merah (kode universal).
+    // Modal Persetujuan Moonlit Ungu (modern, scrollable, dengan opsi [a] selalu sesi ini)
     if let Some(p) = &app.approval {
-        let popup = centered_rect(70, 60, area);
+        let pct_x = if area.width < 80 { 94 } else { 78 };
+        let pct_y = if area.height < 26 { 80 } else { 66 };
+        let popup = centered_rect(pct_x, pct_y, area);
         frame.render_widget(Clear, popup);
-        let mut body = diff_view::detail_lines(&p.detail);
-        body.push(Line::from(""));
-        body.push(Line::from(Span::styled(
-            "[y] setuju    [n] tolak",
-            Style::default()
-                .fg(moonlit::GOLD)
-                .add_modifier(Modifier::BOLD),
-        )));
-        let widget = Paragraph::new(body)
+
+        let modal_bg = Color::Rgb(20, 15, 38);
+        let category = tool_category_from_title(&p.title);
+        let pending_total = app.approval_pending_count();
+        let queue_badge = if pending_total > 1 {
+            format!(" · 1/{pending_total} antre")
+        } else {
+            String::new()
+        };
+
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(moonlit::VIOLET))
+            .style(Style::default().bg(modal_bg))
+            .title_style(
+                Style::default()
+                    .fg(moonlit::LILAC)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .title(format!(" ☾ Persetujuan: {} ", p.title));
+        let inner = outer.inner(popup);
+        frame.render_widget(outer, popup);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2), // header kategori & ringkasan
+                Constraint::Min(3),    // isi diff / perintah (scrollable)
+                Constraint::Length(2), // footer tombol aksi
+            ])
+            .split(inner);
+
+        // Header info kategori + badge
+        let header_lines = vec![
+            Line::from(vec![
+                Span::styled(" ✦ ", Style::default().fg(moonlit::GOLD)),
+                Span::styled("Tool: ", Style::default().fg(moonlit::DIM)),
+                Span::styled(
+                    category.clone(),
+                    Style::default()
+                        .fg(moonlit::CYAN_MOON)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(queue_badge, Style::default().fg(moonlit::LAV)),
+                Span::styled(
+                    "   ·   ↑↓ gulir detail",
+                    Style::default().fg(moonlit::FAINT),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "─".repeat(sections[0].width as usize),
+                Style::default().fg(moonlit::FAINT),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(header_lines).style(Style::default().bg(modal_bg)),
+            sections[0],
+        );
+
+        // Isi detail/diff berwarna (hijau/merah untuk diff, lavender untuk perintah)
+        let body = if p.detail.trim().is_empty() {
+            vec![Line::from(vec![
+                Span::styled("  › ", Style::default().fg(moonlit::VIOLET)),
+                Span::styled(p.title.clone(), Style::default().fg(moonlit::SILVER)),
+            ])]
+        } else {
+            diff_view::detail_lines(&p.detail)
+        };
+        let body_widget = Paragraph::new(body)
+            .style(Style::default().bg(modal_bg))
             .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(moonlit::GOLD))
-                    .title_style(
-                        Style::default()
-                            .fg(moonlit::GOLD)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .title(format!(" Persetujuan: {} ", p.title)),
-            );
-        frame.render_widget(widget, popup);
+            .scroll((app.approval_scroll, 0));
+        frame.render_widget(body_widget, sections[1]);
+
+        // Footer pill tombol aksi modern
+        let pill_ok = Style::default()
+            .bg(moonlit::DEEP)
+            .fg(moonlit::MINT)
+            .add_modifier(Modifier::BOLD);
+        let pill_all = Style::default()
+            .bg(Color::Rgb(46, 28, 86))
+            .fg(moonlit::LILAC)
+            .add_modifier(Modifier::BOLD);
+        let pill_no = Style::default()
+            .bg(Color::Rgb(68, 22, 34))
+            .fg(moonlit::ROSE)
+            .add_modifier(Modifier::BOLD);
+        let always_label = if sections[2].width >= 60 {
+            format!(" [a] selalu {category} sesi ini ")
+        } else if sections[2].width >= 50 {
+            " [a] selalu sesi ini ".to_string()
+        } else {
+            " [a] selalu ".to_string()
+        };
+        let gap = if sections[2].width >= 50 { "  " } else { " " };
+        let footer_lines = vec![
+            Line::from(Span::styled(
+                "─".repeat(sections[2].width as usize),
+                Style::default().fg(moonlit::FAINT),
+            )),
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(" [y] setuju ", pill_ok),
+                Span::raw(gap),
+                Span::styled(always_label, pill_all),
+                Span::raw(gap),
+                Span::styled(" [n] tolak ", pill_no),
+            ]),
+        ];
+        frame.render_widget(
+            Paragraph::new(footer_lines).style(Style::default().bg(modal_bg)),
+            sections[2],
+        );
     }
 }
 
@@ -682,6 +777,9 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
         SlashCommand::Export(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::ExportChat(arg));
         }
+        SlashCommand::Approve(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::SetApproval(arg));
+        }
         SlashCommand::Details => {
             app.show_tool_details = !app.show_tool_details;
             let mode = if app.show_tool_details {
@@ -771,14 +869,33 @@ fn handle_key(
     if key.kind == KeyEventKind::Release {
         return;
     }
-    // Popup approval mengunci semua input lain.
+    // Popup approval mengunci semua input lain (dukung y / a / n / ↑↓ gulir).
     if app.approval.is_some() {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 app.answer_approval(true);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                if let Some(cat) = app.approve_category_for_session() {
+                    app.info(format!(
+                        "Izin sesi: '{cat}' disetujui otomatis untuk sisa sesi ini (/approve untuk ubah)."
+                    ));
+                }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 app.answer_approval(false);
+            }
+            KeyCode::Up => {
+                app.approval_scroll = app.approval_scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                app.approval_scroll = app.approval_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                app.approval_scroll = app.approval_scroll.saturating_sub(8);
+            }
+            KeyCode::PageDown => {
+                app.approval_scroll = app.approval_scroll.saturating_add(8);
             }
             _ => {}
         }
@@ -894,8 +1011,20 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
                 match event::read()? {
                     Event::Key(key) => handle_key(&mut app, &ch.cmd_tx, &ch.cancel, key),
                     Event::Mouse(m) => match m.kind {
-                        MouseEventKind::ScrollUp => app.scroll_up(3),
-                        MouseEventKind::ScrollDown => app.scroll_down(3),
+                        MouseEventKind::ScrollUp => {
+                            if app.approval.is_some() {
+                                app.approval_scroll = app.approval_scroll.saturating_sub(3);
+                            } else {
+                                app.scroll_up(3);
+                            }
+                        }
+                        MouseEventKind::ScrollDown => {
+                            if app.approval.is_some() {
+                                app.approval_scroll = app.approval_scroll.saturating_add(3);
+                            } else {
+                                app.scroll_down(3);
+                            }
+                        }
                         _ => {}
                     },
                     _ => {}

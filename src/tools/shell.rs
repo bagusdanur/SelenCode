@@ -13,6 +13,38 @@ pub struct RunShell {
     pub timeout_secs: u64,
 }
 
+/// Perintah baca-saja / cek versi bawaan yang aman berjalan tanpa mengganggu
+/// user dengan popup approval berulang (tetap menolak chaining/redirect!).
+const SAFE_READONLY_CMDS: &[&str] = &[
+    "ls",
+    "dir",
+    "pwd",
+    "whoami",
+    "uname",
+    "git status",
+    "git diff",
+    "git log",
+    "git branch",
+    "git show",
+    "cargo check",
+    "cargo test",
+    "rustc --version",
+    "cargo --version",
+    "node -v",
+    "node --version",
+    "python --version",
+    "python3 --version",
+];
+
+fn matches_prefix(c: &str, entry: &str) -> bool {
+    let a = entry.trim();
+    !a.is_empty()
+        && (c == a
+            || c.strip_prefix(a)
+                .map(|rest| rest.starts_with(|ch: char| ch.is_whitespace()))
+                .unwrap_or(false))
+}
+
 impl RunShell {
     pub fn new(allowlist: Vec<String>, timeout_secs: u64) -> Self {
         Self {
@@ -32,14 +64,8 @@ impl RunShell {
         if c.contains([';', '|', '&', '`', '>', '<', '\n', '\r']) || c.contains("$(") {
             return false;
         }
-        self.allowlist.iter().any(|a| {
-            let a = a.trim();
-            !a.is_empty()
-                && (c == a
-                    || c.strip_prefix(a)
-                        .map(|rest| rest.starts_with(|ch: char| ch.is_whitespace()))
-                        .unwrap_or(false))
-        })
+        self.allowlist.iter().any(|a| matches_prefix(c, a))
+            || SAFE_READONLY_CMDS.iter().any(|a| matches_prefix(c, a))
     }
 }
 

@@ -3,11 +3,12 @@
 //! meneruskan input keyboard ke sini.
 
 use crate::agent::UiEvent;
-use crate::security::ApprovalRequest;
+use crate::security::{tool_category_from_title, ApprovalPolicy, ApprovalRequest};
 use crate::tui::moonlit::{self, WelcomeInfo};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use tui_textarea::TextArea;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +75,10 @@ pub struct App {
     pub session_out: u64,
     pub approval: Option<PendingApproval>,
     approval_queue: VecDeque<PendingApproval>,
+    /// Scroll vertikal di dalam modal persetujuan (↑↓ / PageUp / PageDown).
+    pub approval_scroll: u16,
+    /// Kebijakan persetujuan bersama dengan Approver (untuk tombol `[a]` & `/approve`).
+    pub approval_policy: Option<Arc<Mutex<ApprovalPolicy>>>,
     pub should_quit: bool,
     /// Rencana dari giliran plan yang menunggu konfirmasi y/n (Fase 6).
     pub pending_plan: Option<String>,
@@ -138,6 +143,8 @@ impl App {
             session_out,
             approval: None,
             approval_queue: VecDeque::new(),
+            approval_scroll: 0,
+            approval_policy: None,
             should_quit: false,
             pending_plan: None,
             plan_next: false,
@@ -332,6 +339,11 @@ impl App {
         }
     }
 
+    /// Jumlah total approval yang menunggu (aktif + antrean).
+    pub fn approval_pending_count(&self) -> usize {
+        self.approval.is_some() as usize + self.approval_queue.len()
+    }
+
     /// Popup approval masuk dari channel approver. Bila sudah ada popup
     /// aktif, antrekan agar permintaan berikutnya tidak hilang/tertimpa.
     pub fn receive_approval(&mut self, req: ApprovalRequest) {
@@ -342,6 +354,7 @@ impl App {
         };
         if self.approval.is_none() {
             self.approval = Some(pending);
+            self.approval_scroll = 0;
         } else {
             self.approval_queue.push_back(pending);
         }
@@ -354,12 +367,51 @@ impl App {
                 if let Some(tx) = p.reply.take() {
                     let _ = tx.send(yes);
                 }
-                if let Some(next) = self.approval_queue.pop_front() {
-                    self.approval = Some(next);
-                }
+                self.approval_scroll = 0;
+                self.advance_approval_queue();
                 true
             }
             None => false,
+        }
+    }
+
+    /// Jawab setuju DAN izinkan kategori tool ini otomatis untuk sisa sesi (`[a]`).
+    /// Mengembalikan nama kategori yang baru diizinkan.
+    pub fn approve_category_for_session(&mut self) -> Option<String> {
+        let mut p = self.approval.take()?;
+        let category = tool_category_from_title(&p.title);
+        if let Some(policy) = &self.approval_policy {
+            if let Ok(mut pol) = policy.lock() {
+                pol.allow_category(category.clone());
+            }
+        }
+        if let Some(tx) = p.reply.take() {
+            let _ = tx.send(true);
+        }
+        self.approval_scroll = 0;
+        self.advance_approval_queue();
+        Some(category)
+    }
+
+    /// Ambil item antrean berikutnya; bila item berikutnya sudah otomatis
+    /// diizinkan oleh `approval_policy`, langsung setujui tanpa memunculkan popup.
+    fn advance_approval_queue(&mut self) {
+        while let Some(mut next) = self.approval_queue.pop_front() {
+            let cat = tool_category_from_title(&next.title);
+            let auto_ok = self
+                .approval_policy
+                .as_ref()
+                .and_then(|pol| pol.lock().ok())
+                .map(|pol| pol.is_auto_allowed(&cat))
+                .unwrap_or(false);
+            if auto_ok {
+                if let Some(tx) = next.reply.take() {
+                    let _ = tx.send(true);
+                }
+                continue;
+            }
+            self.approval = Some(next);
+            break;
         }
     }
 
