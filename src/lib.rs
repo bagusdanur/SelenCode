@@ -8,3 +8,4 @@ pub mod security;
 pub mod store;
 pub mod tools;
 pub mod tui;
+pub mod update;
