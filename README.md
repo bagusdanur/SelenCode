@@ -129,6 +129,24 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/folder"]
 ```
 
+## Update
+
+Mulai v0.1.2, perbarui `selen` langsung dari GitHub Releases:
+
+```bash
+selen update
+```
+
+Perintah ini menanyakan rilis terbaru `bagusdanur/SelenCode`, membandingkan
+versi semver-nya dengan versi binary ini, lalu — bila ada yang lebih baru —
+mengunduh aset sesuai platform (`selen-termux-arm64` di Termux/Android,
+`selen-linux-x64` di Linux x86_64) dan menimpa binary yang sedang terpasang.
+Bila sudah terbaru, ia hanya mencetak `Sudah versi terbaru (vX).`
+
+Alternatif manual (skrip): buat file `$PREFIX/bin/update-selen` berisi unduhan
+`https://github.com/bagusdanur/SelenCode/releases/latest/download/selen-termux-arm64`
+ke `$PREFIX/bin/selen` lalu `chmod +x` — berguna untuk memasang ulang dari nol.
+
 ## Tes
 
 ```bash
