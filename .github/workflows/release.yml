@@ -19,6 +19,8 @@ jobs:
         with:
           targets: aarch64-linux-android
       - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
       - name: Build rilis Termux
