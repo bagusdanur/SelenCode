@@ -17,7 +17,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Jalankan semua unit & integration tests
-        run: cargo test
+        run: |
+          set -o pipefail
+          if ! cargo test 2>&1 | tee /tmp/cargo_test.log; then
+            grep -E "error(\[E[0-9]+\])?:|panicked at|FAILED" /tmp/cargo_test.log | head -n 10 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          fi
       - name: Uji render frame TUI nyata (wide 116 & HP 52)
         run: |
           cargo run --example render_welcome -- /tmp/wide.dump 116 36

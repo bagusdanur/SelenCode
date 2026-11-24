@@ -215,20 +215,25 @@ impl Approver {
     }
 
     pub fn auto_yes(&self) -> bool {
-        self.policy()
+        let policy = self.policy();
+        let yes = policy
             .lock()
             .map(|p| p.mode == ApprovalMode::AutoAll)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        yes
     }
 
     /// Minta persetujuan. true = disetujui.
     pub async fn ask(&self, title: &str, detail: &str) -> bool {
         let category = tool_category_from_title(title);
-        let allowed = self
-            .policy()
-            .lock()
-            .map(|p| p.is_auto_allowed(&category))
-            .unwrap_or(false);
+        let allowed = {
+            let policy = self.policy();
+            let ok = policy
+                .lock()
+                .map(|p| p.is_auto_allowed(&category))
+                .unwrap_or(false);
+            ok
+        };
         if allowed {
             if matches!(self, Approver::Stdin { .. }) {
                 println!("[auto-approve] {title}");

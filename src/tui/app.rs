@@ -398,12 +398,13 @@ impl App {
     fn advance_approval_queue(&mut self) {
         while let Some(mut next) = self.approval_queue.pop_front() {
             let cat = tool_category_from_title(&next.title);
-            let auto_ok = self
-                .approval_policy
-                .as_ref()
-                .and_then(|pol| pol.lock().ok())
-                .map(|pol| pol.is_auto_allowed(&cat))
-                .unwrap_or(false);
+            let auto_ok = match &self.approval_policy {
+                Some(pol) => pol
+                    .lock()
+                    .map(|p| p.is_auto_allowed(&cat))
+                    .unwrap_or(false),
+                None => false,
+            };
             if auto_ok {
                 if let Some(tx) = next.reply.take() {
                     let _ = tx.send(true);
