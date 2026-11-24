@@ -226,7 +226,24 @@ fn render_kartu_menu_dan_live_slash_palette() {
             model: "anthropic/claude-3.7-sonnet".into(),
         }
     );
-    assert_eq!(parse_model_action("list"), ModelAction::FetchList);
+    assert_eq!(parse_model_action("2"), ModelAction::SelectIndex(2));
+    assert_eq!(parse_model_action("set 3"), ModelAction::SelectIndex(3));
+    assert_eq!(
+        parse_model_action("add gemini-2.5-pro claude-sonnet-4"),
+        ModelAction::AddModels(vec![
+            "gemini-2.5-pro".into(),
+            "claude-sonnet-4".into(),
+        ])
+    );
+    assert_eq!(
+        parse_model_action("rm 2"),
+        ModelAction::RemoveModel("2".into())
+    );
+    assert_eq!(parse_model_action("list"), ModelAction::FetchList(None));
+    assert_eq!(
+        parse_model_action("list claude"),
+        ModelAction::FetchList(Some("claude".into()))
+    );
     assert_eq!(
         classify_key_spec("OPENROUTER_API_KEY"),
         KeySpec::EnvVar("OPENROUTER_API_KEY".into())

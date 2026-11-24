@@ -48,8 +48,8 @@ pub enum TuiCommand {
     ShowModels,
     /// /model <arg>: ganti provider, `/model set <id>`, `/model <prov>:<id>`, atau `/model list`.
     SwitchOrSetModel(String),
-    /// /models: tarik daftar model dari endpoint API provider aktif.
-    FetchRemoteModels,
+    /// /models [filter]: tarik daftar model dari endpoint API provider aktif & simpan.
+    FetchRemoteModels(Option<String>),
     /// /provider [preset|add|model|default|rm ...]: kelola & pasang provider lain.
     ManageProvider(Option<String>),
     Undo,
@@ -652,8 +652,8 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
         SlashCommand::Model(Some(arg)) => {
             send_cmd(app, cmd_tx, TuiCommand::SwitchOrSetModel(arg));
         }
-        SlashCommand::Models => {
-            send_cmd(app, cmd_tx, TuiCommand::FetchRemoteModels);
+        SlashCommand::Models(filter) => {
+            send_cmd(app, cmd_tx, TuiCommand::FetchRemoteModels(filter));
         }
         SlashCommand::Provider(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::ManageProvider(arg));

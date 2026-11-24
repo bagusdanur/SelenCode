@@ -9,10 +9,10 @@ pub enum SlashCommand {
     /// `!perintah` — jalankan shell lokal cepat tanpa memanggil LLM (ala OpenCode).
     InlineShell(String),
     Exit,
-    /// /model | /model <provider> | /model set <model> | /model <provider>:<model> | /model list
+    /// /model | /model <nomor> | /model <provider> | /model set <nomor|id> | /model add <id...> | /model rm <nomor|id> | /model list [filter]
     Model(Option<String>),
-    /// /models (pintasan /model list)
-    Models,
+    /// /models [filter] (tarik daftar model dari API, simpan ke daftar bernomor)
+    Models(Option<String>),
     /// /provider | /provider add ... | /provider preset ... | /provider model ... | /provider default ... | /provider rm ...
     Provider(Option<String>),
     /// /undo — batalkan edit/tulis file terakhir oleh agent.
@@ -62,15 +62,15 @@ pub struct CommandDef {
 pub const COMMANDS: &[CommandDef] = &[
     CommandDef {
         cmd: "/model",
-        args: "[provider | set <id> | list]",
-        desc: "lihat, ganti provider, atau input model manual",
+        args: "[no | set <no|id> | add <id> | rm <no>]",
+        desc: "pilih model via nomor, tambah, atau ganti provider",
         takes_args: true,
     },
     CommandDef {
         cmd: "/models",
-        args: "",
-        desc: "tarik daftar model dari API provider aktif",
-        takes_args: false,
+        args: "[filter]",
+        desc: "tarik & simpan daftar model bernomor dari API",
+        takes_args: true,
     },
     CommandDef {
         cmd: "/provider",
@@ -210,7 +210,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
     match head {
         "/exit" | "/quit" => SlashCommand::Exit,
         "/model" => SlashCommand::Model(rest),
-        "/models" => SlashCommand::Models,
+        "/models" => SlashCommand::Models(rest),
         "/provider" | "/connect" => SlashCommand::Provider(rest),
         "/undo" => SlashCommand::Undo,
         "/redo" => SlashCommand::Redo,
@@ -234,21 +234,68 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
 /// Aksi hasil parsing argumen `/model <arg>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelAction {
-    FetchList,
+    /// `/model list [filter]` -> tarik daftar model dari API & simpan ke daftar provider.
+    FetchList(Option<String>),
+    /// `/model <nomor>` atau `/model set <nomor>` -> pilih model berdasarkan nomor urut (1-based).
+    SelectIndex(usize),
+    /// `/model set <model_id>` -> set model manual & tambahkan ke daftar tersimpan.
     SetCurrentModel(String),
+    /// `/model add <m1> [m2 ...]` -> tambah model ke daftar bernomor provider aktif.
+    AddModels(Vec<String>),
+    /// `/model rm <nomor_atau_id>` -> hapus model dari daftar bernomor provider aktif.
+    RemoveModel(String),
+    /// `/model <provider>:<nomor_atau_id>` -> pindah provider + pilih/set modelnya.
     SwitchAndSetModel { provider: String, model: String },
+    /// `/model <target>` -> ganti ke provider `<target>`, cocokkan substring di daftar, atau set manual.
     SwitchOrModel(String),
 }
 
 pub fn parse_model_action(arg: &str) -> ModelAction {
     let arg = arg.trim();
     if arg.eq_ignore_ascii_case("list") || arg.eq_ignore_ascii_case("ls") {
-        return ModelAction::FetchList;
+        return ModelAction::FetchList(None);
+    }
+    if let Some(rest) = arg
+        .strip_prefix("list ")
+        .or_else(|| arg.strip_prefix("LIST "))
+        .or_else(|| arg.strip_prefix("ls "))
+    {
+        let f = rest.trim();
+        return ModelAction::FetchList((!f.is_empty()).then(|| f.to_string()));
+    }
+    if let Ok(idx) = arg.parse::<usize>() {
+        if idx >= 1 {
+            return ModelAction::SelectIndex(idx);
+        }
     }
     if let Some(rest) = arg.strip_prefix("set ").or_else(|| arg.strip_prefix("SET ")) {
-        let model = rest.trim();
-        if !model.is_empty() {
-            return ModelAction::SetCurrentModel(model.to_string());
+        let val = rest.trim();
+        if let Ok(idx) = val.parse::<usize>() {
+            if idx >= 1 {
+                return ModelAction::SelectIndex(idx);
+            }
+        }
+        if !val.is_empty() {
+            return ModelAction::SetCurrentModel(val.to_string());
+        }
+    }
+    if let Some(rest) = arg.strip_prefix("add ").or_else(|| arg.strip_prefix("ADD ")) {
+        let items: Vec<String> = rest
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+        if !items.is_empty() {
+            return ModelAction::AddModels(items);
+        }
+    }
+    if let Some(rest) = arg
+        .strip_prefix("rm ")
+        .or_else(|| arg.strip_prefix("remove "))
+        .or_else(|| arg.strip_prefix("del "))
+    {
+        let target = rest.trim();
+        if !target.is_empty() {
+            return ModelAction::RemoveModel(target.to_string());
         }
     }
     if let Some((prov, model)) = arg.split_once(':') {

@@ -240,89 +240,248 @@ impl Session {
         Ok(())
     }
 
-    /// Tangani `/model <arg>`: ganti provider, input model manual pada provider
-    /// aktif (`/model set <id>`), atau pindah provider + set model
-    /// (`/model <provider>:<id>`). Perubahan model langsung disimpan ke config.
+    /// Tangani `/model <arg>`: pilih lewat nomor (`/model 2` atau `/model set 2`),
+    /// tambah daftar (`/model add <id...>`), hapus (`/model rm <no|id>`),
+    /// ganti provider, input model manual, atau cari cepat lewat potongan nama.
     fn apply_model_arg(&mut self, arg: &str) -> Result<String> {
         match parse_model_action(arg) {
-            ModelAction::FetchList => anyhow::bail!("gunakan jalur async fetch_remote_models"),
-            ModelAction::SetCurrentModel(model) => {
+            ModelAction::FetchList(_) => anyhow::bail!("gunakan jalur async fetch_remote_models"),
+            ModelAction::SelectIndex(idx) => {
+                let list = self.pcfg.effective_models();
+                if idx == 0 || idx > list.len() {
+                    anyhow::bail!(
+                        "nomor model #{idx} tidak ada (rentang tersedia: 1..={}). Cek daftar lewat `/model` atau `/models`.",
+                        list.len()
+                    );
+                }
+                let chosen = list[idx - 1].clone();
                 if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
-                    p.model = model.clone();
+                    p.models = list;
+                    p.model = chosen.clone();
                 }
                 let saved_path = config::save(&self.cfg)?;
                 let pname = self.provider_name.clone();
                 self.switch_provider(&pname)?;
                 Ok(format!(
-                    "# Model Diperbarui\n\
-                     * {} | {} | aktif & tersimpan\n\
+                    "# Model Dipilih (#{idx})\n\
+                     * #{idx} | {} | aktif di provider {}\n\
                      ! Config disimpan ke: {}",
-                    self.provider_name,
                     self.pcfg.model,
+                    self.provider_name,
+                    saved_path.display()
+                ))
+            }
+            ModelAction::SetCurrentModel(model) => {
+                if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+                    p.models = p.effective_models();
+                    p.push_model_unique(&model);
+                    p.model = model.clone();
+                }
+                let saved_path = config::save(&self.cfg)?;
+                let pname = self.provider_name.clone();
+                self.switch_provider(&pname)?;
+                let pos = self
+                    .pcfg
+                    .effective_models()
+                    .iter()
+                    .position(|m| m == &self.pcfg.model)
+                    .map(|i| i + 1)
+                    .unwrap_or(1);
+                Ok(format!(
+                    "# Model Diperbarui (#{pos})\n\
+                     * #{pos} | {} | aktif di provider {} & tersimpan\n\
+                     ! Config disimpan ke: {}",
+                    self.pcfg.model,
+                    self.provider_name,
+                    saved_path.display()
+                ))
+            }
+            ModelAction::AddModels(items) => {
+                let mut added = 0usize;
+                if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+                    p.models = p.effective_models();
+                    for m in &items {
+                        if p.push_model_unique(m) {
+                            added += 1;
+                        }
+                    }
+                    self.pcfg = p.clone();
+                }
+                let saved_path = config::save(&self.cfg)?;
+                let mut out = format!(
+                    "# Daftar Model Diperbarui (+{added} baru, tersimpan ke {})\n",
+                    saved_path.display()
+                );
+                let list = self.pcfg.effective_models();
+                for (i, m) in list.iter().enumerate() {
+                    let active = *m == self.pcfg.model;
+                    let mark = if active { "*" } else { ">" };
+                    let note = if active { "aktif" } else { "" };
+                    out.push_str(&format!("{mark} #{} | {m} | {note}\n", i + 1));
+                }
+                out.push_str("---\n");
+                out.push_str("! Ganti cepat lewat nomor: /model <nomor>");
+                Ok(out)
+            }
+            ModelAction::RemoveModel(target) => {
+                let mut removed: Option<String> = None;
+                if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+                    let mut list = p.effective_models();
+                    let pos = if let Ok(idx) = target.parse::<usize>() {
+                        if idx >= 1 && idx <= list.len() {
+                            Some(idx - 1)
+                        } else {
+                            None
+                        }
+                    } else {
+                        list.iter().position(|m| m == &target)
+                    };
+                    let Some(idx) = pos else {
+                        anyhow::bail!("model '{target}' tidak ditemukan di daftar.");
+                    };
+                    if list[idx] == p.model {
+                        anyhow::bail!(
+                            "tidak bisa menghapus model '{}' yang sedang aktif; ganti dulu ke nomor lain.",
+                            p.model
+                        );
+                    }
+                    removed = Some(list.remove(idx));
+                    p.models = list;
+                    self.pcfg = p.clone();
+                }
+                let saved_path = config::save(&self.cfg)?;
+                Ok(format!(
+                    "# Model Dihapus dari Daftar\n\
+                     > dihapus | {} | tersimpan ke {}",
+                    removed.unwrap_or(target),
                     saved_path.display()
                 ))
             }
             ModelAction::SwitchAndSetModel { provider, model } => {
                 if !self.cfg.providers.contains_key(&provider) {
                     anyhow::bail!(
-                        "provider '{provider}' belum ada. Tambah dulu lewat `/provider add`."
+                        "provider '{provider}' belum ada. Tambah dulu lewat `/provider add` atau `/provider preset`."
                     );
                 }
-                if let Some(p) = self.cfg.providers.get_mut(&provider) {
-                    p.model = model.clone();
-                }
+                let chosen = if let Some(p) = self.cfg.providers.get_mut(&provider) {
+                    let list = p.effective_models();
+                    let resolved = if let Ok(idx) = model.parse::<usize>() {
+                        if idx == 0 || idx > list.len() {
+                            anyhow::bail!(
+                                "nomor model #{idx} tidak ada di provider '{provider}' (rentang 1..={}).",
+                                list.len()
+                            );
+                        }
+                        list[idx - 1].clone()
+                    } else {
+                        model.clone()
+                    };
+                    p.models = list;
+                    p.push_model_unique(&resolved);
+                    p.model = resolved.clone();
+                    resolved
+                } else {
+                    model
+                };
                 let saved_path = config::save(&self.cfg)?;
                 self.switch_provider(&provider)?;
                 Ok(format!(
                     "# Provider & Model Diperbarui\n\
-                     * {} | {} | aktif & tersimpan\n\
+                     * {} | {chosen} | aktif & tersimpan\n\
                      ! Config disimpan ke: {}",
                     self.provider_name,
-                    self.pcfg.model,
                     saved_path.display()
                 ))
             }
             ModelAction::SwitchOrModel(target) => {
+                // 1. Nama provider terdaftar -> pindah ke provider itu.
                 if self.cfg.providers.contains_key(&target) {
                     self.switch_provider(&target)?;
-                    Ok(format!(
-                        "# Provider Diganti\n\
-                         * {} | {} | kind {}\n\
-                         ! {}",
-                        self.provider_name,
-                        self.pcfg.model,
-                        self.pcfg.kind,
-                        self.usage_line()
-                    ))
+                    return Ok(self.models_menu());
+                }
+                // 2. Cek kecocokan di daftar model tersimpan provider aktif (exact atau substring).
+                let list = self.pcfg.effective_models();
+                let needle = target.to_ascii_lowercase();
+                let exact = list.iter().position(|m| m.eq_ignore_ascii_case(&target));
+                let matches: Vec<(usize, &String)> = if let Some(i) = exact {
+                    vec![(i + 1, &list[i])]
                 } else {
-                    // Input bukan nama provider di config -> perlakukan sebagai
-                    // input model manual untuk provider aktif agar praktis.
+                    list.iter()
+                        .enumerate()
+                        .filter(|(_, m)| m.to_ascii_lowercase().contains(&needle))
+                        .map(|(i, m)| (i + 1, m))
+                        .collect()
+                };
+                if matches.len() == 1 {
+                    let (idx, chosen) = (matches[0].0, matches[0].1.clone());
                     if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
-                        p.model = target.clone();
+                        p.models = list;
+                        p.model = chosen;
                     }
                     let saved_path = config::save(&self.cfg)?;
                     let pname = self.provider_name.clone();
                     self.switch_provider(&pname)?;
-                    Ok(format!(
-                        "# Model Manual Dipasang\n\
-                         * {} | {} | aktif & tersimpan\n\
+                    return Ok(format!(
+                        "# Model Dipilih (#{idx})\n\
+                         * #{idx} | {} | aktif di provider {}\n\
                          ! Config disimpan ke: {}",
-                        self.provider_name,
                         self.pcfg.model,
+                        self.provider_name,
                         saved_path.display()
-                    ))
+                    ));
                 }
+                if matches.len() > 1 {
+                    let mut out = format!(
+                        "# Ditemukan {} Model Cocok \"{target}\"\n",
+                        matches.len()
+                    );
+                    for (idx, m) in matches.iter().take(25) {
+                        let active = **m == self.pcfg.model;
+                        let mark = if active { "*" } else { ">" };
+                        let note = if active { "aktif" } else { "" };
+                        out.push_str(&format!("{mark} #{idx} | {m} | {note}\n"));
+                    }
+                    out.push_str("---\n");
+                    out.push_str("! Pilih cepat dengan nomor: /model <nomor>   (mis. /model 2)");
+                    return Ok(out);
+                }
+                // 3. Tidak cocok di daftar -> pasang sebagai model manual baru & simpan!
+                if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+                    p.models = list;
+                    p.push_model_unique(&target);
+                    p.model = target.clone();
+                }
+                let saved_path = config::save(&self.cfg)?;
+                let pname = self.provider_name.clone();
+                self.switch_provider(&pname)?;
+                let pos = self
+                    .pcfg
+                    .effective_models()
+                    .iter()
+                    .position(|m| m == &self.pcfg.model)
+                    .map(|i| i + 1)
+                    .unwrap_or(1);
+                Ok(format!(
+                    "# Model Manual Dipasang (#{pos})\n\
+                     * #{pos} | {} | aktif & tersimpan ke daftar\n\
+                     ! Config disimpan ke: {}",
+                    self.pcfg.model,
+                    saved_path.display()
+                ))
             }
         }
     }
 
-    /// Tarik daftar model real-time dari endpoint `/models` provider aktif.
-    async fn fetch_remote_models_menu(&self) -> Result<String> {
+    /// Tarik daftar model real-time dari endpoint `/models` provider aktif,
+    /// **otomatis menyimpannya** ke daftar bernomor di config, lalu tampilkan
+    /// (opsional disaring dengan kata kunci `filter`).
+    async fn fetch_remote_models_menu(&mut self, filter: Option<&str>) -> Result<String> {
         if self.pcfg.kind != "openai" {
             return Ok(format!(
                 "# Daftar Model ({})\n\
                  ! Provider kind '{}' tidak menyediakan endpoint /models standar OpenAI.\n\
-                 ! Pasang model secara manual dengan: /model set <id-model>",
+                 ! Tambah manual ke daftar bernomor: /model add <model-1> <model-2>\n\
+                 ! Lalu pilih cepat dengan: /model <nomor>",
                 self.provider_name, self.pcfg.kind
             ));
         }
@@ -330,30 +489,64 @@ impl Session {
         let base_url = pcfg
             .base_url
             .ok_or_else(|| anyhow::anyhow!("base_url kosong untuk provider '{}'", self.provider_name))?;
-        let ids = fetch_models(&base_url, &api_key).await?;
-        let mut out = format!(
-            "# Daftar Model dari {} ({} ditemukan)\n",
-            self.provider_name,
-            ids.len()
-        );
-        if ids.is_empty() {
-            out.push_str("! Server mengembalikan daftar model kosong.\n");
-        } else {
-            for id in ids.iter().take(40) {
-                let mark = if *id == self.pcfg.model { "*" } else { ">" };
-                let note = if *id == self.pcfg.model {
-                    "aktif"
-                } else {
-                    ""
-                };
-                out.push_str(&format!("{mark} {id} | | {note}\n"));
+        let mut ids = fetch_models(&base_url, &api_key).await?;
+        if !self.pcfg.model.trim().is_empty() && !ids.iter().any(|m| m == &self.pcfg.model) {
+            ids.insert(0, self.pcfg.model.clone());
+        }
+        // Simpan otomatis ke config agar langsung bisa dipilih via `/model <nomor>`!
+        if !ids.is_empty() {
+            if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+                p.models = ids.clone();
+                self.pcfg = p.clone();
             }
-            if ids.len() > 40 {
-                out.push_str(&format!("... dan {} model lainnya.\n", ids.len() - 40));
+            let _ = config::save(&self.cfg);
+        }
+
+        let needle = filter.map(|f| f.trim().to_ascii_lowercase()).filter(|f| !f.is_empty());
+        let shown: Vec<(usize, &String)> = ids
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                needle
+                    .as_deref()
+                    .map(|n| m.to_ascii_lowercase().contains(n))
+                    .unwrap_or(true)
+            })
+            .map(|(i, m)| (i + 1, m))
+            .collect();
+
+        let header = match &needle {
+            Some(f) => format!(
+                "# Model {} cocok \"{f}\" ({}/{} tersimpan)\n",
+                self.provider_name,
+                shown.len(),
+                ids.len()
+            ),
+            None => format!(
+                "# Daftar Model {} ({} tersimpan ke config)\n",
+                self.provider_name,
+                ids.len()
+            ),
+        };
+        let mut out = header;
+        if shown.is_empty() {
+            out.push_str("! Tidak ada model yang cocok.\n");
+        } else {
+            for (idx, id) in shown.iter().take(40) {
+                let active = **id == self.pcfg.model;
+                let mark = if active { "*" } else { ">" };
+                let note = if active { "aktif" } else { "" };
+                out.push_str(&format!("{mark} #{idx} | {id} | {note}\n"));
+            }
+            if shown.len() > 40 {
+                out.push_str(&format!(
+                    "! ... dan {} model lainnya (saring pakai `/models <kata>`, mis. `/models claude`)\n",
+                    shown.len() - 40
+                ));
             }
         }
         out.push_str("---\n");
-        out.push_str("! Pasang salah satu model di atas: /model set <id-model>");
+        out.push_str("! Pilih cepat lewat nomor: /model <nomor>   (atau /model set <nomor>)");
         Ok(out)
     }
 
@@ -387,6 +580,7 @@ impl Session {
                     kind: kind.clone(),
                     base_url: base_url.clone(),
                     model: model.clone(),
+                    models: vec![model.clone()],
                     api_key_env: api_key_env.clone(),
                     api_key,
                     price_in: None,
@@ -422,6 +616,8 @@ impl Session {
                     .providers
                     .get_mut(&name)
                     .ok_or_else(|| anyhow::anyhow!("provider '{name}' tidak ada di config"))?;
+                p.models = p.effective_models();
+                p.push_model_unique(&model);
                 p.model = model.clone();
                 let saved_path = config::save(&self.cfg)?;
                 if name == self.provider_name {
@@ -521,9 +717,27 @@ impl Session {
         }
     }
 
-    /// Kartu menu `/model` (berwarna di TUI, bersih di `--plain`).
+    /// Kartu menu `/model`: daftar model bernomor milik provider aktif + daftar provider lain.
     fn models_menu(&self) -> String {
-        let mut out = String::from("# Model & Provider Aktif\n");
+        let list = self.pcfg.effective_models();
+        let mut out = format!(
+            "# Model di Provider {} ({} tersimpan)\n",
+            self.provider_name,
+            list.len()
+        );
+        for (i, m) in list.iter().take(30).enumerate() {
+            let active = *m == self.pcfg.model;
+            let mark = if active { "*" } else { ">" };
+            let note = if active { "aktif" } else { "" };
+            out.push_str(&format!("{mark} #{} | {m} | {note}\n", i + 1));
+        }
+        if list.len() > 30 {
+            out.push_str(&format!(
+                "! ... dan {} model lainnya (cari cepat: `/models <kata>` atau `/model <kata>`)\n",
+                list.len() - 30
+            ));
+        }
+        out.push_str("---\n");
         let mut names: Vec<&String> = self.cfg.providers.keys().collect();
         names.sort();
         for n in names {
@@ -535,18 +749,18 @@ impl Session {
             } else {
                 "key belum diset"
             };
+            let count = p.effective_models().len();
             let tag = if active {
-                format!("aktif · kind {} · {key_ok}", p.kind)
+                format!("provider aktif · {} · {count} model · {key_ok}", p.kind)
             } else {
-                format!("kind {} · {key_ok}", p.kind)
+                format!("provider · {} · {count} model · {key_ok}", p.kind)
             };
             out.push_str(&format!("{mark} {n} | {} | {tag}\n", p.model));
         }
         out.push_str("---\n");
-        out.push_str("! Ganti provider:        /model <nama-provider>\n");
-        out.push_str("! Input model manual:    /model set <id-model>   atau   /model <provider>:<id-model>\n");
-        out.push_str("! Tarik daftar dari API: /models   (untuk provider OpenAI-compatible)\n");
-        out.push_str("! Pasang provider baru:  /provider");
+        out.push_str("! Ganti cepat via nomor: /model 2   atau   /model set 2   atau   /model claude\n");
+        out.push_str("! Tarik & simpan API:    /models [filter]   |   Tambah manual: /model add <id>\n");
+        out.push_str("! Pindah provider:       /model <provider>   |   Pasang provider: /provider");
         out
     }
 
@@ -1119,8 +1333,8 @@ async fn tui_worker(
                 let _ = ui_tx.send(UiEvent::Menu(s.models_menu())).await;
             }
             TuiCommand::SwitchOrSetModel(arg) => {
-                if matches!(parse_model_action(&arg), ModelAction::FetchList) {
-                    match s.fetch_remote_models_menu().await {
+                if let ModelAction::FetchList(filter) = parse_model_action(&arg) {
+                    match s.fetch_remote_models_menu(filter.as_deref()).await {
                         Ok(card) => {
                             let _ = ui_tx.send(UiEvent::Menu(card)).await;
                         }
@@ -1145,14 +1359,16 @@ async fn tui_worker(
                     }
                 }
             }
-            TuiCommand::FetchRemoteModels => match s.fetch_remote_models_menu().await {
-                Ok(card) => {
-                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+            TuiCommand::FetchRemoteModels(filter) => {
+                match s.fetch_remote_models_menu(filter.as_deref()).await {
+                    Ok(card) => {
+                        let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                    }
+                    Err(e) => {
+                        let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                    }
                 }
-                Err(e) => {
-                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
-                }
-            },
+            }
             TuiCommand::ManageProvider(arg) => match s.handle_provider(arg.as_deref()) {
                 Ok(card) => {
                     let _ = ui_tx
@@ -1284,8 +1500,8 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
             SlashCommand::Exit => break,
             SlashCommand::Model(None) => s.print_models(),
             SlashCommand::Model(Some(arg)) => {
-                if matches!(parse_model_action(&arg), ModelAction::FetchList) {
-                    match s.fetch_remote_models_menu().await {
+                if let ModelAction::FetchList(filter) = parse_model_action(&arg) {
+                    match s.fetch_remote_models_menu(filter.as_deref()).await {
                         Ok(card) => println!("{}", strip_menu_markup(&card)),
                         Err(e) => eprintln!("[error] {e}"),
                     }
@@ -1296,10 +1512,12 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                     }
                 }
             }
-            SlashCommand::Models => match s.fetch_remote_models_menu().await {
-                Ok(card) => println!("{}", strip_menu_markup(&card)),
-                Err(e) => eprintln!("[error] {e}"),
-            },
+            SlashCommand::Models(filter) => {
+                match s.fetch_remote_models_menu(filter.as_deref()).await {
+                    Ok(card) => println!("{}", strip_menu_markup(&card)),
+                    Err(e) => eprintln!("[error] {e}"),
+                }
+            }
             SlashCommand::Provider(arg) => match s.handle_provider(arg.as_deref()) {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),

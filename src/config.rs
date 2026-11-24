@@ -47,6 +47,10 @@ pub struct ProviderCfg {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     pub model: String,
+    /// Daftar model tersimpan untuk provider ini (diisi otomatis dari `/models`
+    /// atau `/model add` / `/model set`), untuk pemilihan cepat lewat nomor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
     #[serde(default)]
     pub api_key_env: String,
     /// API key opsional yang disimpan langsung lewat `/provider add` (fallback
@@ -196,6 +200,28 @@ pub fn save_to(cfg: &Config, path: &std::path::Path) -> Result<()> {
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+impl ProviderCfg {
+    /// Daftar model efektif (bernomor 1..=N): selalu memastikan `self.model`
+    /// yang sedang aktif ada di daftar agar nomor selalu konsisten.
+    pub fn effective_models(&self) -> Vec<String> {
+        let mut list = self.models.clone();
+        if !self.model.trim().is_empty() && !list.iter().any(|m| m == &self.model) {
+            list.insert(0, self.model.clone());
+        }
+        list
+    }
+
+    /// Tambahkan satu model ke daftar tersimpan bila belum ada.
+    pub fn push_model_unique(&mut self, model: &str) -> bool {
+        let m = model.trim();
+        if m.is_empty() || self.models.iter().any(|x| x == m) {
+            return false;
+        }
+        self.models.push(m.to_string());
+        true
+    }
 }
 
 impl Config {

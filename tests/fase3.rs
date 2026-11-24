@@ -303,7 +303,11 @@ fn slash_command_parsing() {
         SlashCommand::Model(Some("claude".into()))
     );
     assert_eq!(parse_slash_command("/sessions"), SlashCommand::Sessions);
-    assert_eq!(parse_slash_command("/models"), SlashCommand::Models);
+    assert_eq!(parse_slash_command("/models"), SlashCommand::Models(None));
+    assert_eq!(
+        parse_slash_command("/models claude"),
+        SlashCommand::Models(Some("claude".into()))
+    );
     assert_eq!(
         parse_slash_command("/provider add claude anthropic claude-sonnet-4 ANTHROPIC_API_KEY"),
         SlashCommand::Provider(Some(
@@ -393,6 +397,10 @@ fn config_save_load_and_direct_api_key_fallback() {
             kind: "openai".to_string(),
             base_url: Some("https://openrouter.ai/api/v1".to_string()),
             model: "anthropic/claude-3.7-sonnet".to_string(),
+            models: vec![
+                "anthropic/claude-3.7-sonnet".to_string(),
+                "openai/gpt-4.1".to_string(),
+            ],
             api_key_env: String::new(),
             api_key: Some("sk-direct-test-key".to_string()),
             price_in: None,
@@ -411,6 +419,7 @@ fn config_save_load_and_direct_api_key_fallback() {
     let (name, pcfg, key) = loaded.resolve_provider(None).unwrap();
     assert_eq!(name, "or");
     assert_eq!(pcfg.model, "anthropic/claude-3.7-sonnet");
+    assert_eq!(pcfg.effective_models().len(), 2);
     assert_eq!(key, "sk-direct-test-key");
     std::fs::remove_file(&path).ok();
 }
