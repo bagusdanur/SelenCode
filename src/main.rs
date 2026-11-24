@@ -47,6 +47,27 @@ enum Commands {
     },
     /// Lanjutkan sesi terakhir untuk folder ini (mode interaktif)
     Resume,
+    /// Perbarui selen ke rilis terbaru dari GitHub Releases
+    Update,
+}
+
+/// Label tampil provider untuk sambutan: nama + host base_url bila ada,
+/// mis. "router (router.ryukomik.com)".
+fn provider_label(name: &str, pcfg: &ProviderCfg) -> String {
+    match &pcfg.base_url {
+        Some(u) => {
+            let rest = u
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            let host = rest.split('/').next().unwrap_or(rest);
+            if host.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name} ({host})")
+            }
+        }
+        None => name.to_string(),
+    }
 }
 
 /// Buat instance provider dari config sesuai kind:
@@ -309,6 +330,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Resume) => interactive(cli, true).await,
+        Some(Commands::Update) => selencode::update::run().await,
         None => interactive(cli, false).await,
     }
 }
@@ -474,14 +496,15 @@ async fn interactive_tui(cli: Cli, resume: bool) -> Result<()> {
         init_in,
         init_out,
     );
-    app.info("SelenCode — halo, aku Selena. Ketik perintah, /exit untuk keluar.");
+    // Sambutan Moonlit (v0.1.2) digambar dari info ini pada frame pertama:
+    // penuh untuk sesi baru, 1 baris ringkas untuk resume. Catatan resume
+    // (judul/tanggal/jumlah pesan) tetap tampil sebagai baris info.
+    app.provider_label = provider_label(&s.provider_name, &s.pcfg);
+    app.tool_count = s.registry.names().len();
+    app.resumed = s.resumed_note.is_some();
     if let Some(note) = &s.resumed_note {
         app.info(note.clone());
     }
-    app.info(format!(
-        "Provider aktif: {} ({}) · perintah: /plan · /model [nama] · /sessions · /exit",
-        s.provider_name, s.pcfg.model
-    ));
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TuiCommand>(32);
     let (ui_tx, ui_rx) = tokio::sync::mpsc::channel::<UiEvent>(256);
@@ -507,10 +530,9 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
     if let Some(note) = &s.resumed_note {
         println!("{note}");
     }
-    println!("SelenCode — halo, aku Selena. Ketik perintah, /exit untuk keluar.");
     println!(
-        "Perintah: /plan · /model [nama] · /sessions · /exit — provider aktif: {} ({})",
-        s.provider_name, s.pcfg.model
+        "{}",
+        selencode::tui::moonlit::plain_banner(&s.provider_name, &s.pcfg.model)
     );
     let mut plan_next = cli.plan;
     if plan_next {
