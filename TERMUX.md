@@ -64,6 +64,19 @@ selen                               # mode interaktif (TUI; /exit untuk keluar)
 selen resume                        # lanjutkan sesi terakhir folder ini
 ```
 
+## 5. Update
+
+Mulai v0.1.2 cara update utama cukup satu perintah (tidak perlu download
+manual dari browser lagi):
+
+```bash
+selen update
+```
+
+Ia mengambil rilis terbaru dari GitHub, dan bila versinya lebih baru dari
+yang terpasang, binary `selen` ditimpa otomatis. Jalankan `selen` lagi
+sesudahnya untuk memakai versi baru.
+
 ## Catatan
 
 - Sesi tersimpan di `~/.local/share/selencode/selen.db` (SQLite lokal) —
