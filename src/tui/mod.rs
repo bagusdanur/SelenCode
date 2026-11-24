@@ -146,10 +146,8 @@ fn wrap_words(text: &str, max_cols: usize) -> Vec<String> {
             cur_len += 1 + wlen;
         } else {
             lines.push(cur);
-            cur = String::new();
-            cur_len = 0;
             if wlen <= limit {
-                cur.push_str(word);
+                cur = word.to_string();
                 cur_len = wlen;
             } else {
                 let mut buf = String::new();
@@ -1286,12 +1284,7 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>, cancel: &Arc<Notify>
             app.should_quit = true;
         }
         SlashCommand::Stop => {
-            let was_busy = app.busy;
-            let dropped = app.cancel_all_approvals();
-            let had_plan = app.pending_plan.take().is_some() || app.plan_next;
-            app.plan_next = false;
-            app.busy = false;
-            app.streaming = false;
+            let (was_busy, dropped, had_plan) = app.stop_all_active();
             cancel.notify_waiters();
             if was_busy || dropped > 0 || had_plan {
                 app.menu(format!(

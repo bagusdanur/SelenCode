@@ -540,6 +540,17 @@ impl App {
         dropped
     }
 
+    /// Hentikan state aktif (streaming, busy, pending_plan, plan_next) + tolak semua approval.
+    pub fn stop_all_active(&mut self) -> (bool, usize, bool) {
+        let was_busy = self.busy;
+        let dropped = self.cancel_all_approvals();
+        let had_plan = self.pending_plan.take().is_some() || self.plan_next;
+        self.plan_next = false;
+        self.busy = false;
+        self.streaming = false;
+        (was_busy, dropped, had_plan)
+    }
+
     /// Popup approval masuk dari channel approver. Bila sudah ada popup
     /// aktif, antrekan agar permintaan berikutnya tidak hilang/tertimpa.
     pub fn receive_approval(&mut self, req: ApprovalRequest) {
