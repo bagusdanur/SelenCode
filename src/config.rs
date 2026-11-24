@@ -84,6 +84,9 @@ pub struct AgentCfg {
     /// Batas subagent `delegate` yang berjalan paralel (Fase 6).
     #[serde(default = "default_max_parallel_subagents")]
     pub max_parallel_subagents: usize,
+    /// Review self-improvement otomatis pasca-giliran kompleks (ala Hermes Agent).
+    #[serde(default = "default_auto_skills")]
+    pub auto_skills: bool,
 }
 
 impl Default for AgentCfg {
@@ -94,8 +97,13 @@ impl Default for AgentCfg {
             approval: default_approval(),
             context_limit_tokens: default_context_limit_tokens(),
             max_parallel_subagents: default_max_parallel_subagents(),
+            auto_skills: default_auto_skills(),
         }
     }
+}
+
+fn default_auto_skills() -> bool {
+    true
 }
 
 fn default_max_parallel_subagents() -> usize {

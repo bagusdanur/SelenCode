@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use selencode::agent::context::{compact_messages, estimate_tokens};
 use selencode::agent::plan::{approved_plan_prompt, extract_plan, TurnMode};
-use selencode::agent::{run_turn, run_turn_mode, run_turn_ui, run_turn_ui_mode, UiEvent};
+use selencode::agent::{
+    run_self_improvement_review, run_turn, run_turn_mode, run_turn_ui, run_turn_ui_mode, UiEvent,
+};
 use selencode::config::{self, Config, ProviderCfg};
 use selencode::providers::anthropic::AnthropicProvider;
 use selencode::providers::gemini::GeminiProvider;
@@ -13,7 +15,9 @@ use selencode::repl::{
     strip_menu_markup, KeySpec, ModelAction, ProviderAction, SlashCommand, PROVIDER_PRESETS,
 };
 use selencode::security::{is_forbidden_command, redact_secrets, ApprovalRequest, Approver};
-use selencode::skills::{export_conversation_md, init_agents_md, list_skills, load_skill, save_skill};
+use selencode::skills::{
+    export_conversation_md, init_agents_md, list_skills, load_skill, remove_skill, save_skill,
+};
 use selencode::store::Store;
 use selencode::tools::delegate::Delegate;
 use selencode::tools::{default_registry_with_shell, read_only_registry, Ctx, Registry};
@@ -193,6 +197,7 @@ impl Session {
         let auto_yes = cfg.auto_approve(yes);
         let mut ctx = Ctx::new(cwd, auto_yes)
             .with_context_limit(cfg.agent.context_limit_tokens)
+            .with_auto_skills(cfg.agent.auto_skills)
             .with_store(store.clone(), session_id.clone());
         if let Some(tx) = approval_tx {
             ctx = ctx.with_approver(Arc::new(Approver::channel(auto_yes, tx)));
@@ -953,20 +958,85 @@ impl Session {
             .to_string())
     }
 
-    fn handle_skills_list(&self) -> String {
-        let skills = list_skills(&self.ctx.cwd);
-        let mut out = String::from("# Daftar Skills (.selencode/skills)\n");
-        if skills.is_empty() {
-            out.push_str("! Belum ada skill tersimpan.\n");
-        } else {
-            for s in skills {
-                out.push_str(&format!("> {} | {} | {}\n", s.name, s.scope, s.summary));
+    async fn handle_skills(&mut self, arg: Option<&str>) -> Result<String> {
+        let Some(arg) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let skills = list_skills(&self.ctx.cwd);
+            let auto_state = if self.ctx.auto_skills {
+                "AKTIF"
+            } else {
+                "NONAKTIF"
+            };
+            let mut out = format!(
+                "# Daftar Skills (.selencode/skills · auto self-improvement: {auto_state})\n"
+            );
+            if skills.is_empty() {
+                out.push_str("! Belum ada skill tersimpan.\n");
+            } else {
+                for s in skills {
+                    out.push_str(&format!("> {} | {} | {}\n", s.name, s.scope, s.summary));
+                }
             }
+            out.push_str("---\n");
+            out.push_str("! Review otomatis sekarang: /skills review   |   Toggle auto: /skills auto\n");
+            out.push_str("! Lihat / hapus skill:      /skills show <nama>   |   /skills rm <nama>\n");
+            out.push_str("! Pakai / buat manual:      /skill <nama>   |   /learn <nama> <instruksi>");
+            return Ok(out);
+        };
+
+        if arg.eq_ignore_ascii_case("auto") {
+            let next = !self.ctx.auto_skills;
+            self.ctx.auto_skills = next;
+            self.cfg.agent.auto_skills = next;
+            let saved = config::save(&self.cfg)?;
+            let label = if next {
+                "AKTIF (review otomatis setelah giliran kompleks >= 3 tool)"
+            } else {
+                "NONAKTIF (hanya buat skill saat diminta manual)"
+            };
+            return Ok(format!(
+                "# Auto Self-Improvement Skills\n\
+                 * status | {label} | tersimpan ke {}",
+                saved.display()
+            ));
         }
-        out.push_str("---\n");
-        out.push_str("! Aktifkan skill:     /skill <nama>\n");
-        out.push_str("! Buat skill baru:    /learn <nama> <instruksi workflow>");
-        out
+
+        if arg.eq_ignore_ascii_case("review") {
+            if self.messages.is_empty() {
+                return Ok(
+                    "# Self-Improvement Review\n! Belum ada percakapan untuk ditinjau.".into(),
+                );
+            }
+            match run_self_improvement_review(self.provider.clone(), &self.ctx, &self.messages)
+                .await?
+            {
+                Some(summary) => Ok(format!("# {summary}\n* tersimpan | .selencode/skills/ | siap dipakai di sesi berikutnya")),
+                None => Ok("# Self-Improvement Review\n! Belum ditemukan pola baru yang perlu disimpan atau di-patch sebagai skill.".into()),
+            }
+        } else if let Some(name) = arg.strip_prefix("show ").or_else(|| arg.strip_prefix("view ")) {
+            let (info, content) = load_skill(&self.ctx.cwd, name.trim())?;
+            let mut out = format!("# Skill: {} ({})\n", info.name, info.scope);
+            for line in content.lines().take(40) {
+                out.push_str(line);
+                out.push('\n');
+            }
+            Ok(out)
+        } else if let Some(name) = arg.strip_prefix("rm ").or_else(|| arg.strip_prefix("del ")) {
+            let name = name.trim();
+            if remove_skill(&self.ctx.cwd, name)? {
+                Ok(format!("# Skill Dihapus\n> {name} | dihapus dari .selencode/skills/"))
+            } else {
+                anyhow::bail!("skill project '{name}' tidak ditemukan");
+            }
+        } else {
+            // `/skills <nama>` sebagai pintasan lihat isi skill
+            let (info, content) = load_skill(&self.ctx.cwd, arg)?;
+            let mut out = format!("# Skill: {} ({})\n", info.name, info.scope);
+            for line in content.lines().take(40) {
+                out.push_str(line);
+                out.push('\n');
+            }
+            Ok(out)
+        }
     }
 
     fn handle_use_skill(&mut self, arg: Option<&str>) -> Result<String> {
@@ -1294,9 +1364,14 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
-            TuiCommand::Skills => {
-                let _ = ui_tx.send(UiEvent::Menu(s.handle_skills_list())).await;
-            }
+            TuiCommand::Skills(arg) => match s.handle_skills(arg.as_deref()).await {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
             TuiCommand::UseSkill(arg) => match s.handle_use_skill(arg.as_deref()) {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
@@ -1538,9 +1613,10 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
-            SlashCommand::Skills => {
-                println!("{}", strip_menu_markup(&s.handle_skills_list()));
-            }
+            SlashCommand::Skills(arg) => match s.handle_skills(arg.as_deref()).await {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
             SlashCommand::Skill(arg) => match s.handle_use_skill(arg.as_deref()) {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),

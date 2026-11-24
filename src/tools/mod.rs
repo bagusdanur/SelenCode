@@ -5,6 +5,7 @@ pub mod outline;
 pub mod plan;
 pub mod search;
 pub mod shell;
+pub mod skill;
 pub mod undo;
 pub mod web;
 
@@ -38,6 +39,10 @@ pub struct Ctx {
     pub plan_state: Arc<std::sync::Mutex<Vec<plan::PlanStep>>>,
     /// Riwayat snapshot edit file untuk `/undo` dan `/redo`.
     pub undo_stack: Arc<std::sync::Mutex<undo::UndoStack>>,
+    /// Aktifkan review self-improvement otomatis pasca-giliran kompleks (ala Hermes).
+    /// Default false di Ctx::new agar tes mock tidak memicu panggilan ekstra;
+    /// Session::build mengisinya dari `cfg.agent.auto_skills` (default true).
+    pub auto_skills: bool,
 }
 
 impl Ctx {
@@ -50,7 +55,12 @@ impl Ctx {
             session_id: None,
             plan_state: Arc::new(std::sync::Mutex::new(Vec::new())),
             undo_stack: Arc::new(std::sync::Mutex::new(undo::UndoStack::default())),
+            auto_skills: false,
         }
+    }
+    pub fn with_auto_skills(mut self, enabled: bool) -> Self {
+        self.auto_skills = enabled;
+        self
     }
     /// Ganti approver (Fase 4: mode TUI memakai approver berbasis channel).
     pub fn with_approver(mut self, approver: Arc<Approver>) -> Self {
@@ -184,6 +194,7 @@ pub fn default_registry_with_shell(shell_cfg: &ShellCfg) -> Registry {
         .register(Arc::new(git::GitCommit))
         .register(Arc::new(web::FetchUrl))
         .register(Arc::new(plan::UpdatePlan))
+        .register(Arc::new(skill::ManageSkill))
 }
 
 /// Registry BACA-SAJA (Fase 6): persis daftar agent::plan::READ_ONLY_TOOLS.

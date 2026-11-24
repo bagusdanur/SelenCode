@@ -21,8 +21,8 @@ pub enum SlashCommand {
     Redo,
     /// /memory | /memory add <teks> | /memory global <teks> | /memory rm <id>
     Memory(Option<String>),
-    /// /skills — daftar semua skill tersimpan.
-    Skills,
+    /// /skills | /skills auto | /skills review | /skills show <nama> | /skills rm <nama>
+    Skills(Option<String>),
     /// /skill <nama> — aktifkan instruksi skill ke sesi ini.
     Skill(Option<String>),
     /// /learn <nama> <instruksi> — simpan skill baru ke `.selencode/skills/`.
@@ -104,9 +104,9 @@ pub const COMMANDS: &[CommandDef] = &[
     },
     CommandDef {
         cmd: "/skills",
-        args: "",
-        desc: "lihat daftar skill (.selencode/skills/*.md)",
-        takes_args: false,
+        args: "[auto | review | show <nama> | rm <nama>]",
+        desc: "daftar skill, auto self-improvement, & review",
+        takes_args: true,
     },
     CommandDef {
         cmd: "/skill",
@@ -215,7 +215,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/undo" => SlashCommand::Undo,
         "/redo" => SlashCommand::Redo,
         "/memory" => SlashCommand::Memory(rest),
-        "/skills" => SlashCommand::Skills,
+        "/skills" => SlashCommand::Skills(rest),
         "/skill" => SlashCommand::Skill(rest),
         "/learn" => SlashCommand::Learn(rest),
         "/init" => SlashCommand::Init,

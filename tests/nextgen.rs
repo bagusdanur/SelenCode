@@ -5,16 +5,24 @@
 //! - Skills (`/learn`, `/skills`, `/skill`), `/init` (`AGENTS.md`), `/export`
 //! - Parsing `!cmd` inline shell & `/provider preset`
 
+use async_trait::async_trait;
 use selencode::agent::context::{expand_at_mentions, format_memories_section};
-use selencode::providers::{Message, Role};
+use selencode::agent::run_self_improvement_review;
+use selencode::providers::{
+    AssistantReply, Message, Provider, Role, StreamEvent, ToolCall, ToolSpec,
+};
 use selencode::repl::{
     parse_provider_action, parse_slash_command, KeySpec, ProviderAction, SlashCommand,
 };
-use selencode::skills::{export_conversation_md, init_agents_md, list_skills, load_skill, save_skill};
+use selencode::skills::{
+    export_conversation_md, init_agents_md, list_skills, load_skill, remove_skill, save_skill,
+};
 use selencode::store::Store;
 use selencode::tools::{default_registry, Ctx};
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -159,7 +167,15 @@ fn repl_inline_shell_new_commands_and_presets() {
     );
     assert_eq!(parse_slash_command("/undo"), SlashCommand::Undo);
     assert_eq!(parse_slash_command("/redo"), SlashCommand::Redo);
-    assert_eq!(parse_slash_command("/skills"), SlashCommand::Skills);
+    assert_eq!(parse_slash_command("/skills"), SlashCommand::Skills(None));
+    assert_eq!(
+        parse_slash_command("/skills auto"),
+        SlashCommand::Skills(Some("auto".into()))
+    );
+    assert_eq!(
+        parse_slash_command("/skills review"),
+        SlashCommand::Skills(Some("review".into()))
+    );
     assert_eq!(parse_slash_command("/init"), SlashCommand::Init);
     assert_eq!(parse_slash_command("/details"), SlashCommand::Details);
     assert_eq!(
@@ -190,4 +206,98 @@ fn repl_inline_shell_new_commands_and_presets() {
             key_spec: KeySpec::EnvVar("OPENROUTER_API_KEY".into()),
         }
     );
+}
+
+struct ReviewPatchMock {
+    should_patch: bool,
+}
+
+#[async_trait]
+impl Provider for ReviewPatchMock {
+    async fn stream_chat(
+        &self,
+        _msgs: &[Message],
+        _tools: &[ToolSpec],
+        _tx: mpsc::Sender<StreamEvent>,
+    ) -> anyhow::Result<AssistantReply> {
+        if !self.should_patch {
+            return Ok(AssistantReply {
+                text: "NONE".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            });
+        }
+        Ok(AssistantReply {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "sk1".into(),
+                name: "manage_skill".into(),
+                args: json!({
+                    "action": "patch",
+                    "name": "ryukomik-comic-scraper",
+                    "description": "Scraper chapter & bypass selector HTML Ryukomik",
+                    "content": "1. Gunakan selector `.ch-list a`\n2. Hindari rate limit 429 dengan jeda 1s"
+                }),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn autonomous_manage_skill_and_self_improvement_review() {
+    let cwd = temp_dir("autoskill");
+    let ctx = Ctx::new(cwd.clone(), true);
+    let reg = default_registry();
+    let tool = reg.get("manage_skill").expect("manage_skill terdaftar");
+
+    // 1. Create awal lewat tool manage_skill (sekaligus uji redaksi secret).
+    let out = tool
+        .run(
+            json!({
+                "action": "create",
+                "name": "ryukomik-comic-scraper",
+                "description": "Scraper awal",
+                "content": "Langkah 1: fetch HTML (API_KEY=rahasia12345678)"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(out.contains("created"), "{out}");
+    let (_, body) = load_skill(&cwd, "ryukomik-comic-scraper").unwrap();
+    assert!(body.contains("[REDACTED]"));
+    assert!(!body.contains("rahasia12345678"));
+
+    // 2. Self-improvement review melakukan patch otomatis ala Hermes.
+    let history = vec![
+        Message::text(Role::User, "perbaiki selector scraper ryukomik"),
+        Message::text(Role::Assistant, "Sudah diganti ke .ch-list a dan jeda 1s."),
+    ];
+    let provider: Arc<dyn Provider> = Arc::new(ReviewPatchMock { should_patch: true });
+    let note = run_self_improvement_review(provider, &ctx, &history)
+        .await
+        .unwrap()
+        .expect("harus menghasilkan catatan patch skill");
+    assert_eq!(
+        note,
+        "Self-improvement review: Skill 'ryukomik-comic-scraper' patched"
+    );
+    let (_, patched_body) = load_skill(&cwd, "ryukomik-comic-scraper").unwrap();
+    assert!(patched_body.contains(".ch-list a"));
+
+    // 3. Bila model menjawab NONE -> tidak ada notifikasi.
+    let noop: Arc<dyn Provider> = Arc::new(ReviewPatchMock { should_patch: false });
+    assert!(run_self_improvement_review(noop, &ctx, &history)
+        .await
+        .unwrap()
+        .is_none());
+
+    // 4. Hapus skill lewat remove_skill.
+    assert!(remove_skill(&cwd, "ryukomik-comic-scraper").unwrap());
+    assert!(list_skills(&cwd).is_empty());
+
+    std::fs::remove_dir_all(&cwd).ok();
 }

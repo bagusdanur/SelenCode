@@ -88,17 +88,50 @@ pub fn load_skill(cwd: &Path, name: &str) -> Result<(SkillInfo, String)> {
     Ok((info, content))
 }
 
-/// Simpan skill baru ke `.selencode/skills/<nama>.md` (dipakai `/learn`).
-pub fn save_skill(cwd: &Path, name: &str, instruction: &str) -> Result<PathBuf> {
+/// Simpan atau perbarui (patch) skill ke `.selencode/skills/<nama>.md`.
+/// Mengembalikan `(path, is_patch)` di mana `is_patch = true` bila skill sudah
+/// ada sebelumnya dan diperbarui. Konten diredaksi dari pola rahasia sebelum ditulis.
+pub fn upsert_skill(
+    cwd: &Path,
+    name: &str,
+    description: Option<&str>,
+    instruction: &str,
+) -> Result<(PathBuf, String, bool)> {
     let clean = sanitize_skill_name(name)?;
     let dir = project_skills_dir(cwd);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("gagal membuat folder skill {}", dir.display()))?;
     let path = dir.join(format!("{clean}.md"));
-    let body = format!("# Skill: {clean}\n\n{}\n", instruction.trim());
+    let existed = path.exists();
+    let safe_body = crate::security::redact_secrets(instruction.trim());
+    let body = match description.map(|d| d.trim()).filter(|d| !d.is_empty()) {
+        Some(desc) => {
+            let safe_desc = crate::security::redact_secrets(desc);
+            format!("# {clean}\n\n> {safe_desc}\n\n{safe_body}\n")
+        }
+        None => format!("# Skill: {clean}\n\n{safe_body}\n"),
+    };
     std::fs::write(&path, body)
         .with_context(|| format!("gagal menyimpan skill {}", path.display()))?;
+    Ok((path, clean, existed))
+}
+
+/// Simpan skill baru ke `.selencode/skills/<nama>.md` (dipakai `/learn`).
+pub fn save_skill(cwd: &Path, name: &str, instruction: &str) -> Result<PathBuf> {
+    let (path, _, _) = upsert_skill(cwd, name, None, instruction)?;
     Ok(path)
+}
+
+/// Hapus skill project berdasarkan nama.
+pub fn remove_skill(cwd: &Path, name: &str) -> Result<bool> {
+    let clean = sanitize_skill_name(name)?;
+    let path = project_skills_dir(cwd).join(format!("{clean}.md"));
+    if !path.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_file(&path)
+        .with_context(|| format!("gagal menghapus skill {}", path.display()))?;
+    Ok(true)
 }
 
 fn sanitize_skill_name(raw: &str) -> Result<String> {

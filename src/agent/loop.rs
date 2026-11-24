@@ -199,6 +199,8 @@ async fn run_turn_inner(
     let mut last_text = String::new();
     let mut turn_usage = Usage::default();
     let mut have_usage = false;
+    let mut tool_calls_executed = 0usize;
+    let mut skill_touched_in_turn = false;
 
     for step in 0..max_steps {
         // Compaction konteks (Fase 2): ringkas riwayat lama bila estimasi
@@ -292,6 +294,27 @@ async fn run_turn_inner(
         }
 
         if reply.tool_calls.is_empty() {
+            // Self-improvement review otonom (ala Hermes Agent): bila giliran
+            // kerja substansial (>= 3 tool call), evaluasi singkat apakah perlu
+            // create/patch skill di `.selencode/skills/`.
+            if ctx.auto_skills
+                && mode == TurnMode::Execute
+                && tool_calls_executed >= super::review::AUTO_REVIEW_MIN_TOOLS
+                && !skill_touched_in_turn
+            {
+                if let Ok(Some(note)) =
+                    super::review::run_self_improvement_review(provider.clone(), ctx, messages)
+                        .await
+                {
+                    let msg = format!("✦ {note}");
+                    match &ui {
+                        Some(tx) => {
+                            let _ = tx.send(UiEvent::Info(msg)).await;
+                        }
+                        None => eprintln!("[selen] {msg}"),
+                    }
+                }
+            }
             if let Some(tx) = &ui {
                 let reported = reply
                     .usage
@@ -367,6 +390,29 @@ async fn run_turn_inner(
             }
             // update_plan (Fase 6): checklist ditampilkan ke user setiap
             // berhasil diperbarui — polos dicetak, TUI jadi blok khusus.
+            tool_calls_executed += 1;
+            if call.name == "manage_skill" && !is_error {
+                let act = call
+                    .args
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if matches!(act, "create" | "patch") {
+                    skill_touched_in_turn = true;
+                    let short = content
+                        .split(" (")
+                        .next()
+                        .unwrap_or(&content)
+                        .trim_end_matches('.');
+                    let note = format!("✦ Self-improvement review: {short}");
+                    match &ui {
+                        Some(tx) => {
+                            let _ = tx.send(UiEvent::Info(note)).await;
+                        }
+                        None => eprintln!("[selen] {note}"),
+                    }
+                }
+            }
             if call.name == "update_plan" && !is_error {
                 match &ui {
                     Some(tx) => {

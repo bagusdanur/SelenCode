@@ -55,7 +55,7 @@ pub enum TuiCommand {
     Undo,
     Redo,
     Memory(Option<String>),
-    Skills,
+    Skills(Option<String>),
     UseSkill(Option<String>),
     LearnSkill(Option<String>),
     InitAgents,
@@ -667,8 +667,8 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
         SlashCommand::Memory(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Memory(arg));
         }
-        SlashCommand::Skills => {
-            send_cmd(app, cmd_tx, TuiCommand::Skills);
+        SlashCommand::Skills(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Skills(arg));
         }
         SlashCommand::Skill(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::UseSkill(arg));
