@@ -2429,7 +2429,8 @@ async fn handle_telegram_chat_message(
         }
     };
 
-    let mut s = session_arc.lock().await;
+    let mut s_guard = session_arc.lock().await;
+    let s: &mut Session = &mut *s_guard;
 
     // Perintah khusus Telegram (/start, /status).
     if text.eq_ignore_ascii_case("/start") {
