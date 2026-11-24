@@ -1,7 +1,7 @@
 //! Tes v0.1.2 — `selen update`: fungsi murni parse versi, perbandingan,
 //! dan pemetaan aset platform. Tanpa jaringan.
 
-use selencode::update::{asset_name_for, is_newer, parse_version};
+use selencode::update::{asset_name_for, is_newer, parse_version, replace_binary};
 
 #[test]
 fn parse_version_format_dikenal() {
@@ -31,12 +31,33 @@ fn asset_untuk_platform() {
         Some("selen-termux-arm64")
     );
     assert_eq!(asset_name_for("linux", "x86_64"), Some("selen-linux-x64"));
+    assert_eq!(
+        asset_name_for("windows", "x86_64"),
+        Some("selen-windows-x64.exe")
+    );
     // Tidak didukung: tidak ada aset resmi.
-    assert_eq!(asset_name_for("windows", "x86_64"), None);
+    assert_eq!(asset_name_for("windows", "aarch64"), None);
     assert_eq!(asset_name_for("macos", "aarch64"), None);
     assert_eq!(
         asset_name_for("linux", "aarch64"),
         None,
         "glibc ARM tidak dipasok; aset Termux itu bionic"
     );
+}
+
+#[test]
+fn replace_binary_menimpa_file_dengan_aman() {
+    let dir = std::env::temp_dir().join(format!(
+        "selencode-upd-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join(if cfg!(windows) { "selen.exe" } else { "selen" });
+    std::fs::write(&exe, b"versi-lama").unwrap();
+
+    replace_binary(&exe, b"versi-baru").unwrap();
+    assert_eq!(std::fs::read(&exe).unwrap(), b"versi-baru");
+    assert!(!exe.with_extension("tmp").exists());
+    assert!(!exe.with_extension("tmp.exe").exists());
+    std::fs::remove_dir_all(&dir).ok();
 }

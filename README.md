@@ -156,8 +156,9 @@ selen update
 Perintah ini menanyakan rilis terbaru `bagusdanur/SelenCode`, membandingkan
 versi semver-nya dengan versi binary ini, lalu — bila ada yang lebih baru —
 mengunduh aset sesuai platform (`selen-termux-arm64` di Termux/Android,
-`selen-linux-x64` di Linux x86_64) dan menimpa binary yang sedang terpasang.
-Bila sudah terbaru, ia hanya mencetak `Sudah versi terbaru (vX).`
+`selen-linux-x64` di Linux x86_64, `selen-windows-x64.exe` di Windows x64)
+dan mengganti binary yang sedang terpasang. Bila sudah terbaru, ia hanya
+mencetak `Sudah versi terbaru (vX).`
 
 Alternatif manual (skrip): buat file `$PREFIX/bin/update-selen` berisi unduhan
 `https://github.com/bagusdanur/SelenCode/releases/latest/download/selen-termux-arm64`

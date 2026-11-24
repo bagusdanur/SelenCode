@@ -296,6 +296,7 @@ impl Session {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    selencode::update::cleanup_old_binary();
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Run { prompt }) => {

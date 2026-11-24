@@ -39,15 +39,68 @@ pub fn is_newer(remote: (u32, u32, u32), current: (u32, u32, u32)) -> bool {
     remote > current
 }
 
-/// Nama aset rilis untuk platform ini. Aset Termux (bionic/Android)
-/// hanya untuk OS android aarch64; aset Linux glibc hanya x86_64.
-/// Selain itu None — TIDAK ada aset resmi (mis. linux/aarch64 tidak
-/// dipasok: binary Termux itu bionic, tidak jalan di glibc).
+/// Nama aset rilis untuk platform ini:
+/// - Termux (bionic/Android): android + aarch64 -> selen-termux-arm64
+/// - Linux glibc: linux + x86_64 -> selen-linux-x64
+/// - Windows: windows + x86_64 -> selen-windows-x64.exe
+/// Selain itu None — tidak ada aset resmi.
 pub fn asset_name_for(target_os: &str, target_arch: &str) -> Option<&'static str> {
     match (target_os, target_arch) {
         ("android", "aarch64") => Some("selen-termux-arm64"),
         ("linux", "x86_64") => Some("selen-linux-x64"),
+        ("windows", "x86_64") => Some("selen-windows-x64.exe"),
         _ => None,
+    }
+}
+
+/// Bersihkan sisa `.old.exe` dari update Windows sebelumnya (best-effort, no-op di Unix).
+pub fn cleanup_old_binary() {
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(exe.with_extension("old.exe"));
+    }
+}
+
+/// Ganti binary `exe` dengan `bytes` secara aman lintas platform.
+/// - Unix/Termux: tulis ke `.tmp` di sebelah `exe`, chmod 0755, rename atomik.
+/// - Windows: exe yang sedang berjalan tidak bisa ditimpa langsung, tapi bisa
+///   di-rename ke `.old.exe`; pindahkan `exe` -> `.old.exe` lalu `.tmp.exe` -> `exe`
+///   (dengan rollback otomatis bila langkah kedua gagal).
+pub fn replace_binary(exe: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let tmp = exe.with_extension("tmp.exe");
+        let old = exe.with_extension("old.exe");
+        let _ = std::fs::remove_file(&old);
+        std::fs::write(&tmp, bytes)
+            .with_context(|| format!("gagal menulis file sementara {}", tmp.display()))?;
+        if let Err(e) = std::fs::rename(exe, &old) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).context("gagal memindahkan binary lama ke .old.exe");
+        }
+        if let Err(e) = std::fs::rename(&tmp, exe) {
+            let _ = std::fs::rename(&old, exe);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).context("gagal mengganti binary lama dengan yang baru");
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let tmp = exe.with_extension("tmp");
+        std::fs::write(&tmp, bytes)
+            .with_context(|| format!("gagal menulis file sementara {}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+                .context("gagal mengatur izin eksekusi file baru")?;
+        }
+        if let Err(e) = std::fs::rename(&tmp, exe) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).context("gagal mengganti binary lama dengan yang baru");
+        }
+        Ok(())
     }
 }
 
@@ -131,19 +184,7 @@ pub async fn run() -> Result<()> {
         .context("unduhan terputus di tengah jalan")?;
 
     let exe = std::env::current_exe().context("tidak bisa menemukan lokasi binary selen")?;
-    let tmp = exe.with_extension("tmp");
-    std::fs::write(&tmp, &bytes)
-        .with_context(|| format!("gagal menulis file sementara {}", tmp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-            .context("gagal mengatur izin eksekusi file baru")?;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &exe) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).context("gagal mengganti binary lama dengan yang baru");
-    }
+    replace_binary(&exe, &bytes)?;
     println!(
         "Diperbarui ke {} — jalankan `selen` lagi.",
         release.tag_name
