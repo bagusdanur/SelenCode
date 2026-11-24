@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use selencode::agent::context::{compact_messages, estimate_tokens};
+use selencode::agent::context::{
+    calc_context_pct, compact_messages, estimate_tokens, format_context_compact,
+    infer_model_context_limit,
+};
 use selencode::agent::plan::{approved_plan_prompt, extract_plan, TurnMode};
 use selencode::agent::ui::ModelPickerData;
 use selencode::agent::{
@@ -9,7 +12,7 @@ use selencode::agent::{
 use selencode::config::{self, Config, ProviderCfg};
 use selencode::providers::anthropic::AnthropicProvider;
 use selencode::providers::gemini::GeminiProvider;
-use selencode::providers::openai::{fetch_models, OpenAiProvider};
+use selencode::providers::openai::{fetch_models_with_context, OpenAiProvider};
 use selencode::providers::{Message, Provider, Role};
 use selencode::repl::{
     help_menu_markup, parse_model_action, parse_provider_action, parse_slash_command,
@@ -155,6 +158,8 @@ struct Session {
     /// Cache katalog `/models` terakhir di memori (TIDAK otomatis menimpa config,
     /// agar user bisa memilih 1-per-1 lewat `/model add <nomor>` atau modal `/model`).
     last_remote_models: Vec<String>,
+    /// Cache kapasitas context window model yang dilaporkan endpoint API `/models`.
+    model_context_cache: HashMap<String, usize>,
 }
 
 impl Session {
@@ -212,9 +217,19 @@ impl Session {
             Some(tx) => Arc::new(Approver::channel_with_policy(policy, tx)),
             None => Arc::new(Approver::stdin_with_policy(policy)),
         };
+        let init_ctx_limit = pcfg
+            .context_limit
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                if cfg.agent.context_limit_tokens != 100_000 && cfg.agent.context_limit_tokens > 0 {
+                    cfg.agent.context_limit_tokens
+                } else {
+                    infer_model_context_limit(&pcfg.model)
+                }
+            });
         let ctx = Ctx::new(cwd, mode == ApprovalMode::AutoAll)
             .with_approver(approver)
-            .with_context_limit(cfg.agent.context_limit_tokens)
+            .with_context_limit(init_ctx_limit)
             .with_auto_skills(cfg.agent.auto_skills)
             .with_store(store.clone(), session_id.clone());
         // Delegate (Fase 6): subagent memakai provider sesi saat build;
@@ -246,7 +261,35 @@ impl Session {
             messages,
             resumed_note,
             last_remote_models: Vec::new(),
+            model_context_cache: HashMap::new(),
         })
+    }
+
+    /// Hitung kapasitas context window aktif untuk model saat ini:
+    /// 1) override `[providers.<nama>].context_limit`, 2) metadata API `/models`,
+    /// 3) override eksplisit `[agent].context_limit_tokens`, 4) deteksi otomatis nama model AI.
+    fn resolve_context_limit(&self) -> usize {
+        if let Some(n) = self.pcfg.context_limit.filter(|&n| n > 0) {
+            return n;
+        }
+        if let Some(&n) = self.model_context_cache.get(&self.pcfg.model) {
+            if n > 0 {
+                return n;
+            }
+        }
+        if self.cfg.agent.context_limit_tokens != 100_000 && self.cfg.agent.context_limit_tokens > 0
+        {
+            return self.cfg.agent.context_limit_tokens;
+        }
+        infer_model_context_limit(&self.pcfg.model)
+    }
+
+    fn model_context_for(&self, model_id: &str) -> usize {
+        self.model_context_cache
+            .get(model_id)
+            .copied()
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| infer_model_context_limit(model_id))
     }
 
     /// Ganti provider aktif (perintah /model <nama>).
@@ -256,6 +299,7 @@ impl Session {
         self.provider = provider;
         self.provider_name = name.to_string();
         self.pcfg = pcfg;
+        self.ctx.context_limit_tokens = self.resolve_context_limit();
         self.store
             .update_session_provider(&self.session_id, name, &self.pcfg.model)?;
         Ok(())
@@ -560,7 +604,16 @@ impl Session {
         let base_url = pcfg
             .base_url
             .ok_or_else(|| anyhow::anyhow!("base_url kosong untuk provider '{}'", self.provider_name))?;
-        let ids = fetch_models(&base_url, &api_key).await?;
+        let items = fetch_models_with_context(&base_url, &api_key).await?;
+        let mut ids = Vec::with_capacity(items.len());
+        for (id, ctx_opt) in items {
+            if let Some(limit) = ctx_opt {
+                self.model_context_cache.insert(id.clone(), limit);
+            }
+            ids.push(id);
+        }
+        // Perbarui kapasitas konteks model aktif bila baru ditemukan dari API.
+        self.ctx.context_limit_tokens = self.resolve_context_limit();
         self.last_remote_models = ids.clone();
         Ok(ids)
     }
@@ -670,6 +723,7 @@ impl Session {
                     api_key,
                     price_in: None,
                     price_out: None,
+                    context_limit: None,
                 };
                 self.cfg.providers.insert(name.clone(), pcfg);
                 let saved_path = config::save(&self.cfg)?;
@@ -805,15 +859,21 @@ impl Session {
     /// Kartu menu `/model`: daftar model bernomor milik provider aktif + daftar provider lain.
     fn models_menu(&self) -> String {
         let list = self.pcfg.effective_models();
+        let active_ctx = format_context_compact(self.ctx.context_limit_tokens);
         let mut out = format!(
-            "# Model di Provider {} ({} tersimpan)\n",
+            "# Model di Provider {} ({} tersimpan · ctx {active_ctx})\n",
             self.provider_name,
             list.len()
         );
         for (i, m) in list.iter().take(30).enumerate() {
             let active = *m == self.pcfg.model;
             let mark = if active { "*" } else { ">" };
-            let note = if active { "aktif" } else { "" };
+            let m_ctx = format_context_compact(self.model_context_for(m));
+            let note = if active {
+                format!("aktif · ctx {m_ctx}")
+            } else {
+                format!("ctx {m_ctx}")
+            };
             out.push_str(&format!("{mark} #{} | {m} | {note}\n", i + 1));
         }
         if list.len() > 30 {
@@ -1531,16 +1591,22 @@ impl Session {
     }
 
     fn session_info_menu(&self) -> String {
+        let est = estimate_tokens(&self.messages);
+        let lim = self.ctx.context_limit_tokens;
+        let pct = calc_context_pct(est, lim);
         format!(
             "# Info Sesi Aktif\n\
              * sesi | {} | {}\n\
              > provider | {} | model {} (kind {})\n\
+             > konteks | {} / {} ({pct}%) | kapasitas model AI\n\
              > folder | {} | {} pesan di memori",
             self.session_id.chars().take(12).collect::<String>(),
             self.usage_line(),
             self.provider_name,
             self.pcfg.model,
             self.pcfg.kind,
+            format_context_compact(est),
+            format_context_compact(lim),
             self.ctx.cwd.display(),
             self.messages.len(),
         )
@@ -1803,6 +1869,12 @@ async fn tui_worker(
                                 model: s.pcfg.model.clone(),
                             })
                             .await;
+                        let _ = ui_tx
+                            .send(UiEvent::ContextInfo {
+                                used_tokens: estimate_tokens(&s.messages),
+                                limit_tokens: s.ctx.context_limit_tokens,
+                            })
+                            .await;
                         let _ = ui_tx.send(UiEvent::Menu(card)).await;
                     }
                     Err(e) => {
@@ -1882,6 +1954,12 @@ async fn tui_worker(
                             })
                             .await;
                         let _ = ui_tx
+                            .send(UiEvent::ContextInfo {
+                                used_tokens: estimate_tokens(&s.messages),
+                                limit_tokens: s.ctx.context_limit_tokens,
+                            })
+                            .await;
+                        let _ = ui_tx
                             .send(UiEvent::ModelPicker(s.model_picker_data(
                                 false,
                                 Some(format!("Pindah ke provider '{prov}'")),
@@ -1914,6 +1992,12 @@ async fn tui_worker(
                                 .send(UiEvent::ModelChanged {
                                     provider: s.provider_name.clone(),
                                     model: s.pcfg.model.clone(),
+                                })
+                                .await;
+                            let _ = ui_tx
+                                .send(UiEvent::ContextInfo {
+                                    used_tokens: estimate_tokens(&s.messages),
+                                    limit_tokens: s.ctx.context_limit_tokens,
                                 })
                                 .await;
                             let _ = ui_tx.send(UiEvent::Menu(card)).await;
@@ -2014,6 +2098,9 @@ async fn interactive_tui(cli: Cli, resume: bool) -> Result<()> {
     app.provider_label = provider_label(&s.provider_name, &s.pcfg);
     app.tool_count = s.registry.names().len();
     app.session_id = s.session_id.clone();
+    app.context_limit = s.ctx.context_limit_tokens;
+    app.context_used = estimate_tokens(&s.messages);
+    app.context_pct = calc_context_pct(app.context_used, app.context_limit);
     app.approval_policy = Some(s.ctx.approver.policy());
     app.resumed = s.resumed_note.is_some();
     app.plan_next = cli.plan;
@@ -2149,6 +2236,10 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
             },
             SlashCommand::Compact => {
                 println!("{}", strip_menu_markup(&s.compact_now()));
+            }
+            SlashCommand::Stop => {
+                plan_next = false;
+                println!("Tidak ada task latar belakang yang berjalan (mode polos sinkron).");
             }
             SlashCommand::Sessions => {
                 if let Err(e) = s.print_sessions() {
@@ -2693,6 +2784,11 @@ async fn handle_telegram_chat_message(
                 "Perintah tersebut khusus mode terminal. Ketik /help untuk perintah Telegram.",
             )
             .await?;
+            return Ok(());
+        }
+        SlashCommand::Stop => {
+            tg.send_message(chat_id, "🛑 Tidak ada giliran aktif yang berjalan.")
+                .await?;
             return Ok(());
         }
         SlashCommand::Unknown(name) => {

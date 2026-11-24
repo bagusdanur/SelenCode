@@ -47,6 +47,8 @@ pub enum SlashCommand {
     New,
     /// /compact (ringkas riwayat konteks secara manual)
     Compact,
+    /// /stop atau /cancel (hentikan semua task, tool, & giliran agent aktif)
+    Stop,
     /// /help atau /?
     Help,
     /// Perintah garis miring yang tidak dikenal (nama tanpa '/').
@@ -66,27 +68,33 @@ pub struct CommandDef {
 pub const COMMANDS: &[CommandDef] = &[
     CommandDef {
         cmd: "/model",
-        args: "[no | add <id|no> | rm <no> | clear]",
-        desc: "buka pemilih model interaktif, tambah 1-per-1, atau hapus",
+        args: "[no / add / rm / clear]",
+        desc: "pemilih model interaktif, tambah 1-per-1, atau hapus",
         takes_args: true,
     },
     CommandDef {
         cmd: "/models",
         args: "[cari]",
-        desc: "intip katalog model API (pilih 1-per-1 dengan /model add)",
+        desc: "intip katalog API (pilih 1-per-1 dengan /model add)",
         takes_args: true,
     },
     CommandDef {
         cmd: "/provider",
-        args: "[preset | add | model | default | rm]",
+        args: "[preset / add / default / rm]",
         desc: "kelola & pasang provider lain + API key",
         takes_args: true,
     },
     CommandDef {
         cmd: "/telegram",
-        args: "[setup <token> [uid] | allow <uid> | approve | off]",
+        args: "[setup / allow / approve / off]",
         desc: "hubungkan bot Telegram Gateway (`selen telegram`)",
         takes_args: true,
+    },
+    CommandDef {
+        cmd: "/stop",
+        args: "",
+        desc: "hentikan paksa semua task, tool, & giliran agent aktif",
+        takes_args: false,
     },
     CommandDef {
         cmd: "/plan",
@@ -108,13 +116,13 @@ pub const COMMANDS: &[CommandDef] = &[
     },
     CommandDef {
         cmd: "/memory",
-        args: "[add | global | rm <id>]",
+        args: "[add / global / rm <id>]",
         desc: "memori persisten lintas sesi (global & project)",
         takes_args: true,
     },
     CommandDef {
         cmd: "/skills",
-        args: "[auto | review | show <nama> | rm <nama>]",
+        args: "[auto / review / show / rm]",
         desc: "daftar skill, auto self-improvement, & review",
         takes_args: true,
     },
@@ -144,7 +152,7 @@ pub const COMMANDS: &[CommandDef] = &[
     },
     CommandDef {
         cmd: "/approve",
-        args: "[ask | edits | auto]",
+        args: "[ask / edits / auto]",
         desc: "atur mode persetujuan (kurangi popup izin)",
         takes_args: true,
     },
@@ -175,7 +183,7 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef {
         cmd: "/resume",
         args: "",
-        desc: "tampilkan detail sesi aktif",
+        desc: "tampilkan detail sesi & kapasitas konteks model",
         takes_args: false,
     },
     CommandDef {
@@ -244,6 +252,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/plan" => SlashCommand::Plan,
         "/new" | "/clear" => SlashCommand::New,
         "/compact" => SlashCommand::Compact,
+        "/stop" | "/cancel" => SlashCommand::Stop,
         "/help" | "/?" => SlashCommand::Help,
         other => SlashCommand::Unknown(other.trim_start_matches('/').to_string()),
     }
@@ -537,17 +546,17 @@ pub fn help_menu_markup() -> String {
         out.push_str(&format!("> {} | {} | {}\n", c.cmd, c.args, c.desc));
     }
     out.push_str("---\n");
-    out.push_str("# Panduan Cepat Kelola Model (1 per 1)\n");
-    out.push_str("* /model | (tanpa argumen) | buka pemilih interaktif: ↑↓ pilih · Enter pakai · a tambah manual · f katalog API · d hapus · c bersihkan\n");
-    out.push_str("> /model add | <id_model> | tambah 1 model manual ke daftar (contoh: /model add ag/claude-sonnet-4)\n");
-    out.push_str("> /model 2 | atau /model claude | ganti cepat ke model nomor #2 atau cocokkan potongan nama\n");
-    out.push_str("> /model rm 2 | /model clear | hapus 1 model (#2) atau bersihkan semua daftar tersimpan\n");
-    out.push_str("> /models | [kata_cari] | intip katalog API (tidak mengotori daftar), lalu ambil 1-per-1: /model add 1 3\n");
+    out.push_str("# Panduan Cepat Kelola Model\n");
+    out.push_str("* /model | interaktif | ↑↓ pilih · Enter pakai · a tambah manual · f katalog API · d hapus · c reset\n");
+    out.push_str("> /model add | <id_model> | tambah 1 model manual (mis. /model add ag/claude-sonnet-4)\n");
+    out.push_str("> /model 2 | atau kata | ganti cepat ke nomor #2 atau potongan nama\n");
+    out.push_str("> /model rm 2 | /model clear | hapus 1 model (#2) atau bersihkan semua daftar\n");
+    out.push_str("> /models | [kata_cari] | intip katalog API lalu ambil 1-per-1: /model add 1 3\n");
     out.push_str("---\n");
-    out.push_str("! Telegram Gateway:       /telegram setup <BOT_TOKEN> <USER_ID>  lalu jalankan `selen telegram`\n");
-    out.push_str("! Konteks & shell cepat:  @src/main.rs (lampirkan file) · !cargo test (shell lokal instan)\n");
-    out.push_str("! Pasang provider cepat:  /provider preset openrouter <model> <ENV|key>  (cek: /provider preset)\n");
-    out.push_str("! Shortcut keyboard:      / + ↑↓ + Tab palette · Esc batalkan giliran · Alt+Enter baris baru · Ctrl+C keluar");
+    out.push_str("! Hentikan task: /stop atau tekan Esc saat Selena bekerja.\n");
+    out.push_str("! Telegram Bot:  /telegram setup <TOKEN> <USER_ID> lalu jalankan `selen telegram`.\n");
+    out.push_str("! File & shell:  @src/main.rs (lampirkan file) · !cargo test (shell instan).\n");
+    out.push_str("! Keyboard TUI:  / + ↑↓ + Tab palette · Alt+Enter baris baru · Ctrl+C keluar.");
     out
 }
 

@@ -39,9 +39,13 @@ impl OpenAiProvider {
     }
 }
 
-/// Tarik daftar ID model yang tersedia dari endpoint OpenAI-compatible
-/// `GET {base_url}/models` (dipakai `/model list` atau `/models`).
-pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {
+/// Tarik daftar ID model + kapasitas context window opsional (bila API melaporkan
+/// `context_length` / `max_context_length` / `context_window` / `input_token_limit`)
+/// dari endpoint OpenAI-compatible `GET {base_url}/models`.
+pub async fn fetch_models_with_context(
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<(String, Option<usize>)>> {
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(Duration::from_secs(20))
@@ -63,17 +67,31 @@ pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>> 
         ));
     }
     let v: Value = resp.json().await.context("respons /models bukan JSON valid")?;
-    let mut ids: Vec<String> = v["data"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    ids.sort();
-    ids.dedup();
-    Ok(ids)
+    let mut map: BTreeMap<String, Option<usize>> = BTreeMap::new();
+    if let Some(arr) = v["data"].as_array() {
+        for m in arr {
+            let Some(id) = m["id"].as_str() else {
+                continue;
+            };
+            let ctx_len = m["context_length"]
+                .as_u64()
+                .or_else(|| m["max_context_length"].as_u64())
+                .or_else(|| m["context_window"].as_u64())
+                .or_else(|| m["input_token_limit"].as_u64())
+                .or_else(|| m["top_provider"]["context_length"].as_u64())
+                .filter(|&n| n >= 1024)
+                .map(|n| n as usize);
+            map.entry(id.to_string()).or_insert(ctx_len);
+        }
+    }
+    Ok(map.into_iter().collect())
+}
+
+/// Tarik daftar ID model yang tersedia dari endpoint OpenAI-compatible
+/// `GET {base_url}/models` (dipakai `/model list` atau `/models`).
+pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {
+    let items = fetch_models_with_context(base_url, api_key).await?;
+    Ok(items.into_iter().map(|(id, _)| id).collect())
 }
 
 fn messages_to_openai(msgs: &[Message]) -> Vec<Value> {

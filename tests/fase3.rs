@@ -405,6 +405,7 @@ fn config_save_load_and_direct_api_key_fallback() {
             api_key: Some("sk-direct-test-key".to_string()),
             price_in: None,
             price_out: None,
+            context_limit: None,
         },
     );
     let cfg = Config {

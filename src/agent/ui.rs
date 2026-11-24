@@ -44,6 +44,11 @@ pub enum UiEvent {
     TurnDone { usage: Option<Usage> },
     /// Provider aktif berubah (perintah /model dari UI).
     ModelChanged { provider: String, model: String },
+    /// Pemakaian & kapasitas context window model AI aktif (dalam token).
+    ContextInfo {
+        used_tokens: usize,
+        limit_tokens: usize,
+    },
     /// Checklist update_plan diperbarui (Fase 6) — dirender sebagai blok
     /// khusus di transkrip.
     PlanUpdated(String),

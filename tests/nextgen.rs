@@ -427,4 +427,48 @@ fn model_clear_help_panduan_dan_telegram_gateway_helpers() {
     assert_eq!(hub.cancel_chat_approvals(100), 1);
     assert_eq!(rx1.try_recv(), Ok(false));
     assert!(rx2.try_recv().is_err());
+
+    // 8. Perintah /stop & deteksi kapasitas context window model AI
+    assert_eq!(parse_slash_command("/stop"), SlashCommand::Stop);
+    assert_eq!(parse_slash_command("/cancel"), SlashCommand::Stop);
+    for c in selencode::repl::COMMANDS {
+        assert!(
+            !c.args.contains('|'),
+            "args '{}' pada {} tidak boleh berisi `|` agar kolom /help mobile tidak pecah",
+            c.args,
+            c.cmd
+        );
+    }
+    assert_eq!(
+        selencode::agent::context::infer_model_context_limit("ag/gemini-4-neon-low"),
+        1_048_576
+    );
+    assert_eq!(
+        selencode::agent::context::infer_model_context_limit("ag/claude-sonnet-4"),
+        200_000
+    );
+    assert_eq!(
+        selencode::agent::context::infer_model_context_limit("openai/gpt-4.1"),
+        1_047_576
+    );
+    assert_eq!(
+        selencode::agent::context::infer_model_context_limit("gpt-5"),
+        400_000
+    );
+    assert_eq!(
+        selencode::agent::context::infer_model_context_limit("deepseek/deepseek-r1"),
+        128_000
+    );
+    assert_eq!(
+        selencode::agent::context::format_context_compact(1_048_576),
+        "1M"
+    );
+    assert_eq!(
+        selencode::agent::context::format_context_compact(200_000),
+        "200k"
+    );
+    assert_eq!(
+        selencode::agent::context::format_context_compact(2_500),
+        "2.5k"
+    );
 }

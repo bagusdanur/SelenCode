@@ -2,6 +2,7 @@
 //! agar bisa dites: UI nyata (mod.rs) hanya menggambar state ini dan
 //! meneruskan input keyboard ke sini.
 
+use crate::agent::context::{calc_context_pct, infer_model_context_limit};
 use crate::agent::ui::ModelPickerData;
 use crate::agent::UiEvent;
 use crate::security::{tool_category_from_title, ApprovalPolicy, ApprovalRequest};
@@ -219,6 +220,10 @@ pub struct App {
     pub step_current: usize,
     pub step_max: usize,
     pub context_pct: u8,
+    /// Estimasi / pemakaian token konteks aktif saat ini.
+    pub context_used: usize,
+    /// Kapasitas context window model AI yang sedang aktif (dalam token).
+    pub context_limit: usize,
     pub session_in: u64,
     pub session_out: u64,
     pub approval: Option<PendingApproval>,
@@ -276,6 +281,7 @@ impl App {
         session_in: u64,
         session_out: u64,
     ) -> Self {
+        let context_limit = infer_model_context_limit(&model);
         Self {
             cwd,
             provider_label: provider.clone(),
@@ -289,6 +295,8 @@ impl App {
             step_current: 0,
             step_max: max_steps,
             context_pct: 0,
+            context_used: 0,
+            context_limit,
             session_in,
             session_out,
             approval: None,
@@ -445,7 +453,19 @@ impl App {
             }
             UiEvent::ModelChanged { provider, model } => {
                 self.provider = provider;
+                self.context_limit = infer_model_context_limit(&model);
+                self.context_pct = calc_context_pct(self.context_used, self.context_limit);
                 self.model = model;
+            }
+            UiEvent::ContextInfo {
+                used_tokens,
+                limit_tokens,
+            } => {
+                self.context_used = used_tokens;
+                if limit_tokens > 0 {
+                    self.context_limit = limit_tokens;
+                }
+                self.context_pct = calc_context_pct(self.context_used, self.context_limit);
             }
             UiEvent::PlanUpdated(checklist) => {
                 self.streaming = false;
@@ -480,6 +500,8 @@ impl App {
                 self.session_in = 0;
                 self.session_out = 0;
                 self.context_pct = 0;
+                self.context_used = 0;
+                self.context_limit = infer_model_context_limit(&self.model);
                 self.step_current = 0;
                 self.scroll = 0;
                 self.busy = false;
@@ -497,6 +519,25 @@ impl App {
     /// Jumlah total approval yang menunggu (aktif + antrean).
     pub fn approval_pending_count(&self) -> usize {
         self.approval.is_some() as usize + self.approval_queue.len()
+    }
+
+    /// Tolak & bersihkan SEMUA popup approval aktif dan yang mengantre (dipakai `/stop` & `Esc`).
+    pub fn cancel_all_approvals(&mut self) -> usize {
+        let mut dropped = 0usize;
+        if let Some(mut p) = self.approval.take() {
+            if let Some(tx) = p.reply.take() {
+                let _ = tx.send(false);
+            }
+            dropped += 1;
+        }
+        while let Some(mut next) = self.approval_queue.pop_front() {
+            if let Some(tx) = next.reply.take() {
+                let _ = tx.send(false);
+            }
+            dropped += 1;
+        }
+        self.approval_scroll = 0;
+        dropped
     }
 
     /// Popup approval masuk dari channel approver. Bila sudah ada popup

@@ -217,7 +217,14 @@ async fn run_turn_inner(
             *messages = compact_messages(messages);
         }
         if let Some(tx) = &ui {
-            let pct = calc_context_pct(estimate_tokens(messages), ctx.context_limit_tokens);
+            let est = estimate_tokens(messages);
+            let pct = calc_context_pct(est, ctx.context_limit_tokens);
+            let _ = tx
+                .send(UiEvent::ContextInfo {
+                    used_tokens: est,
+                    limit_tokens: ctx.context_limit_tokens,
+                })
+                .await;
             let _ = tx
                 .send(UiEvent::Step {
                     current: step + 1,
@@ -322,6 +329,12 @@ async fn run_turn_inner(
                     .unwrap_or(0);
                 let used = estimate_tokens(messages).max(reported);
                 let pct = calc_context_pct(used, ctx.context_limit_tokens);
+                let _ = tx
+                    .send(UiEvent::ContextInfo {
+                        used_tokens: used,
+                        limit_tokens: ctx.context_limit_tokens,
+                    })
+                    .await;
                 let _ = tx
                     .send(UiEvent::Step {
                         current: step + 1,

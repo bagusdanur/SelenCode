@@ -107,18 +107,90 @@ pub struct TuiChannels {
 
 // ---------- gambar ----------
 
-/// Render kartu menu `/` berwarna Moonlit (bukan teks abu-abu polos).
-/// Markup sederhana: `# judul`, `---`, `* kiri | tengah | kanan` (aktif),
-/// `> kiri | tengah | kanan` (biasa), `! tip`.
-pub fn render_menu_card(markup: &str) -> Vec<Line<'static>> {
+/// Pecah teks per kata agar muat dalam `max_cols` kolom (aman UTF-8, tidak pecah di tengah kata).
+fn wrap_words(text: &str, max_cols: usize) -> Vec<String> {
+    let limit = max_cols.max(12);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+
+    for word in trimmed.split_whitespace() {
+        let wlen = word.chars().count();
+        if cur_len == 0 {
+            if wlen <= limit {
+                cur.push_str(word);
+                cur_len = wlen;
+            } else {
+                // Kata tunggal sangat panjang (mis. URL/path): pecah aman per char.
+                let mut buf = String::new();
+                let mut n = 0usize;
+                for ch in word.chars() {
+                    if n >= limit {
+                        lines.push(buf.clone());
+                        buf.clear();
+                        n = 0;
+                    }
+                    buf.push(ch);
+                    n += 1;
+                }
+                cur = buf;
+                cur_len = n;
+            }
+        } else if cur_len + 1 + wlen <= limit {
+            cur.push(' ');
+            cur.push_str(word);
+            cur_len += 1 + wlen;
+        } else {
+            lines.push(cur);
+            cur = String::new();
+            cur_len = 0;
+            if wlen <= limit {
+                cur.push_str(word);
+                cur_len = wlen;
+            } else {
+                let mut buf = String::new();
+                let mut n = 0usize;
+                for ch in word.chars() {
+                    if n >= limit {
+                        lines.push(buf.clone());
+                        buf.clear();
+                        n = 0;
+                    }
+                    buf.push(ch);
+                    n += 1;
+                }
+                cur = buf;
+                cur_len = n;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Render kartu menu `/` berwarna Moonlit secara responsif sesuai lebar layar
+/// (tata letak 2 baris bertumpuk rapi di Termux HP < 72 kolom, tabel sejajar di desktop).
+pub fn render_menu_card_width(markup: &str, width: u16) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut opened = false;
+    let narrow = width < 72;
+    let indent = if narrow { " " } else { "  " };
+    let inner_w = (width as usize).saturating_sub(if narrow { 2 } else { 4 }).clamp(24, 92);
 
     for raw in markup.lines() {
         if let Some(title) = raw.strip_prefix("# ") {
             opened = true;
+            let title_s = title.trim();
+            let prefix_len = 5 + title_s.chars().count() + 1; // "╭─ ☾ " + title + " "
+            let dashes = inner_w.saturating_sub(prefix_len).max(2);
             out.push(Line::from(vec![
-                Span::styled("  ╭─ ".to_string(), Style::default().fg(moonlit::BORDER)),
+                Span::styled(format!("{indent}╭─ "), Style::default().fg(moonlit::BORDER)),
                 Span::styled(
                     "☾ ".to_string(),
                     Style::default()
@@ -126,102 +198,219 @@ pub fn render_menu_card(markup: &str) -> Vec<Line<'static>> {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    title.trim().to_string(),
+                    title_s.to_string(),
                     Style::default()
                         .fg(moonlit::LILAC)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    " ────────────────────────".to_string(),
+                    format!(" {}", "─".repeat(dashes)),
                     Style::default().fg(moonlit::BORDER),
                 ),
             ]));
         } else if raw.trim() == "---" {
             out.push(Line::from(vec![
-                Span::styled("  ├".to_string(), Style::default().fg(moonlit::BORDER)),
+                Span::styled(format!("{indent}├"), Style::default().fg(moonlit::BORDER)),
                 Span::styled(
-                    "────────────────────────────────────────".to_string(),
+                    "─".repeat(inner_w.saturating_sub(1)),
                     Style::default().fg(moonlit::FAINT),
                 ),
             ]));
         } else if let Some(rest) = raw.strip_prefix("* ").or_else(|| raw.strip_prefix("> ")) {
             let active = raw.starts_with("* ");
-            let parts: Vec<&str> = rest.split('|').map(|p| p.trim()).collect();
-            let mut spans = vec![
-                Span::styled("  │ ".to_string(), Style::default().fg(moonlit::BORDER)),
-                if active {
+            // splitn(3, '|') agar deskripsi di kolom ke-3 tidak pernah terpotong.
+            let parts: Vec<&str> = rest.splitn(3, '|').map(|p| p.trim()).collect();
+            let col1 = parts.first().copied().unwrap_or("");
+            let col2 = parts.get(1).copied().unwrap_or("");
+            let col3 = parts.get(2).copied().unwrap_or("");
+            let col1_color = if active { moonlit::LILAC } else { moonlit::LAV };
+            let bullet = if active {
+                Span::styled(
+                    "● ".to_string(),
+                    Style::default()
+                        .fg(moonlit::MINT)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    "› ".to_string(),
+                    Style::default()
+                        .fg(moonlit::VIOLET)
+                        .add_modifier(Modifier::BOLD),
+                )
+            };
+
+            if narrow {
+                // Mobile / Termux HP: baris 1 = nama + argumen, baris 2+ = deskripsi terindentasi rapi!
+                let mut head_spans = vec![
+                    Span::styled(format!("{indent}│ "), Style::default().fg(moonlit::BORDER)),
+                    bullet,
                     Span::styled(
-                        "● ".to_string(),
-                        Style::default()
-                            .fg(moonlit::MINT)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                        col1.to_string(),
+                        Style::default().fg(col1_color).add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                let head_used = 4 + col1.chars().count();
+                if !col2.is_empty() {
+                    if head_used + 1 + col2.chars().count() <= inner_w {
+                        head_spans.push(Span::styled(
+                            format!(" {col2}"),
+                            Style::default().fg(moonlit::CYAN_MOON),
+                        ));
+                        out.push(Line::from(head_spans));
+                    } else {
+                        out.push(Line::from(head_spans));
+                        for sub in wrap_words(col2, inner_w.saturating_sub(5)) {
+                            out.push(Line::from(vec![
+                                Span::styled(
+                                    format!("{indent}│   "),
+                                    Style::default().fg(moonlit::BORDER),
+                                ),
+                                Span::styled(sub, Style::default().fg(moonlit::CYAN_MOON)),
+                            ]));
+                        }
+                    }
                 } else {
+                    out.push(Line::from(head_spans));
+                }
+                if !col3.is_empty() {
+                    for sub in wrap_words(col3, inner_w.saturating_sub(5)) {
+                        out.push(Line::from(vec![
+                            Span::styled(
+                                format!("{indent}│   "),
+                                Style::default().fg(moonlit::BORDER),
+                            ),
+                            Span::styled(sub, Style::default().fg(moonlit::SILVER)),
+                        ]));
+                    }
+                }
+            } else {
+                // Desktop: kolom sejajar dengan wrap rapi bila deskripsi panjang.
+                let mut spans = vec![
+                    Span::styled(format!("{indent}│ "), Style::default().fg(moonlit::BORDER)),
+                    bullet,
                     Span::styled(
-                        "› ".to_string(),
-                        Style::default()
-                            .fg(moonlit::VIOLET)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                },
-            ];
-            if let Some(&col1) = parts.first() {
-                let col1_color = if active { moonlit::LILAC } else { moonlit::LAV };
-                spans.push(Span::styled(
-                    format!("{col1:<12}"),
-                    Style::default().fg(col1_color).add_modifier(Modifier::BOLD),
-                ));
-            }
-            if let Some(&col2) = parts.get(1) {
+                        format!("{col1:<12}"),
+                        Style::default().fg(col1_color).add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                let mut used = 4 + col1.chars().count().max(12);
                 if !col2.is_empty() {
                     spans.push(Span::styled(
                         format!(" {col2}"),
                         Style::default().fg(moonlit::CYAN_MOON),
                     ));
+                    used += 1 + col2.chars().count();
                 }
-            }
-            if let Some(&col3) = parts.get(2) {
                 if !col3.is_empty() {
-                    spans.push(Span::styled(
-                        "  ·  ".to_string(),
-                        Style::default().fg(moonlit::FAINT),
-                    ));
-                    spans.push(Span::styled(
-                        col3.to_string(),
-                        Style::default().fg(moonlit::SILVER),
-                    ));
+                    let avail = inner_w.saturating_sub(used + 5);
+                    if avail >= col3.chars().count() {
+                        spans.push(Span::styled(
+                            "  ·  ".to_string(),
+                            Style::default().fg(moonlit::FAINT),
+                        ));
+                        spans.push(Span::styled(
+                            col3.to_string(),
+                            Style::default().fg(moonlit::SILVER),
+                        ));
+                        out.push(Line::from(spans));
+                    } else {
+                        let wrapped = wrap_words(col3, inner_w.saturating_sub(18));
+                        if let Some((first, rest_lines)) = wrapped.split_first() {
+                            if avail >= 16 && first.chars().count() <= avail {
+                                spans.push(Span::styled(
+                                    "  ·  ".to_string(),
+                                    Style::default().fg(moonlit::FAINT),
+                                ));
+                                spans.push(Span::styled(
+                                    first.clone(),
+                                    Style::default().fg(moonlit::SILVER),
+                                ));
+                                out.push(Line::from(spans));
+                                for cont in rest_lines {
+                                    out.push(Line::from(vec![
+                                        Span::styled(
+                                            format!("{indent}│                 "),
+                                            Style::default().fg(moonlit::BORDER),
+                                        ),
+                                        Span::styled(
+                                            cont.clone(),
+                                            Style::default().fg(moonlit::SILVER),
+                                        ),
+                                    ]));
+                                }
+                            } else {
+                                out.push(Line::from(spans));
+                                for cont in wrapped {
+                                    out.push(Line::from(vec![
+                                        Span::styled(
+                                            format!("{indent}│     "),
+                                            Style::default().fg(moonlit::BORDER),
+                                        ),
+                                        Span::styled(
+                                            cont,
+                                            Style::default().fg(moonlit::SILVER),
+                                        ),
+                                    ]));
+                                }
+                            }
+                        } else {
+                            out.push(Line::from(spans));
+                        }
+                    }
+                } else {
+                    out.push(Line::from(spans));
                 }
             }
-            out.push(Line::from(spans));
         } else if let Some(tip) = raw.strip_prefix("! ") {
-            out.push(Line::from(vec![
-                Span::styled("  │ ".to_string(), Style::default().fg(moonlit::BORDER)),
-                Span::styled(
-                    "✦ ".to_string(),
-                    Style::default()
-                        .fg(moonlit::GOLD)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(tip.to_string(), Style::default().fg(moonlit::SILVER)),
-            ]));
+            let wrapped = wrap_words(tip, inner_w.saturating_sub(5));
+            for (idx, part) in wrapped.into_iter().enumerate() {
+                if idx == 0 {
+                    out.push(Line::from(vec![
+                        Span::styled(format!("{indent}│ "), Style::default().fg(moonlit::BORDER)),
+                        Span::styled(
+                            "✦ ".to_string(),
+                            Style::default()
+                                .fg(moonlit::GOLD)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(part, Style::default().fg(moonlit::SILVER)),
+                    ]));
+                } else {
+                    out.push(Line::from(vec![
+                        Span::styled(
+                            format!("{indent}│   "),
+                            Style::default().fg(moonlit::BORDER),
+                        ),
+                        Span::styled(part, Style::default().fg(moonlit::SILVER)),
+                    ]));
+                }
+            }
         } else if !raw.trim().is_empty() {
-            out.push(Line::from(vec![
-                Span::styled("  │ ".to_string(), Style::default().fg(moonlit::BORDER)),
-                Span::styled(raw.to_string(), Style::default().fg(moonlit::DIM)),
-            ]));
+            for part in wrap_words(raw, inner_w.saturating_sub(3)) {
+                out.push(Line::from(vec![
+                    Span::styled(format!("{indent}│ "), Style::default().fg(moonlit::BORDER)),
+                    Span::styled(part, Style::default().fg(moonlit::DIM)),
+                ]));
+            }
         }
     }
 
     if opened {
         out.push(Line::from(Span::styled(
-            "  ╰─────────────────────────────────────────".to_string(),
+            format!("{indent}╰{}", "─".repeat(inner_w.saturating_sub(1))),
             Style::default().fg(moonlit::BORDER),
         )));
     }
     out
 }
 
-fn display_lines(app: &App) -> Vec<Line<'static>> {
+/// Render kartu menu `/` berwarna Moonlit dengan lebar baku desktop (96 kolom).
+pub fn render_menu_card(markup: &str) -> Vec<Line<'static>> {
+    render_menu_card_width(markup, 96)
+}
+
+fn display_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     // Sambutan Moonlit menempel di awal transkrip & ikut bergulir.
     let mut out: Vec<Line<'static>> = app.welcome.clone().unwrap_or_default();
     let mut prev_kind: Option<LineKind> = None;
@@ -341,7 +530,7 @@ fn display_lines(app: &App) -> Vec<Line<'static>> {
                 if !out.is_empty() {
                     out.push(Line::from(""));
                 }
-                out.extend(render_menu_card(&l.text));
+                out.extend(render_menu_card_width(&l.text, width));
             }
             LineKind::Error => {
                 for (idx, part) in l.text.lines().enumerate() {
@@ -430,7 +619,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .split(area);
 
     // Transkrip (gulir: app.scroll = jarak dari bawah)
-    let lines = display_lines(app);
+    let lines = display_lines(app, chunks[0].width);
     let viewport = chunks[0].height as usize;
     let total = wrapped_line_count(&lines, chunks[0].width);
     app.last_total_lines = total;
@@ -443,10 +632,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .scroll((y, 0));
     frame.render_widget(transcript, chunks[0]);
 
-    // Status bar Moonlit (ungu bersih): model + fase bulan + konteks + token + langkah + cwd.
-    let status = Paragraph::new(moonlit::status_line(
+    // Status bar Moonlit responsif: model + kapasitas context window AI + token + langkah.
+    let status = Paragraph::new(moonlit::status_line_responsive(
+        chunks[1].width,
         &app.model,
         app.context_pct,
+        app.context_used,
+        app.context_limit,
         app.session_in,
         app.session_out,
         app.step_current,
@@ -478,8 +670,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     app.input.set_block(Block::default());
     frame.render_widget(&app.input, cols[1]);
-    // Kursor hanya relevan tanpa popup.
-    if app.approval.is_none() {
+    // Kursor hanya relevan tanpa popup/modal.
+    if app.approval.is_none() && app.model_picker.is_none() {
         frame.set_cursor_position((
             cols[1].x + app.input.cursor().1 as u16,
             cols[1].y + app.input.cursor().0 as u16,
@@ -487,8 +679,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Live `/` command palette: muncul otomatis tepat di atas status bar saat
-    // user mulai mengetik `/...` (tanpa popup approval aktif).
-    if app.approval.is_none() {
+    // user mulai mengetik `/...` (tanpa popup approval/modal aktif).
+    if app.approval.is_none() && app.model_picker.is_none() {
         let cur_input = app.input.lines().join("\n");
         let palette = filter_commands(&cur_input);
         if !palette.is_empty() && chunks[0].height >= 5 {
@@ -1083,7 +1275,7 @@ fn send_cmd(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>, cmd: TuiCommand) {
     }
 }
 
-fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
+fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>, cancel: &Arc<Notify>) {
     let raw = app.take_input();
     let text = raw.trim().to_string();
     if text.is_empty() {
@@ -1092,6 +1284,24 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
     match parse_slash_command(&text) {
         SlashCommand::Exit => {
             app.should_quit = true;
+        }
+        SlashCommand::Stop => {
+            let was_busy = app.busy;
+            let dropped = app.cancel_all_approvals();
+            let had_plan = app.pending_plan.take().is_some() || app.plan_next;
+            app.plan_next = false;
+            app.busy = false;
+            app.streaming = false;
+            cancel.notify_waiters();
+            if was_busy || dropped > 0 || had_plan {
+                app.menu(format!(
+                    "# Semua Task Agent Dihentikan\n\
+                     * status | dihentikan | giliran aktif & sub-task dibatalkan\n\
+                     > approval | {dropped} ditolak | rencana tertunda dibersihkan"
+                ));
+            } else {
+                app.info("Tidak ada task agent yang sedang berjalan.");
+            }
         }
         SlashCommand::InlineShell(cmd) => {
             if app.busy {
@@ -1471,10 +1681,11 @@ fn handle_key(
         }
         return;
     }
-    // Esc saat Selena sedang bekerja -> batalkan giliran tengah jalan tanpa keluar!
+    // Esc saat Selena sedang bekerja -> batalkan giliran & approval tengah jalan tanpa keluar!
     if key.code == KeyCode::Esc && app.busy {
+        app.cancel_all_approvals();
         cancel.notify_waiters();
-        app.info("Membatalkan giliran (Esc)…");
+        app.info("Membatalkan semua task & giliran (Esc)…");
         return;
     }
 
@@ -1523,7 +1734,7 @@ fn handle_key(
                     app.input.insert_str(item.cmd);
                 }
                 app.palette_idx = 0;
-                submit(app, cmd_tx);
+                submit(app, cmd_tx, cancel);
                 return;
             }
             _ => {}
@@ -1533,7 +1744,7 @@ fn handle_key(
     match key.code {
         KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
             app.palette_idx = 0;
-            submit(app, cmd_tx);
+            submit(app, cmd_tx, cancel);
         }
         KeyCode::PageUp => {
             let p = app.page_size();

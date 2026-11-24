@@ -619,6 +619,86 @@ pub fn status_line(
     Line::from(spans)
 }
 
+/// Baris status responsif (Desktop & Mobile Termux): menampilkan kapasitas
+/// context window model AI yang sebenarnya (mis. `14% 28k/200k` atau `3% 30k/1M`).
+#[allow(clippy::too_many_arguments)]
+pub fn status_line_responsive(
+    width: u16,
+    model: &str,
+    pct: u8,
+    ctx_used: usize,
+    ctx_limit: usize,
+    session_in: u64,
+    session_out: u64,
+    step_current: usize,
+    step_max: usize,
+    cwd: &str,
+    busy: bool,
+) -> Line<'static> {
+    let used_s = crate::agent::context::format_context_compact(ctx_used);
+    let lim_s = crate::agent::context::format_context_compact(ctx_limit.max(1));
+    let ctx_color = if pct >= 85 {
+        ROSE
+    } else if pct >= 65 {
+        GOLD
+    } else {
+        VIOLET
+    };
+
+    // Tata letak ringkas khusus layar sempit / Termux HP (< 76 kolom):
+    // tidak pernah terpotong di tengah kata.
+    if width < 76 {
+        let model_max = (width as usize).saturating_sub(30).clamp(8, 22);
+        let mut spans = vec![
+            sp(" ☾ ", stb(VIOLET)),
+            sp(truncate_chars(model, model_max), stb(LAV)),
+            sp(" │ ", st(FAINT)),
+            sp(format!("{} ", phase_glyph(pct)), stb(ctx_color)),
+            sp(format!("{pct}% "), stb(ctx_color)),
+            sp(format!("{used_s}/{lim_s}"), st(CYAN_MOON)),
+            sp(" │ ", st(FAINT)),
+            sp(format!("{step_current}/{step_max}"), st(DIM)),
+        ];
+        if busy {
+            spans.push(sp(" ✦", stb(GOLD)));
+        }
+        return Line::from(spans);
+    }
+
+    // Tata letak desktop (>= 76 kolom)
+    let (filled, empty) = context_bar_parts(pct);
+    let mut spans = vec![
+        sp(" ☾ ", stb(VIOLET)),
+        sp(truncate_chars(model, 22), stb(LAV)),
+        sp(" │ ", st(FAINT)),
+        sp(format!("{} ", phase_glyph(pct)), stb(ctx_color)),
+        sp(filled, st(ctx_color)),
+        sp(empty, st(FAINT)),
+        sp(format!(" {pct}% "), st(DIM)),
+        sp(format!("{used_s}/{lim_s}"), st(CYAN_MOON)),
+        sp(" │ ", st(FAINT)),
+        sp(
+            format!(
+                "token sesi {} in / {} out",
+                fmt_tokens(session_in),
+                fmt_tokens(session_out)
+            ),
+            st(DIM),
+        ),
+        sp(" │ ", st(FAINT)),
+        sp(format!("langkah {step_current}/{step_max}"), st(DIM)),
+    ];
+    if width >= 105 {
+        spans.push(sp(" │ ", st(FAINT)));
+        spans.push(sp(truncate_chars(cwd, 28), st(DIM)));
+    }
+    if busy {
+        spans.push(sp(" │ ", st(FAINT)));
+        spans.push(sp("✦ bekerja… (/stop)", stb(GOLD)));
+    }
+    Line::from(spans)
+}
+
 // ---------- banner mode polos ----------
 
 /// Banner teks sederhana untuk mode polos (non-TUI): bulan braille kecil

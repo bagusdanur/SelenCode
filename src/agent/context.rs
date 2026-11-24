@@ -239,6 +239,130 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
     chars / 4
 }
 
+/// Deteksi kapasitas context window (dalam token) berdasarkan nama/ID model AI.
+/// Otomatis membuang prefix provider (`ag/`, `openai/`, `anthropic/`, `google/`, dll.).
+pub fn infer_model_context_limit(model: &str) -> usize {
+    let raw = model.trim().to_ascii_lowercase();
+    let short = raw.rsplit('/').next().unwrap_or(&raw);
+    let m = short.rsplit(':').next().unwrap_or(short);
+
+    // Cek penanda eksplisit kapasitas di nama model (mis. `-1m`, `-200k`, `-128k`, `-32k`).
+    if m.contains("1m") || m.contains("1000k") {
+        return 1_000_000;
+    }
+    if m.contains("2m") {
+        return 2_000_000;
+    }
+    if m.contains("256k") {
+        return 256_000;
+    }
+    if m.contains("200k") {
+        return 200_000;
+    }
+    if m.contains("128k") {
+        return 128_000;
+    }
+    if m.contains("64k") {
+        return 64_000;
+    }
+    if m.contains("32k") {
+        return 32_768;
+    }
+
+    // Keluarga Gemini
+    if m.contains("gemini-1.5-pro") || m.contains("gemini-1-5-pro") {
+        return 2_000_000;
+    }
+    if m.contains("gemini") {
+        return 1_048_576;
+    }
+
+    // Keluarga Claude
+    if m.contains("claude") {
+        return 200_000;
+    }
+
+    // Keluarga OpenAI (GPT-4.1, GPT-5, o1/o3/o4, GPT-4o)
+    if m.contains("gpt-4.1") || m.contains("gpt-4-1") {
+        return 1_047_576;
+    }
+    if m.contains("gpt-5") {
+        return 400_000;
+    }
+    if m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.contains("-o1")
+        || m.contains("-o3")
+        || m.contains("-o4")
+    {
+        return 200_000;
+    }
+    if m.contains("gpt-4o") || m.contains("gpt-4-turbo") || m.contains("gpt-4") {
+        return 128_000;
+    }
+    if m.contains("gpt-3.5") {
+        return 16_385;
+    }
+
+    // Keluarga Grok / Llama / Qwen / DeepSeek / Kimi / Mistral / GLM
+    if m.contains("grok-4") {
+        return 256_000;
+    }
+    if m.contains("grok") {
+        return 131_072;
+    }
+    if m.contains("llama-4") || m.contains("llama4") {
+        return 1_000_000;
+    }
+    if m.contains("qwen") {
+        return 131_072;
+    }
+    if m.contains("deepseek")
+        || m.contains("llama-3")
+        || m.contains("llama3")
+        || m.contains("kimi")
+        || m.contains("moonshot")
+        || m.contains("mistral")
+        || m.contains("codestral")
+        || m.contains("devstral")
+        || m.contains("glm-4")
+        || m.contains("glm4")
+        || m.contains("minimax")
+    {
+        return 128_000;
+    }
+
+    128_000
+}
+
+/// Format jumlah token ringkas untuk status bar & info konteks (mis. `1M`, `200k`, `12.4k`, `850`).
+pub fn format_context_compact(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        let m = tokens as f64 / 1_000_000.0;
+        if (m - m.round()).abs() < 0.08 {
+            format!("{}M", m.round() as usize)
+        } else {
+            format!("{m:.1}M")
+        }
+    } else if tokens >= 10_000 {
+        format!("{}k", (tokens + 500) / 1000)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Persentase pemakaian konteks (0..=100), dibulatkan ke atas agar pemakaian
+/// kecil yang nyata (>0 token) tidak tampil sebagai 0%.
+pub fn calc_context_pct(tokens: usize, limit: usize) -> u8 {
+    if limit == 0 || tokens == 0 {
+        return 0;
+    }
+    ((tokens.saturating_mul(100) + limit - 1) / limit).min(100) as u8
+}
+
 /// Compaction memicu bila estimasi melewati 80% batas konteks.
 pub fn needs_compaction(messages: &[Message], limit_tokens: usize) -> bool {
     limit_tokens > 0 && estimate_tokens(messages) > limit_tokens * 80 / 100

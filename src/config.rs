@@ -127,6 +127,10 @@ pub struct ProviderCfg {
     pub price_in: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_out: Option<f64>,
+    /// Override manual kapasitas context window model untuk provider ini (opsional).
+    /// Bila kosong, SelenCode otomatis mendeteksi dari API `/models` atau nama model AI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<usize>,
 }
 
 fn default_kind() -> String {

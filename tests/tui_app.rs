@@ -413,6 +413,80 @@ fn render_modal_model_picker_interaktif_saved_manual_dan_katalog() {
 }
 
 #[test]
+fn render_mobile_help_rapi_dan_context_model_tampil() {
+    use selencode::repl::help_menu_markup;
+    use selencode::tui::render_menu_card_width;
+
+    // 1. Kartu /help di layar sempit Termux HP (50 kolom): tidak ada baris overflow
+    // dan deskripsi /approve serta /skills tidak terpotong karakter `|`.
+    let help = help_menu_markup();
+    let lines = render_menu_card_width(&help, 50);
+    for l in &lines {
+        assert!(
+            l.width() <= 50,
+            "baris menu mobile meluber (>50): {:?}",
+            l.to_string()
+        );
+    }
+    let joined: String = lines
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("/stop"), "/stop tampil di /help");
+    assert!(joined.contains("kurangi popup izin"), "deskripsi /approve utuh");
+    assert!(joined.contains("self-improvement"), "deskripsi /skills utuh");
+
+    // 2. Status bar mobile (50 kolom) menampilkan kapasitas konteks model AI (Gemini -> 1M).
+    let mut a = App::new(
+        "/tmp/proyek".into(),
+        "router".into(),
+        "ag/gemini-4-neon-low".into(),
+        25,
+        0,
+        0,
+    );
+    a.apply_event(UiEvent::ContextInfo {
+        used_tokens: 24_000,
+        limit_tokens: 1_048_576,
+    });
+    a.menu(help);
+    let backend = TestBackend::new(50, 32);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| selencode::tui::draw(f, &mut a)).unwrap();
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("24k/1M"), "kapasitas konteks 1M tampil di status bar mobile");
+}
+
+#[tokio::test]
+async fn stop_cancel_all_approvals_tolak_aktif_dan_antrean() {
+    let mut a = app();
+    let (tx1, rx1) = tokio::sync::oneshot::channel::<bool>();
+    let (tx2, rx2) = tokio::sync::oneshot::channel::<bool>();
+    a.receive_approval(ApprovalRequest {
+        title: "edit_file a.rs".into(),
+        detail: String::new(),
+        reply: tx1,
+    });
+    a.receive_approval(ApprovalRequest {
+        title: "run_shell: cargo build".into(),
+        detail: String::new(),
+        reply: tx2,
+    });
+    assert_eq!(a.cancel_all_approvals(), 2);
+    assert!(a.approval.is_none());
+    assert_eq!(a.approval_pending_count(), 0);
+    assert!(!rx1.await.unwrap());
+    assert!(!rx2.await.unwrap());
+}
+
+#[test]
 fn diff_view_warna_dan_hitung() {
     let diff = "diff src/a.rs\n konteks\n-lama\n+baru\n+kedua\n";
     assert!(looks_like_diff(diff));
