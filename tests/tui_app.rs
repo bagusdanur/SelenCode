@@ -148,7 +148,9 @@ async fn approver_channel_roundtrip() {
 }
 
 #[test]
-fn render_satu_frame_memuat_header_dan_status() {
+fn render_satu_frame_memuat_sambutan_dan_status() {
+    // v0.1.2: header lama digantikan sambutan Moonlit di transkrip —
+    // maksud tes sama: identitas + model + status bar tampil dalam frame.
     let mut a = app();
     a.info("SelenCode — halo, aku Selena.");
     a.push_user("halo");
@@ -157,8 +159,9 @@ fn render_satu_frame_memuat_header_dan_status() {
     term.draw(|f| selencode::tui::draw(f, &mut a)).unwrap();
     let buf = term.backend().buffer().clone();
     let text: String = buf.content().iter().map(|c| c.symbol()).collect();
-    assert!(text.contains("SelenCode"), "header harus memuat SelenCode");
-    assert!(text.contains("model: router/model-x"));
+    assert!(text.contains("SelenCode"), "sambutan harus memuat SelenCode");
+    assert!(text.contains("SELENCODE"), "sambutan Moonlit tampil");
+    assert!(text.contains("model-x"), "model tampil di sambutan");
     assert!(text.contains("token sesi 0 in / 0 out"), "status bar tampil");
     assert!(text.contains("langkah 0/25"));
 }
