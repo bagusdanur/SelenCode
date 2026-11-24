@@ -341,6 +341,76 @@ async fn approve_category_for_session_otomatis_loloskan_antrean_serupa() {
 }
 
 #[test]
+fn render_modal_model_picker_interaktif_saved_manual_dan_katalog() {
+    use selencode::agent::ui::ModelPickerData;
+    use selencode::tui::app::ModelPickerMode;
+
+    let mut a = app();
+    a.apply_event(UiEvent::ModelPicker(ModelPickerData {
+        provider: "router".into(),
+        providers: vec!["openrouter".into(), "router".into()],
+        active_model: "ag/gemini-3-flash".into(),
+        saved_models: vec!["ag/gemini-3-flash".into(), "ag/claude-sonnet-4".into()],
+        remote_models: vec![
+            "ag/gemini-3-flash".into(),
+            "ag/claude-sonnet-4".into(),
+            "ag/gpt-4.1".into(),
+        ],
+        open_catalog: false,
+        status: None,
+    }));
+
+    // 1. Mode Saved: daftar bernomor + tombol shortcut ala Hermes tampil.
+    let backend = TestBackend::new(96, 28);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| selencode::tui::draw(f, &mut a)).unwrap();
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("Kelola Model · router"));
+    assert!(text.contains("Model Saya (2)"));
+    assert!(text.contains("ag/claude-sonnet-4"));
+    assert!(text.contains("[a] + manual"));
+    assert!(text.contains("[c] reset"));
+
+    // 2. Navigasi & mode Catalog dengan filter live + tanda centang [✓] / [ ].
+    let mp = a.model_picker.as_mut().unwrap();
+    assert_eq!(mp.next_provider().as_deref(), Some("openrouter"));
+    mp.mode = ModelPickerMode::Catalog;
+    mp.filter_input = "gpt".into();
+    assert_eq!(mp.filtered_remote().len(), 1);
+    assert_eq!(mp.selected_remote().as_deref(), Some("ag/gpt-4.1"));
+    term.draw(|f| selencode::tui::draw(f, &mut a)).unwrap();
+    let text2: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text2.contains("ag/gpt-4.1"));
+    assert!(text2.contains("[Space] pilih 1-per-1"));
+
+    // 3. Mode AddManual tampil input inline.
+    a.model_picker.as_mut().unwrap().mode = ModelPickerMode::AddManual;
+    a.model_picker.as_mut().unwrap().manual_input = "ag/deepseek-r1".into();
+    term.draw(|f| selencode::tui::draw(f, &mut a)).unwrap();
+    let text3: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text3.contains("ag/deepseek-r1"));
+    assert!(text3.contains("[Enter] simpan"));
+}
+
+#[test]
 fn diff_view_warna_dan_hitung() {
     let diff = "diff src/a.rs\n konteks\n-lama\n+baru\n+kedua\n";
     assert!(looks_like_diff(diff));

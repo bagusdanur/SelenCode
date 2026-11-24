@@ -7,6 +7,19 @@
 
 use crate::providers::Usage;
 
+/// Snapshot data untuk modal pemilih model interaktif (ala Hermes) di TUI.
+#[derive(Debug, Clone)]
+pub struct ModelPickerData {
+    pub provider: String,
+    pub providers: Vec<String>,
+    pub active_model: String,
+    pub saved_models: Vec<String>,
+    pub remote_models: Vec<String>,
+    /// true = langsung buka tab Katalog API (mis. setelah tekan `f`).
+    pub open_catalog: bool,
+    pub status: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     /// Potongan teks jawaban assistant yang sedang streaming.
@@ -41,6 +54,8 @@ pub enum UiEvent {
     Info(String),
     /// Kartu menu terstruktur berwarna (output /help, /model, /provider, /sessions).
     Menu(String),
+    /// Buka atau perbarui modal pemilih model interaktif di TUI.
+    ModelPicker(ModelPickerData),
     /// Sesi baru dimulai (/new): bersihkan transkrip & reset statistik sesi.
     SessionReset {
         session_id: String,

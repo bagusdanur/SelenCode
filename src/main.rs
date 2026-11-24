@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use selencode::agent::context::{compact_messages, estimate_tokens};
 use selencode::agent::plan::{approved_plan_prompt, extract_plan, TurnMode};
+use selencode::agent::ui::ModelPickerData;
 use selencode::agent::{
     run_self_improvement_review, run_turn, run_turn_mode, run_turn_ui, run_turn_ui_mode, UiEvent,
 };
@@ -21,10 +22,14 @@ use selencode::skills::{
     export_conversation_md, init_agents_md, list_skills, load_skill, remove_skill, save_skill,
 };
 use selencode::store::Store;
+use selencode::telegram::{
+    parse_telegram_action, TelegramAction, TelegramClient, TgApprovalHub,
+};
 use selencode::tools::delegate::Delegate;
 use selencode::tools::{default_registry_with_shell, read_only_registry, Ctx, Registry};
 use selencode::tui::app::App;
-use selencode::tui::{TuiChannels, TuiCommand};
+use selencode::tui::{ModelPickerCmd, TuiChannels, TuiCommand};
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +63,8 @@ enum Commands {
     },
     /// Lanjutkan sesi terakhir untuk folder ini (mode interaktif)
     Resume,
+    /// Jalankan Telegram Bot Gateway untuk chat & coding jarak jauh dari Telegram
+    Telegram,
     /// Perbarui selen ke rilis terbaru dari GitHub Releases
     Update,
 }
@@ -145,6 +152,9 @@ struct Session {
     messages: Vec<Message>,
     /// Catatan "Melanjutkan sesi: ..." bila resume memuat sesi lama.
     resumed_note: Option<String>,
+    /// Cache katalog `/models` terakhir di memori (TIDAK otomatis menimpa config,
+    /// agar user bisa memilih 1-per-1 lewat `/model add <nomor>` atau modal `/model`).
+    last_remote_models: Vec<String>,
 }
 
 impl Session {
@@ -235,6 +245,7 @@ impl Session {
             session_id,
             messages,
             resumed_note,
+            last_remote_models: Vec::new(),
         })
     }
 
@@ -307,10 +318,38 @@ impl Session {
                 ))
             }
             ModelAction::AddModels(items) => {
+                // Dukung: `/model add <id_manual>`, `/model add 1 3` (ambil nomor dari `/models` terakhir),
+                // atau `/model add all` (impor semua hasil `/models` terakhir).
+                let mut resolved: Vec<String> = Vec::new();
+                for token in &items {
+                    if token.eq_ignore_ascii_case("all") {
+                        if self.last_remote_models.is_empty() {
+                            anyhow::bail!(
+                                "belum ada katalog API yang dimuat. Jalankan `/models` dulu atau tambah manual: `/model add <id-model>`."
+                            );
+                        }
+                        resolved.extend(self.last_remote_models.iter().cloned());
+                    } else if let Ok(idx) = token.parse::<usize>() {
+                        if idx >= 1 && idx <= self.last_remote_models.len() {
+                            resolved.push(self.last_remote_models[idx - 1].clone());
+                        } else if self.last_remote_models.is_empty() {
+                            anyhow::bail!(
+                                "nomor #{idx} butuh katalog `/models` dulu. Jalankan `/models` lalu `/model add {idx}`, atau tulis ID model langsung: `/model add <id-model>`."
+                            );
+                        } else {
+                            anyhow::bail!(
+                                "nomor katalog #{idx} di luar rentang 1..={}.",
+                                self.last_remote_models.len()
+                            );
+                        }
+                    } else {
+                        resolved.push(token.clone());
+                    }
+                }
                 let mut added = 0usize;
                 if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
                     p.models = p.effective_models();
-                    for m in &items {
+                    for m in &resolved {
                         if p.push_model_unique(m) {
                             added += 1;
                         }
@@ -319,7 +358,7 @@ impl Session {
                 }
                 let saved_path = config::save(&self.cfg)?;
                 let mut out = format!(
-                    "# Daftar Model Diperbarui (+{added} baru, tersimpan ke {})\n",
+                    "# Model Ditambahkan (+{added} baru, tersimpan ke {})\n",
                     saved_path.display()
                 );
                 let list = self.pcfg.effective_models();
@@ -330,8 +369,32 @@ impl Session {
                     out.push_str(&format!("{mark} #{} | {m} | {note}\n", i + 1));
                 }
                 out.push_str("---\n");
-                out.push_str("! Ganti cepat lewat nomor: /model <nomor>");
+                out.push_str("! Ganti cepat lewat nomor: /model <nomor>   |   Hapus: /model rm <nomor> atau /model clear");
                 Ok(out)
+            }
+            ModelAction::ClearModels => {
+                let mut removed_count = 0usize;
+                let active_model = self.pcfg.model.clone();
+                if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+                    let before = p.effective_models().len();
+                    p.models = if p.model.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![p.model.clone()]
+                    };
+                    removed_count = before.saturating_sub(p.models.len());
+                    self.pcfg = p.clone();
+                }
+                let saved_path = config::save(&self.cfg)?;
+                Ok(format!(
+                    "# Daftar Model Dibersihkan (-{removed_count} dihapus)\n\
+                     * #1 | {active_model} | satu-satunya model aktif tersisa di {}\n\
+                     ---\n\
+                     ! Config disimpan ke: {}\n\
+                     ! Tambah 1-per-1 yang kamu mau: /model add <id>   atau   buka pemilih: /model",
+                    self.provider_name,
+                    saved_path.display()
+                ))
             }
             ModelAction::RemoveModel(target) => {
                 let mut removed: Option<String> = None;
@@ -482,37 +545,41 @@ impl Session {
         }
     }
 
-    /// Tarik daftar model real-time dari endpoint `/models` provider aktif,
-    /// **otomatis menyimpannya** ke daftar bernomor di config, lalu tampilkan
-    /// (opsional disaring dengan kata kunci `filter`).
-    async fn fetch_remote_models_menu(&mut self, filter: Option<&str>) -> Result<String> {
+    /// Tarik katalog model real-time dari endpoint `/models` provider aktif
+    /// (disimpan ke cache memori sesi, TIDAK mengotori daftar pribadi di config)
+    /// agar user bisa memilih 1-per-1 yang memang ingin dipakai.
+    async fn fetch_remote_models_raw(&mut self) -> Result<Vec<String>> {
         if self.pcfg.kind != "openai" {
-            return Ok(format!(
-                "# Daftar Model ({})\n\
-                 ! Provider kind '{}' tidak menyediakan endpoint /models standar OpenAI.\n\
-                 ! Tambah manual ke daftar bernomor: /model add <model-1> <model-2>\n\
-                 ! Lalu pilih cepat dengan: /model <nomor>",
-                self.provider_name, self.pcfg.kind
-            ));
+            anyhow::bail!(
+                "provider '{}' (kind={}) tidak menyediakan endpoint /models standar OpenAI. Tambah manual: `/model add <id-model>`",
+                self.provider_name,
+                self.pcfg.kind
+            );
         }
         let (_n, pcfg, api_key) = self.cfg.resolve_provider(Some(&self.provider_name))?;
         let base_url = pcfg
             .base_url
             .ok_or_else(|| anyhow::anyhow!("base_url kosong untuk provider '{}'", self.provider_name))?;
-        let mut ids = fetch_models(&base_url, &api_key).await?;
-        if !self.pcfg.model.trim().is_empty() && !ids.iter().any(|m| m == &self.pcfg.model) {
-            ids.insert(0, self.pcfg.model.clone());
-        }
-        // Simpan otomatis ke config agar langsung bisa dipilih via `/model <nomor>`!
-        if !ids.is_empty() {
-            if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
-                p.models = ids.clone();
-                self.pcfg = p.clone();
-            }
-            let _ = config::save(&self.cfg);
-        }
+        let ids = fetch_models(&base_url, &api_key).await?;
+        self.last_remote_models = ids.clone();
+        Ok(ids)
+    }
 
-        let needle = filter.map(|f| f.trim().to_ascii_lowercase()).filter(|f| !f.is_empty());
+    async fn fetch_remote_models_menu(&mut self, filter: Option<&str>) -> Result<String> {
+        if self.pcfg.kind != "openai" {
+            return Ok(format!(
+                "# Katalog Model ({})\n\
+                 ! Provider kind '{}' tidak menyediakan endpoint /models standar OpenAI.\n\
+                 ! Tambah manual 1-per-1 ke daftar: /model add <id-model>\n\
+                 ! Lalu pilih cepat dengan: /model <nomor>",
+                self.provider_name, self.pcfg.kind
+            ));
+        }
+        let ids = self.fetch_remote_models_raw().await?;
+        let saved = self.pcfg.effective_models();
+        let needle = filter
+            .map(|f| f.trim().to_ascii_lowercase())
+            .filter(|f| !f.is_empty());
         let shown: Vec<(usize, &String)> = ids
             .iter()
             .enumerate()
@@ -527,13 +594,13 @@ impl Session {
 
         let header = match &needle {
             Some(f) => format!(
-                "# Model {} cocok \"{f}\" ({}/{} tersimpan)\n",
+                "# Katalog API {} cocok \"{f}\" ({}/{} tersedia)\n",
                 self.provider_name,
                 shown.len(),
                 ids.len()
             ),
             None => format!(
-                "# Daftar Model {} ({} tersimpan ke config)\n",
+                "# Katalog API {} ({} tersedia · tidak otomatis disimpan)\n",
                 self.provider_name,
                 ids.len()
             ),
@@ -543,9 +610,16 @@ impl Session {
             out.push_str("! Tidak ada model yang cocok.\n");
         } else {
             for (idx, id) in shown.iter().take(40) {
-                let active = **id == self.pcfg.model;
-                let mark = if active { "*" } else { ">" };
-                let note = if active { "aktif" } else { "" };
+                let is_active = **id == self.pcfg.model;
+                let is_saved = saved.iter().any(|s| s == *id);
+                let mark = if is_active { "*" } else { ">" };
+                let note = if is_active {
+                    "aktif · tersimpan"
+                } else if is_saved {
+                    "✓ sudah di daftar"
+                } else {
+                    ""
+                };
                 out.push_str(&format!("{mark} #{idx} | {id} | {note}\n"));
             }
             if shown.len() > 40 {
@@ -556,7 +630,8 @@ impl Session {
             }
         }
         out.push_str("---\n");
-        out.push_str("! Pilih cepat lewat nomor: /model <nomor>   (atau /model set <nomor>)");
+        out.push_str("! Daftar pribadimu tetap bersih! Ambil 1-per-1 yang mau dipakai saja:\n");
+        out.push_str("! /model add 1 3   (simpan #1 & #3)   |   /model add all   |   /model (pemilih interaktif)");
         Ok(out)
     }
 
@@ -768,10 +843,178 @@ impl Session {
             out.push_str(&format!("{mark} {n} | {} | {tag}\n", p.model));
         }
         out.push_str("---\n");
-        out.push_str("! Ganti cepat via nomor: /model 2   atau   /model set 2   atau   /model claude\n");
-        out.push_str("! Tarik & simpan API:    /models [filter]   |   Tambah manual: /model add <id>\n");
-        out.push_str("! Pindah provider:       /model <provider>   |   Pasang provider: /provider");
+        out.push_str("! Ganti cepat:       /model 2   (pakai nomor)   |   /model claude   (potongan nama)\n");
+        out.push_str("! Tambah 1-per-1:    /model add <id>   |   Intip API: /models [cari] lalu /model add 1 3\n");
+        out.push_str("! Hapus daftar:      /model rm <no>   |   Hapus semua: /model clear   |   Provider: /provider");
         out
+    }
+
+    fn model_picker_data(&self, open_catalog: bool, status: Option<String>) -> ModelPickerData {
+        let mut providers: Vec<String> = self.cfg.providers.keys().cloned().collect();
+        providers.sort();
+        ModelPickerData {
+            provider: self.provider_name.clone(),
+            providers,
+            active_model: self.pcfg.model.clone(),
+            saved_models: self.pcfg.effective_models(),
+            remote_models: self.last_remote_models.clone(),
+            open_catalog,
+            status,
+        }
+    }
+
+    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
+    fn handle_telegram(&mut self, arg: Option<&str>) -> Result<String> {
+        match parse_telegram_action(arg) {
+            TelegramAction::Status => {
+                let tok_state = if self.cfg.telegram.is_token_ready() {
+                    if !self.cfg.telegram.bot_token_env.trim().is_empty() {
+                        format!("siap (env {})", self.cfg.telegram.bot_token_env)
+                    } else if self.cfg.telegram.bot_token.is_some() {
+                        "siap (tersimpan di config)".to_string()
+                    } else {
+                        "siap (env SELENCODE_TELEGRAM_TOKEN)".to_string()
+                    }
+                } else {
+                    "belum diatur".to_string()
+                };
+                let users_str = if self.cfg.telegram.allowed_users.is_empty() {
+                    "(kosong — wajib isi whitelist agar aman)".to_string()
+                } else {
+                    self.cfg
+                        .telegram
+                        .allowed_users
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let appr = if self.cfg.telegram.approval.trim().is_empty() {
+                    "ask (tombol inline di Telegram)".to_string()
+                } else {
+                    self.cfg.telegram.approval.clone()
+                };
+                Ok(format!(
+                    "# Telegram Gateway SelenCode\n\
+                     * bot token | {tok_state} | dari @BotFather\n\
+                     > allowed_users | {users_str} | whitelist ID Telegram\n\
+                     > approval | {appr} | ask / edits / auto\n\
+                     ---\n\
+                     ! Pasang cepat:      /telegram setup <BOT_TOKEN> <USER_ID>\n\
+                     ! Tambah/hapus ID:   /telegram allow <USER_ID>   |   /telegram rm <USER_ID>\n\
+                     ! Mode izin bot:     /telegram approve <ask|edits|auto>   |   Matikan: /telegram off\n\
+                     ! Jalankan gateway:  ketik `selen telegram` di terminal (bisa di PC/Termux), lalu chat bot kamu!"
+                ))
+            }
+            TelegramAction::Setup {
+                token_spec,
+                user_id,
+            } => {
+                match token_spec {
+                    KeySpec::EnvVar(env_name) => {
+                        self.cfg.telegram.bot_token_env = env_name;
+                        self.cfg.telegram.bot_token = None;
+                    }
+                    KeySpec::DirectKey(raw) => {
+                        self.cfg.telegram.bot_token = Some(raw);
+                    }
+                }
+                if let Some(uid) = user_id {
+                    if !self.cfg.telegram.allowed_users.contains(&uid) {
+                        self.cfg.telegram.allowed_users.push(uid);
+                    }
+                }
+                let saved = config::save(&self.cfg)?;
+                let uid_note = if self.cfg.telegram.allowed_users.is_empty() {
+                    "Belum ada User ID di whitelist — jalankan `selen telegram`, kirim `/id` ke bot, lalu `/telegram allow <ID>`."
+                        .to_string()
+                } else {
+                    format!(
+                        "Whitelist aktif: {}",
+                        self.cfg
+                            .telegram
+                            .allowed_users
+                            .iter()
+                            .map(|u| u.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                Ok(format!(
+                    "# Telegram Gateway Tersimpan\n\
+                     * status | token tersimpan | {}\n\
+                     > config | {} | aman (chmod 600 di Unix)\n\
+                     ---\n\
+                     ! Jalankan bot sekarang dari terminal: selen telegram",
+                    uid_note,
+                    saved.display()
+                ))
+            }
+            TelegramAction::Allow(uid) => {
+                if !self.cfg.telegram.allowed_users.contains(&uid) {
+                    self.cfg.telegram.allowed_users.push(uid);
+                }
+                let saved = config::save(&self.cfg)?;
+                Ok(format!(
+                    "# User Telegram Diizinkan\n\
+                     * allowed | {uid} | total {} user di whitelist\n\
+                     ! Config disimpan ke: {}",
+                    self.cfg.telegram.allowed_users.len(),
+                    saved.display()
+                ))
+            }
+            TelegramAction::Remove(uid) => {
+                let before = self.cfg.telegram.allowed_users.len();
+                self.cfg.telegram.allowed_users.retain(|x| *x != uid);
+                if self.cfg.telegram.allowed_users.len() == before {
+                    anyhow::bail!("User ID {uid} tidak ada di whitelist Telegram.");
+                }
+                let saved = config::save(&self.cfg)?;
+                Ok(format!(
+                    "# User Telegram Dihapus\n\
+                     > dihapus | {uid} | sisa {} user di whitelist\n\
+                     ! Config disimpan ke: {}",
+                    self.cfg.telegram.allowed_users.len(),
+                    saved.display()
+                ))
+            }
+            TelegramAction::SetApproval(mode) => {
+                if !matches!(mode.as_str(), "ask" | "edits" | "auto") {
+                    anyhow::bail!("mode '{mode}' tidak dikenal. Pilihan: ask, edits, auto");
+                }
+                self.cfg.telegram.approval = mode.clone();
+                let saved = config::save(&self.cfg)?;
+                Ok(format!(
+                    "# Mode Izin Telegram Diperbarui\n\
+                     * approval | {mode} | berlaku saat menjalankan `selen telegram`\n\
+                     ! Config disimpan ke: {}",
+                    saved.display()
+                ))
+            }
+            TelegramAction::Disable => {
+                self.cfg.telegram.bot_token = None;
+                self.cfg.telegram.bot_token_env.clear();
+                let saved = config::save(&self.cfg)?;
+                Ok(format!(
+                    "# Telegram Gateway Dinonaktifkan\n\
+                     > token | dihapus dari config | {}\n\
+                     ! Aktifkan lagi kapan saja: /telegram setup <BOT_TOKEN> <USER_ID>",
+                    saved.display()
+                ))
+            }
+            TelegramAction::Usage => Ok(
+                "# Cara Pakai /telegram\n\
+                 > /telegram | (cek status) | lihat token, whitelist, & mode approval\n\
+                 > /telegram setup | <BOT_TOKEN> [USER_ID] | simpan token @BotFather (+ whitelist ID opsional)\n\
+                 > /telegram allow | <USER_ID> | izinkan user/chat Telegram tertentu\n\
+                 > /telegram rm | <USER_ID> | hapus user dari whitelist\n\
+                 > /telegram approve | <ask|edits|auto> | atur mode izin tool di bot\n\
+                 > /telegram off | | hapus token bot dari config\n\
+                 ---\n\
+                 ! Setelah setup, jalankan di terminal: selen telegram"
+                    .to_string(),
+            ),
+        }
     }
 
     fn providers_menu(&self) -> String {
@@ -1274,6 +1517,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Resume) => interactive(cli, true).await,
+        Some(Commands::Telegram) => run_telegram_gateway(cli).await,
         Some(Commands::Update) => selencode::update::run().await,
         None => interactive(cli, false).await,
     }
@@ -1472,6 +1716,115 @@ async fn tui_worker(
             TuiCommand::ShowModels => {
                 let _ = ui_tx.send(UiEvent::Menu(s.models_menu())).await;
             }
+            TuiCommand::ModelPicker(action) => match action {
+                ModelPickerCmd::Open => {
+                    let _ = ui_tx
+                        .send(UiEvent::ModelPicker(s.model_picker_data(false, None)))
+                        .await;
+                }
+                ModelPickerCmd::SelectModel(model_id) => {
+                    match s.apply_model_arg(&format!("set {model_id}")) {
+                        Ok(card) => {
+                            let _ = ui_tx
+                                .send(UiEvent::ModelChanged {
+                                    provider: s.provider_name.clone(),
+                                    model: s.pcfg.model.clone(),
+                                })
+                                .await;
+                            let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                        }
+                        Err(e) => {
+                            let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                        }
+                    }
+                }
+                ModelPickerCmd::AddOne(model_id) => {
+                    let msg = match s.apply_model_arg(&format!("add {model_id}")) {
+                        Ok(_) => format!("Ditambahkan: {model_id}"),
+                        Err(e) => format!("Gagal: {e}"),
+                    };
+                    let _ = ui_tx
+                        .send(UiEvent::ModelPicker(s.model_picker_data(false, Some(msg))))
+                        .await;
+                }
+                ModelPickerCmd::ToggleOne(model_id) => {
+                    let exists = s.pcfg.effective_models().iter().any(|m| m == &model_id);
+                    let msg = if exists {
+                        match s.apply_model_arg(&format!("rm {model_id}")) {
+                            Ok(_) => format!("Dihapus dari daftar: {model_id}"),
+                            Err(e) => format!("{e}"),
+                        }
+                    } else {
+                        match s.apply_model_arg(&format!("add {model_id}")) {
+                            Ok(_) => format!("Disimpan ke Model Saya: {model_id}"),
+                            Err(e) => format!("Gagal: {e}"),
+                        }
+                    };
+                    let _ = ui_tx
+                        .send(UiEvent::ModelPicker(s.model_picker_data(true, Some(msg))))
+                        .await;
+                }
+                ModelPickerCmd::RemoveOne(model_id) => {
+                    let msg = match s.apply_model_arg(&format!("rm {model_id}")) {
+                        Ok(_) => format!("Dihapus: {model_id}"),
+                        Err(e) => format!("{e}"),
+                    };
+                    let _ = ui_tx
+                        .send(UiEvent::ModelPicker(s.model_picker_data(false, Some(msg))))
+                        .await;
+                }
+                ModelPickerCmd::ClearAll => {
+                    let msg = match s.apply_model_arg("clear") {
+                        Ok(_) => "Daftar dibersihkan — tersisa 1 model aktif.".to_string(),
+                        Err(e) => format!("Gagal: {e}"),
+                    };
+                    let _ = ui_tx
+                        .send(UiEvent::ModelPicker(s.model_picker_data(false, Some(msg))))
+                        .await;
+                }
+                ModelPickerCmd::FetchCatalog => match s.fetch_remote_models_raw().await {
+                    Ok(ids) => {
+                        let msg = format!(
+                            "{} model di katalog API (Space: pilih 1-per-1, Enter: pakai)",
+                            ids.len()
+                        );
+                        let _ = ui_tx
+                            .send(UiEvent::ModelPicker(s.model_picker_data(true, Some(msg))))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = ui_tx
+                            .send(UiEvent::ModelPicker(
+                                s.model_picker_data(false, Some(format!("Katalog gagal: {e}"))),
+                            ))
+                            .await;
+                    }
+                },
+                ModelPickerCmd::SwitchProvider(prov) => match s.switch_provider(&prov) {
+                    Ok(()) => {
+                        s.last_remote_models.clear();
+                        let _ = ui_tx
+                            .send(UiEvent::ModelChanged {
+                                provider: s.provider_name.clone(),
+                                model: s.pcfg.model.clone(),
+                            })
+                            .await;
+                        let _ = ui_tx
+                            .send(UiEvent::ModelPicker(s.model_picker_data(
+                                false,
+                                Some(format!("Pindah ke provider '{prov}'")),
+                            )))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = ui_tx
+                            .send(UiEvent::ModelPicker(
+                                s.model_picker_data(false, Some(format!("Gagal pindah: {e}"))),
+                            ))
+                            .await;
+                    }
+                },
+            },
             TuiCommand::SwitchOrSetModel(arg) => {
                 if let ModelAction::FetchList(filter) = parse_model_action(&arg) {
                     match s.fetch_remote_models_menu(filter.as_deref()).await {
@@ -1517,6 +1870,14 @@ async fn tui_worker(
                             model: s.pcfg.model.clone(),
                         })
                         .await;
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::Telegram(arg) => match s.handle_telegram(arg.as_deref()) {
+                Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
                 }
                 Err(e) => {
@@ -1663,6 +2024,10 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
+            SlashCommand::Telegram(arg) => match s.handle_telegram(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
             SlashCommand::InlineShell(cmd) => match s.handle_inline_shell(&cmd).await {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
@@ -1797,5 +2162,508 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+// ---------- Telegram Bot Gateway (`selen telegram`) ----------
+
+struct BusyChatGuard {
+    set: Arc<std::sync::Mutex<HashSet<i64>>>,
+    chat_id: i64,
+}
+
+impl Drop for BusyChatGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.set.lock() {
+            g.remove(&self.chat_id);
+        }
+    }
+}
+
+/// Bersihkan akhiran `@nama_bot` pada perintah grup Telegram (mis. `/model@selen_bot 2` -> `/model 2`).
+fn normalize_tg_command(raw: &str) -> String {
+    let t = raw.trim();
+    if !t.starts_with('/') {
+        return t.to_string();
+    }
+    let mut parts = t.splitn(2, char::is_whitespace);
+    let head = parts.next().unwrap_or("");
+    let cmd = head.split('@').next().unwrap_or(head);
+    match parts.next() {
+        Some(rest) if !rest.trim().is_empty() => format!("{cmd} {}", rest.trim()),
+        _ => cmd.to_string(),
+    }
+}
+
+async fn run_telegram_gateway(cli: Cli) -> Result<()> {
+    let cfg = config::load()?;
+    let token = cfg.telegram.resolve_token()?;
+    let tg = TelegramClient::new(&token)?;
+    let me = tg.get_me().await?;
+    let bot_handle = me
+        .username
+        .clone()
+        .map(|u| format!("@{u}"))
+        .unwrap_or_else(|| me.first_name.clone());
+    let cwd = std::env::current_dir()?;
+    let (prov_name, pcfg, _) = cfg.resolve_provider(cli.provider.as_deref())?;
+    let tg_mode_str = if cli.yes {
+        "auto".to_string()
+    } else if !cfg.telegram.approval.trim().is_empty() {
+        cfg.telegram.approval.clone()
+    } else {
+        cfg.agent.approval.clone()
+    };
+
+    println!("☾ SelenCode Telegram Gateway aktif!");
+    println!("  Bot      : {bot_handle} (id: {})", me.id);
+    println!("  Provider : {prov_name} / {}", pcfg.model);
+    println!("  Folder   : {}", cwd.display());
+    println!("  Approval : {tg_mode_str}");
+    if cfg.telegram.allowed_users.is_empty() {
+        println!(
+            "  Whitelist: (KOSONG!) Kirim `/id` ke {bot_handle} di Telegram, lalu jalankan `/telegram allow <ID>` di SelenCode."
+        );
+    } else {
+        let ids: Vec<String> = cfg
+            .telegram
+            .allowed_users
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
+        println!("  Whitelist: {}", ids.join(", "));
+    }
+    println!("  Tekan Ctrl+C untuk menghentikan gateway.\n");
+
+    let hub = TgApprovalHub::new();
+    let sessions: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let busy_chats: Arc<std::sync::Mutex<HashSet<i64>>> =
+        Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let provider_override = cli.provider.clone();
+    let yes_flag = cli.yes;
+
+    let mut offset: i64 = 0;
+    loop {
+        let updates = tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n☾ Telegram Gateway dihentikan.");
+                break;
+            }
+            res = tg.get_updates(offset, 25) => match res {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("[telegram] gagal polling: {e} (coba lagi 3 detik)");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            }
+        };
+
+        // Muat ulang config terbaru agar perubahan `/telegram allow` langsung berlaku.
+        let latest_cfg = config::load().unwrap_or_else(|_| cfg.clone());
+
+        for upd in updates {
+            offset = upd.update_id + 1;
+
+            if let Some(cb) = upd.callback_query {
+                let chat_id = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
+                if latest_cfg.telegram.is_allowed(cb.from.id, chat_id) {
+                    let _ = hub.handle_callback(&tg, &cb).await;
+                } else {
+                    let _ = tg
+                        .answer_callback_query(&cb.id, Some("Akses ditolak (tidak di whitelist)."))
+                        .await;
+                }
+                continue;
+            }
+
+            let Some(msg) = upd.message else {
+                continue;
+            };
+            let Some(raw_text) = msg.text else {
+                continue;
+            };
+            let text = normalize_tg_command(&raw_text);
+            if text.is_empty() {
+                continue;
+            }
+            let chat_id = msg.chat.id;
+            let user_id = msg.from.as_ref().map(|u| u.id).unwrap_or(chat_id);
+            let sender_name = msg
+                .from
+                .as_ref()
+                .and_then(|u| u.username.clone().or_else(|| Some(u.first_name.clone())))
+                .unwrap_or_else(|| user_id.to_string());
+
+            // `/id` selalu dijawab agar pemilik bisa langsung tahu ID untuk whitelist.
+            if text.eq_ignore_ascii_case("/id") {
+                let allowed_note = if latest_cfg.telegram.is_allowed(user_id, chat_id) {
+                    "✅ Sudah ada di whitelist."
+                } else {
+                    "🔒 Belum di whitelist. Jalankan di SelenCode:\n/telegram allow <USER_ID>"
+                };
+                let _ = tg
+                    .send_message(
+                        chat_id,
+                        &format!(
+                            "☾ Info ID Telegram kamu:\nUser ID: {user_id}\nChat ID: {chat_id}\n{allowed_note}"
+                        ),
+                    )
+                    .await;
+                continue;
+            }
+
+            if !latest_cfg.telegram.is_allowed(user_id, chat_id) {
+                println!("[telegram] ditolak dari {sender_name} (user={user_id}, chat={chat_id})");
+                let _ = tg
+                    .send_message(
+                        chat_id,
+                        &format!(
+                            "🔒 Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode.\n\
+                             Tambahkan dari terminal SelenCode:\n\
+                             /telegram allow {user_id}"
+                        ),
+                    )
+                    .await;
+                continue;
+            }
+
+            // Cegah 2 giliran tumpang tindih pada chat yang sama.
+            let acquired = {
+                let mut set = busy_chats.lock().expect("busy_chats poisoned");
+                set.insert(chat_id)
+            };
+            if !acquired {
+                let _ = tg
+                    .send_message(
+                        chat_id,
+                        "⏳ Selena masih mengerjakan permintaan sebelumnya di chat ini. Tunggu sebentar ya!",
+                    )
+                    .await;
+                continue;
+            }
+
+            println!("[telegram] {sender_name} ({chat_id}): {text}");
+            let tg_clone = tg.clone();
+            let hub_clone = hub.clone();
+            let sessions_clone = sessions.clone();
+            let busy_clone = busy_chats.clone();
+            let prov_clone = provider_override.clone();
+            let tg_approval_cfg = latest_cfg.telegram.approval.clone();
+
+            tokio::spawn(async move {
+                let _guard = BusyChatGuard {
+                    set: busy_clone,
+                    chat_id,
+                };
+                if let Err(e) = handle_telegram_chat_message(
+                    tg_clone.clone(),
+                    hub_clone,
+                    sessions_clone,
+                    prov_clone,
+                    yes_flag,
+                    tg_approval_cfg,
+                    chat_id,
+                    text,
+                )
+                .await
+                {
+                    let _ = tg_clone
+                        .send_long_message(chat_id, &format!("❌ Error: {e}"))
+                        .await;
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_telegram_chat_message(
+    tg: TelegramClient,
+    hub: Arc<TgApprovalHub>,
+    sessions: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>>,
+    provider_override: Option<String>,
+    yes_flag: bool,
+    tg_approval_cfg: String,
+    chat_id: i64,
+    text: String,
+) -> Result<()> {
+    // Ambil atau buat Session khusus untuk chat_id ini.
+    let session_arc = {
+        let mut map = sessions.lock().await;
+        if let Some(existing) = map.get(&chat_id) {
+            existing.clone()
+        } else {
+            let (approval_tx, mut approval_rx) =
+                tokio::sync::mpsc::channel::<ApprovalRequest>(16);
+            let s = Session::build(
+                provider_override.as_deref(),
+                yes_flag,
+                false,
+                Some(&text),
+                Some(approval_tx),
+            )
+            .await?;
+            let policy = s.ctx.approver.policy();
+            if !yes_flag && !tg_approval_cfg.trim().is_empty() {
+                let mode = ApprovalMode::from_config(&tg_approval_cfg, false);
+                if let Ok(mut p) = policy.lock() {
+                    p.mode = mode;
+                }
+            }
+            let tg_appr = tg.clone();
+            let hub_appr = hub.clone();
+            let pol_appr = policy.clone();
+            tokio::spawn(async move {
+                while let Some(req) = approval_rx.recv().await {
+                    hub_appr
+                        .dispatch(&tg_appr, chat_id, pol_appr.clone(), req)
+                        .await;
+                }
+            });
+            let arc = Arc::new(tokio::sync::Mutex::new(s));
+            map.insert(chat_id, arc.clone());
+            arc
+        }
+    };
+
+    let mut s = session_arc.lock().await;
+
+    // Perintah khusus Telegram (/start, /status).
+    if text.eq_ignore_ascii_case("/start") {
+        let msg = format!(
+            "☾ Halo! Aku Selena dari SelenCode.\n\
+             Provider: {} / {}\n\
+             Folder: {}\n\n\
+             Kirim pesan coding apa saja langsung di chat ini!\n\
+             Perintah cepat:\n\
+             • /model — lihat daftar model bernomor\n\
+             • /model 2 · /model add <id> · /model clear\n\
+             • /models [cari] — intip katalog API\n\
+             • /approve [ask|edits|auto] — atur mode izin\n\
+             • /new — mulai sesi baru · /status — info sesi\n\
+             • /help — semua perintah",
+            s.provider_name,
+            s.pcfg.model,
+            s.ctx.cwd.display()
+        );
+        tg.send_long_message(chat_id, &msg).await?;
+        return Ok(());
+    }
+    if text.eq_ignore_ascii_case("/status") {
+        let info = strip_menu_markup(&s.session_info_menu());
+        tg.send_long_message(chat_id, &info).await?;
+        return Ok(());
+    }
+
+    match parse_slash_command(&text) {
+        SlashCommand::Help => {
+            tg.send_long_message(chat_id, &strip_menu_markup(&help_menu_markup()))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Model(None) => {
+            tg.send_long_message(chat_id, &strip_menu_markup(&s.models_menu()))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Model(Some(arg)) => {
+            let reply = if let ModelAction::FetchList(filter) = parse_model_action(&arg) {
+                s.fetch_remote_models_menu(filter.as_deref()).await?
+            } else {
+                s.apply_model_arg(&arg)?
+            };
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Models(filter) => {
+            let reply = s.fetch_remote_models_menu(filter.as_deref()).await?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Provider(arg) => {
+            let reply = s.handle_provider(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Approve(arg) => {
+            let reply = s.handle_approve(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::New => {
+            let sid = s.reset_session()?;
+            tg.send_message(chat_id, &format!("✨ Sesi baru dimulai ({sid})."))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Compact => {
+            let reply = s.compact_now();
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Skills(arg) => {
+            let reply = s.handle_skills(arg.as_deref()).await?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Skill(arg) => {
+            let reply = s.handle_use_skill(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Learn(arg) => {
+            let reply = s.handle_learn_skill(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Memory(arg) => {
+            let reply = s.handle_memory(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Undo => {
+            let reply = s.handle_undo()?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Redo => {
+            let reply = s.handle_redo()?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Telegram(arg) => {
+            let reply = s.handle_telegram(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Sessions => {
+            let reply = s.sessions_menu()?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Resume => {
+            tg.send_long_message(chat_id, &strip_menu_markup(&s.session_info_menu()))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Init => {
+            let reply = s.handle_init()?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Export(arg) => {
+            let reply = s.handle_export(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::InlineShell(cmd) => {
+            let reply = s.handle_inline_shell(&cmd).await?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Exit | SlashCommand::Details | SlashCommand::Plan => {
+            tg.send_message(
+                chat_id,
+                "Perintah tersebut khusus mode terminal. Ketik /help untuk perintah Telegram.",
+            )
+            .await?;
+            return Ok(());
+        }
+        SlashCommand::Unknown(name) => {
+            tg.send_message(
+                chat_id,
+                &format!("Perintah /{name} tidak dikenal. Ketik /help untuk daftar perintah."),
+            )
+            .await?;
+            return Ok(());
+        }
+        SlashCommand::NotCommand => {}
+    }
+
+    // Giliran agent normal dengan indikator mengetik otomatis setiap 4 detik.
+    let typing_stop = Arc::new(tokio::sync::Notify::new());
+    let typing_stop_clone = typing_stop.clone();
+    let tg_typing = tg.clone();
+    let typing_task = tokio::spawn(async move {
+        loop {
+            tg_typing.send_typing(chat_id).await;
+            tokio::select! {
+                _ = typing_stop_clone.notified() => break,
+                _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+            }
+        }
+    });
+
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::channel::<UiEvent>(256);
+    let collector = tokio::spawn(async move {
+        let mut tools: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        while let Some(ev) = ui_rx.recv().await {
+            match ev {
+                UiEvent::ToolDone {
+                    name,
+                    summary,
+                    is_error,
+                } => {
+                    let icon = if is_error { "✗" } else { "✓" };
+                    let short: String = summary.chars().take(70).collect();
+                    tools.push(format!("{icon} {name}: {short}"));
+                }
+                UiEvent::Info(info) if info.contains("Self-improvement") => {
+                    notes.push(info);
+                }
+                _ => {}
+            }
+        }
+        (tools, notes)
+    });
+
+    let turn_res = run_turn_ui(
+        s.provider.clone(),
+        &s.registry,
+        &s.ctx,
+        &mut s.messages,
+        &text,
+        s.cfg.agent.max_steps,
+        ui_tx,
+    )
+    .await;
+
+    typing_stop.notify_waiters();
+    let _ = typing_task.await;
+    let (tools, notes) = collector.await.unwrap_or_default();
+
+    let answer = turn_res?;
+    let mut final_msg = String::new();
+    if !tools.is_empty() {
+        let shown: Vec<String> = tools.into_iter().take(8).collect();
+        final_msg.push_str("🔧 Aksi:\n");
+        final_msg.push_str(&shown.join("\n"));
+        final_msg.push_str("\n\n");
+    }
+    final_msg.push_str(answer.trim());
+    for note in notes {
+        final_msg.push_str(&format!("\n\n{note}"));
+    }
+    tg.send_long_message(chat_id, &final_msg).await?;
     Ok(())
 }

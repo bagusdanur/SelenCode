@@ -315,3 +315,77 @@ async fn autonomous_manage_skill_and_self_improvement_review() {
 
     std::fs::remove_dir_all(&cwd).ok();
 }
+
+#[test]
+fn model_clear_help_panduan_dan_telegram_gateway_helpers() {
+    use selencode::config::TelegramCfg;
+    use selencode::repl::{help_menu_markup, parse_model_action, ModelAction};
+    use selencode::telegram::{
+        parse_callback_approval, parse_telegram_action, split_telegram_chunks, ApprovalDecision,
+        TelegramAction,
+    };
+
+    // 1. /model clear & /model rm all + /help panduan lengkap
+    assert_eq!(parse_model_action("clear"), ModelAction::ClearModels);
+    assert_eq!(parse_model_action("rm all"), ModelAction::ClearModels);
+    assert_eq!(parse_model_action("rm *"), ModelAction::ClearModels);
+    assert_eq!(
+        parse_slash_command("/telegram setup 123456:ABCdef 998877"),
+        SlashCommand::Telegram(Some("setup 123456:ABCdef 998877".into()))
+    );
+    let help = help_menu_markup();
+    assert!(help.contains("Panduan Cepat Kelola Model"));
+    assert!(help.contains("/model clear"));
+    assert!(help.contains("/telegram"));
+
+    // 2. Parsing aksi /telegram
+    assert_eq!(
+        parse_telegram_action(Some("setup 123456:ABC_xyz 778899")),
+        TelegramAction::Setup {
+            token_spec: KeySpec::DirectKey("123456:ABC_xyz".into()),
+            user_id: Some(778899),
+        }
+    );
+    assert_eq!(
+        parse_telegram_action(Some("allow 112233")),
+        TelegramAction::Allow(112233)
+    );
+    assert_eq!(
+        parse_telegram_action(Some("approve edits")),
+        TelegramAction::SetApproval("edits".into())
+    );
+    assert_eq!(parse_telegram_action(Some("off")), TelegramAction::Disable);
+
+    // 3. Whitelist keamanan TelegramCfg
+    let mut tcfg = TelegramCfg::default();
+    assert!(tcfg.is_empty());
+    assert!(!tcfg.is_allowed(111, 111));
+    tcfg.bot_token = Some("999:secret".into());
+    tcfg.allowed_users.push(111);
+    assert!(tcfg.is_allowed(111, 999));
+    assert!(!tcfg.is_allowed(222, 999));
+    assert_eq!(tcfg.resolve_token().unwrap(), "999:secret");
+
+    // 4. Parsing callback inline approval Telegram
+    assert_eq!(
+        parse_callback_approval("ap:42:y"),
+        Some((42, ApprovalDecision::ApproveOnce))
+    );
+    assert_eq!(
+        parse_callback_approval("ap:42:a"),
+        Some((42, ApprovalDecision::ApproveCategory))
+    );
+    assert_eq!(
+        parse_callback_approval("ap:42:n"),
+        Some((42, ApprovalDecision::Deny))
+    );
+    assert_eq!(parse_callback_approval("invalid"), None);
+
+    // 5. Pemecahan pesan panjang aman UTF-8 (emoji & baris)
+    let long = "baris halo 🚀\n".repeat(40);
+    let chunks = split_telegram_chunks(&long, 120);
+    assert!(chunks.len() >= 4);
+    for c in &chunks {
+        assert!(c.chars().count() <= 120);
+    }
+}

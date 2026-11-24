@@ -7,6 +7,7 @@ pub mod repl;
 pub mod security;
 pub mod skills;
 pub mod store;
+pub mod telegram;
 pub mod tools;
 pub mod tui;
 pub mod update;

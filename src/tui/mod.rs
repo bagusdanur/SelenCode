@@ -17,7 +17,7 @@ use crate::agent::UiEvent;
 use crate::repl::{filter_commands, help_menu_markup, parse_slash_command, SlashCommand};
 use crate::security::{tool_category_from_title, ApprovalRequest};
 use anyhow::Result;
-use app::{App, LineKind, ToolState};
+use app::{App, LineKind, ModelPickerMode, ToolState};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
@@ -35,6 +35,27 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 
+/// Aksi dari modal pemilih model interaktif (`/model`) ke worker agent.
+#[derive(Debug)]
+pub enum ModelPickerCmd {
+    /// Buka / muat snapshot daftar model pribadi & provider.
+    Open,
+    /// Aktifkan model terpilih (tambah ke daftar bila belum ada).
+    SelectModel(String),
+    /// Tambah 1 model manual ke daftar pribadi tanpa menutup modal.
+    AddOne(String),
+    /// Toggle 1 model dari katalog API (tambah jika belum ada, hapus jika sudah ada & bukan aktif).
+    ToggleOne(String),
+    /// Hapus 1 model dari daftar pribadi.
+    RemoveOne(String),
+    /// Bersihkan semua model tersimpan kecuali model aktif.
+    ClearAll,
+    /// Tarik katalog model real-time dari endpoint API provider aktif.
+    FetchCatalog,
+    /// Pindah ke provider lain lalu perbarui isi modal.
+    SwitchProvider(String),
+}
+
 /// Perintah dari UI ke worker agent (dimiliki main.rs).
 #[derive(Debug)]
 pub enum TuiCommand {
@@ -46,12 +67,16 @@ pub enum TuiCommand {
     /// `!cmd` — jalankan shell lokal cepat tanpa memanggil LLM.
     InlineShell(String),
     ShowModels,
-    /// /model <arg>: ganti provider, `/model set <id>`, `/model <prov>:<id>`, atau `/model list`.
+    /// Aksi modal pemilih model interaktif ala Hermes.
+    ModelPicker(ModelPickerCmd),
+    /// /model <arg>: ganti provider, `/model set <id>`, `/model <prov>:<id>`, `/model add ...`, `/model rm ...`, `/model clear`.
     SwitchOrSetModel(String),
-    /// /models [filter]: tarik daftar model dari endpoint API provider aktif & simpan.
+    /// /models [filter]: intip katalog model dari endpoint API provider aktif (tanpa mengotori config).
     FetchRemoteModels(Option<String>),
     /// /provider [preset|add|model|default|rm ...]: kelola & pasang provider lain.
     ManageProvider(Option<String>),
+    /// /telegram [setup|allow|rm|approve|off]: kelola koneksi Telegram Gateway.
+    Telegram(Option<String>),
     Undo,
     Redo,
     Memory(Option<String>),
@@ -546,6 +571,336 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
 
+    // Modal Pemilih Model Interaktif Moonlit Ungu (ala Hermes: pilih 1-per-1, tambah manual, hapus)
+    if let Some(mp) = &app.model_picker {
+        let pct_x = if area.width < 90 { 94 } else { 80 };
+        let pct_y = if area.height < 26 { 84 } else { 72 };
+        let popup = centered_rect(pct_x, pct_y, area);
+        frame.render_widget(Clear, popup);
+
+        let modal_bg = Color::Rgb(20, 15, 38);
+        let row_hl = Color::Rgb(46, 28, 86);
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(moonlit::VIOLET))
+            .style(Style::default().bg(modal_bg))
+            .title_style(
+                Style::default()
+                    .fg(moonlit::LILAC)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .title(format!(" ☾ Kelola Model · {} ", mp.provider));
+        let inner = outer.inner(popup);
+        frame.render_widget(outer, popup);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // tab & info provider / status
+                Constraint::Min(4),    // daftar model atau input manual
+                Constraint::Length(2), // footer tombol shortcut
+            ])
+            .split(inner);
+
+        let tab_saved_style = if mp.mode != ModelPickerMode::Catalog {
+            Style::default()
+                .bg(row_hl)
+                .fg(moonlit::LILAC)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(modal_bg).fg(moonlit::DIM)
+        };
+        let tab_cat_style = if mp.mode == ModelPickerMode::Catalog {
+            Style::default()
+                .bg(row_hl)
+                .fg(moonlit::CYAN_MOON)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(modal_bg).fg(moonlit::DIM)
+        };
+        let cat_count = if mp.loading_remote {
+            "memuat…".to_string()
+        } else {
+            mp.remote_models.len().to_string()
+        };
+        let status_line = match mp.mode {
+            ModelPickerMode::AddManual => Line::from(vec![
+                Span::styled(" ✦ ", Style::default().fg(moonlit::GOLD)),
+                Span::styled("Tambah 1 model manual: ", Style::default().fg(moonlit::LAV)),
+                Span::styled(
+                    format!("{}█", mp.manual_input),
+                    Style::default()
+                        .fg(moonlit::MINT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            ModelPickerMode::Catalog => Line::from(vec![
+                Span::styled(" ✦ ", Style::default().fg(moonlit::CYAN_MOON)),
+                Span::styled("Cari katalog: ", Style::default().fg(moonlit::DIM)),
+                Span::styled(
+                    if mp.filter_input.is_empty() {
+                        "(ketik huruf untuk filter…)"
+                    } else {
+                        mp.filter_input.as_str()
+                    },
+                    Style::default().fg(if mp.filter_input.is_empty() {
+                        moonlit::FAINT
+                    } else {
+                        moonlit::LILAC
+                    }),
+                ),
+                Span::styled("█", Style::default().fg(moonlit::VIOLET)),
+            ]),
+            ModelPickerMode::Saved => {
+                if let Some(st) = &mp.status {
+                    Line::from(vec![
+                        Span::styled(" ✦ ", Style::default().fg(moonlit::MINT)),
+                        Span::styled(st.clone(), Style::default().fg(moonlit::LAV)),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled(" ✦ ", Style::default().fg(moonlit::GOLD)),
+                        Span::styled("Aktif: ", Style::default().fg(moonlit::DIM)),
+                        Span::styled(
+                            mp.active_model.clone(),
+                            Style::default()
+                                .fg(moonlit::CYAN_MOON)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ])
+                }
+            }
+        };
+        let prov_hint = if mp.providers.len() > 1 {
+            format!("  ·  Tab: provider ({})", mp.providers.len())
+        } else {
+            String::new()
+        };
+        let header_lines = vec![
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    format!(" Model Saya ({}) ", mp.saved_models.len()),
+                    tab_saved_style,
+                ),
+                Span::raw("  "),
+                Span::styled(format!(" Katalog API ({cat_count}) "), tab_cat_style),
+                Span::styled(prov_hint, Style::default().fg(moonlit::FAINT)),
+            ]),
+            status_line,
+            Line::from(Span::styled(
+                "─".repeat(sections[0].width as usize),
+                Style::default().fg(moonlit::FAINT),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(header_lines).style(Style::default().bg(modal_bg)),
+            sections[0],
+        );
+
+        let body_h = sections[1].height as usize;
+        let mut body_lines: Vec<Line<'static>> = Vec::new();
+        match mp.mode {
+            ModelPickerMode::AddManual => {
+                body_lines.push(Line::from(""));
+                body_lines.push(Line::from(vec![
+                    Span::styled("   › ", Style::default().fg(moonlit::VIOLET)),
+                    Span::styled(
+                        "Ketik ID model yang ingin ditambahkan ke daftar pribadimu, lalu tekan Enter.",
+                        Style::default().fg(moonlit::SILVER),
+                    ),
+                ]));
+                body_lines.push(Line::from(vec![
+                    Span::styled("   · ", Style::default().fg(moonlit::DIM)),
+                    Span::styled(
+                        "Contoh: ag/claude-sonnet-4  ·  ag/gemini-2.5-pro  ·  gpt-4.1",
+                        Style::default().fg(moonlit::DIM),
+                    ),
+                ]));
+                body_lines.push(Line::from(""));
+                body_lines.push(Line::from(vec![
+                    Span::styled("   · ", Style::default().fg(moonlit::MINT)),
+                    Span::styled(
+                        "Model akan masuk ke daftar bernomor 1-per-1 (tidak menimpa model lain).",
+                        Style::default().fg(moonlit::LAV),
+                    ),
+                ]));
+            }
+            ModelPickerMode::Saved => {
+                let total = mp.saved_models.len();
+                let start = if total > body_h && body_h > 0 && mp.selected >= body_h {
+                    mp.selected + 1 - body_h
+                } else {
+                    0
+                };
+                for (idx, m) in mp
+                    .saved_models
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(body_h.max(1))
+                {
+                    let is_sel = idx == mp.selected;
+                    let is_act = *m == mp.active_model;
+                    let bg = if is_sel {
+                        Style::default().bg(row_hl)
+                    } else {
+                        Style::default().bg(modal_bg)
+                    };
+                    let marker = if is_sel { "▸ " } else { "  " };
+                    let num = format!("#{:<2} ", idx + 1);
+                    let badge = if is_act { "  ● aktif" } else { "" };
+                    body_lines.push(Line::from(vec![
+                        Span::styled(format!(" {marker}"), bg.fg(moonlit::LILAC)),
+                        Span::styled(num, bg.fg(moonlit::VIOLET).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            m.clone(),
+                            bg.fg(if is_sel || is_act {
+                                moonlit::LILAC
+                            } else {
+                                moonlit::SILVER
+                            })
+                            .add_modifier(if is_sel {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                        ),
+                        Span::styled(badge, bg.fg(moonlit::MINT).add_modifier(Modifier::BOLD)),
+                    ]));
+                }
+            }
+            ModelPickerMode::Catalog => {
+                if mp.loading_remote {
+                    body_lines.push(Line::from(Span::styled(
+                        "  ☾ Menarik daftar model dari endpoint API…",
+                        Style::default().fg(moonlit::LAV),
+                    )));
+                } else {
+                    let items = mp.filtered_remote();
+                    if items.is_empty() {
+                        body_lines.push(Line::from(Span::styled(
+                            "  (tidak ada model di katalog yang cocok — tekan Esc untuk kembali)",
+                            Style::default().fg(moonlit::DIM),
+                        )));
+                    } else {
+                        let total = items.len();
+                        let start = if total > body_h && body_h > 0 && mp.selected >= body_h {
+                            mp.selected + 1 - body_h
+                        } else {
+                            0
+                        };
+                        for (idx, m) in items
+                            .iter()
+                            .enumerate()
+                            .skip(start)
+                            .take(body_h.max(1))
+                        {
+                            let is_sel = idx == mp.selected;
+                            let saved = mp.is_saved(m.as_str());
+                            let bg = if is_sel {
+                                Style::default().bg(row_hl)
+                            } else {
+                                Style::default().bg(modal_bg)
+                            };
+                            let check = if saved { "[✓] " } else { "[ ] " };
+                            let check_color = if saved { moonlit::MINT } else { moonlit::DIM };
+                            body_lines.push(Line::from(vec![
+                                Span::styled(
+                                    if is_sel { " ▸ " } else { "   " },
+                                    bg.fg(moonlit::LILAC),
+                                ),
+                                Span::styled(check, bg.fg(check_color).add_modifier(Modifier::BOLD)),
+                                Span::styled(
+                                    m.to_string(),
+                                    bg.fg(if is_sel {
+                                        moonlit::LILAC
+                                    } else {
+                                        moonlit::SILVER
+                                    }),
+                                ),
+                            ]));
+                        }
+                    }
+                }
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(body_lines).style(Style::default().bg(modal_bg)),
+            sections[1],
+        );
+
+        let pill_ok = Style::default()
+            .bg(moonlit::DEEP)
+            .fg(moonlit::MINT)
+            .add_modifier(Modifier::BOLD);
+        let pill_alt = Style::default()
+            .bg(row_hl)
+            .fg(moonlit::LILAC)
+            .add_modifier(Modifier::BOLD);
+        let pill_del = Style::default()
+            .bg(Color::Rgb(68, 22, 34))
+            .fg(moonlit::ROSE)
+            .add_modifier(Modifier::BOLD);
+        let footer_spans = match mp.mode {
+            ModelPickerMode::AddManual => vec![
+                Span::raw(" "),
+                Span::styled(" [Enter] simpan ", pill_ok),
+                Span::raw("  "),
+                Span::styled(" [Esc] batal ", pill_del),
+            ],
+            ModelPickerMode::Catalog => vec![
+                Span::raw(" "),
+                Span::styled(" [Space] pilih 1-per-1 ", pill_alt),
+                Span::raw(" "),
+                Span::styled(" [Enter] pakai ", pill_ok),
+                Span::raw(" "),
+                Span::styled(" [Esc] kembali ", pill_del),
+            ],
+            ModelPickerMode::Saved => {
+                if sections[2].width >= 68 {
+                    vec![
+                        Span::raw(" "),
+                        Span::styled(" [Enter] pakai ", pill_ok),
+                        Span::raw(" "),
+                        Span::styled(" [a] + manual ", pill_alt),
+                        Span::raw(" "),
+                        Span::styled(" [f] katalog ", pill_alt),
+                        Span::raw(" "),
+                        Span::styled(" [d] hapus ", pill_del),
+                        Span::raw(" "),
+                        Span::styled(" [c] reset ", pill_del),
+                    ]
+                } else {
+                    vec![
+                        Span::raw(" "),
+                        Span::styled(" [Enter] pakai ", pill_ok),
+                        Span::raw(" "),
+                        Span::styled(" [a]+ ", pill_alt),
+                        Span::raw(" "),
+                        Span::styled(" [f]API ", pill_alt),
+                        Span::raw(" "),
+                        Span::styled(" [d]rm ", pill_del),
+                        Span::raw(" "),
+                        Span::styled(" [c]clr ", pill_del),
+                    ]
+                }
+            }
+        };
+        let footer_lines = vec![
+            Line::from(Span::styled(
+                "─".repeat(sections[2].width as usize),
+                Style::default().fg(moonlit::FAINT),
+            )),
+            Line::from(footer_spans),
+        ];
+        frame.render_widget(
+            Paragraph::new(footer_lines).style(Style::default().bg(modal_bg)),
+            sections[2],
+        );
+    }
+
     // Modal Persetujuan Moonlit Ungu (modern, scrollable, dengan opsi [a] selalu sesi ini)
     if let Some(p) = &app.approval {
         let pct_x = if area.width < 90 { 92 } else { 78 };
@@ -742,7 +1097,7 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
             app.menu(help_menu_markup());
         }
         SlashCommand::Model(None) => {
-            send_cmd(app, cmd_tx, TuiCommand::ShowModels);
+            send_cmd(app, cmd_tx, TuiCommand::ModelPicker(ModelPickerCmd::Open));
         }
         SlashCommand::Model(Some(arg)) => {
             send_cmd(app, cmd_tx, TuiCommand::SwitchOrSetModel(arg));
@@ -752,6 +1107,9 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
         }
         SlashCommand::Provider(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::ManageProvider(arg));
+        }
+        SlashCommand::Telegram(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Telegram(arg));
         }
         SlashCommand::Undo => {
             send_cmd(app, cmd_tx, TuiCommand::Undo);
@@ -901,6 +1259,182 @@ fn handle_key(
         }
         return;
     }
+    // Modal Pemilih Model Interaktif (`/model`) menangkap keyboard saat terbuka.
+    if app.model_picker.is_some() {
+        let mode = app.model_picker.as_ref().map(|m| m.mode).unwrap_or(ModelPickerMode::Saved);
+        match mode {
+            ModelPickerMode::AddManual => match key.code {
+                KeyCode::Esc => {
+                    if let Some(mp) = &mut app.model_picker {
+                        mp.manual_input.clear();
+                        mp.mode = ModelPickerMode::Saved;
+                    }
+                }
+                KeyCode::Enter => {
+                    let id = app
+                        .model_picker
+                        .as_mut()
+                        .map(|mp| {
+                            let s = mp.manual_input.trim().to_string();
+                            mp.manual_input.clear();
+                            mp.mode = ModelPickerMode::Saved;
+                            s
+                        })
+                        .unwrap_or_default();
+                    if !id.is_empty() {
+                        send_cmd(app, cmd_tx, TuiCommand::ModelPicker(ModelPickerCmd::AddOne(id)));
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(mp) = &mut app.model_picker {
+                        mp.manual_input.pop();
+                    }
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(mp) = &mut app.model_picker {
+                        mp.manual_input.push(c);
+                    }
+                }
+                _ => {}
+            },
+            ModelPickerMode::Catalog => match key.code {
+                KeyCode::Esc | KeyCode::Tab => {
+                    if let Some(mp) = &mut app.model_picker {
+                        mp.mode = ModelPickerMode::Saved;
+                        mp.filter_input.clear();
+                        mp.clamp_selection();
+                    }
+                }
+                KeyCode::Up => {
+                    if let Some(mp) = &mut app.model_picker {
+                        mp.move_up();
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(mp) = &mut app.model_picker {
+                        mp.move_down();
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    let chosen = app.model_picker.as_ref().and_then(|mp| mp.selected_remote());
+                    if let Some(id) = chosen {
+                        send_cmd(
+                            app,
+                            cmd_tx,
+                            TuiCommand::ModelPicker(ModelPickerCmd::ToggleOne(id)),
+                        );
+                    }
+                }
+                KeyCode::Enter => {
+                    let chosen = app.model_picker.as_ref().and_then(|mp| mp.selected_remote());
+                    if let Some(id) = chosen {
+                        app.model_picker = None;
+                        send_cmd(
+                            app,
+                            cmd_tx,
+                            TuiCommand::ModelPicker(ModelPickerCmd::SelectModel(id)),
+                        );
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(mp) = &mut app.model_picker {
+                        mp.filter_input.pop();
+                        mp.selected = 0;
+                    }
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(mp) = &mut app.model_picker {
+                        mp.filter_input.push(c);
+                        mp.selected = 0;
+                    }
+                }
+                _ => {}
+            },
+            ModelPickerMode::Saved => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    app.model_picker = None;
+                }
+                KeyCode::Up => {
+                    if let Some(mp) = &mut app.model_picker {
+                        mp.move_up();
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(mp) = &mut app.model_picker {
+                        mp.move_down();
+                    }
+                }
+                KeyCode::Enter => {
+                    let chosen = app.model_picker.as_ref().and_then(|mp| mp.selected_saved());
+                    if let Some(id) = chosen {
+                        app.model_picker = None;
+                        send_cmd(
+                            app,
+                            cmd_tx,
+                            TuiCommand::ModelPicker(ModelPickerCmd::SelectModel(id)),
+                        );
+                    }
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    if let Some(mp) = &mut app.model_picker {
+                        mp.manual_input.clear();
+                        mp.mode = ModelPickerMode::AddManual;
+                    }
+                }
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    let need_fetch = if let Some(mp) = &mut app.model_picker {
+                        mp.mode = ModelPickerMode::Catalog;
+                        mp.filter_input.clear();
+                        mp.selected = 0;
+                        if mp.remote_models.is_empty() {
+                            mp.loading_remote = true;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if need_fetch {
+                        send_cmd(
+                            app,
+                            cmd_tx,
+                            TuiCommand::ModelPicker(ModelPickerCmd::FetchCatalog),
+                        );
+                    }
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+                    let chosen = app.model_picker.as_ref().and_then(|mp| mp.selected_saved());
+                    if let Some(id) = chosen {
+                        send_cmd(
+                            app,
+                            cmd_tx,
+                            TuiCommand::ModelPicker(ModelPickerCmd::RemoveOne(id)),
+                        );
+                    }
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    send_cmd(
+                        app,
+                        cmd_tx,
+                        TuiCommand::ModelPicker(ModelPickerCmd::ClearAll),
+                    );
+                }
+                KeyCode::Tab => {
+                    let next = app.model_picker.as_ref().and_then(|mp| mp.next_provider());
+                    if let Some(prov) = next {
+                        send_cmd(
+                            app,
+                            cmd_tx,
+                            TuiCommand::ModelPicker(ModelPickerCmd::SwitchProvider(prov)),
+                        );
+                    }
+                }
+                _ => {}
+            },
+        }
+        return;
+    }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         cancel.notify_waiters();
         app.should_quit = true;
@@ -1014,6 +1548,8 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
                         MouseEventKind::ScrollUp => {
                             if app.approval.is_some() {
                                 app.approval_scroll = app.approval_scroll.saturating_sub(3);
+                            } else if let Some(mp) = &mut app.model_picker {
+                                mp.move_up();
                             } else {
                                 app.scroll_up(3);
                             }
@@ -1021,6 +1557,8 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
                         MouseEventKind::ScrollDown => {
                             if app.approval.is_some() {
                                 app.approval_scroll = app.approval_scroll.saturating_add(3);
+                            } else if let Some(mp) = &mut app.model_picker {
+                                mp.move_down();
                             } else {
                                 app.scroll_down(3);
                             }

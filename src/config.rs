@@ -14,6 +14,69 @@ pub struct Config {
     /// Server MCP eksternal (Fase 7). Default kosong = perilaku Fase 6.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerCfg>,
+    /// Pengaturan Telegram Bot Gateway (`selen telegram` & `/telegram`).
+    #[serde(default, skip_serializing_if = "TelegramCfg::is_empty")]
+    pub telegram: TelegramCfg,
+}
+
+/// Konfigurasi Telegram Bot Gateway (`[telegram]` di selencode.toml).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramCfg {
+    /// Nama env var berisi Bot API token dari @BotFather (mis. `SELENCODE_TELEGRAM_TOKEN`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bot_token_env: String,
+    /// Token bot opsional yang disimpan langsung lewat `/telegram setup`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_token: Option<String>,
+    /// Whitelist User ID / Chat ID Telegram yang boleh mengontrol SelenCode.
+    /// Kosong = bot menolak eksekusi perintah dan hanya membalas ID pengirim untuk keamanan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_users: Vec<i64>,
+    /// Mode persetujuan tool di sesi Telegram: `"ask"` (default, kirim tombol inline),
+    /// `"edits"` (otomatis edit file), atau `"auto"` (otomatis semua aksi aman).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub approval: String,
+}
+
+impl TelegramCfg {
+    pub fn is_empty(&self) -> bool {
+        self.bot_token_env.trim().is_empty()
+            && self.bot_token.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true)
+            && self.allowed_users.is_empty()
+            && self.approval.trim().is_empty()
+    }
+
+    /// Ambil token bot Telegram (prioritas: env var `bot_token_env` -> `SELENCODE_TELEGRAM_TOKEN` -> `bot_token`).
+    pub fn resolve_token(&self) -> Result<String> {
+        if !self.bot_token_env.trim().is_empty() {
+            if let Ok(v) = std::env::var(self.bot_token_env.trim()) {
+                if !v.trim().is_empty() {
+                    return Ok(v.trim().to_string());
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("SELENCODE_TELEGRAM_TOKEN") {
+            if !v.trim().is_empty() {
+                return Ok(v.trim().to_string());
+            }
+        }
+        if let Some(tok) = self.bot_token.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            return Ok(tok.to_string());
+        }
+        Err(anyhow!(
+            "Token bot Telegram belum diatur. Jalankan `/telegram setup <BOT_TOKEN> <USER_ID>` di SelenCode atau set env SELENCODE_TELEGRAM_TOKEN."
+        ))
+    }
+
+    pub fn is_token_ready(&self) -> bool {
+        self.resolve_token().is_ok()
+    }
+
+    /// Cek apakah pengirim / chat termasuk whitelist `allowed_users`.
+    pub fn is_allowed(&self, user_id: i64, chat_id: i64) -> bool {
+        !self.allowed_users.is_empty()
+            && (self.allowed_users.contains(&user_id) || self.allowed_users.contains(&chat_id))
+    }
 }
 
 /// Satu server MCP stdio (Fase 7): proses lokal yang di-spawn selen,
@@ -203,7 +266,7 @@ pub fn save_to(cfg: &Config, path: &std::path::Path) -> Result<()> {
     std::fs::write(path, text)
         .with_context(|| format!("gagal menyimpan config {}", path.display()))?;
     #[cfg(unix)]
-    if cfg.providers.values().any(|p| p.api_key.is_some()) {
+    if cfg.providers.values().any(|p| p.api_key.is_some()) || cfg.telegram.bot_token.is_some() {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }

@@ -2,6 +2,7 @@
 //! agar bisa dites: UI nyata (mod.rs) hanya menggambar state ini dan
 //! meneruskan input keyboard ke sini.
 
+use crate::agent::ui::ModelPickerData;
 use crate::agent::UiEvent;
 use crate::security::{tool_category_from_title, ApprovalPolicy, ApprovalRequest};
 use crate::tui::moonlit::{self, WelcomeInfo};
@@ -58,6 +59,153 @@ pub struct PendingApproval {
     pub reply: Option<tokio::sync::oneshot::Sender<bool>>,
 }
 
+/// Mode tampilan di dalam modal pemilih model interaktif (ala Hermes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelPickerMode {
+    /// Daftar model pribadi tersimpan (curated 1-per-1).
+    Saved,
+    /// Input inline untuk menambah 1 model manual.
+    AddManual,
+    /// Katalog model dari API (filter live, pilih 1-per-1 dengan Space).
+    Catalog,
+}
+
+/// State modal pemilih model interaktif di TUI (`/model`).
+#[derive(Debug, Clone)]
+pub struct ModelPickerState {
+    pub provider: String,
+    pub providers: Vec<String>,
+    pub active_model: String,
+    pub saved_models: Vec<String>,
+    pub remote_models: Vec<String>,
+    pub mode: ModelPickerMode,
+    pub selected: usize,
+    pub manual_input: String,
+    pub filter_input: String,
+    pub loading_remote: bool,
+    pub status: Option<String>,
+}
+
+impl ModelPickerState {
+    pub fn from_data(d: ModelPickerData) -> Self {
+        let active_idx = d
+            .saved_models
+            .iter()
+            .position(|m| m == &d.active_model)
+            .unwrap_or(0);
+        let mode = if d.open_catalog {
+            ModelPickerMode::Catalog
+        } else {
+            ModelPickerMode::Saved
+        };
+        Self {
+            provider: d.provider,
+            providers: d.providers,
+            active_model: d.active_model,
+            saved_models: d.saved_models,
+            remote_models: d.remote_models,
+            mode,
+            selected: if mode == ModelPickerMode::Catalog { 0 } else { active_idx },
+            manual_input: String::new(),
+            filter_input: String::new(),
+            loading_remote: false,
+            status: d.status,
+        }
+    }
+
+    /// Terapkan pembaruan data tanpa membuang mode/filter yang sedang dibuka user.
+    pub fn update_from(&mut self, d: ModelPickerData) {
+        let same_provider = self.provider == d.provider;
+        self.provider = d.provider;
+        self.providers = d.providers;
+        self.active_model = d.active_model;
+        self.saved_models = d.saved_models;
+        if !d.remote_models.is_empty() || !same_provider {
+            self.remote_models = d.remote_models;
+        }
+        self.loading_remote = false;
+        self.status = d.status;
+        if d.open_catalog {
+            self.mode = ModelPickerMode::Catalog;
+        } else if !same_provider {
+            self.mode = ModelPickerMode::Saved;
+            self.filter_input.clear();
+        }
+        self.clamp_selection();
+    }
+
+    pub fn filtered_remote(&self) -> Vec<&String> {
+        let needle = self.filter_input.trim().to_ascii_lowercase();
+        self.remote_models
+            .iter()
+            .filter(|m| needle.is_empty() || m.to_ascii_lowercase().contains(&needle))
+            .collect()
+    }
+
+    pub fn is_saved(&self, model_id: &str) -> bool {
+        self.saved_models.iter().any(|m| m == model_id)
+    }
+
+    pub fn current_len(&self) -> usize {
+        match self.mode {
+            ModelPickerMode::Saved => self.saved_models.len(),
+            ModelPickerMode::Catalog => self.filtered_remote().len(),
+            ModelPickerMode::AddManual => 0,
+        }
+    }
+
+    pub fn clamp_selection(&mut self) {
+        let len = self.current_len();
+        if len == 0 {
+            self.selected = 0;
+        } else if self.selected >= len {
+            self.selected = len - 1;
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        let len = self.current_len();
+        if len == 0 {
+            return;
+        }
+        self.selected = if self.selected == 0 {
+            len - 1
+        } else {
+            self.selected - 1
+        };
+    }
+
+    pub fn move_down(&mut self) {
+        let len = self.current_len();
+        if len == 0 {
+            return;
+        }
+        self.selected = (self.selected + 1) % len;
+    }
+
+    pub fn selected_saved(&self) -> Option<String> {
+        self.saved_models.get(self.selected).cloned()
+    }
+
+    pub fn selected_remote(&self) -> Option<String> {
+        self.filtered_remote()
+            .get(self.selected)
+            .map(|s| (*s).clone())
+    }
+
+    pub fn next_provider(&self) -> Option<String> {
+        if self.providers.len() <= 1 {
+            return None;
+        }
+        let idx = self
+            .providers
+            .iter()
+            .position(|p| p == &self.provider)
+            .unwrap_or(0);
+        Some(self.providers[(idx + 1) % self.providers.len()].clone())
+    }
+}
+
 pub struct App {
     pub cwd: String,
     pub provider: String,
@@ -79,6 +227,8 @@ pub struct App {
     pub approval_scroll: u16,
     /// Kebijakan persetujuan bersama dengan Approver (untuk tombol `[a]` & `/approve`).
     pub approval_policy: Option<Arc<Mutex<ApprovalPolicy>>>,
+    /// Modal pemilih model interaktif (`/model` di TUI).
+    pub model_picker: Option<ModelPickerState>,
     pub should_quit: bool,
     /// Rencana dari giliran plan yang menunggu konfirmasi y/n (Fase 6).
     pub pending_plan: Option<String>,
@@ -145,6 +295,7 @@ impl App {
             approval_queue: VecDeque::new(),
             approval_scroll: 0,
             approval_policy: None,
+            model_picker: None,
             should_quit: false,
             pending_plan: None,
             plan_next: false,
@@ -311,6 +462,10 @@ impl App {
             }
             UiEvent::Info(text) => self.info(text),
             UiEvent::Menu(markup) => self.menu(markup),
+            UiEvent::ModelPicker(data) => match &mut self.model_picker {
+                Some(mp) => mp.update_from(data),
+                None => self.model_picker = Some(ModelPickerState::from_data(data)),
+            },
             UiEvent::SessionReset {
                 session_id,
                 provider,

@@ -9,12 +9,14 @@ pub enum SlashCommand {
     /// `!perintah` — jalankan shell lokal cepat tanpa memanggil LLM (ala OpenCode).
     InlineShell(String),
     Exit,
-    /// /model | /model <nomor> | /model <provider> | /model set <nomor|id> | /model add <id...> | /model rm <nomor|id> | /model list [filter]
+    /// /model | /model <nomor> | /model <provider> | /model set <nomor|id> | /model add <id|no...> | /model rm <nomor|id|all> | /model clear | /model list [filter]
     Model(Option<String>),
-    /// /models [filter] (tarik daftar model dari API, simpan ke daftar bernomor)
+    /// /models [filter] (intip katalog model dari API tanpa mengotori daftar tersimpan)
     Models(Option<String>),
     /// /provider | /provider add ... | /provider preset ... | /provider model ... | /provider default ... | /provider rm ...
     Provider(Option<String>),
+    /// /telegram [setup <token> [user_id] | allow <id> | rm <id> | approve <mode> | off]
+    Telegram(Option<String>),
     /// /undo — batalkan edit/tulis file terakhir oleh agent.
     Undo,
     /// /redo — terapkan ulang edit/tulis file yang baru di-undo.
@@ -64,20 +66,26 @@ pub struct CommandDef {
 pub const COMMANDS: &[CommandDef] = &[
     CommandDef {
         cmd: "/model",
-        args: "[no | set <no|id> | add <id> | rm <no>]",
-        desc: "pilih model via nomor, tambah, atau ganti provider",
+        args: "[no | add <id|no> | rm <no> | clear]",
+        desc: "buka pemilih model interaktif, tambah 1-per-1, atau hapus",
         takes_args: true,
     },
     CommandDef {
         cmd: "/models",
-        args: "[filter]",
-        desc: "tarik & simpan daftar model bernomor dari API",
+        args: "[cari]",
+        desc: "intip katalog model API (pilih 1-per-1 dengan /model add)",
         takes_args: true,
     },
     CommandDef {
         cmd: "/provider",
         args: "[preset | add | model | default | rm]",
         desc: "kelola & pasang provider lain + API key",
+        takes_args: true,
+    },
+    CommandDef {
+        cmd: "/telegram",
+        args: "[setup <token> [uid] | allow <uid> | approve | off]",
+        desc: "hubungkan bot Telegram Gateway (`selen telegram`)",
         takes_args: true,
     },
     CommandDef {
@@ -220,6 +228,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/model" => SlashCommand::Model(rest),
         "/models" => SlashCommand::Models(rest),
         "/provider" | "/connect" => SlashCommand::Provider(rest),
+        "/telegram" | "/tg" => SlashCommand::Telegram(rest),
         "/undo" => SlashCommand::Undo,
         "/redo" => SlashCommand::Redo,
         "/memory" => SlashCommand::Memory(rest),
@@ -249,10 +258,12 @@ pub enum ModelAction {
     SelectIndex(usize),
     /// `/model set <model_id>` -> set model manual & tambahkan ke daftar tersimpan.
     SetCurrentModel(String),
-    /// `/model add <m1> [m2 ...]` -> tambah model ke daftar bernomor provider aktif.
+    /// `/model add <m1> [m2 ...]` -> tambah model (ID manual atau nomor dari `/models`) ke daftar bernomor provider aktif.
     AddModels(Vec<String>),
-    /// `/model rm <nomor_atau_id>` -> hapus model dari daftar bernomor provider aktif.
+    /// `/model rm <nomor_atau_id>` -> hapus 1 model dari daftar bernomor provider aktif.
     RemoveModel(String),
+    /// `/model clear` / `/model rm all` -> hapus semua model tersimpan (sisakan 1 model aktif saja).
+    ClearModels,
     /// `/model <provider>:<nomor_atau_id>` -> pindah provider + pilih/set modelnya.
     SwitchAndSetModel { provider: String, model: String },
     /// `/model <target>` -> ganti ke provider `<target>`, cocokkan substring di daftar, atau set manual.
@@ -261,6 +272,9 @@ pub enum ModelAction {
 
 pub fn parse_model_action(arg: &str) -> ModelAction {
     let arg = arg.trim();
+    if arg.eq_ignore_ascii_case("clear") || arg.eq_ignore_ascii_case("reset") {
+        return ModelAction::ClearModels;
+    }
     if arg.eq_ignore_ascii_case("list") || arg.eq_ignore_ascii_case("ls") {
         return ModelAction::FetchList(None);
     }
@@ -299,10 +313,14 @@ pub fn parse_model_action(arg: &str) -> ModelAction {
     }
     if let Some(rest) = arg
         .strip_prefix("rm ")
+        .or_else(|| arg.strip_prefix("RM "))
         .or_else(|| arg.strip_prefix("remove "))
         .or_else(|| arg.strip_prefix("del "))
     {
         let target = rest.trim();
+        if target.eq_ignore_ascii_case("all") || target == "*" {
+            return ModelAction::ClearModels;
+        }
         if !target.is_empty() {
             return ModelAction::RemoveModel(target.to_string());
         }
@@ -519,6 +537,14 @@ pub fn help_menu_markup() -> String {
         out.push_str(&format!("> {} | {} | {}\n", c.cmd, c.args, c.desc));
     }
     out.push_str("---\n");
+    out.push_str("# Panduan Cepat Kelola Model (1 per 1)\n");
+    out.push_str("* /model | (tanpa argumen) | buka pemilih interaktif: ↑↓ pilih · Enter pakai · a tambah manual · f katalog API · d hapus · c bersihkan\n");
+    out.push_str("> /model add | <id_model> | tambah 1 model manual ke daftar (contoh: /model add ag/claude-sonnet-4)\n");
+    out.push_str("> /model 2 | atau /model claude | ganti cepat ke model nomor #2 atau cocokkan potongan nama\n");
+    out.push_str("> /model rm 2 | /model clear | hapus 1 model (#2) atau bersihkan semua daftar tersimpan\n");
+    out.push_str("> /models | [kata_cari] | intip katalog API (tidak mengotori daftar), lalu ambil 1-per-1: /model add 1 3\n");
+    out.push_str("---\n");
+    out.push_str("! Telegram Gateway:       /telegram setup <BOT_TOKEN> <USER_ID>  lalu jalankan `selen telegram`\n");
     out.push_str("! Konteks & shell cepat:  @src/main.rs (lampirkan file) · !cargo test (shell lokal instan)\n");
     out.push_str("! Pasang provider cepat:  /provider preset openrouter <model> <ENV|key>  (cek: /provider preset)\n");
     out.push_str("! Shortcut keyboard:      / + ↑↓ + Tab palette · Esc batalkan giliran · Alt+Enter baris baru · Ctrl+C keluar");
