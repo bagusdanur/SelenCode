@@ -163,11 +163,6 @@ async fn run_turn_inner(
         persist_message(ctx, &sys_msg);
         messages.push(sys_msg);
     }
-    if mode == TurnMode::Plan {
-        let note = Message::text(Role::System, PLAN_NOTE);
-        persist_message(ctx, &note);
-        messages.push(note);
-    }
     // Konteks pintar (Fase 5): bila user menyebut path file kode yang ada,
     // lampirkan outline-nya ke pesan user giliran ini (bukan system prompt —
     // system prompt dibuat sekali; konteks per-giliran menempel di giliran).
@@ -216,7 +211,18 @@ async fn run_turn_inner(
         // Provider dipindah ke task agar StreamEvent bisa dikonsumsi sambil jalan.
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(128);
         let p = provider.clone();
-        let snapshot = messages.clone();
+        let mut snapshot = messages.clone();
+        // PLAN_NOTE hanya disisipkan sementara pada snapshot giliran Plan (tidak
+        // disimpan ke riwayat/DB) agar giliran Execute berikutnya tidak ikut
+        // terlarang menulis.
+        if mode == TurnMode::Plan {
+            let pos = if snapshot.first().map(|m| m.role == Role::System).unwrap_or(false) {
+                1
+            } else {
+                0
+            };
+            snapshot.insert(pos, Message::text(Role::System, PLAN_NOTE));
+        }
         let tools_c = tools.clone();
         let handle = tokio::spawn(async move { p.stream_chat(&snapshot, &tools_c, tx).await });
         let mut printed = false;
@@ -386,14 +392,18 @@ fn summarize(s: &str, max: usize) -> String {
     out
 }
 
-/// Potong hasil tool agar konteks tidak meledak (30KB).
+/// Potong hasil tool agar konteks tidak meledak (30KB, aman UTF-8).
 fn truncate(s: String) -> String {
     const MAX: usize = 30 * 1024;
     if s.len() <= MAX {
         s
     } else {
+        let mut end = MAX;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
         let mut cut = s;
-        cut.truncate(MAX);
+        cut.truncate(end);
         cut.push_str("\n... (hasil dipotong 30KB)");
         cut
     }

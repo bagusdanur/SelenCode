@@ -23,9 +23,15 @@ impl RunShell {
 
     /// Cocok allowlist = perintah sama persis dengan entri, atau diawali
     /// entri + spasi (mis. allowlist "git status" cocok "git status --short",
-    /// tapi allowlist "ls" TIDAK cocok "lsof").
+    /// tapi allowlist "ls" TIDAK cocok "lsof"). Perintah yang mengandung
+    /// operator chaining/subshell/redirect (`;`, `|`, `&`, `` ` ``, `$(`,
+    /// `>`, `<`, newline) TIDAK pernah lolos allowlist agar tidak bisa
+    /// disusupi perintah tambahan tanpa approval.
     fn is_allowlisted(&self, command: &str) -> bool {
         let c = command.trim();
+        if c.contains([';', '|', '&', '`', '>', '<', '\n', '\r']) || c.contains("$(") {
+            return false;
+        }
         self.allowlist.iter().any(|a| {
             let a = a.trim();
             !a.is_empty()
@@ -92,7 +98,9 @@ impl Tool for RunShell {
             c.args(["-c", &command]);
             c
         };
-        cmd.current_dir(&ctx.cwd).kill_on_drop(true);
+        cmd.current_dir(&ctx.cwd)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
 
         let (code, output) = run_timed(&mut cmd, self.timeout_secs)
             .await

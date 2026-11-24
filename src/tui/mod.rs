@@ -13,7 +13,7 @@ pub mod diff_view;
 pub mod moonlit;
 
 use crate::agent::UiEvent;
-use crate::repl::{parse_slash_command, SlashCommand};
+use crate::repl::{parse_slash_command, SlashCommand, HELP_TEXT};
 use crate::security::ApprovalRequest;
 use anyhow::Result;
 use app::{App, LineKind, ToolState};
@@ -145,6 +145,46 @@ fn display_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
+/// Hitung jumlah baris visual sesudah wrap selebar `width`, agar auto-scroll
+/// akurat di layar sempit (mis. Termux HP 52 kolom) dan teks terbaru di bawah
+/// tidak tersembunyi di luar viewport.
+fn wrapped_line_count(lines: &[Line], width: u16) -> usize {
+    let w = width as usize;
+    if w == 0 {
+        return lines.len();
+    }
+    let mut total = 0usize;
+    for line in lines {
+        let lw = line.width();
+        if lw <= w {
+            total += 1;
+            continue;
+        }
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let mut rows = 1usize;
+        let mut col = 0usize;
+        for seg in text.split_inclusive(' ') {
+            let sw = seg.chars().count();
+            if col > 0 && col + sw > w {
+                rows += 1;
+                col = 0;
+            }
+            if sw > w {
+                let extra = (col + sw).saturating_sub(1) / w;
+                rows += extra;
+                col = (col + sw) % w;
+                if col == 0 {
+                    col = w;
+                }
+            } else {
+                col += sw;
+            }
+        }
+        total += rows;
+    }
+    total
+}
+
 /// Gambar 1 frame. Publik agar bisa dites dengan TestBackend.
 ///
 /// Tata letak Moonlit (v0.1.2): TANPA header terpisah — sambutan Moonlit
@@ -173,19 +213,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Transkrip (gulir: app.scroll = jarak dari bawah)
     let lines = display_lines(app);
     let viewport = chunks[0].height as usize;
-    let total = lines.len();
+    let total = wrapped_line_count(&lines, chunks[0].width);
     app.last_total_lines = total;
     app.last_viewport = viewport;
     let max_scroll = total.saturating_sub(viewport);
     let from_bottom = (app.scroll as usize).min(max_scroll);
-    let y = (max_scroll - from_bottom) as u16;
+    let y = (max_scroll - from_bottom).min(u16::MAX as usize) as u16;
     let transcript = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((y, 0));
     frame.render_widget(transcript, chunks[0]);
 
-    // Status bar Moonlit: fase bulan + konteks + token + langkah + cwd.
+    // Status bar Moonlit × Hermes: model + fase bulan + konteks + token + langkah + cwd.
     let status = Paragraph::new(moonlit::status_line(
+        &app.model,
         app.context_pct,
         app.session_in,
         app.session_out,
@@ -196,11 +237,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ));
     frame.render_widget(status, chunks[1]);
 
-    // Input: bingkai DEEP digambar sebagai Block luar; prompt "❯" violet
+    // Input: bingkai BORDER (emas hangat bergaya Hermes); prompt "❯" emas
     // tebal di sel kiri dalam bingkai; textarea tanpa bingkai di sisanya.
     let input_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(moonlit::DEEP));
+        .border_style(Style::default().fg(moonlit::BORDER));
     let inner = input_block.inner(chunks[2]);
     frame.render_widget(input_block, chunks[2]);
     let cols = Layout::default()
@@ -211,7 +252,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(Span::styled(
             "❯",
             Style::default()
-                .fg(moonlit::VIOLET)
+                .fg(moonlit::GOLD)
                 .add_modifier(Modifier::BOLD),
         )),
         cols[0],
@@ -302,6 +343,12 @@ impl Drop for TerminalGuard {
 
 // ---------- loop UI (blocking) ----------
 
+fn send_cmd(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>, cmd: TuiCommand) {
+    if let Err(e) = cmd_tx.try_send(cmd) {
+        app.error(format!("Gagal mengirim perintah ke worker: {e}"));
+    }
+}
+
 fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
     let raw = app.take_input();
     let text = raw.trim().to_string();
@@ -312,17 +359,20 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
         SlashCommand::Exit => {
             app.should_quit = true;
         }
+        SlashCommand::Help => {
+            app.info(HELP_TEXT);
+        }
         SlashCommand::Model(None) => {
-            let _ = cmd_tx.blocking_send(TuiCommand::ShowModels);
+            send_cmd(app, cmd_tx, TuiCommand::ShowModels);
         }
         SlashCommand::Model(Some(name)) => {
-            let _ = cmd_tx.blocking_send(TuiCommand::SwitchModel(name));
+            send_cmd(app, cmd_tx, TuiCommand::SwitchModel(name));
         }
         SlashCommand::Sessions => {
-            let _ = cmd_tx.blocking_send(TuiCommand::ShowSessions);
+            send_cmd(app, cmd_tx, TuiCommand::ShowSessions);
         }
         SlashCommand::Resume => {
-            let _ = cmd_tx.blocking_send(TuiCommand::ShowSessionInfo);
+            send_cmd(app, cmd_tx, TuiCommand::ShowSessionInfo);
         }
         SlashCommand::Plan => {
             app.plan_next = true;
@@ -332,10 +382,16 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
         }
         SlashCommand::Unknown(name) => {
             app.error(format!(
-                "Perintah /{name} tidak dikenal. Pilihan: /plan, /model, /sessions, /exit"
+                "Perintah /{name} tidak dikenal. Pilihan: /plan, /model, /sessions, /help, /exit"
             ));
         }
         SlashCommand::NotCommand => {
+            if app.busy {
+                app.info(
+                    "Selena masih bekerja — tunggu giliran selesai atau tekan Ctrl+C untuk keluar.",
+                );
+                return;
+            }
             // Konfirmasi rencana yang menunggu (Fase 6): input berikutnya
             // harus y/n sebelum prompt baru diterima.
             if app.pending_plan.is_some() {
@@ -343,7 +399,7 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
                     "y" | "yes" => {
                         let plan = app.pending_plan.take().unwrap_or_default();
                         app.push_user(&text);
-                        let _ = cmd_tx.blocking_send(TuiCommand::ExecutePlan(plan));
+                        send_cmd(app, cmd_tx, TuiCommand::ExecutePlan(plan));
                     }
                     "n" | "no" => {
                         app.pending_plan = None;
@@ -358,9 +414,9 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
             app.push_user(&text);
             if app.plan_next {
                 app.plan_next = false;
-                let _ = cmd_tx.blocking_send(TuiCommand::PromptPlan(text));
+                send_cmd(app, cmd_tx, TuiCommand::PromptPlan(text));
             } else {
-                let _ = cmd_tx.blocking_send(TuiCommand::Prompt(text));
+                send_cmd(app, cmd_tx, TuiCommand::Prompt(text));
             }
         }
     }
@@ -445,8 +501,9 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
         Ok(())
     })();
 
-    // Beri tahu worker untuk berhenti; abaikan bila worker sudah mati.
-    let _ = ch.cmd_tx.blocking_send(TuiCommand::Shutdown);
+    // Beri tahu worker untuk berhenti tanpa memblokir (agar Ctrl+C tidak
+    // pernah macet bila worker sedang sibuk/hang).
+    let _ = ch.cmd_tx.try_send(TuiCommand::Shutdown);
     // Terminal dipulihkan oleh TerminalGuard (Drop) — juga saat `result`
     // berisi Err dan saat panic (panic hook).
     result

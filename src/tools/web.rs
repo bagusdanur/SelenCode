@@ -25,12 +25,25 @@ pub fn is_forbidden_ip(ip: &IpAddr) -> bool {
                 || *v4 == Ipv4Addr::new(192, 0, 0, 0)
         }
         IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            let mapped_forbidden = if segs[0..5] == [0, 0, 0, 0, 0] && segs[5] == 0xffff {
+                let v4 = Ipv4Addr::new(
+                    (segs[6] >> 8) as u8,
+                    segs[6] as u8,
+                    (segs[7] >> 8) as u8,
+                    segs[7] as u8,
+                );
+                is_forbidden_ip(&IpAddr::V4(v4))
+            } else {
+                false
+            };
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link local fe80::/10
+                || (segs[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (segs[0] & 0xffc0) == 0xfe80 // link local fe80::/10
                 || *v6 == Ipv6Addr::LOCALHOST
+                || mapped_forbidden
         }
     }
 }
@@ -48,8 +61,9 @@ pub async fn check_url_allowed(raw: &str) -> Result<reqwest::Url> {
         .host_str()
         .ok_or_else(|| anyhow!("URL tanpa host"))?
         .to_string();
-    // IP literal: cek langsung, tanpa DNS.
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // IP literal: cek langsung, tanpa DNS (buang kurung siku untuk IPv6 literal seperti [::1]).
+    let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare_host.parse::<IpAddr>() {
         if is_forbidden_ip(&ip) {
             return Err(anyhow!(
                 "host {host} ditolak: IP privat/loopback/link-local tidak boleh di-fetch (SSRF)"

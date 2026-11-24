@@ -29,7 +29,11 @@ fn unified_diff(old: &str, new: &str, label: &str) -> String {
         }
     }
     if out.len() > 6000 {
-        out.truncate(6000);
+        let mut end = 6000;
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
         out.push_str("\n... (diff dipotong)\n");
     }
     out
@@ -90,13 +94,22 @@ impl Tool for ReadFile {
         if is_secret_file(&p) {
             return Err(anyhow!("file '{rel}' ditolak: termasuk file rahasia (.env/*.key/*.pem/id_rsa)"));
         }
-        let bytes = std::fs::read(&p).map_err(|e| anyhow!("gagal membaca {rel}: {e}"))?;
-        if bytes.len() > MAX_READ_BYTES {
+        let has_range = args.get("start").is_some() || args.get("end").is_some();
+        const MAX_RAW_SLICE_BYTES: u64 = 10 * 1024 * 1024;
+        let meta = std::fs::metadata(&p).map_err(|e| anyhow!("gagal membaca {rel}: {e}"))?;
+        if !has_range && meta.len() > MAX_READ_BYTES as u64 {
             return Err(anyhow!(
-                "file {rel} terlalu besar ({} byte > {MAX_READ_BYTES}); baca per rentang baris",
-                bytes.len()
+                "file {rel} terlalu besar ({} byte > {MAX_READ_BYTES}); baca per rentang baris dengan start/end",
+                meta.len()
             ));
         }
+        if meta.len() > MAX_RAW_SLICE_BYTES {
+            return Err(anyhow!(
+                "file {rel} terlalu besar ({} byte > {MAX_RAW_SLICE_BYTES})",
+                meta.len()
+            ));
+        }
+        let bytes = std::fs::read(&p).map_err(|e| anyhow!("gagal membaca {rel}: {e}"))?;
         let text = String::from_utf8_lossy(&bytes);
         let lines: Vec<&str> = text.lines().collect();
         let start = args.get("start").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
@@ -111,7 +124,16 @@ impl Tool for ReadFile {
         }
         let slice = &lines[(start - 1).min(lines.len())..end];
         let take = slice.len().min(MAX_READ_LINES);
-        Ok(slice[..take].join("\n"))
+        let mut out = slice[..take].join("\n");
+        if out.len() > MAX_READ_BYTES {
+            let mut cut = MAX_READ_BYTES;
+            while cut > 0 && !out.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.truncate(cut);
+            out.push_str("\n... (hasil dipotong 100KB; persempit start/end)");
+        }
+        Ok(out)
     }
 }
 
@@ -137,6 +159,9 @@ impl Tool for WriteFile {
         let rel = str_arg(&args, "path").ok_or_else(|| anyhow!("argumen 'path' wajib"))?;
         let content = str_arg(&args, "content").ok_or_else(|| anyhow!("argumen 'content' wajib"))?;
         let p = resolve_in_sandbox(&ctx.cwd, std::path::Path::new(rel))?;
+        if is_secret_file(&p) {
+            return Err(anyhow!("file '{rel}' ditolak: file rahasia tidak boleh ditulis lewat tool"));
+        }
         let old = std::fs::read_to_string(&p).unwrap_or_default();
         let diff = unified_diff(&old, content, rel);
         if !ctx.approver.ask(&format!("write_file {rel}"), &diff).await {

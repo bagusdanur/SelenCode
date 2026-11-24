@@ -125,6 +125,27 @@ async fn popup_approval_jawaban_n_dan_y() {
     assert!(a.answer_approval(true));
     assert!(rx.await.unwrap());
 
+    // Antrean approval: permintaan kedua tidak menimpa yang pertama.
+    let (tx1, rx1) = tokio::sync::oneshot::channel::<bool>();
+    let (tx2, rx2) = tokio::sync::oneshot::channel::<bool>();
+    a.receive_approval(ApprovalRequest {
+        title: "satu".into(),
+        detail: String::new(),
+        reply: tx1,
+    });
+    a.receive_approval(ApprovalRequest {
+        title: "dua".into(),
+        detail: String::new(),
+        reply: tx2,
+    });
+    assert_eq!(a.approval.as_ref().unwrap().title, "satu");
+    assert!(a.answer_approval(true));
+    assert_eq!(a.approval.as_ref().unwrap().title, "dua");
+    assert!(a.answer_approval(false));
+    assert!(a.approval.is_none());
+    assert!(rx1.await.unwrap());
+    assert!(!rx2.await.unwrap());
+
     // Tanpa popup: answer mengembalikan false, tidak panik.
     assert!(!a.answer_approval(true));
 }

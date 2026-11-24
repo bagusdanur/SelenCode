@@ -14,6 +14,16 @@ pkg install git ripgrep          # tool yang mungkin dipakai agent
 
 ## 2. Pasang binary dari GitHub Releases
 
+### Cara cepat (disarankan — 1 perintah)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bagusdanur/SelenCode/main/install.sh | sh
+```
+
+Skrip otomatis mendeteksi Termux arm64, mengunduh `selen-termux-arm64` dari rilis terbaru GitHub, memasangnya ke `$PREFIX/bin/selen`, dan memverifikasi `selen --version`.
+
+### Cara manual
+
 1. Buka halaman **Releases** repo SelenCode di GitHub dari HP.
 2. Download aset **`selen-termux-arm64`** (jangan yang `selen-linux-x64`).
 3. Di Termux, dari folder tempat file itu terdownload (biasanya

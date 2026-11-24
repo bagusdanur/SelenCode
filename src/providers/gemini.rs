@@ -5,7 +5,12 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Adapter Gemini native (Fase 3).
 /// POST {base}/v1beta/models/{model}:streamGenerateContent?alt=sse
@@ -29,12 +34,16 @@ pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
 impl GeminiProvider {
     pub fn new(base_url: String, api_key: String, model: String, max_output_tokens: u32) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
             max_output_tokens,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 }
@@ -137,7 +146,7 @@ impl GeminiStreamParser {
     }
 
     pub fn handle_chunk(&mut self, v: &Value) -> Option<String> {
-        let mut token: Option<String> = None;
+        let mut token = String::new();
         if let Some(u) = v.get("usageMetadata") {
             if u.is_object() {
                 self.input_tokens = u["promptTokenCount"].as_u64().unwrap_or(0);
@@ -154,7 +163,7 @@ impl GeminiStreamParser {
                 if let Some(t) = p["text"].as_str() {
                     if !t.is_empty() {
                         self.text.push_str(t);
-                        token = Some(t.to_string());
+                        token.push_str(t);
                     }
                 }
                 if let Some(fc) = p.get("functionCall") {
@@ -171,7 +180,11 @@ impl GeminiStreamParser {
                 }
             }
         }
-        token
+        if token.is_empty() {
+            None
+        } else {
+            Some(token)
+        }
     }
 
     pub fn finish(self) -> AssistantReply {
@@ -209,15 +222,23 @@ impl Provider for GeminiProvider {
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
             self.base_url, self.model
         );
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-goog-api-key", &self.api_key)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("gagal menghubungi Gemini di {url}"))?;
+        let resp = tokio::time::timeout(
+            RESPONSE_TIMEOUT,
+            self.client
+                .post(&url)
+                .header("x-goog-api-key", &self.api_key)
+                .header("content-type", "application/json")
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timeout {} detik menunggu respons awal Gemini di {url}",
+                RESPONSE_TIMEOUT.as_secs()
+            )
+        })?
+        .with_context(|| format!("gagal menghubungi Gemini di {url}"))?;
         if !resp.status().is_success() {
             let st = resp.status();
             let txt = resp.text().await.unwrap_or_default();
@@ -230,7 +251,18 @@ impl Provider for GeminiProvider {
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
         let mut parser = GeminiStreamParser::new();
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let next_chunk = tokio::time::timeout(CHUNK_TIMEOUT, stream.next())
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "stream Gemini macet (tidak ada data selama {} detik)",
+                        CHUNK_TIMEOUT.as_secs()
+                    )
+                })?;
+            let Some(chunk) = next_chunk else {
+                break;
+            };
             let chunk = chunk.context("stream Gemini terputus")?;
             buf.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(pos) = buf.find('\n') {
@@ -247,6 +279,17 @@ impl Provider for GeminiProvider {
                 };
                 if let Some(tok) = parser.handle_chunk(&v) {
                     let _ = tx.send(StreamEvent::Token(tok)).await;
+                }
+            }
+        }
+        let tail = buf.trim();
+        if let Some(data) = tail.strip_prefix("data:") {
+            let data = data.trim();
+            if !data.is_empty() {
+                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                    if let Some(tok) = parser.handle_chunk(&v) {
+                        let _ = tx.send(StreamEvent::Token(tok)).await;
+                    }
                 }
             }
         }

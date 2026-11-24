@@ -6,7 +6,12 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Adapter Anthropic Messages API (Fase 3).
 /// POST {base_url}/v1/messages, header x-api-key + anthropic-version, SSE stream.
@@ -28,12 +33,16 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 impl AnthropicProvider {
     pub fn new(base_url: String, api_key: String, model: String, max_output_tokens: u32) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
             max_output_tokens,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 }
@@ -70,8 +79,18 @@ pub fn build_request(msgs: &[Message], tools: &[ToolSpec], model: &str, max_toke
             }
             Role::User | Role::Tool => {
                 // ToolResult (role Tool, atau menempel di User) -> pesan user.
-                let blocks: Vec<Value> = m.content.iter().map(block_to_anthropic).collect();
+                // Anthropic mensyaratkan role user/assistant bergantian ketat:
+                // bila pesan sebelumnya sudah role user, gabungkan block-nya.
+                let mut blocks: Vec<Value> = m.content.iter().map(block_to_anthropic).collect();
                 if !blocks.is_empty() {
+                    if let Some(last) = out_msgs.last_mut() {
+                        if last["role"] == "user" {
+                            if let Some(arr) = last["content"].as_array_mut() {
+                                arr.append(&mut blocks);
+                                continue;
+                            }
+                        }
+                    }
                     out_msgs.push(json!({"role": "user", "content": blocks}));
                 }
             }
@@ -252,16 +271,24 @@ impl Provider for AnthropicProvider {
     ) -> Result<AssistantReply> {
         let body = build_request(msgs, tools, &self.model, self.max_output_tokens);
         let url = format!("{}/v1/messages", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("gagal menghubungi Anthropic di {url}"))?;
+        let resp = tokio::time::timeout(
+            RESPONSE_TIMEOUT,
+            self.client
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("content-type", "application/json")
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timeout {} detik menunggu respons awal Anthropic di {url}",
+                RESPONSE_TIMEOUT.as_secs()
+            )
+        })?
+        .with_context(|| format!("gagal menghubungi Anthropic di {url}"))?;
         if !resp.status().is_success() {
             let st = resp.status();
             let txt = resp.text().await.unwrap_or_default();
@@ -274,7 +301,18 @@ impl Provider for AnthropicProvider {
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
         let mut parser = AnthropicStreamParser::new();
-        while let Some(chunk) = stream.next().await {
+        'stream: loop {
+            let next_chunk = tokio::time::timeout(CHUNK_TIMEOUT, stream.next())
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "stream Anthropic macet (tidak ada data selama {} detik)",
+                        CHUNK_TIMEOUT.as_secs()
+                    )
+                })?;
+            let Some(chunk) = next_chunk else {
+                break 'stream;
+            };
             let chunk = chunk.context("stream Anthropic terputus")?;
             buf.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(pos) = buf.find('\n') {
@@ -289,6 +327,9 @@ impl Provider for AnthropicProvider {
                 let Ok(v) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
+                if v["type"].as_str() == Some("message_stop") {
+                    break 'stream;
+                }
                 if let Some(tok) = parser.handle_event(&v) {
                     let _ = tx.send(StreamEvent::Token(tok)).await;
                 }

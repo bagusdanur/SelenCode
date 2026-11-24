@@ -84,4 +84,18 @@ fn shell_allowlist_controls_needs_approval() {
     let tool2 = RunShell::new(vec!["ls".into()], 120);
     assert!(tool2.needs_approval(&json!({"command": "lsof -i"})));
     assert!(!tool2.needs_approval(&json!({"command": "ls -la"})));
+    // Chaining / subshell / redirect TIDAK boleh lolos allowlist
+    for sneaky in [
+        "ls ; rm -rf x",
+        "ls && cat .env",
+        "ls | sh",
+        "ls $(whoami)",
+        "ls `id`",
+        "ls > out.txt",
+    ] {
+        assert!(
+            tool2.needs_approval(&json!({"command": sneaky})),
+            "perintah '{sneaky}' tidak boleh lolos allowlist"
+        );
+    }
 }

@@ -9,6 +9,22 @@ Blueprint lengkap: lihat `BLUEPRINT.md`. Status: **Fase 0–7 selesai — bluepr
 (lihat `HASIL-FASE-0-1.md` s/d `HASIL-FASE-7.md`, plus `HASIL-9ROUTER.md` untuk
 tes live pertama ke provider 9Router). Cara pasang di Termux: lihat `TERMUX.md`.
 
+## Pasang Cepat (1 Perintah)
+
+**Termux (Android) & Linux x86_64 / VPS / WSL:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bagusdanur/SelenCode/main/install.sh | sh
+```
+
+**Windows (PowerShell / Windows Terminal):**
+
+```powershell
+irm https://raw.githubusercontent.com/bagusdanur/SelenCode/main/install.ps1 | iex
+```
+
+Skrip mendeteksi platform secara otomatis (`selen-termux-arm64`, `selen-linux-x64`, atau `selen-windows-x64.exe`), mengunduh binary terbaru dari GitHub Releases, dan memasangnya ke `PATH` agar `selen` langsung bisa dipanggil.
+
 ## Pakai
 
 ```bash

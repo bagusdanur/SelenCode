@@ -10,7 +10,11 @@ const GIT_TIMEOUT: u64 = 30;
 /// injeksi lewat argumen seperti pesan commit).
 async fn git_cmd(ctx: &Ctx, args: &[&str]) -> Result<(Option<i32>, String)> {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args).current_dir(&ctx.cwd).kill_on_drop(true);
+    cmd.args(args)
+        .current_dir(&ctx.cwd)
+        .stdin(std::process::Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true);
     run_timed(&mut cmd, GIT_TIMEOUT)
         .await
         .map_err(|e| anyhow!("git {}: {e}", args.first().copied().unwrap_or("")))

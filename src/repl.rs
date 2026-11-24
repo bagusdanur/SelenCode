@@ -15,6 +15,8 @@ pub enum SlashCommand {
     Resume,
     /// /plan (Fase 6: giliran berikutnya plan mode baca-saja)
     Plan,
+    /// /help atau /?
+    Help,
     /// Perintah garis miring yang tidak dikenal (nama tanpa '/').
     Unknown(String),
 }
@@ -33,6 +35,16 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/sessions" => SlashCommand::Sessions,
         "/resume" => SlashCommand::Resume,
         "/plan" => SlashCommand::Plan,
+        "/help" | "/?" => SlashCommand::Help,
         other => SlashCommand::Unknown(other.trim_start_matches('/').to_string()),
     }
 }
+
+/// Teks bantuan perintah garis miring (dipakai mode polos & TUI).
+pub const HELP_TEXT: &str = "Perintah tersedia:\n\
+  /plan            — giliran berikutnya plan mode (baca-saja, minta setuju sebelum eksekusi)\n\
+  /model [nama]    — lihat atau ganti provider/model aktif\n\
+  /sessions        — daftar 10 sesi terakhir di folder ini\n\
+  /resume          — info sesi aktif (gunakan `selen resume` dari CLI untuk melanjutkan)\n\
+  /help            — tampilkan daftar perintah ini\n\
+  /exit            — keluar";

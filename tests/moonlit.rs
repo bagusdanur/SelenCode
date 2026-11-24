@@ -2,7 +2,9 @@
 //! responsif, glyph fase bulan. Semua fungsi murni, tanpa terminal.
 
 use ratatui::text::Line;
-use selencode::tui::moonlit::{moon_art, phase_glyph, welcome_lines, wordmark, WelcomeInfo};
+use selencode::tui::moonlit::{
+    banner_3d_lines, moon_art, phase_glyph, welcome_lines, wordmark, WelcomeInfo,
+};
 
 fn info() -> WelcomeInfo {
     WelcomeInfo::new(
@@ -76,7 +78,15 @@ fn welcome_lebar_116_memuat_identitas() {
     assert!(text.contains("ag/gemini-3-flash"), "model tampil");
     assert!(text.contains("Tools") && text.contains("Perintah"), "panel tampil");
     assert!(text.contains("12 tool aktif"), "jumlah tool dari info");
-    assert!(text.starts_with('╭'), "bingkai membulat dibuka");
+    assert!(text.contains('█'), "banner 3D SELENCODE tampil");
+    assert!(text.contains('╭') && text.contains('╰'), "bingkai membulat tampil");
+
+    // Banner 3D terpisah juga harus konsisten dan tidak overflow.
+    let b3d = banner_3d_lines(116);
+    assert_eq!(b3d.len(), 6);
+    for l in &b3d {
+        assert!(l.width() <= 116);
+    }
 }
 
 #[test]

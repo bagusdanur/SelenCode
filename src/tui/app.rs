@@ -7,6 +7,7 @@ use crate::security::ApprovalRequest;
 use crate::tui::moonlit::{self, WelcomeInfo};
 use ratatui::style::Style;
 use ratatui::text::Line;
+use std::collections::VecDeque;
 use tui_textarea::TextArea;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +71,7 @@ pub struct App {
     pub session_in: u64,
     pub session_out: u64,
     pub approval: Option<PendingApproval>,
+    approval_queue: VecDeque<PendingApproval>,
     pub should_quit: bool,
     /// Rencana dari giliran plan yang menunggu konfirmasi y/n (Fase 6).
     pub pending_plan: Option<String>,
@@ -81,6 +83,8 @@ pub struct App {
     pub provider_label: String,
     /// Jumlah tool registry mode Execute (untuk layar sambutan Moonlit).
     pub tool_count: usize,
+    /// ID sesi aktif (opsional, untuk tampilan metadata kartu sambutan).
+    pub session_id: String,
     /// Sesi ini hasil resume? Sambutan penuh diganti 1 baris ringkas.
     pub resumed: bool,
     /// Baris sambutan Moonlit — dibuat sekali pada frame pertama (saat
@@ -127,10 +131,12 @@ impl App {
             session_in,
             session_out,
             approval: None,
+            approval_queue: VecDeque::new(),
             should_quit: false,
             pending_plan: None,
             plan_next: false,
             tool_count: 0,
+            session_id: String::new(),
             resumed: false,
             welcome: None,
             streaming: false,
@@ -141,13 +147,18 @@ impl App {
 
     /// Info untuk layar sambutan Moonlit, dari state sesi saat ini.
     pub fn welcome_info(&self) -> WelcomeInfo {
-        WelcomeInfo::new(
+        let info = WelcomeInfo::new(
             self.provider.clone(),
             self.provider_label.clone(),
             self.model.clone(),
             self.cwd.clone(),
             self.tool_count,
-        )
+        );
+        if self.session_id.is_empty() {
+            info
+        } else {
+            info.with_session_id(&self.session_id)
+        }
     }
 
     pub fn info(&mut self, text: impl Into<String>) {
@@ -284,13 +295,19 @@ impl App {
         }
     }
 
-    /// Popup approval masuk dari channel approver.
+    /// Popup approval masuk dari channel approver. Bila sudah ada popup
+    /// aktif, antrekan agar permintaan berikutnya tidak hilang/tertimpa.
     pub fn receive_approval(&mut self, req: ApprovalRequest) {
-        self.approval = Some(PendingApproval {
+        let pending = PendingApproval {
             title: req.title,
             detail: req.detail,
             reply: Some(req.reply),
-        });
+        };
+        if self.approval.is_none() {
+            self.approval = Some(pending);
+        } else {
+            self.approval_queue.push_back(pending);
+        }
     }
 
     /// Jawab popup yang sedang tampil. true bila memang ada popup.
@@ -299,6 +316,9 @@ impl App {
             Some(mut p) => {
                 if let Some(tx) = p.reply.take() {
                     let _ = tx.send(yes);
+                }
+                if let Some(next) = self.approval_queue.pop_front() {
+                    self.approval = Some(next);
                 }
                 true
             }

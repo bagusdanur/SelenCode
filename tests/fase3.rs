@@ -274,6 +274,7 @@ async fn fetch_url_rejects_private_and_bad_schemes() {
         "http://127.0.0.1/",
         "http://127.0.0.1:8080/admin",
         "http://[::1]/",
+        "http://[::ffff:127.0.0.1]/",
         "http://10.0.0.5/",
         "http://192.168.1.1/",
         "http://169.254.169.254/latest/meta-data",
@@ -302,6 +303,8 @@ fn slash_command_parsing() {
         SlashCommand::Model(Some("claude".into()))
     );
     assert_eq!(parse_slash_command("/sessions"), SlashCommand::Sessions);
+    assert_eq!(parse_slash_command("/help"), SlashCommand::Help);
+    assert_eq!(parse_slash_command("/?"), SlashCommand::Help);
     assert_eq!(
         parse_slash_command("/ngawur"),
         SlashCommand::Unknown("ngawur".into())

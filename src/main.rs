@@ -7,7 +7,7 @@ use selencode::providers::anthropic::AnthropicProvider;
 use selencode::providers::gemini::GeminiProvider;
 use selencode::providers::openai::OpenAiProvider;
 use selencode::providers::{Message, Provider};
-use selencode::repl::{parse_slash_command, SlashCommand};
+use selencode::repl::{parse_slash_command, SlashCommand, HELP_TEXT};
 use selencode::security::{ApprovalRequest, Approver};
 use selencode::store::Store;
 use selencode::tools::delegate::Delegate;
@@ -152,7 +152,7 @@ impl Session {
         yes: bool,
         resume: bool,
         first_prompt: Option<&str>,
-        approver: Option<Arc<Approver>>,
+        approval_tx: Option<tokio::sync::mpsc::Sender<ApprovalRequest>>,
     ) -> Result<Session> {
         let cfg = config::load()?;
         let (name, pcfg, api_key) = cfg.resolve_provider(provider_name)?;
@@ -185,11 +185,12 @@ impl Session {
             )
         });
 
-        let mut ctx = Ctx::new(cwd, cfg.auto_approve(yes))
+        let auto_yes = cfg.auto_approve(yes);
+        let mut ctx = Ctx::new(cwd, auto_yes)
             .with_context_limit(cfg.agent.context_limit_tokens)
             .with_store(store.clone(), session_id.clone());
-        if let Some(a) = approver {
-            ctx = ctx.with_approver(a);
+        if let Some(tx) = approval_tx {
+            ctx = ctx.with_approver(Arc::new(Approver::channel(auto_yes, tx)));
         }
         // Delegate (Fase 6): subagent memakai provider sesi saat build;
         // ganti provider via /model TIDAK mengganti provider subagent
@@ -483,10 +484,12 @@ async fn tui_worker(
 async fn interactive_tui(cli: Cli, resume: bool) -> Result<()> {
     // Approver berbasis channel: permintaan approval dari tool mengalir ke
     // popup TUI, jawaban kembali via oneshot (lihat security::Approver).
+    // Dibangun di dalam Session::build agar `agent.approval = "auto"` dari
+    // config ikut berlaku di mode TUI.
     let (approval_tx, approval_rx) =
         tokio::sync::mpsc::channel::<ApprovalRequest>(8);
-    let approver = Arc::new(Approver::channel(cli.yes, approval_tx));
-    let s = Session::build(cli.provider.as_deref(), cli.yes, resume, None, Some(approver)).await?;
+    let s =
+        Session::build(cli.provider.as_deref(), cli.yes, resume, None, Some(approval_tx)).await?;
     let (init_in, init_out) = s.store.total_usage(&s.session_id).unwrap_or((0, 0));
     let mut app = App::new(
         s.ctx.cwd.to_string_lossy().to_string(),
@@ -501,9 +504,14 @@ async fn interactive_tui(cli: Cli, resume: bool) -> Result<()> {
     // (judul/tanggal/jumlah pesan) tetap tampil sebagai baris info.
     app.provider_label = provider_label(&s.provider_name, &s.pcfg);
     app.tool_count = s.registry.names().len();
+    app.session_id = s.session_id.clone();
     app.resumed = s.resumed_note.is_some();
+    app.plan_next = cli.plan;
     if let Some(note) = &s.resumed_note {
         app.info(note.clone());
+    }
+    if cli.plan {
+        app.info("Mode plan aktif untuk giliran pertama (--plan).");
     }
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TuiCommand>(32);
@@ -579,8 +587,13 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                 plan_next = true;
                 println!("Mode plan aktif untuk giliran berikutnya (baca-saja, diakhiri rencana).");
             }
+            SlashCommand::Help => {
+                println!("{HELP_TEXT}");
+            }
             SlashCommand::Unknown(name) => {
-                eprintln!("Perintah /{name} tidak dikenal. Pilihan: /plan, /model, /sessions, /exit");
+                eprintln!(
+                    "Perintah /{name} tidak dikenal. Pilihan: /plan, /model, /sessions, /help, /exit"
+                );
             }
             SlashCommand::NotCommand => {
                 if plan_next {

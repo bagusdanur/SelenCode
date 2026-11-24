@@ -89,6 +89,33 @@ async fn sandbox_rejects_escape_and_secret_read() {
         .unwrap_err();
     assert!(err.to_string().contains("rahasia"), "{err}");
 
+    let err = reg
+        .get("write_file")
+        .unwrap()
+        .run(json!({"path": ".env", "content": "HACK=1"}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("rahasia"), "{err}");
+
+    // File >100KB tetap bisa dibaca per rentang baris dengan start/end.
+    let big_content = "baris-panjang-untuk-uji-rentang-0123456789\n".repeat(3000);
+    assert!(big_content.len() > 100 * 1024);
+    std::fs::write(cwd.join("besar.txt"), &big_content).unwrap();
+    assert!(reg
+        .get("read_file")
+        .unwrap()
+        .run(json!({"path": "besar.txt"}), &ctx)
+        .await
+        .is_err());
+    let sliced = run_tool(
+        &reg,
+        "read_file",
+        json!({"path": "besar.txt", "start": 10, "end": 12}),
+        &ctx,
+    )
+    .await;
+    assert_eq!(sliced.lines().count(), 3);
+
     // search tidak membocorkan isi .env
     let out = run_tool(&reg, "search_text", json!({"query": "SECRET"}), &ctx).await;
     assert!(!out.contains(".env"), "{out}");

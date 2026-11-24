@@ -79,7 +79,24 @@ impl Tool for McpTool {
         !self.trust
     }
 
-    async fn run(&self, args: Value, _ctx: &Ctx) -> Result<String> {
+    async fn run(&self, args: Value, ctx: &Ctx) -> Result<String> {
+        if self.needs_approval(&args) {
+            let detail =
+                serde_json::to_string_pretty(&args).unwrap_or_else(|_| args.to_string());
+            if !ctx
+                .approver
+                .ask(
+                    &format!("mcp: {}/{}", self.server_name, self.remote_name),
+                    &detail,
+                )
+                .await
+            {
+                return Ok(format!(
+                    "Ditolak user — tool MCP '{}/{}' TIDAK dijalankan.",
+                    self.server_name, self.remote_name
+                ));
+            }
+        }
         self.client.call_tool(&self.remote_name, args).await
     }
 }

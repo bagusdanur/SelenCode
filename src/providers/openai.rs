@@ -6,7 +6,12 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Provider OpenAI-compatible: 9Router, OpenRouter, OpenAI, dsb.
 /// POST {base_url}/chat/completions dengan stream=true + SSE.
@@ -20,12 +25,16 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(base_url: String, api_key: String, model: String, max_output_tokens: u32) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
             max_output_tokens,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 }
@@ -123,14 +132,22 @@ impl Provider for OpenAiProvider {
         }
 
         let url = format!("{}/chat/completions", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("gagal menghubungi provider di {url}"))?;
+        let resp = tokio::time::timeout(
+            RESPONSE_TIMEOUT,
+            self.client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timeout {} detik menunggu respons awal provider di {url}",
+                RESPONSE_TIMEOUT.as_secs()
+            )
+        })?
+        .with_context(|| format!("gagal menghubungi provider di {url}"))?;
         if !resp.status().is_success() {
             let st = resp.status();
             let txt = resp.text().await.unwrap_or_default();
@@ -144,7 +161,18 @@ impl Provider for OpenAiProvider {
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<Usage> = None;
 
-        while let Some(chunk) = stream.next().await {
+        'stream: loop {
+            let next_chunk = tokio::time::timeout(CHUNK_TIMEOUT, stream.next())
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "stream provider macet (tidak ada data selama {} detik)",
+                        CHUNK_TIMEOUT.as_secs()
+                    )
+                })?;
+            let Some(chunk) = next_chunk else {
+                break 'stream;
+            };
             let chunk = chunk.context("stream provider terputus")?;
             buf.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(pos) = buf.find('\n') {
@@ -156,7 +184,7 @@ impl Provider for OpenAiProvider {
                 let data = data.trim();
                 if data == "[DONE]" {
                     buf.clear();
-                    break;
+                    break 'stream;
                 }
                 if data.is_empty() {
                     continue;
@@ -199,6 +227,31 @@ impl Provider for OpenAiProvider {
                         }
                         if let Some(a) = tc["function"]["arguments"].as_str() {
                             e.args_buf.push_str(a);
+                        }
+                    }
+                }
+            }
+        }
+        // Tangani baris terakhir tanpa '\n' penutup bila stream langsung EOF.
+        let tail = buf.trim();
+        if let Some(data) = tail.strip_prefix("data:") {
+            let data = data.trim();
+            if !data.is_empty() && data != "[DONE]" {
+                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                    if v["usage"].is_object() {
+                        usage = Some(Usage {
+                            input_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                            output_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                        });
+                    }
+                    let choice = &v["choices"][0];
+                    if let Some(fr) = choice["finish_reason"].as_str() {
+                        finish_reason = Some(fr.to_string());
+                    }
+                    if let Some(tok) = choice["delta"]["content"].as_str() {
+                        if !tok.is_empty() {
+                            text.push_str(tok);
+                            let _ = tx.send(StreamEvent::Token(tok.to_string())).await;
                         }
                     }
                 }

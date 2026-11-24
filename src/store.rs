@@ -127,6 +127,8 @@ impl Store {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("gagal membuka DB sesi {}", path.display()))?;
+        let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
+        let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
         conn.execute_batch(SCHEMA).context("gagal membuat skema sesi")?;
         Ok(Self {
             conn: Mutex::new(conn),

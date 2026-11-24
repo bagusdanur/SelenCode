@@ -65,8 +65,22 @@ async fn mcp_echo_server_end_to_end() {
     assert_eq!(exposed_name("tes", "echo"), "mcp__tes__echo");
     let tool = McpTool::new("tes", &infos[0], client.clone(), false);
     assert_eq!(tool.spec().name, "mcp__tes__echo");
-    // Server tidak di-trust -> approval wajib.
+    // Server tidak di-trust -> approval wajib, dan penolakan membatalkan panggilan.
     assert!(tool.needs_approval(&json!({"text": "x"})));
+    let (atx, mut arx) = tokio::sync::mpsc::channel(4);
+    let deny_ctx = Ctx::new(PathBuf::from("."), false)
+        .with_approver(std::sync::Arc::new(selencode::security::Approver::channel(false, atx)));
+    let deny_handle = tokio::spawn(async move {
+        if let Some(req) = arx.recv().await {
+            let _ = req.reply.send(false);
+        }
+    });
+    let denied = tool
+        .run(json!({"text": "jangan"}), &deny_ctx)
+        .await
+        .expect("penolakan approval mengembalikan pesan, bukan Err");
+    deny_handle.await.unwrap();
+    assert!(denied.contains("Ditolak"), "{denied}");
 
     let ctx = Ctx::new(PathBuf::from("."), true);
     let out = tool

@@ -7,7 +7,6 @@
 //! loop dijalankan lewat jalur UiEvent dengan receiver yang dibuang.
 
 use crate::providers::{Message, Provider, Role, Usage};
-use crate::security::Approver;
 use crate::tools::plan::PlanStep;
 use crate::tools::{Ctx, Registry};
 use anyhow::Result;
@@ -43,9 +42,9 @@ pub async fn run_subagent(
 ) -> Result<(String, Option<Usage>)> {
     let child_ctx = Ctx {
         cwd: parent_ctx.cwd.clone(),
-        // Approver auto_yes tidak pernah benar-benar ditanya: registry anak
-        // baca-saja tidak mengandung tool ber-approval.
-        approver: Arc::new(Approver::new(true)),
+        // Warisi approver induk agar tool baca-saja yang butuh izin (fetch_url)
+        // tetap menghormati persetujuan user (tidak pernah diam-diam auto_yes).
+        approver: parent_ctx.approver.clone(),
         context_limit_tokens: parent_ctx.context_limit_tokens,
         store: None,
         session_id: None,
