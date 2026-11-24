@@ -1,13 +1,17 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use selencode::agent::context::{compact_messages, estimate_tokens};
 use selencode::agent::plan::{approved_plan_prompt, extract_plan, TurnMode};
 use selencode::agent::{run_turn, run_turn_mode, run_turn_ui, run_turn_ui_mode, UiEvent};
 use selencode::config::{self, Config, ProviderCfg};
 use selencode::providers::anthropic::AnthropicProvider;
 use selencode::providers::gemini::GeminiProvider;
-use selencode::providers::openai::OpenAiProvider;
+use selencode::providers::openai::{fetch_models, OpenAiProvider};
 use selencode::providers::{Message, Provider};
-use selencode::repl::{parse_slash_command, SlashCommand, HELP_TEXT};
+use selencode::repl::{
+    help_menu_markup, parse_model_action, parse_provider_action, parse_slash_command,
+    strip_menu_markup, KeySpec, ModelAction, ProviderAction, SlashCommand,
+};
 use selencode::security::{ApprovalRequest, Approver};
 use selencode::store::Store;
 use selencode::tools::delegate::Delegate;
@@ -235,6 +239,271 @@ impl Session {
         Ok(())
     }
 
+    /// Tangani `/model <arg>`: ganti provider, input model manual pada provider
+    /// aktif (`/model set <id>`), atau pindah provider + set model
+    /// (`/model <provider>:<id>`). Perubahan model langsung disimpan ke config.
+    fn apply_model_arg(&mut self, arg: &str) -> Result<String> {
+        match parse_model_action(arg) {
+            ModelAction::FetchList => anyhow::bail!("gunakan jalur async fetch_remote_models"),
+            ModelAction::SetCurrentModel(model) => {
+                if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+                    p.model = model.clone();
+                }
+                let saved_path = config::save(&self.cfg)?;
+                let pname = self.provider_name.clone();
+                self.switch_provider(&pname)?;
+                Ok(format!(
+                    "# Model Diperbarui\n\
+                     * {} | {} | aktif & tersimpan\n\
+                     ! Config disimpan ke: {}",
+                    self.provider_name,
+                    self.pcfg.model,
+                    saved_path.display()
+                ))
+            }
+            ModelAction::SwitchAndSetModel { provider, model } => {
+                if !self.cfg.providers.contains_key(&provider) {
+                    anyhow::bail!(
+                        "provider '{provider}' belum ada. Tambah dulu lewat `/provider add`."
+                    );
+                }
+                if let Some(p) = self.cfg.providers.get_mut(&provider) {
+                    p.model = model.clone();
+                }
+                let saved_path = config::save(&self.cfg)?;
+                self.switch_provider(&provider)?;
+                Ok(format!(
+                    "# Provider & Model Diperbarui\n\
+                     * {} | {} | aktif & tersimpan\n\
+                     ! Config disimpan ke: {}",
+                    self.provider_name,
+                    self.pcfg.model,
+                    saved_path.display()
+                ))
+            }
+            ModelAction::SwitchOrModel(target) => {
+                if self.cfg.providers.contains_key(&target) {
+                    self.switch_provider(&target)?;
+                    Ok(format!(
+                        "# Provider Diganti\n\
+                         * {} | {} | kind {}\n\
+                         ! {}",
+                        self.provider_name,
+                        self.pcfg.model,
+                        self.pcfg.kind,
+                        self.usage_line()
+                    ))
+                } else {
+                    // Input bukan nama provider di config -> perlakukan sebagai
+                    // input model manual untuk provider aktif agar praktis.
+                    if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+                        p.model = target.clone();
+                    }
+                    let saved_path = config::save(&self.cfg)?;
+                    let pname = self.provider_name.clone();
+                    self.switch_provider(&pname)?;
+                    Ok(format!(
+                        "# Model Manual Dipasang\n\
+                         * {} | {} | aktif & tersimpan\n\
+                         ! Config disimpan ke: {}",
+                        self.provider_name,
+                        self.pcfg.model,
+                        saved_path.display()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Tarik daftar model real-time dari endpoint `/models` provider aktif.
+    async fn fetch_remote_models_menu(&self) -> Result<String> {
+        if self.pcfg.kind != "openai" {
+            return Ok(format!(
+                "# Daftar Model ({})\n\
+                 ! Provider kind '{}' tidak menyediakan endpoint /models standar OpenAI.\n\
+                 ! Pasang model secara manual dengan: /model set <id-model>",
+                self.provider_name, self.pcfg.kind
+            ));
+        }
+        let (_n, pcfg, api_key) = self.cfg.resolve_provider(Some(&self.provider_name))?;
+        let base_url = pcfg
+            .base_url
+            .ok_or_else(|| anyhow::anyhow!("base_url kosong untuk provider '{}'", self.provider_name))?;
+        let ids = fetch_models(&base_url, &api_key).await?;
+        let mut out = format!(
+            "# Daftar Model dari {} ({} ditemukan)\n",
+            self.provider_name,
+            ids.len()
+        );
+        if ids.is_empty() {
+            out.push_str("! Server mengembalikan daftar model kosong.\n");
+        } else {
+            for id in ids.iter().take(40) {
+                let mark = if *id == self.pcfg.model { "*" } else { ">" };
+                let note = if *id == self.pcfg.model {
+                    "aktif"
+                } else {
+                    ""
+                };
+                out.push_str(&format!("{mark} {id} | | {note}\n"));
+            }
+            if ids.len() > 40 {
+                out.push_str(&format!("... dan {} model lainnya.\n", ids.len() - 40));
+            }
+        }
+        out.push_str("---\n");
+        out.push_str("! Pasang salah satu model di atas: /model set <id-model>");
+        Ok(out)
+    }
+
+    /// Tangani `/provider` (list, add, model, default, rm).
+    fn handle_provider(&mut self, arg: Option<&str>) -> Result<String> {
+        match parse_provider_action(arg) {
+            ProviderAction::List => Ok(self.providers_menu()),
+            ProviderAction::Add {
+                name,
+                kind,
+                model,
+                base_url,
+                key_spec,
+            } => {
+                if !matches!(kind.as_str(), "openai" | "anthropic" | "gemini") {
+                    anyhow::bail!(
+                        "kind '{kind}' tidak dikenal. Pilihan: openai, anthropic, gemini"
+                    );
+                }
+                if kind == "openai" && base_url.is_none() {
+                    anyhow::bail!(
+                        "base_url wajib untuk kind=openai. Contoh:\n  /provider add openrouter openai anthropic/claude-3.7-sonnet https://openrouter.ai/api/v1 OPENROUTER_API_KEY"
+                    );
+                }
+                let (api_key_env, api_key) = match key_spec {
+                    KeySpec::EnvVar(env_name) => (env_name, None),
+                    KeySpec::DirectKey(raw) => (String::new(), Some(raw)),
+                };
+                let pcfg = ProviderCfg {
+                    kind: kind.clone(),
+                    base_url: base_url.clone(),
+                    model: model.clone(),
+                    api_key_env: api_key_env.clone(),
+                    api_key,
+                    price_in: None,
+                    price_out: None,
+                };
+                self.cfg.providers.insert(name.clone(), pcfg);
+                let saved_path = config::save(&self.cfg)?;
+                let key_info = if !api_key_env.is_empty() {
+                    if std::env::var(&api_key_env).is_ok() {
+                        format!("env {api_key_env} (siap)")
+                    } else {
+                        format!("env {api_key_env} (belum di-export)")
+                    }
+                } else {
+                    "api_key tersimpan di config".to_string()
+                };
+                // Bila provider yang baru ditambah sedang aktif, muat ulang instance-nya.
+                if name == self.provider_name && self.cfg.is_key_ready(&name) {
+                    let _ = self.switch_provider(&name);
+                }
+                Ok(format!(
+                    "# Provider Ditambahkan\n\
+                     > {name} | {model} | kind {kind} · {key_info}\n\
+                     ---\n\
+                     ! Config disimpan ke: {}\n\
+                     ! Pakai sekarang: /model {name}   |   Jadikan default: /provider default {name}",
+                    saved_path.display()
+                ))
+            }
+            ProviderAction::SetModel { name, model } => {
+                let p = self
+                    .cfg
+                    .providers
+                    .get_mut(&name)
+                    .ok_or_else(|| anyhow::anyhow!("provider '{name}' tidak ada di config"))?;
+                p.model = model.clone();
+                let saved_path = config::save(&self.cfg)?;
+                if name == self.provider_name {
+                    self.switch_provider(&name)?;
+                }
+                Ok(format!(
+                    "# Model Provider Diperbarui\n\
+                     * {name} | {model} | tersimpan\n\
+                     ! Config disimpan ke: {}",
+                    saved_path.display()
+                ))
+            }
+            ProviderAction::SetDefault(name) => {
+                if !self.cfg.providers.contains_key(&name) {
+                    anyhow::bail!("provider '{name}' tidak ada di config");
+                }
+                self.cfg.default_provider = name.clone();
+                let saved_path = config::save(&self.cfg)?;
+                Ok(format!(
+                    "# Default Provider Diperbarui\n\
+                     * {name} | default | tersimpan ke {}",
+                    saved_path.display()
+                ))
+            }
+            ProviderAction::Remove(name) => {
+                if name == self.provider_name {
+                    anyhow::bail!("tidak bisa menghapus provider '{name}' yang sedang aktif; pindah dulu lewat `/model <lain>`.");
+                }
+                if self.cfg.providers.remove(&name).is_none() {
+                    anyhow::bail!("provider '{name}' tidak ada di config");
+                }
+                if self.cfg.default_provider == name {
+                    self.cfg.default_provider = self.provider_name.clone();
+                }
+                let saved_path = config::save(&self.cfg)?;
+                Ok(format!(
+                    "# Provider Dihapus\n\
+                     > {name} | dihapus | tersimpan ke {}",
+                    saved_path.display()
+                ))
+            }
+            ProviderAction::Usage => Ok(self.provider_usage_menu()),
+        }
+    }
+
+    /// Mulai sesi baru yang bersih (/new).
+    fn reset_session(&mut self) -> Result<String> {
+        let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
+        let new_id = self.store.create_session(
+            &cwd_str,
+            &self.provider_name,
+            &self.pcfg.model,
+            "(sesi baru)",
+        )?;
+        self.session_id = new_id.clone();
+        self.ctx.session_id = Some(new_id.clone());
+        self.messages.clear();
+        if let Ok(mut plan) = self.ctx.plan_state.lock() {
+            plan.clear();
+        }
+        Ok(new_id)
+    }
+
+    /// Compaction konteks manual (/compact).
+    fn compact_now(&mut self) -> String {
+        let before_msgs = self.messages.len();
+        let before_tok = estimate_tokens(&self.messages);
+        let compacted = compact_messages(&self.messages);
+        let after_msgs = compacted.len();
+        let after_tok = estimate_tokens(&compacted);
+        self.messages = compacted;
+        if after_msgs == before_msgs {
+            format!(
+                "# Compaction Konteks\n\
+                 ! Riwayat masih pendek ({before_msgs} pesan, ~{before_tok} token) — belum perlu diringkas."
+            )
+        } else {
+            format!(
+                "# Compaction Konteks Selesai\n\
+                 * pesan | {before_msgs} → {after_msgs} | estimasi ~{before_tok} → ~{after_tok} token"
+            )
+        }
+    }
+
     /// Ringkasan token sesi + estimasi biaya bila harga dikonfigurasi.
     fn usage_line(&self) -> String {
         match self.store.total_usage(&self.session_id) {
@@ -250,46 +519,136 @@ impl Session {
         }
     }
 
-    /// Teks daftar provider (dipakai mode polos & TUI — 1 sumber kebenaran).
-    fn models_text(&self) -> String {
+    /// Kartu menu `/model` (berwarna di TUI, bersih di `--plain`).
+    fn models_menu(&self) -> String {
+        let mut out = String::from("# Model & Provider Aktif\n");
+        let mut names: Vec<&String> = self.cfg.providers.keys().collect();
+        names.sort();
+        for n in names {
+            let p = &self.cfg.providers[n];
+            let active = *n == self.provider_name;
+            let mark = if active { "*" } else { ">" };
+            let key_ok = if self.cfg.is_key_ready(n) {
+                "siap"
+            } else {
+                "key belum diset"
+            };
+            let tag = if active {
+                format!("aktif · kind {} · {key_ok}", p.kind)
+            } else {
+                format!("kind {} · {key_ok}", p.kind)
+            };
+            out.push_str(&format!("{mark} {n} | {} | {tag}\n", p.model));
+        }
+        out.push_str("---\n");
+        out.push_str("! Ganti provider:        /model <nama-provider>\n");
+        out.push_str("! Input model manual:    /model set <id-model>   atau   /model <provider>:<id-model>\n");
+        out.push_str("! Tarik daftar dari API: /models   (untuk provider OpenAI-compatible)\n");
+        out.push_str("! Pasang provider baru:  /provider");
+        out
+    }
+
+    fn providers_menu(&self) -> String {
         let mut out = format!(
-            "Provider aktif: {} (kind {}, model {})\nProvider tersedia di config:",
-            self.provider_name, self.pcfg.kind, self.pcfg.model
+            "# Manajemen Provider (config: {})\n",
+            config::active_config_path().display()
         );
         let mut names: Vec<&String> = self.cfg.providers.keys().collect();
         names.sort();
         for n in names {
             let p = &self.cfg.providers[n];
-            let mark = if *n == self.provider_name { " *" } else { "" };
-            out.push_str(&format!("\n  - {n}: kind {}, model {}{mark}", p.kind, p.model));
+            let mark = if *n == self.provider_name { "*" } else { ">" };
+            let url = p.base_url.as_deref().unwrap_or("(endpoint resmi)");
+            let key_status = if self.cfg.is_key_ready(n) {
+                if !p.api_key_env.is_empty() {
+                    format!("env {} siap", p.api_key_env)
+                } else {
+                    "api_key siap".to_string()
+                }
+            } else if !p.api_key_env.is_empty() {
+                format!("env {} KOSONG", p.api_key_env)
+            } else {
+                "key KOSONG".to_string()
+            };
+            let def_tag = if *n == self.cfg.default_provider {
+                " · default"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "{mark} {n} | {} | {} · {url} · {key_status}{def_tag}\n",
+                p.model, p.kind
+            ));
         }
+        out.push_str("---\n");
+        out.push_str(&self.provider_usage_footer());
         out
     }
 
-    fn print_models(&self) {
-        println!("{}", self.models_text());
+    fn provider_usage_footer(&self) -> String {
+        "! Tambah OpenAI-compat:  /provider add <nama> openai <model> <base_url> <ENV_atau_key>\n\
+         ! Tambah Claude/Gemini:  /provider add <nama> <anthropic|gemini> <model> <ENV_atau_key>\n\
+         ! Ubah model provider:   /provider model <nama> <id-model>\n\
+         ! Set default / hapus:   /provider default <nama>   |   /provider rm <nama>"
+            .to_string()
     }
 
-    /// Teks daftar sesi terakhir cwd ini (mode polos & TUI).
-    fn sessions_text(&self) -> Result<String> {
+    fn provider_usage_menu(&self) -> String {
+        format!(
+            "# Cara Pakai /provider\n\
+             {}\n\
+             ---\n\
+             ! Contoh OpenRouter: /provider add openrouter openai anthropic/claude-3.7-sonnet https://openrouter.ai/api/v1 OPENROUTER_API_KEY\n\
+             ! Contoh Gemini:     /provider add gemini gemini gemini-2.5-pro GEMINI_API_KEY",
+            self.provider_usage_footer()
+        )
+    }
+
+    fn print_models(&self) {
+        println!("{}", strip_menu_markup(&self.models_menu()));
+    }
+
+    /// Kartu daftar sesi terakhir cwd ini (mode TUI & polos).
+    fn sessions_menu(&self) -> Result<String> {
         let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
         let list = self.store.list_sessions(&cwd_str, 10)?;
         if list.is_empty() {
-            return Ok("(belum ada sesi tersimpan untuk folder ini)".to_string());
+            return Ok(
+                "# Sesi Tersimpan\n! Belum ada sesi tersimpan untuk folder ini.".to_string(),
+            );
         }
-        let mut out = "Sesi terakhir di folder ini:".to_string();
+        let mut out = String::from("# 10 Sesi Terakhir di Folder Ini\n");
         for s in list {
-            let mark = if s.id == self.session_id { " *" } else { "" };
+            let mark = if s.id == self.session_id { "*" } else { ">" };
+            let short_ts: String = s.created_at.chars().take(16).collect();
             out.push_str(&format!(
-                "\n  - {} · {}/{} · \"{}\"{}",
-                s.created_at, s.provider, s.model, s.title, mark
+                "{mark} {short_ts} | {}/{} | \"{}\"\n",
+                s.provider, s.model, s.title
             ));
         }
+        out.push_str("---\n");
+        out.push_str("! Lanjutkan sesi terakhir dari terminal: selen resume");
         Ok(out)
     }
 
+    fn session_info_menu(&self) -> String {
+        format!(
+            "# Info Sesi Aktif\n\
+             * sesi | {} | {}\n\
+             > provider | {} | model {} (kind {})\n\
+             > folder | {} | {} pesan di memori",
+            self.session_id.chars().take(12).collect::<String>(),
+            self.usage_line(),
+            self.provider_name,
+            self.pcfg.model,
+            self.pcfg.kind,
+            self.ctx.cwd.display(),
+            self.messages.len(),
+        )
+    }
+
     fn print_sessions(&self) -> Result<()> {
-        println!("{}", self.sessions_text()?);
+        println!("{}", strip_menu_markup(&self.sessions_menu()?));
         Ok(())
     }
 }
@@ -436,46 +795,85 @@ async fn tui_worker(
                 }
             }
             TuiCommand::ShowModels => {
-                let _ = ui_tx.send(UiEvent::Info(s.models_text())).await;
+                let _ = ui_tx.send(UiEvent::Menu(s.models_menu())).await;
             }
-            TuiCommand::SwitchModel(name) => match s.switch_provider(&name) {
-                Ok(()) => {
+            TuiCommand::SwitchOrSetModel(arg) => {
+                if matches!(parse_model_action(&arg), ModelAction::FetchList) {
+                    match s.fetch_remote_models_menu().await {
+                        Ok(card) => {
+                            let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                        }
+                        Err(e) => {
+                            let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                        }
+                    }
+                } else {
+                    match s.apply_model_arg(&arg) {
+                        Ok(card) => {
+                            let _ = ui_tx
+                                .send(UiEvent::ModelChanged {
+                                    provider: s.provider_name.clone(),
+                                    model: s.pcfg.model.clone(),
+                                })
+                                .await;
+                            let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                        }
+                        Err(e) => {
+                            let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                        }
+                    }
+                }
+            }
+            TuiCommand::FetchRemoteModels => match s.fetch_remote_models_menu().await {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::ManageProvider(arg) => match s.handle_provider(arg.as_deref()) {
+                Ok(card) => {
                     let _ = ui_tx
                         .send(UiEvent::ModelChanged {
                             provider: s.provider_name.clone(),
                             model: s.pcfg.model.clone(),
                         })
                         .await;
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::NewSession => match s.reset_session() {
+                Ok(sid) => {
                     let _ = ui_tx
-                        .send(UiEvent::Info(format!(
-                            "Provider diganti ke {} (model {}). {}",
-                            s.provider_name,
-                            s.pcfg.model,
-                            s.usage_line()
-                        )))
+                        .send(UiEvent::SessionReset {
+                            session_id: sid,
+                            provider: s.provider_name.clone(),
+                            model: s.pcfg.model.clone(),
+                        })
                         .await;
                 }
                 Err(e) => {
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
-            TuiCommand::ShowSessions => match s.sessions_text() {
+            TuiCommand::CompactContext => {
+                let card = s.compact_now();
+                let _ = ui_tx.send(UiEvent::Menu(card)).await;
+            }
+            TuiCommand::ShowSessions => match s.sessions_menu() {
                 Ok(t) => {
-                    let _ = ui_tx.send(UiEvent::Info(t)).await;
+                    let _ = ui_tx.send(UiEvent::Menu(t)).await;
                 }
                 Err(e) => {
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
             TuiCommand::ShowSessionInfo => {
-                let _ = ui_tx
-                    .send(UiEvent::Info(format!(
-                        "Sesi aktif: {} · provider {} · {}",
-                        s.session_id,
-                        s.provider_name,
-                        s.usage_line()
-                    )))
-                    .await;
+                let _ = ui_tx.send(UiEvent::Menu(s.session_info_menu())).await;
             }
             TuiCommand::Shutdown => break,
         }
@@ -562,38 +960,52 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
         match parse_slash_command(line) {
             SlashCommand::Exit => break,
             SlashCommand::Model(None) => s.print_models(),
-            SlashCommand::Model(Some(name)) => match s.switch_provider(&name) {
-                Ok(()) => println!(
-                    "Provider diganti ke {} (model {}). {}",
-                    s.provider_name,
-                    s.pcfg.model,
-                    s.usage_line()
-                ),
+            SlashCommand::Model(Some(arg)) => {
+                if matches!(parse_model_action(&arg), ModelAction::FetchList) {
+                    match s.fetch_remote_models_menu().await {
+                        Ok(card) => println!("{}", strip_menu_markup(&card)),
+                        Err(e) => eprintln!("[error] {e}"),
+                    }
+                } else {
+                    match s.apply_model_arg(&arg) {
+                        Ok(card) => println!("{}", strip_menu_markup(&card)),
+                        Err(e) => eprintln!("[error] {e}"),
+                    }
+                }
+            }
+            SlashCommand::Models => match s.fetch_remote_models_menu().await {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
+            SlashCommand::Provider(arg) => match s.handle_provider(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::New => match s.reset_session() {
+                Ok(sid) => println!("Sesi baru dimulai ({sid})."),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Compact => {
+                println!("{}", strip_menu_markup(&s.compact_now()));
+            }
             SlashCommand::Sessions => {
                 if let Err(e) = s.print_sessions() {
                     eprintln!("[error] {e}");
                 }
             }
             SlashCommand::Resume => {
-                println!(
-                    "Sesi aktif: {} · provider {} · {}",
-                    s.session_id,
-                    s.provider_name,
-                    s.usage_line()
-                );
+                println!("{}", strip_menu_markup(&s.session_info_menu()));
             }
             SlashCommand::Plan => {
                 plan_next = true;
                 println!("Mode plan aktif untuk giliran berikutnya (baca-saja, diakhiri rencana).");
             }
             SlashCommand::Help => {
-                println!("{HELP_TEXT}");
+                println!("{}", strip_menu_markup(&help_menu_markup()));
             }
             SlashCommand::Unknown(name) => {
                 eprintln!(
-                    "Perintah /{name} tidak dikenal. Pilihan: /plan, /model, /sessions, /help, /exit"
+                    "Perintah /{name} tidak dikenal. Ketik /help untuk daftar semua perintah."
                 );
             }
             SlashCommand::NotCommand => {

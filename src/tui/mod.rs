@@ -14,7 +14,7 @@ pub mod markdown;
 pub mod moonlit;
 
 use crate::agent::UiEvent;
-use crate::repl::{parse_slash_command, SlashCommand, HELP_TEXT};
+use crate::repl::{filter_commands, help_menu_markup, parse_slash_command, SlashCommand};
 use crate::security::ApprovalRequest;
 use anyhow::Result;
 use app::{App, LineKind, ToolState};
@@ -26,7 +26,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -43,7 +43,16 @@ pub enum TuiCommand {
     /// Jalankan rencana yang sudah disetujui user (teks rencana utuh).
     ExecutePlan(String),
     ShowModels,
-    SwitchModel(String),
+    /// /model <arg>: ganti provider, `/model set <id>`, `/model <prov>:<id>`, atau `/model list`.
+    SwitchOrSetModel(String),
+    /// /models: tarik daftar model dari endpoint API provider aktif.
+    FetchRemoteModels,
+    /// /provider [add|model|default|rm ...]: kelola & pasang provider lain.
+    ManageProvider(Option<String>),
+    /// /new: mulai sesi baru yang bersih.
+    NewSession,
+    /// /compact: ringkas riwayat konteks secara manual.
+    CompactContext,
     ShowSessions,
     ShowSessionInfo,
     Shutdown,
@@ -57,6 +66,120 @@ pub struct TuiChannels {
 }
 
 // ---------- gambar ----------
+
+/// Render kartu menu `/` berwarna Moonlit (bukan teks abu-abu polos).
+/// Markup sederhana: `# judul`, `---`, `* kiri | tengah | kanan` (aktif),
+/// `> kiri | tengah | kanan` (biasa), `! tip`.
+pub fn render_menu_card(markup: &str) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut opened = false;
+
+    for raw in markup.lines() {
+        if let Some(title) = raw.strip_prefix("# ") {
+            opened = true;
+            out.push(Line::from(vec![
+                Span::styled("  ╭─ ".to_string(), Style::default().fg(moonlit::BORDER)),
+                Span::styled(
+                    "☾ ".to_string(),
+                    Style::default()
+                        .fg(moonlit::VIOLET)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    title.trim().to_string(),
+                    Style::default()
+                        .fg(moonlit::LILAC)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " ────────────────────────".to_string(),
+                    Style::default().fg(moonlit::BORDER),
+                ),
+            ]));
+        } else if raw.trim() == "---" {
+            out.push(Line::from(vec![
+                Span::styled("  ├".to_string(), Style::default().fg(moonlit::BORDER)),
+                Span::styled(
+                    "────────────────────────────────────────".to_string(),
+                    Style::default().fg(moonlit::FAINT),
+                ),
+            ]));
+        } else if let Some(rest) = raw.strip_prefix("* ").or_else(|| raw.strip_prefix("> ")) {
+            let active = raw.starts_with("* ");
+            let parts: Vec<&str> = rest.split('|').map(|p| p.trim()).collect();
+            let mut spans = vec![
+                Span::styled("  │ ".to_string(), Style::default().fg(moonlit::BORDER)),
+                if active {
+                    Span::styled(
+                        "● ".to_string(),
+                        Style::default()
+                            .fg(moonlit::MINT)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::styled(
+                        "› ".to_string(),
+                        Style::default()
+                            .fg(moonlit::VIOLET)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                },
+            ];
+            if let Some(&col1) = parts.first() {
+                let col1_color = if active { moonlit::LILAC } else { moonlit::LAV };
+                spans.push(Span::styled(
+                    format!("{col1:<12}"),
+                    Style::default().fg(col1_color).add_modifier(Modifier::BOLD),
+                ));
+            }
+            if let Some(&col2) = parts.get(1) {
+                if !col2.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" {col2}"),
+                        Style::default().fg(moonlit::CYAN_MOON),
+                    ));
+                }
+            }
+            if let Some(&col3) = parts.get(2) {
+                if !col3.is_empty() {
+                    spans.push(Span::styled(
+                        "  ·  ".to_string(),
+                        Style::default().fg(moonlit::FAINT),
+                    ));
+                    spans.push(Span::styled(
+                        col3.to_string(),
+                        Style::default().fg(moonlit::SILVER),
+                    ));
+                }
+            }
+            out.push(Line::from(spans));
+        } else if let Some(tip) = raw.strip_prefix("! ") {
+            out.push(Line::from(vec![
+                Span::styled("  │ ".to_string(), Style::default().fg(moonlit::BORDER)),
+                Span::styled(
+                    "✦ ".to_string(),
+                    Style::default()
+                        .fg(moonlit::GOLD)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(tip.to_string(), Style::default().fg(moonlit::SILVER)),
+            ]));
+        } else if !raw.trim().is_empty() {
+            out.push(Line::from(vec![
+                Span::styled("  │ ".to_string(), Style::default().fg(moonlit::BORDER)),
+                Span::styled(raw.to_string(), Style::default().fg(moonlit::DIM)),
+            ]));
+        }
+    }
+
+    if opened {
+        out.push(Line::from(Span::styled(
+            "  ╰─────────────────────────────────────────".to_string(),
+            Style::default().fg(moonlit::BORDER),
+        )));
+    }
+    out
+}
 
 fn display_lines(app: &App) -> Vec<Line<'static>> {
     // Sambutan Moonlit menempel di awal transkrip & ikut bergulir.
@@ -164,6 +287,12 @@ fn display_lines(app: &App) -> Vec<Line<'static>> {
                         ]));
                     }
                 }
+            }
+            LineKind::Menu => {
+                if !out.is_empty() {
+                    out.push(Line::from(""));
+                }
+                out.extend(render_menu_card(&l.text));
             }
             LineKind::Error => {
                 for (idx, part) in l.text.lines().enumerate() {
@@ -308,6 +437,91 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ));
     }
 
+    // Live `/` command palette: muncul otomatis tepat di atas status bar saat
+    // user mulai mengetik `/...` (tanpa popup approval aktif).
+    if app.approval.is_none() {
+        let cur_input = app.input.lines().join("\n");
+        let palette = filter_commands(&cur_input);
+        if !palette.is_empty() && chunks[0].height >= 5 {
+            if app.palette_idx >= palette.len() {
+                app.palette_idx = 0;
+            }
+            let h = (palette.len() as u16 + 2)
+                .min(chunks[0].height.saturating_sub(1))
+                .min(12);
+            let w = chunks[0].width.saturating_sub(2).min(86).max(24);
+            let popup = Rect {
+                x: chunks[0].x + 1,
+                y: chunks[0].y + chunks[0].height.saturating_sub(h),
+                width: w,
+                height: h,
+            };
+            frame.render_widget(Clear, popup);
+            let max_rows = h.saturating_sub(2) as usize;
+            let start = if app.palette_idx >= max_rows {
+                app.palette_idx + 1 - max_rows
+            } else {
+                0
+            };
+            let mut plines: Vec<Line<'static>> = Vec::new();
+            for (idx, item) in palette.iter().enumerate().skip(start).take(max_rows) {
+                let selected = idx == app.palette_idx;
+                let bg = if selected {
+                    Style::default().bg(Color::Rgb(42, 26, 78))
+                } else {
+                    Style::default()
+                };
+                let prefix = if selected {
+                    Span::styled(
+                        " ❯ ",
+                        bg.fg(moonlit::GOLD).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::styled("   ", bg)
+                };
+                let mut spans = vec![
+                    prefix,
+                    Span::styled(
+                        format!("{:<10}", item.cmd),
+                        bg.fg(if selected {
+                            moonlit::LILAC
+                        } else {
+                            moonlit::LAV
+                        })
+                        .add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                if !item.args.is_empty() {
+                    spans.push(Span::styled(
+                        format!("{} ", item.args),
+                        bg.fg(moonlit::CYAN_MOON),
+                    ));
+                }
+                spans.push(Span::styled(
+                    format!("· {}", item.desc),
+                    bg.fg(if selected {
+                        moonlit::SILVER
+                    } else {
+                        moonlit::DIM
+                    }),
+                ));
+                plines.push(Line::from(spans));
+            }
+            let widget = Paragraph::new(plines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(moonlit::VIOLET))
+                    .title_style(
+                        Style::default()
+                            .fg(moonlit::LILAC)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .title(" ☾ Menu Perintah (↑↓ pilih · Tab isi · Enter) "),
+            );
+            frame.render_widget(widget, popup);
+        }
+    }
+
     // Popup approval (modal, di atas segalanya) — bingkai GOLD Moonlit;
     // warna diff di badan popup tetap hijau/merah (kode universal).
     if let Some(p) = &app.approval {
@@ -401,13 +615,33 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
             app.should_quit = true;
         }
         SlashCommand::Help => {
-            app.info(HELP_TEXT);
+            app.menu(help_menu_markup());
         }
         SlashCommand::Model(None) => {
             send_cmd(app, cmd_tx, TuiCommand::ShowModels);
         }
-        SlashCommand::Model(Some(name)) => {
-            send_cmd(app, cmd_tx, TuiCommand::SwitchModel(name));
+        SlashCommand::Model(Some(arg)) => {
+            send_cmd(app, cmd_tx, TuiCommand::SwitchOrSetModel(arg));
+        }
+        SlashCommand::Models => {
+            send_cmd(app, cmd_tx, TuiCommand::FetchRemoteModels);
+        }
+        SlashCommand::Provider(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::ManageProvider(arg));
+        }
+        SlashCommand::New => {
+            if app.busy {
+                app.error("Tunggu giliran saat ini selesai sebelum memulai sesi baru.");
+            } else {
+                send_cmd(app, cmd_tx, TuiCommand::NewSession);
+            }
+        }
+        SlashCommand::Compact => {
+            if app.busy {
+                app.error("Tunggu giliran saat ini selesai sebelum /compact.");
+            } else {
+                send_cmd(app, cmd_tx, TuiCommand::CompactContext);
+            }
         }
         SlashCommand::Sessions => {
             send_cmd(app, cmd_tx, TuiCommand::ShowSessions);
@@ -417,13 +651,14 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
         }
         SlashCommand::Plan => {
             app.plan_next = true;
-            app.info(
-                "Mode plan aktif: giliran berikutnya baca-saja dan diakhiri rencana untuk disetujui.",
+            app.menu(
+                "# Mode Plan Aktif\n\
+                 ! Giliran berikutnya berjalan baca-saja dan diakhiri rencana untuk disetujui sebelum eksekusi.",
             );
         }
         SlashCommand::Unknown(name) => {
             app.error(format!(
-                "Perintah /{name} tidak dikenal. Pilihan: /plan, /model, /sessions, /help, /exit"
+                "Perintah /{name} tidak dikenal. Ketik /help atau / untuk melihat daftar perintah."
             ));
         }
         SlashCommand::NotCommand => {
@@ -484,8 +719,62 @@ fn handle_key(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>, key: KeyEvent) {
         app.should_quit = true;
         return;
     }
+
+    // Navigasi live `/` command palette saat input sedang mengetik prefix perintah.
+    let cur_input = app.input.lines().join("\n");
+    let palette = filter_commands(&cur_input);
+    if !palette.is_empty() {
+        let len = palette.len();
+        if app.palette_idx >= len {
+            app.palette_idx = 0;
+        }
+        match key.code {
+            KeyCode::Up => {
+                app.palette_idx = if app.palette_idx == 0 {
+                    len - 1
+                } else {
+                    app.palette_idx - 1
+                };
+                return;
+            }
+            KeyCode::Down => {
+                app.palette_idx = (app.palette_idx + 1) % len;
+                return;
+            }
+            KeyCode::Tab => {
+                let item = palette[app.palette_idx];
+                let filled = if item.takes_args {
+                    format!("{} ", item.cmd)
+                } else {
+                    item.cmd.to_string()
+                };
+                app.input = app::new_textarea();
+                app.input.insert_str(&filled);
+                app.palette_idx = 0;
+                return;
+            }
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
+                let item = palette[app.palette_idx];
+                if cur_input != item.cmd {
+                    app.input = app::new_textarea();
+                    if item.takes_args {
+                        app.input.insert_str(&format!("{} ", item.cmd));
+                        app.palette_idx = 0;
+                        return;
+                    }
+                    app.input.insert_str(item.cmd);
+                }
+                app.palette_idx = 0;
+                submit(app, cmd_tx);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
+            app.palette_idx = 0;
             submit(app, cmd_tx);
         }
         KeyCode::PageUp => {
@@ -498,6 +787,7 @@ fn handle_key(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>, key: KeyEvent) {
         }
         _ => {
             app.input.input(key);
+            app.palette_idx = 0;
         }
     }
 }

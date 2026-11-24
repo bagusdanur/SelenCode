@@ -336,12 +336,12 @@ const TOOL_ROWS: [(&str, &str); 6] = [
 ];
 
 const CMD_ROWS: [(&str, &str); 6] = [
+    ("/model    ", "ganti provider · input model manual"),
+    ("/provider ", "pasang provider baru & API key"),
     ("/plan     ", "mode baca-saja berencana"),
-    ("/model    ", "lihat & ganti provider/model"),
-    ("/sessions ", "riwayat sesi folder ini"),
-    ("/resume   ", "info sesi aktif"),
-    ("/help     ", "daftar perintah"),
-    ("/exit     ", "keluar"),
+    ("/new      ", "mulai sesi baru · /compact ringkas"),
+    ("/sessions ", "riwayat sesi · /models tarik API"),
+    ("/help     ", "semua perintah · ketik / palette"),
 ];
 
 /// Layar sambutan Moonlit orisinal selebar `width` (wide >= 96, HP < 96).

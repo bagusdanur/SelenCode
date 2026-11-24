@@ -303,6 +303,16 @@ fn slash_command_parsing() {
         SlashCommand::Model(Some("claude".into()))
     );
     assert_eq!(parse_slash_command("/sessions"), SlashCommand::Sessions);
+    assert_eq!(parse_slash_command("/models"), SlashCommand::Models);
+    assert_eq!(
+        parse_slash_command("/provider add claude anthropic claude-sonnet-4 ANTHROPIC_API_KEY"),
+        SlashCommand::Provider(Some(
+            "add claude anthropic claude-sonnet-4 ANTHROPIC_API_KEY".into()
+        ))
+    );
+    assert_eq!(parse_slash_command("/new"), SlashCommand::New);
+    assert_eq!(parse_slash_command("/clear"), SlashCommand::New);
+    assert_eq!(parse_slash_command("/compact"), SlashCommand::Compact);
     assert_eq!(parse_slash_command("/help"), SlashCommand::Help);
     assert_eq!(parse_slash_command("/?"), SlashCommand::Help);
     assert_eq!(
@@ -364,5 +374,43 @@ async fn loop_persists_messages_and_usage_to_store() {
     assert_eq!(saved.len(), messages.len());
     assert!(saved.len() >= 3, "system+user+assistant tersimpan: {saved:?}");
     assert_eq!(store.total_usage(&sid).unwrap(), (11, 7));
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn config_save_load_and_direct_api_key_fallback() {
+    use selencode::config::{load_from, save_to, AgentCfg, Config, ProviderCfg, ShellCfg};
+    use std::collections::HashMap;
+
+    let path = std::env::temp_dir().join(format!(
+        "selencode-cfg-{}.toml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut providers = HashMap::new();
+    providers.insert(
+        "or".to_string(),
+        ProviderCfg {
+            kind: "openai".to_string(),
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            model: "anthropic/claude-3.7-sonnet".to_string(),
+            api_key_env: String::new(),
+            api_key: Some("sk-direct-test-key".to_string()),
+            price_in: None,
+            price_out: None,
+        },
+    );
+    let cfg = Config {
+        default_provider: "or".to_string(),
+        providers,
+        agent: AgentCfg::default(),
+        shell: ShellCfg::default(),
+        mcp_servers: Vec::new(),
+    };
+    save_to(&cfg, &path).unwrap();
+    let loaded = load_from(&path).unwrap();
+    let (name, pcfg, key) = loaded.resolve_provider(None).unwrap();
+    assert_eq!(name, "or");
+    assert_eq!(pcfg.model, "anthropic/claude-3.7-sonnet");
+    assert_eq!(key, "sk-direct-test-key");
     std::fs::remove_file(&path).ok();
 }

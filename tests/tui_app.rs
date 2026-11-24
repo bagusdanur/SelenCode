@@ -209,6 +209,61 @@ fn render_percakapan_markdown_rapi_tanpa_tanda_mentah() {
 }
 
 #[test]
+fn render_kartu_menu_dan_live_slash_palette() {
+    use selencode::repl::{
+        classify_key_spec, filter_commands, parse_model_action, parse_provider_action, KeySpec,
+        ModelAction, ProviderAction,
+    };
+
+    assert_eq!(
+        parse_model_action("set ag/gemini-3-flash"),
+        ModelAction::SetCurrentModel("ag/gemini-3-flash".into())
+    );
+    assert_eq!(
+        parse_model_action("openrouter:anthropic/claude-3.7-sonnet"),
+        ModelAction::SwitchAndSetModel {
+            provider: "openrouter".into(),
+            model: "anthropic/claude-3.7-sonnet".into(),
+        }
+    );
+    assert_eq!(parse_model_action("list"), ModelAction::FetchList);
+    assert_eq!(
+        classify_key_spec("OPENROUTER_API_KEY"),
+        KeySpec::EnvVar("OPENROUTER_API_KEY".into())
+    );
+    assert_eq!(
+        classify_key_spec("sk-or-v1-abc123"),
+        KeySpec::DirectKey("sk-or-v1-abc123".into())
+    );
+    assert!(matches!(
+        parse_provider_action(Some(
+            "add openrouter openai gpt-4o https://openrouter.ai/api/v1 OPENROUTER_API_KEY"
+        )),
+        ProviderAction::Add { .. }
+    ));
+    assert!(matches!(
+        parse_provider_action(Some("add claude anthropic claude-sonnet-4 ANTHROPIC_API_KEY")),
+        ProviderAction::Add { base_url: None, .. }
+    ));
+    assert!(filter_commands("/mo").len() >= 2);
+    assert!(filter_commands("/model set x").is_empty());
+
+    // Render kartu menu + popup palette live di TestBackend.
+    let mut a = app();
+    a.menu("# Model & Provider Aktif\n* router | ag/gemini-3-flash | aktif\n---\n! Tip cepat");
+    a.input.insert_str("/mo");
+
+    let backend = TestBackend::new(100, 30);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| selencode::tui::draw(f, &mut a)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+    assert!(text.contains("Model & Provider Aktif"), "kartu menu tampil");
+    assert!(text.contains("Menu Perintah"), "popup live palette `/` tampil");
+    assert!(text.contains("/models"), "filter palette cocok /models");
+}
+
+#[test]
 fn render_popup_approval_tampil() {
     let mut a = app();
     let (tx, _rx) = tokio::sync::oneshot::channel::<bool>();

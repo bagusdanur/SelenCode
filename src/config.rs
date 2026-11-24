@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub default_provider: String,
     pub providers: HashMap<String, ProviderCfg>,
@@ -12,20 +12,20 @@ pub struct Config {
     #[serde(default)]
     pub shell: ShellCfg,
     /// Server MCP eksternal (Fase 7). Default kosong = perilaku Fase 6.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerCfg>,
 }
 
 /// Satu server MCP stdio (Fase 7): proses lokal yang di-spawn selen,
 /// tool-nya muncul di registry sebagai `mcp__<name>__<tool>`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerCfg {
     pub name: String,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     /// Env tambahan untuk proses server (opsional).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
     /// true = tool server ini berjalan TANPA approval. Default false:
     /// server eksternal tidak dikenal, jadi setiap panggilan ditanya dulu.
@@ -40,18 +40,25 @@ fn default_mcp_timeout_secs() -> u64 {
     30
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderCfg {
     #[serde(default = "default_kind")]
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     pub model: String,
+    #[serde(default)]
     pub api_key_env: String,
+    /// API key opsional yang disimpan langsung lewat `/provider add` (fallback
+    /// bila env var `api_key_env` belum diset). Disarankan tetap pakai env var
+    /// bila file config ikut di-commit ke git.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     /// Harga opsional per 1M token (Fase 3). Bila kosong, biaya TIDAK ditebak —
     /// yang ditampilkan hanya jumlah token.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_in: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_out: Option<f64>,
 }
 
@@ -59,7 +66,7 @@ fn default_kind() -> String {
     "openai".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCfg {
     #[serde(default = "default_max_steps")]
     pub max_steps: usize,
@@ -104,7 +111,7 @@ fn default_context_limit_tokens() -> usize {
     100_000
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellCfg {
     #[serde(default)]
     pub allowlist: Vec<String>,
@@ -153,8 +160,47 @@ pub fn load_from(path: &std::path::Path) -> Result<Config> {
     Ok(cfg)
 }
 
+/// Path config aktif yang sedang dipakai (atau lokasi global default untuk penyimpanan).
+pub fn active_config_path() -> PathBuf {
+    for p in candidate_paths() {
+        if p.exists() {
+            return p;
+        }
+    }
+    if let Some(cfg) = dirs::config_dir() {
+        return cfg.join("selencode").join("config.toml");
+    }
+    PathBuf::from("./selencode.toml")
+}
+
+/// Simpan config ke path aktif (membuat folder induk bila perlu).
+pub fn save(cfg: &Config) -> Result<PathBuf> {
+    let path = active_config_path();
+    save_to(cfg, &path)?;
+    Ok(path)
+}
+
+pub fn save_to(cfg: &Config, path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("gagal membuat folder config {}", parent.display()))?;
+        }
+    }
+    let text = toml::to_string_pretty(cfg).context("gagal memformat config TOML")?;
+    std::fs::write(path, text)
+        .with_context(|| format!("gagal menyimpan config {}", path.display()))?;
+    #[cfg(unix)]
+    if cfg.providers.values().any(|p| p.api_key.is_some()) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
 impl Config {
     /// Ambil (nama, cfg, api_key) untuk provider terpilih.
+    /// Prioritas key: env var `api_key_env` -> field `api_key` di config.
     pub fn resolve_provider(&self, name: Option<&str>) -> Result<(String, ProviderCfg, String)> {
         let name = name.unwrap_or(&self.default_provider).to_string();
         let cfg = self
@@ -162,14 +208,31 @@ impl Config {
             .get(&name)
             .ok_or_else(|| anyhow!("provider '{name}' tidak ada di config"))?
             .clone();
-        let key = std::env::var(&cfg.api_key_env).map_err(|_| {
-            anyhow!(
-                "env var {} (api_key_env provider '{name}') belum di-set. Contoh: export {}=...",
-                cfg.api_key_env,
-                cfg.api_key_env
-            )
+        let key = if !cfg.api_key_env.trim().is_empty() {
+            std::env::var(&cfg.api_key_env).ok().filter(|v| !v.trim().is_empty())
+        } else {
+            None
+        }
+        .or_else(|| cfg.api_key.clone().filter(|v| !v.trim().is_empty()))
+        .ok_or_else(|| {
+            if cfg.api_key_env.trim().is_empty() {
+                anyhow!(
+                    "provider '{name}' belum punya API key. Atur lewat `/provider add` atau isi api_key_env di config."
+                )
+            } else {
+                anyhow!(
+                    "env var {} (api_key_env provider '{name}') belum di-set. Contoh: export {}=...",
+                    cfg.api_key_env,
+                    cfg.api_key_env
+                )
+            }
         })?;
         Ok((name, cfg, key))
+    }
+
+    /// Apakah API key untuk provider ini siap dipakai (dari env atau config)?
+    pub fn is_key_ready(&self, name: &str) -> bool {
+        self.resolve_provider(Some(name)).is_ok()
     }
 
     pub fn auto_approve(&self, yes_flag: bool) -> bool {

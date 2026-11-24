@@ -16,6 +16,8 @@ pub enum LineKind {
     Assistant,
     Tool,
     Info,
+    /// Kartu output perintah `/` berwarna & terstruktur (bukan abu-abu polos).
+    Menu,
     Error,
     /// Blok checklist update_plan (Fase 6).
     Plan,
@@ -96,6 +98,8 @@ pub struct App {
     /// terakhir, untuk menghitung lompatan PageUp/PageDown.
     pub last_total_lines: usize,
     pub last_viewport: usize,
+    /// Indeks item terpilih pada popup live `/` command palette.
+    pub palette_idx: usize,
 }
 
 pub fn new_textarea() -> TextArea<'static> {
@@ -142,6 +146,7 @@ impl App {
             streaming: false,
             last_total_lines: 0,
             last_viewport: 0,
+            palette_idx: 0,
         }
     }
 
@@ -165,6 +170,13 @@ impl App {
         self.lines
             .push(TranscriptLine::simple(LineKind::Info, text.into()));
         self.streaming = false;
+    }
+
+    pub fn menu(&mut self, markup: impl Into<String>) {
+        self.lines
+            .push(TranscriptLine::simple(LineKind::Menu, markup.into()));
+        self.streaming = false;
+        self.scroll = 0;
     }
 
     pub fn error(&mut self, text: impl Into<String>) {
@@ -288,6 +300,28 @@ impl App {
                 );
             }
             UiEvent::Info(text) => self.info(text),
+            UiEvent::Menu(markup) => self.menu(markup),
+            UiEvent::SessionReset {
+                session_id,
+                provider,
+                model,
+            } => {
+                self.lines.clear();
+                self.welcome = None;
+                self.resumed = false;
+                self.session_id = session_id;
+                self.provider = provider;
+                self.model = model;
+                self.session_in = 0;
+                self.session_out = 0;
+                self.context_pct = 0;
+                self.step_current = 0;
+                self.scroll = 0;
+                self.busy = false;
+                self.streaming = false;
+                self.pending_plan = None;
+                self.plan_next = false;
+            }
             UiEvent::Error(text) => {
                 self.busy = false;
                 self.error(text);

@@ -37,8 +37,16 @@ pub enum UiEvent {
     /// Giliran plan selesai & rencana diekstrak (Fase 6): UI menyimpan
     /// rencana ini sebagai menunggu konfirmasi y/n dari user.
     PlanReady(String),
-    /// Pesan informasi (ringkasan token, daftar sesi, compaction, dll).
+    /// Pesan informasi (ringkasan token, compaction, dll).
     Info(String),
+    /// Kartu menu terstruktur berwarna (output /help, /model, /provider, /sessions).
+    Menu(String),
+    /// Sesi baru dimulai (/new): bersihkan transkrip & reset statistik sesi.
+    SessionReset {
+        session_id: String,
+        provider: String,
+        model: String,
+    },
     /// Giliran gagal dengan error.
     Error(String),
 }

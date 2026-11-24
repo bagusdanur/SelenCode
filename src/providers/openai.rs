@@ -39,6 +39,43 @@ impl OpenAiProvider {
     }
 }
 
+/// Tarik daftar ID model yang tersedia dari endpoint OpenAI-compatible
+/// `GET {base_url}/models` (dipakai `/model list` atau `/models`).
+pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .with_context(|| format!("gagal menghubungi {url}"))?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let txt = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "endpoint /models membalas {st}: {}",
+            txt.chars().take(300).collect::<String>()
+        ));
+    }
+    let v: Value = resp.json().await.context("respons /models bukan JSON valid")?;
+    let mut ids: Vec<String> = v["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
 fn messages_to_openai(msgs: &[Message]) -> Vec<Value> {
     let mut out = Vec::new();
     for m in msgs {
