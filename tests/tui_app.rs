@@ -188,6 +188,27 @@ fn render_satu_frame_memuat_sambutan_dan_status() {
 }
 
 #[test]
+fn render_percakapan_markdown_rapi_tanpa_tanda_mentah() {
+    let mut a = app();
+    a.push_user("kamu bisa apa aja");
+    a.apply_event(UiEvent::Token(
+        "1. **Membaca Kode**: gunakan `read_file`.\n2. **Edit**: pakai `edit_file`.".into(),
+    ));
+    a.apply_event(UiEvent::TurnDone { usage: None });
+
+    let backend = TestBackend::new(100, 30);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| selencode::tui::draw(f, &mut a)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+    assert!(text.contains("Selena"), "header Selena tampil");
+    assert!(text.contains("Membaca Kode"), "teks bold tampil");
+    assert!(text.contains("read_file"), "teks kode inline tampil");
+    assert!(!text.contains("**Membaca"), "tanda ** mentah tidak boleh tampil");
+    assert!(!text.contains("`read_file`"), "tanda ` mentah tidak boleh tampil");
+}
+
+#[test]
 fn render_popup_approval_tampil() {
     let mut a = app();
     let (tx, _rx) = tokio::sync::oneshot::channel::<bool>();

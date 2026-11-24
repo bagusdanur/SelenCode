@@ -10,6 +10,7 @@
 
 pub mod app;
 pub mod diff_view;
+pub mod markdown;
 pub mod moonlit;
 
 use crate::agent::UiEvent;
@@ -25,7 +26,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -60,86 +61,126 @@ pub struct TuiChannels {
 fn display_lines(app: &App) -> Vec<Line<'static>> {
     // Sambutan Moonlit menempel di awal transkrip & ikut bergulir.
     let mut out: Vec<Line<'static>> = app.welcome.clone().unwrap_or_default();
-    if !out.is_empty() {
-        out.push(Line::from(""));
-    }
+    let mut prev_kind: Option<LineKind> = None;
+
     for l in &app.lines {
         match l.kind {
             LineKind::User => {
+                if !out.is_empty() {
+                    out.push(Line::from(""));
+                }
                 let mut first = true;
                 for part in l.text.lines() {
-                    let prefix = if first { "> " } else { "  " };
+                    let (bar, prompt) = if first {
+                        ("  ┃ ", "❯ ")
+                    } else {
+                        ("  ┃ ", "  ")
+                    };
                     out.push(Line::from(vec![
+                        Span::styled(bar.to_string(), Style::default().fg(moonlit::DEEP)),
                         Span::styled(
-                            prefix.to_string(),
+                            prompt.to_string(),
                             Style::default()
                                 .fg(moonlit::VIOLET)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             part.to_string(),
-                            Style::default().add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(moonlit::SILVER)
+                                .add_modifier(Modifier::BOLD),
                         ),
                     ]));
                     first = false;
                 }
             }
             LineKind::Assistant => {
-                for part in l.text.lines() {
-                    out.push(Line::from(part.to_string()));
+                if prev_kind != Some(LineKind::Assistant) {
+                    if !out.is_empty() {
+                        out.push(Line::from(""));
+                    }
+                    out.push(Line::from(vec![
+                        Span::styled(
+                            "  ☾ ".to_string(),
+                            Style::default()
+                                .fg(moonlit::VIOLET)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            "Selena".to_string(),
+                            Style::default()
+                                .fg(moonlit::LILAC)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
                 }
+                out.extend(markdown::render_markdown(&l.text));
             }
             LineKind::Tool => {
                 let (icon, color) = match l.tool_state {
-                    Some(ToolState::Pending) => ("◐", Color::Yellow),
-                    Some(ToolState::Ok) => ("●", Color::Green),
-                    Some(ToolState::Err) => ("✖", Color::Red),
-                    None => ("●", Color::DarkGray),
+                    Some(ToolState::Pending) => ("◐", moonlit::GOLD),
+                    Some(ToolState::Ok) => ("●", moonlit::MINT),
+                    Some(ToolState::Err) => ("✖", moonlit::ROSE),
+                    None => ("●", moonlit::DIM),
                 };
                 let mut first = true;
                 for part in l.text.lines() {
                     let prefix = if first {
-                        format!("{icon} ")
+                        format!("  {icon} ")
                     } else {
-                        "  ".to_string()
+                        "    ".to_string()
                     };
                     out.push(Line::from(vec![
                         Span::styled(prefix, Style::default().fg(color)),
-                        Span::styled(part.to_string(), Style::default().fg(Color::Gray)),
+                        Span::styled(part.to_string(), Style::default().fg(moonlit::DIM)),
                     ]));
                     first = false;
                 }
             }
             LineKind::Plan => {
+                if !out.is_empty() {
+                    out.push(Line::from(""));
+                }
                 for part in l.text.lines() {
-                    out.push(Line::from(Span::styled(
-                        part.to_string(),
-                        Style::default().fg(moonlit::LAV),
-                    )));
+                    out.push(Line::from(vec![
+                        Span::styled("  ┃ ".to_string(), Style::default().fg(moonlit::VIOLET)),
+                        Span::styled(part.to_string(), Style::default().fg(moonlit::LAV)),
+                    ]));
                 }
             }
             LineKind::Info => {
-                for part in l.text.lines() {
-                    out.push(Line::from(Span::styled(
-                        part.to_string(),
-                        Style::default().fg(moonlit::DIM),
-                    )));
+                let is_usage = l.text.starts_with("token sesi ini:");
+                for (idx, part) in l.text.lines().enumerate() {
+                    if is_usage {
+                        out.push(Line::from(vec![
+                            Span::styled("  ╰─ ".to_string(), Style::default().fg(moonlit::FAINT)),
+                            Span::styled(part.to_string(), Style::default().fg(moonlit::DIM)),
+                        ]));
+                    } else {
+                        let prefix = if idx == 0 { "  · " } else { "    " };
+                        out.push(Line::from(vec![
+                            Span::styled(prefix.to_string(), Style::default().fg(moonlit::VIOLET)),
+                            Span::styled(part.to_string(), Style::default().fg(moonlit::DIM)),
+                        ]));
+                    }
                 }
             }
             LineKind::Error => {
-                for part in l.text.lines() {
-                    out.push(Line::from(Span::styled(
-                        format!("[error] {part}"),
-                        Style::default().fg(Color::Red),
-                    )));
+                for (idx, part) in l.text.lines().enumerate() {
+                    let prefix = if idx == 0 { "  ✖ [error] " } else { "            " };
+                    out.push(Line::from(vec![
+                        Span::styled(prefix.to_string(), Style::default().fg(moonlit::ROSE)),
+                        Span::styled(part.to_string(), Style::default().fg(moonlit::ROSE)),
+                    ]));
                 }
             }
         }
+        prev_kind = Some(l.kind);
     }
     if out.is_empty() {
         out.push(Line::from(Span::styled(
-            "Ketik perintah untuk Selena…",
-            Style::default().fg(Color::DarkGray),
+            "  ☾ Ketik perintah untuk Selena…",
+            Style::default().fg(moonlit::DIM),
         )));
     }
     out
@@ -224,7 +265,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .scroll((y, 0));
     frame.render_widget(transcript, chunks[0]);
 
-    // Status bar Moonlit × Hermes: model + fase bulan + konteks + token + langkah + cwd.
+    // Status bar Moonlit (ungu bersih): model + fase bulan + konteks + token + langkah + cwd.
     let status = Paragraph::new(moonlit::status_line(
         &app.model,
         app.context_pct,
@@ -237,8 +278,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ));
     frame.render_widget(status, chunks[1]);
 
-    // Input: bingkai BORDER (emas hangat bergaya Hermes); prompt "❯" emas
-    // tebal di sel kiri dalam bingkai; textarea tanpa bingkai di sisanya.
+    // Input: bingkai BORDER (ungu Moonlit); prompt "❯" violet tebal di sel
+    // kiri dalam bingkai; textarea tanpa bingkai di sisanya.
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(moonlit::BORDER));
@@ -252,7 +293,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(Span::styled(
             "❯",
             Style::default()
-                .fg(moonlit::GOLD)
+                .fg(moonlit::VIOLET)
                 .add_modifier(Modifier::BOLD),
         )),
         cols[0],

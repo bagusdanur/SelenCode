@@ -1,0 +1,48 @@
+name: ci
+
+# Tes nyata otomatis di setiap push ke main & PR (tanpa membuat rilis / tanpa naik versi).
+# Menjalankan seluruh cargo test, kompilasi example render_welcome, dan build tes Windows.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-linux:
+    name: Cargo Test & Visual Render (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Jalankan semua unit & integration tests
+        run: cargo test
+      - name: Uji render frame TUI nyata (wide 116 & HP 52)
+        run: |
+          cargo run --example render_welcome -- /tmp/wide.dump 116 36
+          cargo run --example render_welcome -- /tmp/hp.dump 52 32
+          python3 -m pip install --quiet pillow
+          python3 design/render_bukti.py /tmp/wide.dump /tmp/preview-wide.png
+          python3 design/render_bukti.py /tmp/hp.dump /tmp/preview-hp.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tui-preview-png
+          path: |
+            /tmp/preview-wide.png
+            /tmp/preview-hp.png
+
+  test-windows:
+    name: Cargo Test & Check (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Jalankan tes di Windows
+        run: cargo test --test moonlit --test tui_app --test update --test fase2 --test fase3 --test fase6 --test loop_mock --test tools_file --test outline
+      - name: Build preview selen.exe (Windows)
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-selen-windows-x64.exe
+          path: target/release/selen.exe

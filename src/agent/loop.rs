@@ -195,11 +195,7 @@ async fn run_turn_inner(
             *messages = compact_messages(messages);
         }
         if let Some(tx) = &ui {
-            let pct = if ctx.context_limit_tokens > 0 {
-                (estimate_tokens(messages) * 100 / ctx.context_limit_tokens).min(100) as u8
-            } else {
-                0
-            };
+            let pct = calc_context_pct(estimate_tokens(messages), ctx.context_limit_tokens);
             let _ = tx
                 .send(UiEvent::Step {
                     current: step + 1,
@@ -277,6 +273,19 @@ async fn run_turn_inner(
 
         if reply.tool_calls.is_empty() {
             if let Some(tx) = &ui {
+                let reported = reply
+                    .usage
+                    .map(|u| (u.input_tokens + u.output_tokens) as usize)
+                    .unwrap_or(0);
+                let used = estimate_tokens(messages).max(reported);
+                let pct = calc_context_pct(used, ctx.context_limit_tokens);
+                let _ = tx
+                    .send(UiEvent::Step {
+                        current: step + 1,
+                        max: max_steps,
+                        context_pct: pct,
+                    })
+                    .await;
                 let _ = tx
                     .send(UiEvent::TurnDone {
                         usage: have_usage.then_some(turn_usage),
@@ -380,6 +389,15 @@ async fn run_turn_inner(
             .await;
     }
     Ok((last_text, have_usage.then_some(turn_usage)))
+}
+
+/// Persentase pemakaian konteks (0..=100), dibulatkan ke atas agar pemakaian
+/// kecil yang nyata (>0 token) tidak tampil sebagai 0%.
+fn calc_context_pct(tokens: usize, limit: usize) -> u8 {
+    if limit == 0 || tokens == 0 {
+        return 0;
+    }
+    ((tokens.saturating_mul(100) + limit - 1) / limit).min(100) as u8
 }
 
 /// Ringkasan 1 baris: ambil baris pertama non-kosong, potong di batas char.

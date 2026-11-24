@@ -43,9 +43,19 @@ fn main() {
     );
     app.provider_label = "router (router.ryukomik.com)".to_string();
     app.tool_count = 12;
-    app.context_pct = 43;
-    app.session_in = 12_480;
-    app.step_current = 3;
+    app.session_id = "a1b2c3d4e5f6".to_string();
+    app.context_pct = 18;
+    app.session_in = 8_280;
+    app.session_out = 254;
+    app.step_current = 1;
+    app.push_user("kamu bisa apa aja");
+    app.apply_event(selencode::agent::UiEvent::Token(
+        "Sebagai **Selena**, aku bisa membantu:\n\n1. **Membaca & Memahami Kode**: pakai `search_text`, `outline`, dan `read_file`.\n2. **Menulis & Mengedit**: ubah kode dengan `edit_file`.\n\n```rust\nfn main() { println!(\"halo\"); }\n```"
+            .into(),
+    ));
+    app.apply_event(selencode::agent::UiEvent::TurnDone { usage: None });
+    app.info("token sesi ini: 8.280 in / 254 out");
+    app.scroll = 0;
 
     let backend = TestBackend::new(w, h);
     let mut term = Terminal::new(backend).unwrap();

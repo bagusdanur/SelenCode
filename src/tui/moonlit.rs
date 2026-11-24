@@ -1,27 +1,27 @@
-//! Desain "Moonlit × Hermes" untuk TUI SelenCode — fungsi murni, gampang
-//! dites. Menggabungkan estetika Hermes-Agent (banner 3D berbayang di atas
-//! kartu berbingkai judul, panel dua kolom emblem + daftar tool & perintah,
-//! footer ringkas, status bar bergaya bar) dengan identitas Moonlit SelenCode
-//! (bulan sabit braille, bintang emas, aksen gold/amber & lavender).
+//! Desain orisinal "Moonlit" untuk TUI SelenCode — fungsi murni, gampang
+//! dites. Identitas khas SelenCode: palet ungu malam (Lilac, Lavender, Violet,
+//! Deep Indigo) dengan bulan sabit braille bergradien ungu, bintang kecil emas
+//! sebagai aksen tipis, kartu Lunar Observatory terpadu, dan status bar bersih.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-// ---------- palet Moonlit × Hermes ----------
+// ---------- palet Moonlit (ungu malam khas SelenCode) ----------
 
 pub const BG: Color = Color::Rgb(13, 10, 26);
+pub const LILAC: Color = Color::Rgb(233, 213, 255);
+pub const LAV: Color = Color::Rgb(196, 181, 253);
 pub const VIOLET: Color = Color::Rgb(167, 139, 250);
 pub const DEEP: Color = Color::Rgb(109, 40, 217);
-pub const LAV: Color = Color::Rgb(196, 181, 253);
+pub const SHADOW: Color = Color::Rgb(76, 29, 149);
+pub const BORDER: Color = Color::Rgb(99, 78, 158);
+pub const CYAN_MOON: Color = Color::Rgb(125, 211, 252);
 pub const SILVER: Color = Color::Rgb(229, 231, 235);
 pub const DIM: Color = Color::Rgb(148, 140, 180);
-pub const FAINT: Color = Color::Rgb(94, 84, 130);
+pub const FAINT: Color = Color::Rgb(84, 74, 118);
 pub const GOLD: Color = Color::Rgb(252, 211, 77);
-pub const GOLD_BRIGHT: Color = Color::Rgb(254, 240, 138);
-pub const AMBER: Color = Color::Rgb(245, 158, 11);
-pub const AMBER_DIM: Color = Color::Rgb(168, 132, 68);
-pub const SHADOW: Color = Color::Rgb(138, 92, 38);
-pub const BORDER: Color = Color::Rgb(150, 118, 62);
+pub const MINT: Color = Color::Rgb(110, 231, 160);
+pub const ROSE: Color = Color::Rgb(248, 113, 113);
 
 fn st(color: Color) -> Style {
     Style::default().fg(color)
@@ -45,10 +45,9 @@ const BRAILLE_BITS: [(usize, usize, u32); 8] = [
     (1, 3, 0x80),
 ];
 
-/// Bulan sabit dari karakter braille: titik menyala bila berada di dalam
-/// lingkaran besar DAN di luar lingkaran geser (potongan sabit). Sel kosong
-/// memakai U+2800 (braille blank) agar lebar baris konsisten di semua
-/// terminal. Semua baris punya jumlah karakter persis `cols`.
+/// Bulan sabit dari karakter braille: titik menyala bila di dalam lingkaran
+/// besar DAN di luar lingkaran geser (potongan sabit). Sel kosong memakai
+/// U+2800 (braille blank) agar lebar baris konsisten di semua terminal.
 pub fn moon_art(cols: usize, rows: usize) -> Vec<String> {
     if cols == 0 || rows == 0 {
         return Vec::new();
@@ -82,74 +81,7 @@ pub fn moon_art(cols: usize, rows: usize) -> Vec<String> {
     out
 }
 
-// ---------- banner 3D ANSI Shadow bergaya Hermes ----------
-
-/// Banner 3D "SELENCODE" (6 baris, 83 kolom) dengan blok `█` + bayangan
-/// box-drawing `╗═╝║╚╔` bergaya Hermes-Agent.
-const BANNER_3D_ROWS: [&str; 6] = [
-    "███████╗ ███████╗ ██╗      ███████╗ ███╗   ██╗  ██████╗  ██████╗  ██████╗  ███████╗",
-    "██╔════╝ ██╔════╝ ██║      ██╔════╝ ████╗  ██║ ██╔════╝ ██╔═══██╗ ██╔══██╗ ██╔════╝",
-    "███████╗ █████╗   ██║      █████╗   ██╔██╗ ██║ ██║      ██║   ██║ ██║  ██║ █████╗  ",
-    "╚════██║ ██╔══╝   ██║      ██╔══╝   ██║╚██╗██║ ██║      ██║   ██║ ██║  ██║ ██╔══╝  ",
-    "███████║ ███████╗ ███████╗ ███████╗ ██║ ╚████║ ╚██████╗ ╚██████╔╝ ██████╔╝ ███████╗",
-    "╚══════╝ ╚══════╝ ╚══════╝ ╚══════╝ ╚═╝  ╚═══╝  ╚═════╝  ╚═════╝  ╚═════╝  ╚══════╝",
-];
-
-/// Warna gradien vertikal per baris banner 3D (emas terang -> amber hangat).
-const BANNER_GRADIENT: [Color; 6] = [
-    GOLD_BRIGHT,
-    GOLD_BRIGHT,
-    GOLD,
-    AMBER,
-    AMBER,
-    SHADOW,
-];
-
-/// Render banner 3D "SELENCODE" bergaya Hermes dengan gradien vertikal pada
-/// badan huruf (`█`) dan warna bayangan redup pada sisi 3D (`╗═╝║╚╔`).
-pub fn banner_3d_lines(width: usize) -> Vec<Line<'static>> {
-    let art_w = BANNER_3D_ROWS[0].chars().count();
-    let pad = width.saturating_sub(art_w) / 2;
-    let mut out = Vec::with_capacity(BANNER_3D_ROWS.len());
-    for (row_idx, raw) in BANNER_3D_ROWS.iter().enumerate() {
-        let face_color = BANNER_GRADIENT[row_idx];
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        if pad > 0 {
-            spans.push(Span::raw(" ".repeat(pad)));
-        }
-        // Kelompokkan run karakter sejenis agar jumlah Span tetap ringkas.
-        let mut run = String::new();
-        let mut run_kind: u8 = 0; // 0 = spasi, 1 = blok █, 2 = bayangan 3D
-        let flush = |spans: &mut Vec<Span<'static>>, run: &mut String, kind: u8| {
-            if run.is_empty() {
-                return;
-            }
-            let text = std::mem::take(run);
-            match kind {
-                1 => spans.push(Span::styled(text, stb(face_color))),
-                2 => spans.push(Span::styled(text, st(SHADOW))),
-                _ => spans.push(Span::raw(text)),
-            }
-        };
-        for ch in raw.chars() {
-            let kind = match ch {
-                '█' => 1,
-                ' ' => 0,
-                _ => 2,
-            };
-            if kind != run_kind {
-                flush(&mut spans, &mut run, run_kind);
-                run_kind = kind;
-            }
-            run.push(ch);
-        }
-        flush(&mut spans, &mut run, run_kind);
-        out.push(Line::from(fit(spans, width)));
-    }
-    out
-}
-
-// ---------- wordmark balok 5x7 (dipertahankan untuk kompatibilitas) ----------
+// ---------- wordmark piksel 5x7 khas SelenCode ----------
 
 fn glyph(ch: char) -> [&'static str; 7] {
     match ch {
@@ -164,8 +96,7 @@ fn glyph(ch: char) -> [&'static str; 7] {
     }
 }
 
-/// Wordmark "SELENCODE" balok 5x7: 7 baris, semua baris lebar karakter sama
-/// (9 huruf x 6 - 1 = 53).
+/// Wordmark "SELENCODE" piksel 5x7: 7 baris, lebar seragam 53 kolom.
 pub fn wordmark() -> Vec<String> {
     let mut rows: Vec<String> = vec![String::new(); 7];
     for ch in "SELENCODE".chars() {
@@ -197,12 +128,15 @@ pub fn phase_glyph(pct: u8) -> char {
     PHASES[idx]
 }
 
-/// Bar konteks 10 sel: "▓" terisi / "░" kosong — dikembalikan sebagai
-/// (terisi, kosong) agar bisa diwarnai terpisah.
+/// Bar konteks 10 sel bersih (`━` terisi / `─` kosong) — tajam di Windows
+/// Terminal, VS Code Terminal, Linux, dan Termux.
 pub fn context_bar_parts(pct: u8) -> (String, String) {
-    let filled = ((pct as usize * 10) + 50) / 100;
-    let filled = filled.min(10);
-    ("▓".repeat(filled), "░".repeat(10 - filled))
+    let filled = if pct == 0 {
+        0
+    } else {
+        (((pct as usize * 10) + 50) / 100).clamp(1, 10)
+    };
+    ("━".repeat(filled), "─".repeat(10 - filled))
 }
 
 /// Format angka gaya id-ID: 12480 -> "12.480".
@@ -223,14 +157,11 @@ pub fn fmt_tokens(n: u64) -> String {
 #[derive(Debug, Clone)]
 pub struct WelcomeInfo {
     pub version: String,
-    /// Nama pendek provider, mis. "router".
     pub provider_name: String,
-    /// Label tampil provider, mis. "router (router.ryukomik.com)".
     pub provider_label: String,
     pub model: String,
     pub cwd: String,
     pub tool_count: usize,
-    /// Potongan pendek ID sesi aktif (mis. 8 karakter pertama UUID).
     pub session_short: String,
 }
 
@@ -254,7 +185,7 @@ impl WelcomeInfo {
     }
 
     pub fn with_session_id(mut self, session_id: &str) -> Self {
-        let short: String = session_id.chars().take(12).collect();
+        let short: String = session_id.chars().take(10).collect();
         if !short.is_empty() {
             self.session_short = short;
         }
@@ -262,7 +193,7 @@ impl WelcomeInfo {
     }
 }
 
-// ---------- perakitan baris berbingkai ----------
+// ---------- perakitan bingkai Lunar Observatory ----------
 
 fn text_w(s: &str) -> usize {
     s.chars().count()
@@ -272,7 +203,6 @@ fn spans_w(spans: &[Span]) -> usize {
     spans.iter().map(|s| text_w(&s.content)).sum()
 }
 
-/// Potong spans agar total lebar <= budget (per karakter, gaya dipertahankan).
 fn fit(spans: Vec<Span<'static>>, budget: usize) -> Vec<Span<'static>> {
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
@@ -293,8 +223,6 @@ fn fit(spans: Vec<Span<'static>>, budget: usize) -> Vec<Span<'static>> {
     out
 }
 
-/// Bungkus konten menjadi 1 baris berbingkai "│ ... │" selebar persis
-/// `width` (dipotong aman bila kepanjangan, di-pad bila kurang).
 fn framed(content: Vec<Span<'static>>, width: usize) -> Line<'static> {
     if width < 2 {
         return Line::from("");
@@ -311,42 +239,72 @@ fn framed(content: Vec<Span<'static>>, width: usize) -> Line<'static> {
     Line::from(line)
 }
 
-fn border_line(width: usize, left: char, right: char) -> Line<'static> {
+fn divider_line(width: usize) -> Line<'static> {
     if width < 2 {
         return Line::from("");
     }
-    let mut s = String::with_capacity(width);
-    s.push(left);
-    for _ in 0..width - 2 {
-        s.push('─');
-    }
-    s.push(right);
-    Line::from(Span::styled(s, st(BORDER)))
+    Line::from(vec![
+        sp("├", st(BORDER)),
+        sp("─".repeat(width - 2), st(FAINT)),
+        sp("┤", st(BORDER)),
+    ])
 }
 
-/// Bingkai atas berjudul di tengah: `╭──── Title ────╮` (gaya Hermes).
-fn titled_top_border(width: usize, title: &str) -> Line<'static> {
-    if width < 6 {
-        return border_line(width, '╭', '╮');
+/// Bingkai atas asimetris khas SelenCode: `╭── ☾ SelenCode · edisi Moonlit ─────── v0.1.4 ──╮`
+fn top_frame(width: usize, left_tag: &str, right_tag: &str) -> Line<'static> {
+    if width < 10 {
+        return Line::from(Span::styled(
+            format!("╭{}╮", "─".repeat(width.saturating_sub(2))),
+            st(BORDER),
+        ));
     }
     let inner = width - 2;
-    let label = format!(" {title} ");
-    let lw = text_w(&label);
-    if lw >= inner {
-        let cut: String = label.chars().take(inner).collect();
+    let left = format!("── {left_tag} ");
+    let right = format!(" {right_tag} ──");
+    let lw = text_w(&left);
+    let rw = text_w(&right);
+    if lw + rw >= inner {
+        let cut = truncate_chars(left_tag, inner.saturating_sub(2));
+        let fill = inner.saturating_sub(text_w(&cut) + 2);
         return Line::from(vec![
-            sp("╭", st(BORDER)),
-            sp(cut, stb(GOLD)),
-            sp("╮", st(BORDER)),
+            sp("╭─", st(BORDER)),
+            sp(format!(" {cut} "), stb(LAV)),
+            sp(format!("{}╮", "─".repeat(fill.saturating_sub(1))), st(BORDER)),
         ]);
     }
-    let rem = inner - lw;
-    let left_dash = rem / 2;
-    let right_dash = rem - left_dash;
+    let mid = inner - lw - rw;
     Line::from(vec![
-        sp(format!("╭{}", "─".repeat(left_dash)), st(BORDER)),
-        sp(label, stb(GOLD)),
-        sp(format!("{}╮", "─".repeat(right_dash)), st(BORDER)),
+        sp("╭── ", st(BORDER)),
+        sp(left_tag.to_string(), stb(LAV)),
+        sp(format!(" {} ", "─".repeat(mid)), st(BORDER)),
+        sp(right_tag.to_string(), st(DIM)),
+        sp(" ──╮", st(BORDER)),
+    ])
+}
+
+/// Bingkai bawah terpadu dengan footer badge: `╰── sandbox: folder ini saja ──── /help ──╯`
+fn bottom_frame(width: usize, left_note: &str, right_note: &str) -> Line<'static> {
+    if width < 10 {
+        return Line::from(Span::styled(
+            format!("╰{}╯", "─".repeat(width.saturating_sub(2))),
+            st(BORDER),
+        ));
+    }
+    let inner = width - 2;
+    let left = format!("── {left_note} ");
+    let right = format!(" {right_note} ──");
+    let lw = text_w(&left);
+    let rw = text_w(&right);
+    if lw + rw >= inner {
+        return Line::from(Span::styled(format!("╰{}╯", "─".repeat(inner)), st(BORDER)));
+    }
+    let mid = inner - lw - rw;
+    Line::from(vec![
+        sp("╰── ", st(BORDER)),
+        sp(left_note.to_string(), st(DIM)),
+        sp(format!(" {} ", "─".repeat(mid)), st(BORDER)),
+        sp(right_note.to_string(), st(VIOLET)),
+        sp(" ──╯", st(BORDER)),
     ])
 }
 
@@ -366,33 +324,31 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-// ---------- layar sambutan (Hermes × Moonlit) ----------
+// ---------- layar sambutan orisinal Moonlit ----------
 
-const TOOL_GROUPS: [(&str, &str); 7] = [
-    ("file:   ", "list_files, read_file, write_file, edit_file"),
-    ("search: ", "search_text, outline (AST tree-sitter)"),
-    ("shell:  ", "run_shell (approval / allowlist)"),
-    ("git:    ", "git_status, git_diff, git_commit"),
-    ("web:    ", "fetch_url (anti-SSRF)"),
-    ("plan:   ", "update_plan, delegate (subagent paralel)"),
-    ("mcp:    ", "mcp__* (server MCP eksternal)"),
+const TOOL_ROWS: [(&str, &str); 6] = [
+    ("file    ", "list_files · read_file · write_file · edit_file"),
+    ("cari    ", "search_text · outline (AST tree-sitter)"),
+    ("shell   ", "run_shell (izin dulu / allowlist)"),
+    ("git     ", "git_status · git_diff · git_commit"),
+    ("web     ", "fetch_url (anti-SSRF)"),
+    ("agent   ", "update_plan · delegate · mcp__*"),
 ];
 
-const CMD_LIST: [(&str, &str); 6] = [
-    ("/plan     ", "rencana dulu, eksekusi sesudah disetujui"),
-    ("/model    ", "lihat & ganti provider/model aktif"),
-    ("/sessions ", "daftar 10 sesi terakhir di folder ini"),
-    ("/resume   ", "info sesi aktif (CLI: selen resume)"),
-    ("/help     ", "tampilkan semua perintah"),
-    ("/exit     ", "keluar dari SelenCode"),
+const CMD_ROWS: [(&str, &str); 6] = [
+    ("/plan     ", "mode baca-saja berencana"),
+    ("/model    ", "lihat & ganti provider/model"),
+    ("/sessions ", "riwayat sesi folder ini"),
+    ("/resume   ", "info sesi aktif"),
+    ("/help     ", "daftar perintah"),
+    ("/exit     ", "keluar"),
 ];
 
-/// Baris-baris sambutan bergaya Hermes × Moonlit selebar `width`.
-/// Tata letak lebar bila `width >= 90`, tata letak HP (Termux) bila lebih sempit.
+/// Layar sambutan Moonlit orisinal selebar `width` (wide >= 96, HP < 96).
 /// Semua baris dijamin `<= width`.
 pub fn welcome_lines(width: u16, info: &WelcomeInfo) -> Vec<Line<'static>> {
     let width = (width as usize).max(4);
-    if width >= 90 {
+    if width >= 96 {
         welcome_wide(width, info)
     } else {
         welcome_narrow(width, info)
@@ -400,126 +356,124 @@ pub fn welcome_lines(width: u16, info: &WelcomeInfo) -> Vec<Line<'static>> {
 }
 
 fn welcome_wide(width: usize, info: &WelcomeInfo) -> Vec<Line<'static>> {
+    let inner = width - 2;
     let mut out: Vec<Line<'static>> = Vec::new();
 
-    // 1. Banner 3D "SELENCODE" berbayang di atas kartu (persis gaya Hermes).
-    out.extend(banner_3d_lines(width));
-    out.push(Line::from(""));
+    // 1. Top frame asimetris ungu khas SelenCode
+    out.push(top_frame(
+        width,
+        "☾ SelenCode · edisi Moonlit",
+        &format!("v{}", info.version),
+    ));
 
-    // 2. Kartu utama berbingkai judul di tengah.
-    let title = format!("SelenCode v{} · edisi Moonlit · Selena", info.version);
-    out.push(titled_top_border(width, &title));
-
-    // Kolom kiri (emblem bulan sabit braille + info sesi) lebar tetap 34 sel.
-    const LEFT_COL: usize = 34;
+    // 2. Zona Hero: bulan sabit braille gradien ungu di kiri + wordmark 2-nada
+    //    ungu + strip status sesi di kanan.
     let moon = moon_art(20, 11);
-    let mut left_rows: Vec<Vec<Span<'static>>> = Vec::new();
-    left_rows.push(vec![]);
-    for (i, mrow) in moon.iter().enumerate() {
-        let color = if i <= 2 {
-            GOLD_BRIGHT
-        } else if i <= 7 {
-            GOLD
-        } else {
-            AMBER
+    let mark = wordmark();
+    let mut right_rows: Vec<Vec<Span<'static>>> = Vec::new();
+    right_rows.push(vec![]);
+    for (i, mrow) in mark.iter().enumerate() {
+        let color = match i {
+            0..=1 => LILAC,
+            2..=4 => VIOLET,
+            _ => DEEP,
         };
-        let mut row = vec![Span::raw("     "), sp(mrow.clone(), st(color))];
+        right_rows.push(vec![sp(mrow.clone(), stb(color))]);
+    }
+    right_rows.push(vec![
+        sp("☾ Selena", stb(LAV)),
+        sp("  ·  asisten coding terminal  ·  full Rust", st(DIM)),
+    ]);
+    right_rows.push(vec![
+        sp("● ", st(MINT)),
+        sp(truncate_chars(&info.model, 28), stb(LILAC)),
+        sp("  via  ", st(FAINT)),
+        sp(truncate_chars(&info.provider_label, 30), st(SILVER)),
+    ]);
+    right_rows.push(vec![
+        sp("⌂ ", st(VIOLET)),
+        sp(truncate_chars(&info.cwd, 42), st(DIM)),
+        sp("   sesi ", st(FAINT)),
+        sp(info.session_short.clone(), st(LAV)),
+    ]);
+
+    for i in 0..11 {
+        let mcolor = match i {
+            0..=2 => LILAC,
+            3..=7 => VIOLET,
+            _ => DEEP,
+        };
+        let mut row: Vec<Span<'static>> = vec![Span::raw("   "), sp(moon[i].clone(), st(mcolor))];
         if i == 1 {
-            row.push(sp(" ✦", stb(GOLD_BRIGHT)));
+            row.push(sp(" ✦", stb(GOLD)));
         } else if i == 3 {
             row.push(sp("  ✧", st(LAV)));
+        } else if i == 8 {
+            row.push(sp(" ·", st(FAINT)));
         }
-        left_rows.push(row);
+        let cur = spans_w(&row);
+        if cur < 30 {
+            row.push(Span::raw(" ".repeat(30 - cur)));
+        }
+        if let Some(rr) = right_rows.get(i) {
+            row.extend(rr.iter().cloned());
+        }
+        out.push(framed(row, width));
     }
-    left_rows.push(vec![]);
-    left_rows.push(vec![
-        sp("  ", st(DIM)),
-        sp(truncate_chars(&info.model, 17), stb(GOLD)),
-        sp(" / ", st(BORDER)),
-        sp(truncate_chars(&info.provider_name, 10), st(AMBER_DIM)),
-    ]);
-    left_rows.push(vec![
-        sp("  ", st(DIM)),
-        sp(truncate_chars(&info.cwd, LEFT_COL - 4), st(DIM)),
-    ]);
-    left_rows.push(vec![
-        sp("  Session: ", st(DIM)),
-        sp(truncate_chars(&info.session_short, 12), st(LAV)),
-        sp(" · Selena", st(DIM)),
-    ]);
-    left_rows.push(vec![
-        sp("  Provider: ", st(DIM)),
-        sp(truncate_chars(&info.provider_label, LEFT_COL - 13), st(DIM)),
-    ]);
 
-    // Kolom kanan: Available Tools + Available Commands (Perintah) + ringkasan.
-    let mut right_rows: Vec<Vec<Span<'static>>> = Vec::new();
-    right_rows.push(vec![sp("Available Tools", stb(GOLD))]);
-    for (cat, list) in TOOL_GROUPS {
-        right_rows.push(vec![
-            sp(cat, st(AMBER_DIM)),
-            sp(list, st(SILVER)),
-        ]);
-    }
-    right_rows.push(vec![]);
-    right_rows.push(vec![sp("Available Commands (Perintah)", stb(GOLD))]);
-    for (cmd, desc) in CMD_LIST {
-        right_rows.push(vec![
-            sp(cmd, stb(LAV)),
-            sp(desc, st(SILVER)),
-        ]);
-    }
-    right_rows.push(vec![]);
-    right_rows.push(vec![
-        sp(format!("{} tool aktif", info.tool_count), stb(GOLD)),
-        sp("   ", st(DIM)),
-        sp(format!("{} perintah", CMD_LIST.len()), st(AMBER_DIM)),
-        sp("   ", st(DIM)),
-        sp("sandbox: folder ini saja", st(DIM)),
-        sp("   ", st(DIM)),
-        sp("/help", st(LAV)),
-    ]);
+    // 3. Pemisah halus antar Hero & Dock
+    out.push(divider_line(width));
 
-    let total_rows = left_rows.len().max(right_rows.len());
-    for i in 0..total_rows {
-        let mut content: Vec<Span<'static>> = left_rows.get(i).cloned().unwrap_or_default();
+    // 4. Dock dua kolom: Kemampuan (kiri) & Perintah (kanan) dengan pemisah │
+    let split_col = (inner * 58 / 100).max(48);
+    let dock_row = |left: Vec<Span<'static>>, right: Vec<Span<'static>>| -> Line<'static> {
+        let mut content = fit(left, split_col.saturating_sub(2));
         let cur = spans_w(&content);
-        if cur < LEFT_COL {
-            content.push(Span::raw(" ".repeat(LEFT_COL - cur)));
-        } else {
-            content = fit(content, LEFT_COL.saturating_sub(1));
-            let c2 = spans_w(&content);
-            if c2 < LEFT_COL {
-                content.push(Span::raw(" ".repeat(LEFT_COL - c2)));
-            }
+        if cur < split_col {
+            content.push(Span::raw(" ".repeat(split_col - cur)));
         }
-        if let Some(r) = right_rows.get(i) {
-            content.extend(r.iter().cloned());
-        }
-        out.push(framed(content, width));
+        content.push(sp("│ ", st(FAINT)));
+        content.extend(right);
+        framed(content, width)
+    };
+
+    out.push(dock_row(
+        vec![
+            sp("  ☾ Kemampuan ", stb(LAV)),
+            sp(format!("({} tool aktif)", info.tool_count), st(DIM)),
+        ],
+        vec![sp("⌘ Perintah", stb(LAV))],
+    ));
+
+    for ((tk, tv), (ck, cv)) in TOOL_ROWS.iter().zip(CMD_ROWS.iter()) {
+        out.push(dock_row(
+            vec![
+                sp("  › ", st(VIOLET)),
+                sp(*tk, stb(VIOLET)),
+                sp(*tv, st(SILVER)),
+            ],
+            vec![sp(*ck, stb(LAV)), sp(*cv, st(DIM))],
+        ));
     }
 
-    out.push(border_line(width, '╰', '╯'));
+    // 5. Bottom frame terpadu
+    out.push(bottom_frame(
+        width,
+        "sandbox: folder ini saja",
+        "/help untuk bantuan",
+    ));
 
-    // 3. Baris sambutan & tip di bawah kartu (persis gaya Hermes).
+    // 6. Sapaan singkat di bawah kartu
     out.push(Line::from(""));
     out.push(Line::from(fit(
         vec![
-            sp("Welcome to ", st(SILVER)),
-            sp("SelenCode", stb(GOLD)),
-            sp(" (Selena)! Ketik pesanmu atau ", st(SILVER)),
-            sp("/help", stb(LAV)),
-            sp(" untuk daftar perintah.", st(SILVER)),
-        ],
-        width,
-    )));
-    out.push(Line::from(fit(
-        vec![
-            sp("✦ Tip: ", stb(AMBER)),
-            sp(
-                "pakai /plan untuk mode baca-saja berencana, Alt+Enter untuk baris baru, Ctrl+C untuk keluar.",
-                st(AMBER_DIM),
-            ),
+            sp("  ☾ ", stb(VIOLET)),
+            sp("Selena siap. ", stb(LILAC)),
+            sp("Ketik pesanmu, ", st(DIM)),
+            sp("Alt+Enter", st(LAV)),
+            sp(" baris baru, ", st(DIM)),
+            sp("/plan", st(LAV)),
+            sp(" untuk rencana dulu.", st(DIM)),
         ],
         width,
     )));
@@ -528,97 +482,89 @@ fn welcome_wide(width: usize, info: &WelcomeInfo) -> Vec<Line<'static>> {
 
 fn welcome_narrow(width: usize, info: &WelcomeInfo) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
-    let title = format!("☾ SelenCode v{} · Moonlit", info.version);
-    out.push(titled_top_border(width, &title));
+    out.push(top_frame(
+        width,
+        "☾ SelenCode",
+        &format!("v{}", info.version),
+    ));
 
     let moon = moon_art(12, 7);
     for (i, mrow) in moon.iter().enumerate() {
-        let color = if i <= 2 { GOLD_BRIGHT } else if i <= 4 { GOLD } else { AMBER };
-        let mut content: Vec<Span<'static>> = vec![Span::raw("  "), sp(mrow.clone(), st(color))];
+        let mcolor = match i {
+            0..=1 => LILAC,
+            2..=4 => VIOLET,
+            _ => DEEP,
+        };
+        let mut row: Vec<Span<'static>> = vec![Span::raw("  "), sp(mrow.clone(), st(mcolor))];
         match i {
             1 => {
-                content.push(sp(" ✦  ", stb(GOLD_BRIGHT)));
-                content.push(sp("SELENCODE", stb(GOLD)));
+                row.push(sp(" ✦  ", stb(GOLD)));
+                row.push(sp("SELENCODE", stb(LILAC)));
             }
             2 => {
-                content.push(sp("    ", st(DIM)));
-                content.push(sp("Selena · edisi Moonlit", st(LAV)));
+                row.push(sp("    ", st(DIM)));
+                row.push(sp("Selena · edisi Moonlit", st(LAV)));
             }
             4 => {
-                content.push(sp("    ", st(DIM)));
-                content.push(sp(truncate_chars(&info.model, width.saturating_sub(20)), stb(SILVER)));
+                row.push(sp("    ", st(DIM)));
+                row.push(sp("● ", st(MINT)));
+                row.push(sp(
+                    truncate_chars(&info.model, width.saturating_sub(22)),
+                    stb(SILVER),
+                ));
             }
             5 => {
-                content.push(sp("    ", st(DIM)));
-                content.push(sp(
+                row.push(sp("    ", st(DIM)));
+                row.push(sp(
                     format!("{} · {} tool aktif", info.provider_name, info.tool_count),
-                    st(AMBER_DIM),
+                    st(DIM),
                 ));
             }
             _ => {}
         }
-        out.push(framed(content, width));
+        out.push(framed(row, width));
     }
 
-    let inner = width.saturating_sub(4);
-    out.push(framed(
-        vec![sp(format!(" {}", "─".repeat(inner)), st(FAINT))],
-        width,
-    ));
+    out.push(divider_line(width));
     out.push(framed(
         vec![
-            sp(" Folder  ", st(AMBER_DIM)),
-            sp(truncate_chars(&info.cwd, width.saturating_sub(12)), st(DIM)),
+            sp(" ⌂ ", st(VIOLET)),
+            sp(truncate_chars(&info.cwd, width.saturating_sub(6)), st(DIM)),
         ],
         width,
     ));
     out.push(framed(
         vec![
-            sp(" Sesi    ", st(AMBER_DIM)),
-            sp(format!("{} · sandbox aktif", info.session_short), st(SILVER)),
-        ],
-        width,
-    ));
-    out.push(framed(vec![], width));
-    out.push(framed(
-        vec![sp(" Available Tools & Perintah", stb(GOLD))],
-        width,
-    ));
-    out.push(framed(
-        vec![
-            sp(" tools: ", st(AMBER_DIM)),
+            sp(" ☾ Tools: ", stb(LAV)),
             sp("file, search, outline, shell, git, web, plan, mcp", st(SILVER)),
         ],
         width,
     ));
     out.push(framed(
         vec![
-            sp(" ✦ /plan", stb(LAV)),
+            sp(" ⌘ ", st(VIOLET)),
+            sp("/plan", stb(LAV)),
             sp(" rencana  ", st(DIM)),
-            sp("✦ /model", stb(LAV)),
-            sp(" ganti  ", st(DIM)),
-            sp("✦ /help", stb(LAV)),
+            sp("/model", stb(LAV)),
+            sp(" model  ", st(DIM)),
+            sp("/help", stb(LAV)),
             sp(" bantuan", st(DIM)),
         ],
         width,
     ));
-    out.push(border_line(width, '╰', '╯'));
-
-    out.push(Line::from(fit(
-        vec![
-            sp("✦ Tip: ", stb(AMBER)),
-            sp("ketik pesan atau /help untuk semua perintah.", st(AMBER_DIM)),
-        ],
+    out.push(bottom_frame(
         width,
-    )));
+        "sandbox aktif",
+        &format!("sesi {}", info.session_short),
+    ));
     out
 }
 
-/// Sambutan ringkas untuk sesi resume: 1 baris bergaya Moonlit × Hermes.
+/// Sambutan ringkas untuk sesi resume: 1 baris bergaya Moonlit ungu.
 pub fn resume_lines(info: &WelcomeInfo) -> Vec<Line<'static>> {
     vec![Line::from(vec![
-        sp("☾ ", stb(GOLD)),
-        sp("SelenCode", stb(GOLD_BRIGHT)),
+        sp("☾ ", stb(VIOLET)),
+        sp("SelenCode", stb(LILAC)),
         sp(
             format!(
                 " — sesi dilanjutkan · {}/{}",
@@ -629,10 +575,10 @@ pub fn resume_lines(info: &WelcomeInfo) -> Vec<Line<'static>> {
     ])]
 }
 
-// ---------- status bar (gaya Hermes) ----------
+// ---------- status bar Moonlit (ungu bersih) ----------
 
-/// Baris status Moonlit × Hermes: model + fase bulan + bar konteks + token
-/// sesi + langkah + cwd (+ "bekerja…" saat sibuk).
+/// Baris status Moonlit: model + fase bulan + bar konteks tajam + token sesi
+/// + langkah + cwd (+ indikator bekerja saat sibuk).
 pub fn status_line(
     model: &str,
     pct: u8,
@@ -645,16 +591,14 @@ pub fn status_line(
 ) -> Line<'static> {
     let (filled, empty) = context_bar_parts(pct);
     let mut spans = vec![
-        sp(" ✦ ", stb(GOLD)),
-        sp(truncate_chars(model, 24), stb(GOLD_BRIGHT)),
-        sp(" │ ", st(BORDER)),
-        sp(format!("{} ctx ", phase_glyph(pct)), stb(AMBER)),
-        sp("[", st(BORDER)),
-        sp(filled, st(GOLD)),
+        sp(" ☾ ", stb(VIOLET)),
+        sp(truncate_chars(model, 22), stb(LAV)),
+        sp(" │ ", st(FAINT)),
+        sp(format!("{} ", phase_glyph(pct)), stb(VIOLET)),
+        sp(filled, st(VIOLET)),
         sp(empty, st(FAINT)),
-        sp("]", st(BORDER)),
         sp(format!(" {pct}%"), st(DIM)),
-        sp(" │ ", st(BORDER)),
+        sp(" │ ", st(FAINT)),
         sp(
             format!(
                 "token sesi {} in / {} out",
@@ -663,14 +607,14 @@ pub fn status_line(
             ),
             st(DIM),
         ),
-        sp(" │ ", st(BORDER)),
+        sp(" │ ", st(FAINT)),
         sp(format!("langkah {step_current}/{step_max}"), st(DIM)),
-        sp(" │ ", st(BORDER)),
-        sp(truncate_chars(cwd, 32), st(LAV)),
+        sp(" │ ", st(FAINT)),
+        sp(truncate_chars(cwd, 30), st(DIM)),
     ];
     if busy {
-        spans.push(sp(" │ ", st(BORDER)));
-        spans.push(sp("◐ bekerja…", stb(GOLD)));
+        spans.push(sp(" │ ", st(FAINT)));
+        spans.push(sp("✦ bekerja…", stb(GOLD)));
     }
     Line::from(spans)
 }
@@ -678,13 +622,15 @@ pub fn status_line(
 // ---------- banner mode polos ----------
 
 /// Banner teks sederhana untuk mode polos (non-TUI): bulan braille kecil
-/// berwarna emas (ANSI truecolor) + sapaan + baris provider/perintah.
+/// berwarna violet (ANSI truecolor) + sapaan + baris provider/perintah.
 pub fn plain_banner(provider_name: &str, model: &str) -> String {
     let mut out = String::new();
     for row in moon_art(10, 5) {
-        out.push_str(&format!("\u{1b}[38;2;252;211;77m{row}\u{1b}[0m\n"));
+        out.push_str(&format!("\u{1b}[38;2;167;139;250m{row}\u{1b}[0m\n"));
     }
-    out.push_str("SelenCode — halo, aku Selena. Ketik perintah, /help untuk bantuan, /exit untuk keluar.\n");
+    out.push_str(
+        "SelenCode — halo, aku Selena. Ketik perintah, /help untuk bantuan, /exit untuk keluar.\n",
+    );
     out.push_str(&format!(
         "Perintah: /plan · /model [nama] · /sessions · /help · /exit — provider aktif: {provider_name} ({model})"
     ));
