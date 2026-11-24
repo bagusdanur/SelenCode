@@ -388,4 +388,43 @@ fn model_clear_help_panduan_dan_telegram_gateway_helpers() {
     for c in &chunks {
         assert!(c.chars().count() <= 120);
     }
+
+    // 6. Redaksi token bot agar tidak bocor di pesan error jaringan
+    let leaked = "error sending request for url (https://api.telegram.org/bot999:SECRET_TOK/getUpdates)";
+    let safe = selencode::telegram::redact_tg_token(leaked, "999:SECRET_TOK");
+    assert!(!safe.contains("999:SECRET_TOK"));
+    assert!(safe.contains("[BOT_TOKEN]"));
+
+    // 7. Pembatalan approval tertunda (/cancel) melepas oneshot chat terkait saja
+    let hub = selencode::telegram::TgApprovalHub::new();
+    let pol = std::sync::Arc::new(std::sync::Mutex::new(
+        selencode::security::ApprovalPolicy::default(),
+    ));
+    let (tx1, mut rx1) = tokio::sync::oneshot::channel();
+    let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+    hub.register_for_test(
+        100,
+        selencode::telegram::PendingTgApproval {
+            chat_id: 100,
+            message_id: 1,
+            base_text: "a".into(),
+            category: "edit_file".into(),
+            policy: pol.clone(),
+            reply: tx1,
+        },
+    );
+    hub.register_for_test(
+        200,
+        selencode::telegram::PendingTgApproval {
+            chat_id: 200,
+            message_id: 2,
+            base_text: "b".into(),
+            category: "run_shell".into(),
+            policy: pol,
+            reply: tx2,
+        },
+    );
+    assert_eq!(hub.cancel_chat_approvals(100), 1);
+    assert_eq!(rx1.try_recv(), Ok(false));
+    assert!(rx2.try_recv().is_err());
 }

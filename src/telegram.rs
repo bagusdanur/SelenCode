@@ -25,6 +25,19 @@ use std::time::Duration;
 /// Batas aman panjang satu pesan Telegram (maks resmi 4096 karakter).
 pub const TELEGRAM_MAX_CHARS: usize = 3900;
 
+/// Timeout otomatis permintaan persetujuan di Telegram (5 menit) agar chat
+/// tidak terkunci selamanya jika user tidak menekan tombol.
+pub const APPROVAL_TIMEOUT_SECS: u64 = 300;
+
+/// Sensor token bot Telegram agar tidak pernah bocor ke log error atau chat.
+pub fn redact_tg_token(text: &str, token: &str) -> String {
+    let t = token.trim();
+    if t.is_empty() {
+        return text.to_string();
+    }
+    text.replace(t, "[BOT_TOKEN]")
+}
+
 /// Hasil parsing perintah `/telegram <arg>` di REPL/TUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TelegramAction {
@@ -236,6 +249,7 @@ pub struct TgUpdate {
 #[derive(Clone)]
 pub struct TelegramClient {
     http: reqwest::Client,
+    token: String,
     base_url: String,
 }
 
@@ -246,9 +260,11 @@ impl TelegramClient {
             .timeout(Duration::from_secs(60))
             .build()
             .context("gagal membuat HTTP client Telegram")?;
+        let tok = bot_token.trim().to_string();
         Ok(Self {
             http,
-            base_url: format!("https://api.telegram.org/bot{}", bot_token.trim()),
+            base_url: format!("https://api.telegram.org/bot{tok}"),
+            token: tok,
         })
     }
 
@@ -260,23 +276,37 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .with_context(|| format!("gagal menghubungi Telegram API ({method})"))?;
+            .map_err(|e| {
+                let clean = redact_tg_token(&e.without_url().to_string(), &self.token);
+                anyhow!("gagal menghubungi Telegram API ({method}): {clean}")
+            })?;
         let status = resp.status();
-        let parsed: ApiResponse<T> = resp
-            .json()
-            .await
-            .with_context(|| format!("respons Telegram API ({method}, HTTP {status}) tidak valid"))?;
+        let parsed: ApiResponse<T> = resp.json().await.map_err(|e| {
+            let clean = redact_tg_token(&e.without_url().to_string(), &self.token);
+            anyhow!("respons Telegram API ({method}, HTTP {status}) tidak valid: {clean}")
+        })?;
         if !parsed.ok {
-            return Err(anyhow!(
-                "Telegram API ({method}) menolak: {}",
+            let desc = redact_tg_token(
                 parsed
                     .description
-                    .unwrap_or_else(|| format!("HTTP {status}"))
-            ));
+                    .as_deref()
+                    .unwrap_or("permintaan ditolak"),
+                &self.token,
+            );
+            return Err(anyhow!("Telegram API ({method}) menolak (HTTP {status}): {desc}"));
         }
         parsed
             .result
             .ok_or_else(|| anyhow!("Telegram API ({method}) mengembalikan result kosong"))
+    }
+
+    /// Lewati antrean pesan lama sebelum gateway dinyalakan agar perintah lama
+    /// tidak ikut tereksekusi saat `selen telegram` baru mulai.
+    pub async fn skip_backlog(&self) -> i64 {
+        match self.get_updates(-1, 0).await {
+            Ok(list) => list.last().map(|u| u.update_id + 1).unwrap_or(0),
+            Err(_) => 0,
+        }
     }
 
     pub async fn get_me(&self) -> Result<TgUser> {
@@ -400,8 +430,9 @@ impl TgApprovalHub {
     }
 
     /// Kirim pesan persetujuan dengan 3 tombol inline ke Telegram & daftarkan callback-nya.
+    /// Otomatis kedaluwarsa setelah `APPROVAL_TIMEOUT_SECS` agar chat tidak pernah macet selamanya.
     pub async fn dispatch(
-        &self,
+        self: &Arc<Self>,
         tg: &TelegramClient,
         chat_id: i64,
         policy: Arc<Mutex<ApprovalPolicy>>,
@@ -443,12 +474,57 @@ impl TgApprovalHub {
                         },
                     );
                 }
+                let hub_exp = Arc::clone(self);
+                let tg_exp = tg.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(APPROVAL_TIMEOUT_SECS)).await;
+                    let expired = hub_exp.pending.lock().ok().and_then(|mut m| m.remove(&id));
+                    if let Some(item) = expired {
+                        let _ = item.reply.send(false);
+                        let updated = format!(
+                            "{}\n\n⏰ Persetujuan kedaluwarsa (ditolak otomatis).",
+                            item.base_text
+                        );
+                        let _ = tg_exp
+                            .edit_message_text(item.chat_id, item.message_id, &updated)
+                            .await;
+                    }
+                });
             }
             Err(_) => {
                 // Gagal mengirim pesan approval -> tolak demi keamanan.
                 let _ = req.reply.send(false);
             }
         }
+    }
+
+    /// Daftarkan approval secara langsung (khusus helper tes unit tanpa jaringan).
+    pub fn register_for_test(&self, chat_id: i64, item: PendingTgApproval) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = chat_id;
+        if let Ok(mut map) = self.pending.lock() {
+            map.insert(id, item);
+        }
+        id
+    }
+
+    /// Batalkan & tolak semua permintaan approval yang tertunda untuk `chat_id` (mis. `/cancel`).
+    pub fn cancel_chat_approvals(&self, chat_id: i64) -> usize {
+        let removed: Vec<PendingTgApproval> = {
+            let Ok(mut map) = self.pending.lock() else {
+                return 0;
+            };
+            let ids: Vec<u64> = map
+                .iter()
+                .filter_map(|(k, v)| (v.chat_id == chat_id).then_some(*k))
+                .collect();
+            ids.into_iter().filter_map(|k| map.remove(&k)).collect()
+        };
+        let count = removed.len();
+        for item in removed {
+            let _ = item.reply.send(false);
+        }
+        count
     }
 
     /// Proses `callback_query` dari Telegram. Mengembalikan `true` jika cocok dengan approval aktif.
@@ -459,14 +535,27 @@ impl TgApprovalHub {
         let Some((id, decision)) = parse_callback_approval(data) else {
             return false;
         };
-        let entry = self
-            .pending
-            .lock()
-            .ok()
-            .and_then(|mut map| map.remove(&id));
+        let cb_chat_id = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
+        let entry = {
+            let Ok(mut map) = self.pending.lock() else {
+                return false;
+            };
+            if let Some(existing) = map.get(&id) {
+                if existing.chat_id != cb_chat_id {
+                    None
+                } else {
+                    map.remove(&id)
+                }
+            } else {
+                None
+            }
+        };
         let Some(item) = entry else {
             let _ = tg
-                .answer_callback_query(&cb.id, Some("Permintaan persetujuan ini sudah kedaluwarsa."))
+                .answer_callback_query(
+                    &cb.id,
+                    Some("Permintaan persetujuan ini sudah kedaluwarsa atau bukan dari chat ini."),
+                )
                 .await;
             return true;
         };

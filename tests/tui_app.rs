@@ -377,11 +377,12 @@ fn render_modal_model_picker_interaktif_saved_manual_dan_katalog() {
     assert!(text.contains("[a] + manual"));
     assert!(text.contains("[c] reset"));
 
-    // 2. Navigasi & mode Catalog dengan filter live + tanda centang [✓] / [ ].
+    // 2. Navigasi & mode Catalog dengan filter live + tanda centang [✓] / [ ] + pesan status.
     let mp = a.model_picker.as_mut().unwrap();
     assert_eq!(mp.next_provider().as_deref(), Some("openrouter"));
     mp.mode = ModelPickerMode::Catalog;
     mp.filter_input = "gpt".into();
+    mp.status = Some("Disimpan ke Model Saya".into());
     assert_eq!(mp.filtered_remote().len(), 1);
     assert_eq!(mp.selected_remote().as_deref(), Some("ag/gpt-4.1"));
     term.draw(|f| selencode::tui::draw(f, &mut a)).unwrap();
@@ -394,6 +395,7 @@ fn render_modal_model_picker_interaktif_saved_manual_dan_katalog() {
         .collect();
     assert!(text2.contains("ag/gpt-4.1"));
     assert!(text2.contains("[Space] pilih 1-per-1"));
+    assert!(text2.contains("Disimpan ke Model Saya"));
 
     // 3. Mode AddManual tampil input inline.
     a.model_picker.as_mut().unwrap().mode = ModelPickerMode::AddManual;

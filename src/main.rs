@@ -863,8 +863,81 @@ impl Session {
         }
     }
 
+    /// Aktifkan 1 model secara literal (tanpa parsing ulang string agar ID numerik/"all" tetap aman).
+    fn select_model_literal(&mut self, model_id: &str) -> Result<String> {
+        let id = model_id.trim();
+        if id.is_empty() {
+            anyhow::bail!("ID model tidak boleh kosong.");
+        }
+        if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+            p.models = p.effective_models();
+            p.push_model_unique(id);
+            p.model = id.to_string();
+        }
+        let saved_path = config::save(&self.cfg)?;
+        let pname = self.provider_name.clone();
+        self.switch_provider(&pname)?;
+        let pos = self
+            .pcfg
+            .effective_models()
+            .iter()
+            .position(|m| m == &self.pcfg.model)
+            .map(|i| i + 1)
+            .unwrap_or(1);
+        Ok(format!(
+            "# Model Diperbarui (#{pos})\n\
+             * #{pos} | {} | aktif di provider {} & tersimpan\n\
+             ! Config disimpan ke: {}",
+            self.pcfg.model,
+            self.provider_name,
+            saved_path.display()
+        ))
+    }
+
+    /// Tambah 1 model secara literal ke daftar pribadi provider aktif (mengembalikan `true` jika baru).
+    fn add_model_literal(&mut self, model_id: &str) -> Result<bool> {
+        let id = model_id.trim();
+        if id.is_empty() {
+            anyhow::bail!("ID model tidak boleh kosong.");
+        }
+        let mut added = false;
+        if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+            p.models = p.effective_models();
+            added = p.push_model_unique(id);
+            self.pcfg = p.clone();
+        }
+        config::save(&self.cfg)?;
+        Ok(added)
+    }
+
+    /// Hapus 1 model secara literal dari daftar pribadi provider aktif.
+    fn remove_model_literal(&mut self, model_id: &str) -> Result<()> {
+        let id = model_id.trim();
+        if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+            let mut list = p.effective_models();
+            let Some(pos) = list.iter().position(|m| m == id) else {
+                anyhow::bail!("model '{id}' tidak ditemukan di daftar.");
+            };
+            if list[pos] == p.model {
+                anyhow::bail!(
+                    "tidak bisa menghapus model '{}' yang sedang aktif; pindah dulu ke model lain.",
+                    p.model
+                );
+            }
+            list.remove(pos);
+            p.models = list;
+            self.pcfg = p.clone();
+        }
+        config::save(&self.cfg)?;
+        Ok(())
+    }
+
     /// Tangani `/telegram [setup|allow|rm|approve|off]`.
     fn handle_telegram(&mut self, arg: Option<&str>) -> Result<String> {
+        // Sinkronkan bagian `[telegram]` terbaru dari disk agar edit terminal & bot tidak saling timpa.
+        if let Ok(fresh) = config::load() {
+            self.cfg.telegram = fresh.telegram;
+        }
         match parse_telegram_action(arg) {
             TelegramAction::Status => {
                 let tok_state = if self.cfg.telegram.is_token_ready() {
@@ -1722,25 +1795,24 @@ async fn tui_worker(
                         .send(UiEvent::ModelPicker(s.model_picker_data(false, None)))
                         .await;
                 }
-                ModelPickerCmd::SelectModel(model_id) => {
-                    match s.apply_model_arg(&format!("set {model_id}")) {
-                        Ok(card) => {
-                            let _ = ui_tx
-                                .send(UiEvent::ModelChanged {
-                                    provider: s.provider_name.clone(),
-                                    model: s.pcfg.model.clone(),
-                                })
-                                .await;
-                            let _ = ui_tx.send(UiEvent::Menu(card)).await;
-                        }
-                        Err(e) => {
-                            let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
-                        }
+                ModelPickerCmd::SelectModel(model_id) => match s.select_model_literal(&model_id) {
+                    Ok(card) => {
+                        let _ = ui_tx
+                            .send(UiEvent::ModelChanged {
+                                provider: s.provider_name.clone(),
+                                model: s.pcfg.model.clone(),
+                            })
+                            .await;
+                        let _ = ui_tx.send(UiEvent::Menu(card)).await;
                     }
-                }
+                    Err(e) => {
+                        let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                    }
+                },
                 ModelPickerCmd::AddOne(model_id) => {
-                    let msg = match s.apply_model_arg(&format!("add {model_id}")) {
-                        Ok(_) => format!("Ditambahkan: {model_id}"),
+                    let msg = match s.add_model_literal(&model_id) {
+                        Ok(true) => format!("Ditambahkan: {model_id}"),
+                        Ok(false) => format!("Sudah ada di daftar: {model_id}"),
                         Err(e) => format!("Gagal: {e}"),
                     };
                     let _ = ui_tx
@@ -1750,12 +1822,12 @@ async fn tui_worker(
                 ModelPickerCmd::ToggleOne(model_id) => {
                     let exists = s.pcfg.effective_models().iter().any(|m| m == &model_id);
                     let msg = if exists {
-                        match s.apply_model_arg(&format!("rm {model_id}")) {
-                            Ok(_) => format!("Dihapus dari daftar: {model_id}"),
+                        match s.remove_model_literal(&model_id) {
+                            Ok(()) => format!("Dihapus dari daftar: {model_id}"),
                             Err(e) => format!("{e}"),
                         }
                     } else {
-                        match s.apply_model_arg(&format!("add {model_id}")) {
+                        match s.add_model_literal(&model_id) {
                             Ok(_) => format!("Disimpan ke Model Saya: {model_id}"),
                             Err(e) => format!("Gagal: {e}"),
                         }
@@ -1765,8 +1837,8 @@ async fn tui_worker(
                         .await;
                 }
                 ModelPickerCmd::RemoveOne(model_id) => {
-                    let msg = match s.apply_model_arg(&format!("rm {model_id}")) {
-                        Ok(_) => format!("Dihapus: {model_id}"),
+                    let msg = match s.remove_model_literal(&model_id) {
+                        Ok(()) => format!("Dihapus: {model_id}"),
                         Err(e) => format!("{e}"),
                     };
                     let _ = ui_tx
@@ -2240,10 +2312,16 @@ async fn run_telegram_gateway(cli: Cli) -> Result<()> {
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let busy_chats: Arc<std::sync::Mutex<HashSet<i64>>> =
         Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let cancel_tokens: Arc<std::sync::Mutex<HashMap<i64, Arc<tokio::sync::Notify>>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
     let provider_override = cli.provider.clone();
     let yes_flag = cli.yes;
 
-    let mut offset: i64 = 0;
+    // Lewati antrean pesan lama sebelum gateway dinyalakan agar tidak mengeksekusi perintah usang.
+    let mut offset: i64 = tg.skip_backlog().await;
+    if offset > 0 {
+        println!("  (Antrean pesan lama sebelum startup dilewati; siap menerima pesan baru.)\n");
+    }
     loop {
         let updates = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -2329,6 +2407,25 @@ async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 continue;
             }
 
+            // `/cancel` selalu diproses walau chat sedang sibuk — batalkan giliran & approval tertunda!
+            if text.eq_ignore_ascii_case("/cancel") || text.eq_ignore_ascii_case("/stop") {
+                let cancelled_approvals = hub.cancel_chat_approvals(chat_id);
+                let notify_opt = cancel_tokens
+                    .lock()
+                    .ok()
+                    .and_then(|map| map.get(&chat_id).cloned());
+                if let Some(n) = notify_opt {
+                    n.notify_waiters();
+                }
+                let msg = if cancelled_approvals > 0 {
+                    format!("🛑 Dibatalkan ({cancelled_approvals} persetujuan tertunda ditolak).")
+                } else {
+                    "🛑 Sinyal pembatalan dikirim ke giliran aktif.".to_string()
+                };
+                let _ = tg.send_message(chat_id, &msg).await;
+                continue;
+            }
+
             // Cegah 2 giliran tumpang tindih pada chat yang sama.
             let acquired = {
                 let mut set = busy_chats.lock().expect("busy_chats poisoned");
@@ -2338,11 +2435,18 @@ async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 let _ = tg
                     .send_message(
                         chat_id,
-                        "⏳ Selena masih mengerjakan permintaan sebelumnya di chat ini. Tunggu sebentar ya!",
+                        "⏳ Selena masih mengerjakan permintaan sebelumnya di chat ini. Kirim `/cancel` jika ingin membatalkan.",
                     )
                     .await;
                 continue;
             }
+
+            let cancel_notify = {
+                let mut map = cancel_tokens.lock().expect("cancel_tokens poisoned");
+                map.entry(chat_id)
+                    .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+                    .clone()
+            };
 
             println!("[telegram] {sender_name} ({chat_id}): {text}");
             let tg_clone = tg.clone();
@@ -2361,6 +2465,7 @@ async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     tg_clone.clone(),
                     hub_clone,
                     sessions_clone,
+                    cancel_notify,
                     prov_clone,
                     yes_flag,
                     tg_approval_cfg,
@@ -2384,6 +2489,7 @@ async fn handle_telegram_chat_message(
     tg: TelegramClient,
     hub: Arc<TgApprovalHub>,
     sessions: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>>,
+    cancel: Arc<tokio::sync::Notify>,
     provider_override: Option<String>,
     yes_flag: bool,
     tg_approval_cfg: String,
@@ -2638,21 +2744,27 @@ async fn handle_telegram_chat_message(
         (tools, notes)
     });
 
-    let turn_res = run_turn_ui(
-        s.provider.clone(),
-        &s.registry,
-        &s.ctx,
-        &mut s.messages,
-        &text,
-        s.cfg.agent.max_steps,
-        ui_tx,
-    )
-    .await;
+    let turn_res = tokio::select! {
+        r = run_turn_ui(
+            s.provider.clone(),
+            &s.registry,
+            &s.ctx,
+            &mut s.messages,
+            &text,
+            s.cfg.agent.max_steps,
+            ui_tx,
+        ) => Some(r),
+        _ = cancel.notified() => None,
+    };
 
     typing_stop.notify_waiters();
     let _ = typing_task.await;
     let (tools, notes) = collector.await.unwrap_or_default();
 
+    let Some(turn_res) = turn_res else {
+        tg.send_message(chat_id, "🛑 Giliran dibatalkan.").await?;
+        return Ok(());
+    };
     let answer = turn_res?;
     let mut final_msg = String::new();
     if !tools.is_empty() {

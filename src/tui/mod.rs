@@ -635,23 +635,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
-            ModelPickerMode::Catalog => Line::from(vec![
-                Span::styled(" ✦ ", Style::default().fg(moonlit::CYAN_MOON)),
-                Span::styled("Cari katalog: ", Style::default().fg(moonlit::DIM)),
-                Span::styled(
-                    if mp.filter_input.is_empty() {
-                        "(ketik huruf untuk filter…)"
-                    } else {
-                        mp.filter_input.as_str()
-                    },
-                    Style::default().fg(if mp.filter_input.is_empty() {
-                        moonlit::FAINT
-                    } else {
-                        moonlit::LILAC
-                    }),
-                ),
-                Span::styled("█", Style::default().fg(moonlit::VIOLET)),
-            ]),
+            ModelPickerMode::Catalog => {
+                let mut spans = vec![
+                    Span::styled(" ✦ ", Style::default().fg(moonlit::CYAN_MOON)),
+                    Span::styled("Cari katalog: ", Style::default().fg(moonlit::DIM)),
+                    Span::styled(
+                        if mp.filter_input.is_empty() {
+                            "(ketik huruf untuk filter…)"
+                        } else {
+                            mp.filter_input.as_str()
+                        },
+                        Style::default().fg(if mp.filter_input.is_empty() {
+                            moonlit::FAINT
+                        } else {
+                            moonlit::LILAC
+                        }),
+                    ),
+                    Span::styled("█", Style::default().fg(moonlit::VIOLET)),
+                ];
+                if let Some(st) = &mp.status {
+                    spans.push(Span::styled("   ·   ", Style::default().fg(moonlit::FAINT)));
+                    spans.push(Span::styled(st.clone(), Style::default().fg(moonlit::MINT)));
+                }
+                Line::from(spans)
+            }
             ModelPickerMode::Saved => {
                 if let Some(st) = &mp.status {
                     Line::from(vec![
@@ -1227,6 +1234,12 @@ fn handle_key(
     if key.kind == KeyEventKind::Release {
         return;
     }
+    // Ctrl+C selalu keluar dengan bersih, termasuk saat modal approval atau pemilih model terbuka.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        cancel.notify_waiters();
+        app.should_quit = true;
+        return;
+    }
     // Popup approval mengunci semua input lain (dukung y / a / n / ↑↓ gulir).
     if app.approval.is_some() {
         match key.code {
@@ -1351,7 +1364,12 @@ fn handle_key(
                 _ => {}
             },
             ModelPickerMode::Saved => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                KeyCode::Esc => {
+                    app.model_picker = None;
+                }
+                KeyCode::Char('q') | KeyCode::Char('Q')
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     app.model_picker = None;
                 }
                 KeyCode::Up => {
@@ -1375,13 +1393,17 @@ fn handle_key(
                         );
                     }
                 }
-                KeyCode::Char('a') | KeyCode::Char('A') => {
+                KeyCode::Char('a') | KeyCode::Char('A')
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     if let Some(mp) = &mut app.model_picker {
                         mp.manual_input.clear();
                         mp.mode = ModelPickerMode::AddManual;
                     }
                 }
-                KeyCode::Char('f') | KeyCode::Char('F') => {
+                KeyCode::Char('f') | KeyCode::Char('F')
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     let need_fetch = if let Some(mp) = &mut app.model_picker {
                         mp.mode = ModelPickerMode::Catalog;
                         mp.filter_input.clear();
@@ -1403,7 +1425,9 @@ fn handle_key(
                         );
                     }
                 }
-                KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+                KeyCode::Char('d') | KeyCode::Char('D')
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     let chosen = app.model_picker.as_ref().and_then(|mp| mp.selected_saved());
                     if let Some(id) = chosen {
                         send_cmd(
@@ -1413,7 +1437,19 @@ fn handle_key(
                         );
                     }
                 }
-                KeyCode::Char('c') | KeyCode::Char('C') => {
+                KeyCode::Delete => {
+                    let chosen = app.model_picker.as_ref().and_then(|mp| mp.selected_saved());
+                    if let Some(id) = chosen {
+                        send_cmd(
+                            app,
+                            cmd_tx,
+                            TuiCommand::ModelPicker(ModelPickerCmd::RemoveOne(id)),
+                        );
+                    }
+                }
+                KeyCode::Char('c') | KeyCode::Char('C')
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     send_cmd(
                         app,
                         cmd_tx,
@@ -1433,11 +1469,6 @@ fn handle_key(
                 _ => {}
             },
         }
-        return;
-    }
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        cancel.notify_waiters();
-        app.should_quit = true;
         return;
     }
     // Esc saat Selena sedang bekerja -> batalkan giliran tengah jalan tanpa keluar!
