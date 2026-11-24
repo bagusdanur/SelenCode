@@ -548,7 +548,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Modal Persetujuan Moonlit Ungu (modern, scrollable, dengan opsi [a] selalu sesi ini)
     if let Some(p) = &app.approval {
-        let pct_x = if area.width < 80 { 94 } else { 78 };
+        let pct_x = if area.width < 90 { 92 } else { 78 };
         let pct_y = if area.height < 26 { 80 } else { 66 };
         let popup = centered_rect(pct_x, pct_y, area);
         frame.render_widget(Clear, popup);
