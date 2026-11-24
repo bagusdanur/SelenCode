@@ -413,6 +413,7 @@ fn config_save_load_and_direct_api_key_fallback() {
         agent: AgentCfg::default(),
         shell: ShellCfg::default(),
         mcp_servers: Vec::new(),
+        telegram: Default::default(),
     };
     save_to(&cfg, &path).unwrap();
     let loaded = load_from(&path).unwrap();
