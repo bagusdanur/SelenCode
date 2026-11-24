@@ -4,6 +4,9 @@
 
 use crate::agent::UiEvent;
 use crate::security::ApprovalRequest;
+use crate::tui::moonlit::{self, WelcomeInfo};
+use ratatui::style::Style;
+use ratatui::text::Line;
 use tui_textarea::TextArea;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +75,17 @@ pub struct App {
     pub pending_plan: Option<String>,
     /// Giliran berikutnya dijalankan sebagai plan mode (dari /plan).
     pub plan_next: bool,
+    /// Label tampil provider untuk sambutan, mis.
+    /// "router (router.ryukomik.com)". Diisi main.rs dari config;
+    /// bawaan = nama provider.
+    pub provider_label: String,
+    /// Jumlah tool registry mode Execute (untuk layar sambutan Moonlit).
+    pub tool_count: usize,
+    /// Sesi ini hasil resume? Sambutan penuh diganti 1 baris ringkas.
+    pub resumed: bool,
+    /// Baris sambutan Moonlit — dibuat sekali pada frame pertama (saat
+    /// lebar terminal diketahui) lalu ikut bergulir di transkrip.
+    pub welcome: Option<Vec<Line<'static>>>,
     /// Baris assistant terakhir masih menerima token streaming.
     streaming: bool,
     /// Diisi oleh fungsi gambar: total baris transkrip & tinggi viewport
@@ -82,7 +96,8 @@ pub struct App {
 
 pub fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
-    ta.set_placeholder_text("ketik perintah…");
+    ta.set_placeholder_text("Tanya apa saja…");
+    ta.set_placeholder_style(Style::default().fg(moonlit::DIM));
     ta.set_cursor_line_style(ratatui::style::Style::default());
     ta
 }
@@ -98,6 +113,7 @@ impl App {
     ) -> Self {
         Self {
             cwd,
+            provider_label: provider.clone(),
             provider,
             model,
             max_steps,
@@ -114,10 +130,24 @@ impl App {
             should_quit: false,
             pending_plan: None,
             plan_next: false,
+            tool_count: 0,
+            resumed: false,
+            welcome: None,
             streaming: false,
             last_total_lines: 0,
             last_viewport: 0,
         }
+    }
+
+    /// Info untuk layar sambutan Moonlit, dari state sesi saat ini.
+    pub fn welcome_info(&self) -> WelcomeInfo {
+        WelcomeInfo::new(
+            self.provider.clone(),
+            self.provider_label.clone(),
+            self.model.clone(),
+            self.cwd.clone(),
+            self.tool_count,
+        )
     }
 
     pub fn info(&mut self, text: impl Into<String>) {
