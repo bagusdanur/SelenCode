@@ -121,11 +121,12 @@ impl ApprovalPolicy {
     }
 
     pub fn is_auto_allowed(&self, category: &str) -> bool {
-        match self.mode {
+        let by_mode = match self.mode {
             ApprovalMode::AutoAll => true,
             ApprovalMode::AutoEdits => matches!(category, "edit_file" | "write_file"),
             ApprovalMode::Ask => false,
-        } || self.session_allowed.contains(category)
+        };
+        by_mode || self.session_allowed.contains(category)
     }
 
     pub fn allow_category(&mut self, category: impl Into<String>) {
