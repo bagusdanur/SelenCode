@@ -100,6 +100,8 @@ pub struct App {
     pub last_viewport: usize,
     /// Indeks item terpilih pada popup live `/` command palette.
     pub palette_idx: usize,
+    /// Tampilkan argumen & ringkasan tool secara penuh (toggle via `/details`).
+    pub show_tool_details: bool,
 }
 
 pub fn new_textarea() -> TextArea<'static> {
@@ -147,6 +149,7 @@ impl App {
             last_total_lines: 0,
             last_viewport: 0,
             palette_idx: 0,
+            show_tool_details: true,
         }
     }
 

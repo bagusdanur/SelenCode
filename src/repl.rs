@@ -1,18 +1,38 @@
-//! Parsing perintah garis miring mode interaktif + katalog perintah tunggal
-//! untuk palette live `/` di TUI dan tampilan `/help`.
+//! Parsing perintah garis miring (`/`) & inline shell (`!cmd`) mode interaktif
+//! + katalog perintah tunggal untuk palette live `/` di TUI dan tampilan `/help`.
 //! Perintah garis miring TIDAK pernah diteruskan ke provider LLM.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     /// Bukan perintah (teks biasa untuk agent).
     NotCommand,
+    /// `!perintah` — jalankan shell lokal cepat tanpa memanggil LLM (ala OpenCode).
+    InlineShell(String),
     Exit,
     /// /model | /model <provider> | /model set <model> | /model <provider>:<model> | /model list
     Model(Option<String>),
     /// /models (pintasan /model list)
     Models,
-    /// /provider | /provider add ... | /provider model ... | /provider default ... | /provider rm ...
+    /// /provider | /provider add ... | /provider preset ... | /provider model ... | /provider default ... | /provider rm ...
     Provider(Option<String>),
+    /// /undo — batalkan edit/tulis file terakhir oleh agent.
+    Undo,
+    /// /redo — terapkan ulang edit/tulis file yang baru di-undo.
+    Redo,
+    /// /memory | /memory add <teks> | /memory global <teks> | /memory rm <id>
+    Memory(Option<String>),
+    /// /skills — daftar semua skill tersimpan.
+    Skills,
+    /// /skill <nama> — aktifkan instruksi skill ke sesi ini.
+    Skill(Option<String>),
+    /// /learn <nama> <instruksi> — simpan skill baru ke `.selencode/skills/`.
+    Learn(Option<String>),
+    /// /init — buat starter `AGENTS.md` sesuai stack project.
+    Init,
+    /// /export [nama.md] — ekspor percakapan saat ini ke file Markdown.
+    Export(Option<String>),
+    /// /details — toggle tampilan ringkas vs detail pada baris tool di TUI.
+    Details,
     /// /sessions
     Sessions,
     /// /resume (di dalam sesi interaktif: tampilkan info sesi aktif)
@@ -54,7 +74,7 @@ pub const COMMANDS: &[CommandDef] = &[
     },
     CommandDef {
         cmd: "/provider",
-        args: "[add | model | default | rm]",
+        args: "[preset | add | model | default | rm]",
         desc: "kelola & pasang provider lain + API key",
         takes_args: true,
     },
@@ -62,6 +82,60 @@ pub const COMMANDS: &[CommandDef] = &[
         cmd: "/plan",
         args: "",
         desc: "giliran berikutnya baca-saja & minta izin rencana",
+        takes_args: false,
+    },
+    CommandDef {
+        cmd: "/undo",
+        args: "",
+        desc: "batalkan perubahan file terakhir oleh agent",
+        takes_args: false,
+    },
+    CommandDef {
+        cmd: "/redo",
+        args: "",
+        desc: "terapkan ulang perubahan yang baru di-undo",
+        takes_args: false,
+    },
+    CommandDef {
+        cmd: "/memory",
+        args: "[add | global | rm <id>]",
+        desc: "memori persisten lintas sesi (global & project)",
+        takes_args: true,
+    },
+    CommandDef {
+        cmd: "/skills",
+        args: "",
+        desc: "lihat daftar skill (.selencode/skills/*.md)",
+        takes_args: false,
+    },
+    CommandDef {
+        cmd: "/skill",
+        args: "<nama>",
+        desc: "aktifkan skill ke percakapan saat ini",
+        takes_args: true,
+    },
+    CommandDef {
+        cmd: "/learn",
+        args: "<nama> <instruksi>",
+        desc: "simpan workflow/instruksi baru sebagai skill",
+        takes_args: true,
+    },
+    CommandDef {
+        cmd: "/init",
+        args: "",
+        desc: "buat file panduan AGENTS.md untuk project ini",
+        takes_args: false,
+    },
+    CommandDef {
+        cmd: "/export",
+        args: "[nama.md]",
+        desc: "ekspor riwayat percakapan ke Markdown",
+        takes_args: true,
+    },
+    CommandDef {
+        cmd: "/details",
+        args: "",
+        desc: "toggle tampilan ringkas / detail hasil tool",
         takes_args: false,
     },
     CommandDef {
@@ -117,17 +191,36 @@ pub fn filter_commands(input: &str) -> Vec<&'static CommandDef> {
 
 pub fn parse_slash_command(line: &str) -> SlashCommand {
     let line = line.trim();
+    if let Some(cmd) = line.strip_prefix('!') {
+        let cmd = cmd.trim();
+        if !cmd.is_empty() {
+            return SlashCommand::InlineShell(cmd.to_string());
+        }
+        return SlashCommand::NotCommand;
+    }
     if !line.starts_with('/') {
         return SlashCommand::NotCommand;
     }
     let mut parts = line.splitn(2, char::is_whitespace);
     let head = parts.next().unwrap_or("");
-    let rest = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let rest = parts
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     match head {
         "/exit" | "/quit" => SlashCommand::Exit,
         "/model" => SlashCommand::Model(rest),
         "/models" => SlashCommand::Models,
         "/provider" | "/connect" => SlashCommand::Provider(rest),
+        "/undo" => SlashCommand::Undo,
+        "/redo" => SlashCommand::Redo,
+        "/memory" => SlashCommand::Memory(rest),
+        "/skills" => SlashCommand::Skills,
+        "/skill" => SlashCommand::Skill(rest),
+        "/learn" => SlashCommand::Learn(rest),
+        "/init" => SlashCommand::Init,
+        "/export" => SlashCommand::Export(rest),
+        "/details" => SlashCommand::Details,
         "/sessions" => SlashCommand::Sessions,
         "/resume" => SlashCommand::Resume,
         "/plan" => SlashCommand::Plan,
@@ -141,13 +234,9 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
 /// Aksi hasil parsing argumen `/model <arg>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelAction {
-    /// `/model list` -> tarik daftar model dari provider aktif.
     FetchList,
-    /// `/model set <model_id>` -> set model manual pada provider aktif & simpan.
     SetCurrentModel(String),
-    /// `/model <provider>:<model_id>` -> pindah provider + set model manual & simpan.
     SwitchAndSetModel { provider: String, model: String },
-    /// `/model <target>` -> ganti ke provider bernama `<target>` (atau set model bila bukan nama provider).
     SwitchOrModel(String),
 }
 
@@ -165,8 +254,6 @@ pub fn parse_model_action(arg: &str) -> ModelAction {
     if let Some((prov, model)) = arg.split_once(':') {
         let prov = prov.trim();
         let model = model.trim();
-        // Hindari memotong model yang memang memakai ':' (mis. Ollama `qwen2.5:7b`)
-        // bila bagian kiri mengandung '/' atau titik.
         if !prov.is_empty() && !model.is_empty() && !prov.contains('/') && !prov.contains('.') {
             return ModelAction::SwitchAndSetModel {
                 provider: prov.to_string(),
@@ -177,15 +264,13 @@ pub fn parse_model_action(arg: &str) -> ModelAction {
     ModelAction::SwitchOrModel(arg.to_string())
 }
 
-/// Spesifikasi kunci API dari `/provider add`.
+/// Spesifikasi kunci API dari `/provider add` / `/provider preset`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeySpec {
     EnvVar(String),
     DirectKey(String),
 }
 
-/// Klasifikasi argumen API key: nama env var (mis. `OPENROUTER_API_KEY` atau
-/// `env:MY_KEY`) vs API key mentah (mis. `sk-or-v1-...`).
 pub fn classify_key_spec(raw: &str) -> KeySpec {
     let raw = raw.trim();
     if let Some(env_name) = raw.strip_prefix("env:").or_else(|| raw.strip_prefix("ENV:")) {
@@ -203,10 +288,79 @@ pub fn classify_key_spec(raw: &str) -> KeySpec {
     }
 }
 
+/// Preset provider populer agar user tidak perlu menghafal `base_url`.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderPreset {
+    pub id: &'static str,
+    pub kind: &'static str,
+    pub base_url: Option<&'static str>,
+    pub default_model: &'static str,
+    pub default_env: &'static str,
+}
+
+pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        id: "openrouter",
+        kind: "openai",
+        base_url: Some("https://openrouter.ai/api/v1"),
+        default_model: "anthropic/claude-3.7-sonnet",
+        default_env: "OPENROUTER_API_KEY",
+    },
+    ProviderPreset {
+        id: "9router",
+        kind: "openai",
+        base_url: Some("https://router.ryukomik.com/v1"),
+        default_model: "ag/gemini-3-flash",
+        default_env: "SELENCODE_ROUTER_KEY",
+    },
+    ProviderPreset {
+        id: "groq",
+        kind: "openai",
+        base_url: Some("https://api.groq.com/openai/v1"),
+        default_model: "llama-3.3-70b-versatile",
+        default_env: "GROQ_API_KEY",
+    },
+    ProviderPreset {
+        id: "deepseek",
+        kind: "openai",
+        base_url: Some("https://api.deepseek.com/v1"),
+        default_model: "deepseek-chat",
+        default_env: "DEEPSEEK_API_KEY",
+    },
+    ProviderPreset {
+        id: "ollama",
+        kind: "openai",
+        base_url: Some("http://localhost:11434/v1"),
+        default_model: "qwen2.5-coder:7b",
+        default_env: "",
+    },
+    ProviderPreset {
+        id: "anthropic",
+        kind: "anthropic",
+        base_url: None,
+        default_model: "claude-sonnet-4-20250514",
+        default_env: "ANTHROPIC_API_KEY",
+    },
+    ProviderPreset {
+        id: "gemini",
+        kind: "gemini",
+        base_url: None,
+        default_model: "gemini-2.5-pro",
+        default_env: "GEMINI_API_KEY",
+    },
+];
+
+pub fn find_preset(id: &str) -> Option<&'static ProviderPreset> {
+    PROVIDER_PRESETS
+        .iter()
+        .find(|p| p.id.eq_ignore_ascii_case(id))
+}
+
 /// Aksi hasil parsing `/provider [subcommand ...]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderAction {
     List,
+    ListPresets,
     Add {
         name: String,
         kind: String,
@@ -230,6 +384,32 @@ pub fn parse_provider_action(arg: Option<&str>) -> ProviderAction {
     let tokens: Vec<&str> = arg.split_whitespace().collect();
     match tokens.first().copied().unwrap_or("") {
         "list" | "ls" => ProviderAction::List,
+        "presets" => ProviderAction::ListPresets,
+        "preset" => {
+            if tokens.len() == 1 {
+                return ProviderAction::ListPresets;
+            }
+            let Some(p) = find_preset(tokens[1]) else {
+                return ProviderAction::ListPresets;
+            };
+            let model = tokens
+                .get(2)
+                .copied()
+                .unwrap_or(p.default_model)
+                .to_string();
+            let key_spec = match tokens.get(3).copied() {
+                Some(raw) => classify_key_spec(raw),
+                None if p.id == "ollama" => KeySpec::DirectKey("ollama".to_string()),
+                None => KeySpec::EnvVar(p.default_env.to_string()),
+            };
+            ProviderAction::Add {
+                name: p.id.to_string(),
+                kind: p.kind.to_string(),
+                model,
+                base_url: p.base_url.map(|s| s.to_string()),
+                key_spec,
+            }
+        }
         "default" if tokens.len() == 2 => ProviderAction::SetDefault(tokens[1].to_string()),
         "rm" | "remove" | "del" if tokens.len() == 2 => {
             ProviderAction::Remove(tokens[1].to_string())
@@ -239,8 +419,6 @@ pub fn parse_provider_action(arg: Option<&str>) -> ProviderAction {
             model: tokens[2].to_string(),
         },
         "add" => {
-            // Format 1 (openai/custom): /provider add <nama> <kind> <model> <base_url> <ENV_atau_key>
-            // Format 2 (anthropic/gemini default URL): /provider add <nama> <kind> <model> <ENV_atau_key>
             if tokens.len() < 5 {
                 return ProviderAction::Usage;
             }
@@ -262,36 +440,32 @@ pub fn parse_provider_action(arg: Option<&str>) -> ProviderAction {
                     base_url,
                     key_spec,
                 }
-            } else {
-                // 5 token: tokens[4] = key_spec (untuk anthropic/gemini dengan base_url default)
-                if kind == "anthropic" || kind == "gemini" {
-                    ProviderAction::Add {
-                        name,
-                        kind,
-                        model,
-                        base_url: None,
-                        key_spec: classify_key_spec(tokens[4]),
-                    }
-                } else {
-                    ProviderAction::Usage
+            } else if kind == "anthropic" || kind == "gemini" {
+                ProviderAction::Add {
+                    name,
+                    kind,
+                    model,
+                    base_url: None,
+                    key_spec: classify_key_spec(tokens[4]),
                 }
+            } else {
+                ProviderAction::Usage
             }
         }
         _ => ProviderAction::Usage,
     }
 }
 
-/// Kartu bantuan `/help` memakai markup menu terstruktur (`#`, `>`, `---`, `!`)
-/// agar tampil berwarna & rapi di TUI, dan dibersihkan otomatis di mode polos.
+/// Kartu bantuan `/help` memakai markup menu terstruktur (`#`, `>`, `---`, `!`).
 pub fn help_menu_markup() -> String {
     let mut out = String::from("# Daftar Perintah SelenCode\n");
     for c in COMMANDS {
         out.push_str(&format!("> {} | {} | {}\n", c.cmd, c.args, c.desc));
     }
     out.push_str("---\n");
-    out.push_str("! Pasang model manual:  /model set <id-model>   atau   /model <provider>:<id-model>\n");
-    out.push_str("! Pasang provider baru: /provider add <nama> <openai|anthropic|gemini> <model> [base_url] <ENV|api_key>\n");
-    out.push_str("! Shortcut keyboard:    Ketik / + ↑↓ + Tab untuk palette · Alt+Enter baris baru · Ctrl+C keluar");
+    out.push_str("! Konteks & shell cepat:  @src/main.rs (lampirkan file) · !cargo test (shell lokal instan)\n");
+    out.push_str("! Pasang provider cepat:  /provider preset openrouter <model> <ENV|key>  (cek: /provider preset)\n");
+    out.push_str("! Shortcut keyboard:      / + ↑↓ + Tab palette · Esc batalkan giliran · Alt+Enter baris baru · Ctrl+C keluar");
     out
 }
 

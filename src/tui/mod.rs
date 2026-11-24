@@ -31,8 +31,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io::stdout;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 /// Perintah dari UI ke worker agent (dimiliki main.rs).
 #[derive(Debug)]
@@ -42,13 +43,23 @@ pub enum TuiCommand {
     PromptPlan(String),
     /// Jalankan rencana yang sudah disetujui user (teks rencana utuh).
     ExecutePlan(String),
+    /// `!cmd` — jalankan shell lokal cepat tanpa memanggil LLM.
+    InlineShell(String),
     ShowModels,
     /// /model <arg>: ganti provider, `/model set <id>`, `/model <prov>:<id>`, atau `/model list`.
     SwitchOrSetModel(String),
     /// /models: tarik daftar model dari endpoint API provider aktif.
     FetchRemoteModels,
-    /// /provider [add|model|default|rm ...]: kelola & pasang provider lain.
+    /// /provider [preset|add|model|default|rm ...]: kelola & pasang provider lain.
     ManageProvider(Option<String>),
+    Undo,
+    Redo,
+    Memory(Option<String>),
+    Skills,
+    UseSkill(Option<String>),
+    LearnSkill(Option<String>),
+    InitAgents,
+    ExportChat(Option<String>),
     /// /new: mulai sesi baru yang bersih.
     NewSession,
     /// /compact: ringkas riwayat konteks secara manual.
@@ -63,6 +74,8 @@ pub struct TuiChannels {
     pub cmd_tx: mpsc::Sender<TuiCommand>,
     pub event_rx: mpsc::Receiver<UiEvent>,
     pub approval_rx: mpsc::Receiver<ApprovalRequest>,
+    /// Sinyal pembatalan giliran saat user menekan `Esc` ketika agent sibuk.
+    pub cancel: Arc<Notify>,
 }
 
 // ---------- gambar ----------
@@ -246,18 +259,27 @@ fn display_lines(app: &App) -> Vec<Line<'static>> {
                     Some(ToolState::Err) => ("✖", moonlit::ROSE),
                     None => ("●", moonlit::DIM),
                 };
-                let mut first = true;
-                for part in l.text.lines() {
-                    let prefix = if first {
-                        format!("  {icon} ")
-                    } else {
-                        "    ".to_string()
-                    };
+                if !app.show_tool_details {
+                    let label = l.tool_name.as_deref().unwrap_or("tool");
                     out.push(Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(color)),
-                        Span::styled(part.to_string(), Style::default().fg(moonlit::DIM)),
+                        Span::styled(format!("  {icon} "), Style::default().fg(color)),
+                        Span::styled(label.to_string(), Style::default().fg(moonlit::LAV)),
+                        Span::styled(" (ringkas · /details)", Style::default().fg(moonlit::FAINT)),
                     ]));
-                    first = false;
+                } else {
+                    let mut first = true;
+                    for part in l.text.lines() {
+                        let prefix = if first {
+                            format!("  {icon} ")
+                        } else {
+                            "    ".to_string()
+                        };
+                        out.push(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(color)),
+                            Span::styled(part.to_string(), Style::default().fg(moonlit::DIM)),
+                        ]));
+                        first = false;
+                    }
                 }
             }
             LineKind::Plan => {
@@ -614,6 +636,13 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
         SlashCommand::Exit => {
             app.should_quit = true;
         }
+        SlashCommand::InlineShell(cmd) => {
+            if app.busy {
+                app.error("Tunggu giliran saat ini selesai atau tekan Esc untuk membatalkan.");
+            } else {
+                send_cmd(app, cmd_tx, TuiCommand::InlineShell(cmd));
+            }
+        }
         SlashCommand::Help => {
             app.menu(help_menu_markup());
         }
@@ -629,9 +658,44 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
         SlashCommand::Provider(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::ManageProvider(arg));
         }
+        SlashCommand::Undo => {
+            send_cmd(app, cmd_tx, TuiCommand::Undo);
+        }
+        SlashCommand::Redo => {
+            send_cmd(app, cmd_tx, TuiCommand::Redo);
+        }
+        SlashCommand::Memory(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Memory(arg));
+        }
+        SlashCommand::Skills => {
+            send_cmd(app, cmd_tx, TuiCommand::Skills);
+        }
+        SlashCommand::Skill(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::UseSkill(arg));
+        }
+        SlashCommand::Learn(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::LearnSkill(arg));
+        }
+        SlashCommand::Init => {
+            send_cmd(app, cmd_tx, TuiCommand::InitAgents);
+        }
+        SlashCommand::Export(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::ExportChat(arg));
+        }
+        SlashCommand::Details => {
+            app.show_tool_details = !app.show_tool_details;
+            let mode = if app.show_tool_details {
+                "detail (argumen & ringkasan tampil)"
+            } else {
+                "ringkas (hanya nama & status tool)"
+            };
+            app.menu(format!(
+                "# Tampilan Tool Diubah\n* mode | {mode} | jalankan /details lagi untuk mengganti"
+            ));
+        }
         SlashCommand::New => {
             if app.busy {
-                app.error("Tunggu giliran saat ini selesai sebelum memulai sesi baru.");
+                app.error("Tunggu giliran saat ini selesai atau tekan Esc untuk membatalkan.");
             } else {
                 send_cmd(app, cmd_tx, TuiCommand::NewSession);
             }
@@ -664,7 +728,7 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
         SlashCommand::NotCommand => {
             if app.busy {
                 app.info(
-                    "Selena masih bekerja — tunggu giliran selesai atau tekan Ctrl+C untuk keluar.",
+                    "Selena masih bekerja — tekan Esc untuk membatalkan atau tunggu selesai.",
                 );
                 return;
             }
@@ -698,7 +762,12 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>) {
     }
 }
 
-fn handle_key(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>, key: KeyEvent) {
+fn handle_key(
+    app: &mut App,
+    cmd_tx: &mpsc::Sender<TuiCommand>,
+    cancel: &Arc<Notify>,
+    key: KeyEvent,
+) {
     if key.kind == KeyEventKind::Release {
         return;
     }
@@ -716,7 +785,14 @@ fn handle_key(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>, key: KeyEvent) {
         return;
     }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        cancel.notify_waiters();
         app.should_quit = true;
+        return;
+    }
+    // Esc saat Selena sedang bekerja -> batalkan giliran tengah jalan tanpa keluar!
+    if key.code == KeyCode::Esc && app.busy {
+        cancel.notify_waiters();
+        app.info("Membatalkan giliran (Esc)…");
         return;
     }
 
@@ -816,7 +892,7 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
             }
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
-                    Event::Key(key) => handle_key(&mut app, &ch.cmd_tx, key),
+                    Event::Key(key) => handle_key(&mut app, &ch.cmd_tx, &ch.cancel, key),
                     Event::Mouse(m) => match m.kind {
                         MouseEventKind::ScrollUp => app.scroll_up(3),
                         MouseEventKind::ScrollDown => app.scroll_down(3),

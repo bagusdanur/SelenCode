@@ -7,7 +7,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::context::{
-    auto_outline, build_system_prompt, compact_messages, estimate_tokens, needs_compaction,
+    auto_outline, build_system_prompt, compact_messages, estimate_tokens, expand_at_mentions,
+    format_memories_section, needs_compaction,
 };
 use super::plan::{is_read_only, TurnMode, PLAN_NOTE};
 use super::ui::UiEvent;
@@ -158,20 +159,39 @@ async fn run_turn_inner(
         TurnMode::Execute => registry.specs(),
     };
     if messages.is_empty() {
-        let sys = build_system_prompt(&ctx.cwd, &tools);
+        let mut sys = build_system_prompt(&ctx.cwd, &tools);
+        if let Some(store) = &ctx.store {
+            let cwd_str = ctx.cwd.to_string_lossy().to_string();
+            if let Ok(mems) = store.list_memories(&cwd_str, 20) {
+                let mem_sec = format_memories_section(&mems);
+                if !mem_sec.is_empty() {
+                    sys.push_str(&mem_sec);
+                }
+            }
+        }
         let sys_msg = Message::text(Role::System, sys);
         persist_message(ctx, &sys_msg);
         messages.push(sys_msg);
     }
-    // Konteks pintar (Fase 5): bila user menyebut path file kode yang ada,
-    // lampirkan outline-nya ke pesan user giliran ini (bukan system prompt —
-    // system prompt dibuat sekali; konteks per-giliran menempel di giliran).
-    // Blok ikut tersimpan di sesi persis seperti yang dilihat provider.
+    // Lampiran eksplisit `@path/to/file` (ala OpenCode) + konteks pintar auto-outline.
     let mut user_text = user_prompt.to_string();
-    let auto = auto_outline(&ctx.cwd, user_prompt);
-    if !auto.is_empty() {
+    let (at_block, attached_files) = expand_at_mentions(&ctx.cwd, user_prompt);
+    if !at_block.is_empty() {
         user_text.push_str("\n\n");
-        user_text.push_str(&auto);
+        user_text.push_str(&at_block);
+        let note = format!("Melampirkan @file: {}", attached_files.join(", "));
+        match &ui {
+            Some(tx) => {
+                let _ = tx.send(UiEvent::Info(note)).await;
+            }
+            None => eprintln!("[selen] {note}"),
+        }
+    } else {
+        let auto = auto_outline(&ctx.cwd, user_prompt);
+        if !auto.is_empty() {
+            user_text.push_str("\n\n");
+            user_text.push_str(&auto);
+        }
     }
     let user_msg = Message::text(Role::User, user_text);
     persist_message(ctx, &user_msg);

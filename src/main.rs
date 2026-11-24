@@ -7,12 +7,13 @@ use selencode::config::{self, Config, ProviderCfg};
 use selencode::providers::anthropic::AnthropicProvider;
 use selencode::providers::gemini::GeminiProvider;
 use selencode::providers::openai::{fetch_models, OpenAiProvider};
-use selencode::providers::{Message, Provider};
+use selencode::providers::{Message, Provider, Role};
 use selencode::repl::{
     help_menu_markup, parse_model_action, parse_provider_action, parse_slash_command,
-    strip_menu_markup, KeySpec, ModelAction, ProviderAction, SlashCommand,
+    strip_menu_markup, KeySpec, ModelAction, ProviderAction, SlashCommand, PROVIDER_PRESETS,
 };
-use selencode::security::{ApprovalRequest, Approver};
+use selencode::security::{is_forbidden_command, redact_secrets, ApprovalRequest, Approver};
+use selencode::skills::{export_conversation_md, init_agents_md, list_skills, load_skill, save_skill};
 use selencode::store::Store;
 use selencode::tools::delegate::Delegate;
 use selencode::tools::{default_registry_with_shell, read_only_registry, Ctx, Registry};
@@ -360,6 +361,7 @@ impl Session {
     fn handle_provider(&mut self, arg: Option<&str>) -> Result<String> {
         match parse_provider_action(arg) {
             ProviderAction::List => Ok(self.providers_menu()),
+            ProviderAction::ListPresets => Ok(self.provider_presets_menu()),
             ProviderAction::Add {
                 name,
                 kind,
@@ -585,11 +587,251 @@ impl Session {
         out
     }
 
+    fn provider_presets_menu(&self) -> String {
+        let mut out = String::from("# Preset Provider Siap Pakai\n");
+        for p in PROVIDER_PRESETS {
+            let url = p.base_url.unwrap_or("(endpoint resmi)");
+            let env = if p.default_env.is_empty() {
+                "(tanpa API key — lokal)"
+            } else {
+                p.default_env
+            };
+            out.push_str(&format!(
+                "> {} | {} | {} · {url} · {env}\n",
+                p.id, p.default_model, p.kind
+            ));
+        }
+        out.push_str("---\n");
+        out.push_str("! Pasang cepat: /provider preset <id> [model] [ENV_atau_api_key]\n");
+        out.push_str("! Contoh:       /provider preset openrouter anthropic/claude-3.7-sonnet OPENROUTER_API_KEY\n");
+        out.push_str("! Contoh lokal: /provider preset ollama qwen2.5-coder:7b");
+        out
+    }
+
+    /// `!perintah` — jalankan shell lokal cepat tanpa memanggil LLM (ala OpenCode).
+    async fn handle_inline_shell(&self, command: &str) -> Result<String> {
+        if is_forbidden_command(command) {
+            anyhow::bail!("perintah ditolak demi keamanan (pola destruktif): {command}");
+        }
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new("cmd");
+            c.args(["/C", command]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new("sh");
+            c.args(["-c", command]);
+            c
+        };
+        cmd.current_dir(&self.ctx.cwd)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let out = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("timeout 60 detik menjalankan `!{command}`"))??;
+        let code = out.status.code().unwrap_or(-1);
+        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&out.stderr));
+        let clean = redact_secrets(&combined);
+        let mut lines: Vec<&str> = clean.lines().collect();
+        let truncated = if lines.len() > 30 {
+            lines.truncate(30);
+            true
+        } else {
+            false
+        };
+        let mut card = format!("# Shell: !{command} (exit {code})\n");
+        if lines.is_empty() {
+            card.push_str("! (tanpa output)\n");
+        } else {
+            for l in lines {
+                card.push_str(l);
+                card.push('\n');
+            }
+            if truncated {
+                card.push_str("! ... (output dipotong 30 baris)\n");
+            }
+        }
+        Ok(card)
+    }
+
+    fn handle_undo(&self) -> Result<String> {
+        let mut stack = self.ctx.undo_stack.lock().expect("undo_stack poisoned");
+        match stack.undo()? {
+            Some(msg) => Ok(format!(
+                "# Undo Berhasil\n* dipulihkan | {msg} | sisa undo: {}, redo: {}",
+                stack.undo_len(),
+                stack.redo_len()
+            )),
+            None => Ok("# Undo\n! Tidak ada perubahan file yang bisa di-undo di sesi ini.".into()),
+        }
+    }
+
+    fn handle_redo(&self) -> Result<String> {
+        let mut stack = self.ctx.undo_stack.lock().expect("undo_stack poisoned");
+        match stack.redo()? {
+            Some(msg) => Ok(format!(
+                "# Redo Berhasil\n* diterapkan | {msg} | sisa undo: {}, redo: {}",
+                stack.undo_len(),
+                stack.redo_len()
+            )),
+            None => Ok("# Redo\n! Tidak ada perubahan file yang bisa di-redo.".into()),
+        }
+    }
+
+    fn handle_memory(&self, arg: Option<&str>) -> Result<String> {
+        let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
+        let Some(arg) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let list = self.store.list_memories(&cwd_str, 30)?;
+            let mut out = String::from("# Memori Persisten Selena\n");
+            if list.is_empty() {
+                out.push_str("! Belum ada memori tersimpan.\n");
+            } else {
+                for m in list {
+                    let scope = if m.scope == "global" { "global" } else { "project" };
+                    out.push_str(&format!("> #{} | {scope} | {}\n", m.id, m.content));
+                }
+            }
+            out.push_str("---\n");
+            out.push_str("! Simpan memori project: /memory add <catatan>\n");
+            out.push_str("! Simpan memori global:  /memory global <catatan>\n");
+            out.push_str("! Hapus memori:          /memory rm <id>");
+            return Ok(out);
+        };
+        if let Some(rest) = arg.strip_prefix("add ") {
+            let text = rest.trim();
+            if text.is_empty() {
+                anyhow::bail!("isi memori kosong. Contoh: /memory add Selalu pakai bahasa Indonesia");
+            }
+            let id = self.store.add_memory(&cwd_str, text)?;
+            return Ok(format!(
+                "# Memori Project Disimpan\n* #{id} | project | {text}"
+            ));
+        }
+        if let Some(rest) = arg.strip_prefix("global ") {
+            let text = rest.trim();
+            if text.is_empty() {
+                anyhow::bail!("isi memori global kosong.");
+            }
+            let id = self.store.add_memory("global", text)?;
+            return Ok(format!(
+                "# Memori Global Disimpan\n* #{id} | global | {text}"
+            ));
+        }
+        if let Some(rest) = arg.strip_prefix("rm ").or_else(|| arg.strip_prefix("del ")) {
+            let id: i64 = rest
+                .trim()
+                .trim_start_matches('#')
+                .parse()
+                .map_err(|_| anyhow::anyhow!("id memori harus angka (mis. /memory rm 1)"))?;
+            if self.store.remove_memory(id)? {
+                return Ok(format!("# Memori Dihapus\n> #{id} | dihapus"));
+            }
+            anyhow::bail!("memori #{id} tidak ditemukan");
+        }
+        Ok("# Cara Pakai /memory\n\
+            ! /memory                  — lihat semua memori aktif\n\
+            ! /memory add <catatan>    — simpan memori khusus project ini\n\
+            ! /memory global <catatan> — simpan memori global lintas project\n\
+            ! /memory rm <id>          — hapus memori berdasarkan ID"
+            .to_string())
+    }
+
+    fn handle_skills_list(&self) -> String {
+        let skills = list_skills(&self.ctx.cwd);
+        let mut out = String::from("# Daftar Skills (.selencode/skills)\n");
+        if skills.is_empty() {
+            out.push_str("! Belum ada skill tersimpan.\n");
+        } else {
+            for s in skills {
+                out.push_str(&format!("> {} | {} | {}\n", s.name, s.scope, s.summary));
+            }
+        }
+        out.push_str("---\n");
+        out.push_str("! Aktifkan skill:     /skill <nama>\n");
+        out.push_str("! Buat skill baru:    /learn <nama> <instruksi workflow>");
+        out
+    }
+
+    fn handle_use_skill(&mut self, arg: Option<&str>) -> Result<String> {
+        let name = arg
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("sebutkan nama skill. Contoh: /skill review"))?;
+        let (info, content) = load_skill(&self.ctx.cwd, name)?;
+        let sys = Message::text(
+            Role::System,
+            format!("[Skill aktif: {}]\n{content}", info.name),
+        );
+        let _ = self.store.save_message(&self.session_id, &sys);
+        self.messages.push(sys);
+        Ok(format!(
+            "# Skill Diaktifkan\n* {} | {} | {}",
+            info.name, info.scope, info.summary
+        ))
+    }
+
+    fn handle_learn_skill(&self, arg: Option<&str>) -> Result<String> {
+        let raw = arg
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "format: /learn <nama> <instruksi>. Contoh: /learn test Jalankan cargo test sebelum commit"
+                )
+            })?;
+        let mut parts = raw.splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or("");
+        let instr = parts.next().map(|s| s.trim()).unwrap_or("");
+        if name.is_empty() || instr.is_empty() {
+            anyhow::bail!(
+                "format: /learn <nama> <instruksi>. Contoh: /learn test Jalankan cargo test sebelum commit"
+            );
+        }
+        let path = save_skill(&self.ctx.cwd, name, instr)?;
+        Ok(format!(
+            "# Skill Baru Tersimpan\n* {name} | project | {}\n! Aktifkan kapan saja dengan: /skill {name}",
+            path.display()
+        ))
+    }
+
+    fn handle_init(&self) -> Result<String> {
+        let (path, created) = init_agents_md(&self.ctx.cwd)?;
+        if created {
+            Ok(format!(
+                "# AGENTS.md Dibuat\n* dibuat | {} | otomatis dibaca Selena di sesi berikutnya",
+                path.display()
+            ))
+        } else {
+            Ok(format!(
+                "# AGENTS.md Sudah Ada\n! File {} sudah ada (tidak ditimpa).",
+                path.display()
+            ))
+        }
+    }
+
+    fn handle_export(&self, arg: Option<&str>) -> Result<String> {
+        let path = export_conversation_md(
+            &self.ctx.cwd,
+            arg,
+            &self.provider_name,
+            &self.pcfg.model,
+            &self.messages,
+        )?;
+        Ok(format!(
+            "# Percakapan Diekspor\n* markdown | {} | {} pesan diekspor",
+            path.display(),
+            self.messages.len()
+        ))
+    }
+
     fn provider_usage_footer(&self) -> String {
-        "! Tambah OpenAI-compat:  /provider add <nama> openai <model> <base_url> <ENV_atau_key>\n\
+        "! Preset siap pakai:     /provider preset   |   /provider preset <id> [model] [ENV|key]\n\
+         ! Tambah OpenAI-compat:  /provider add <nama> openai <model> <base_url> <ENV_atau_key>\n\
          ! Tambah Claude/Gemini:  /provider add <nama> <anthropic|gemini> <model> <ENV_atau_key>\n\
-         ! Ubah model provider:   /provider model <nama> <id-model>\n\
-         ! Set default / hapus:   /provider default <nama>   |   /provider rm <nama>"
+         ! Ubah model / default:  /provider model <nama> <id-model>   |   /provider default <nama>"
             .to_string()
     }
 
@@ -713,87 +955,166 @@ async fn tui_worker(
     mut s: Session,
     mut cmd_rx: tokio::sync::mpsc::Receiver<TuiCommand>,
     ui_tx: tokio::sync::mpsc::Sender<UiEvent>,
+    cancel: Arc<tokio::sync::Notify>,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             TuiCommand::Prompt(prompt) => {
-                let r = run_turn_ui(
-                    s.provider.clone(),
-                    &s.registry,
-                    &s.ctx,
-                    &mut s.messages,
-                    &prompt,
-                    s.cfg.agent.max_steps,
-                    ui_tx.clone(),
-                )
-                .await;
-                match r {
-                    Ok(_) => {
-                        let _ = ui_tx.send(UiEvent::Info(s.usage_line())).await;
-                    }
-                    Err(e) => {
-                        let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
-                        // Pastikan UI lepas dari keadaan sibuk.
+                tokio::select! {
+                    r = run_turn_ui(
+                        s.provider.clone(),
+                        &s.registry,
+                        &s.ctx,
+                        &mut s.messages,
+                        &prompt,
+                        s.cfg.agent.max_steps,
+                        ui_tx.clone(),
+                    ) => match r {
+                        Ok(_) => {
+                            let _ = ui_tx.send(UiEvent::Info(s.usage_line())).await;
+                        }
+                        Err(e) => {
+                            let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                            let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
+                        }
+                    },
+                    _ = cancel.notified() => {
+                        let _ = ui_tx.send(UiEvent::Info("Giliran dibatalkan oleh user (Esc).".into())).await;
                         let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
                     }
                 }
             }
             TuiCommand::PromptPlan(prompt) => {
-                let r = run_turn_ui_mode(
-                    s.provider.clone(),
-                    &s.registry,
-                    &s.ctx,
-                    &mut s.messages,
-                    &prompt,
-                    s.cfg.agent.max_steps,
-                    ui_tx.clone(),
-                    TurnMode::Plan,
-                )
-                .await;
-                match r {
-                    Ok(text) => {
-                        let _ = ui_tx.send(UiEvent::Info(s.usage_line())).await;
-                        match extract_plan(&text) {
-                            Some(plan) => {
-                                let _ = ui_tx.send(UiEvent::PlanReady(plan)).await;
-                            }
-                            None => {
-                                let _ = ui_tx
-                                    .send(UiEvent::Info(
-                                        "Giliran plan selesai tanpa teks rencana.".into(),
-                                    ))
-                                    .await;
+                tokio::select! {
+                    r = run_turn_ui_mode(
+                        s.provider.clone(),
+                        &s.registry,
+                        &s.ctx,
+                        &mut s.messages,
+                        &prompt,
+                        s.cfg.agent.max_steps,
+                        ui_tx.clone(),
+                        TurnMode::Plan,
+                    ) => match r {
+                        Ok(text) => {
+                            let _ = ui_tx.send(UiEvent::Info(s.usage_line())).await;
+                            match extract_plan(&text) {
+                                Some(plan) => {
+                                    let _ = ui_tx.send(UiEvent::PlanReady(plan)).await;
+                                }
+                                None => {
+                                    let _ = ui_tx
+                                        .send(UiEvent::Info(
+                                            "Giliran plan selesai tanpa teks rencana.".into(),
+                                        ))
+                                        .await;
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                        Err(e) => {
+                            let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                            let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
+                        }
+                    },
+                    _ = cancel.notified() => {
+                        let _ = ui_tx.send(UiEvent::Info("Giliran plan dibatalkan (Esc).".into())).await;
                         let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
                     }
                 }
             }
             TuiCommand::ExecutePlan(plan) => {
                 let prompt = approved_plan_prompt(&plan);
-                let r = run_turn_ui(
-                    s.provider.clone(),
-                    &s.registry,
-                    &s.ctx,
-                    &mut s.messages,
-                    &prompt,
-                    s.cfg.agent.max_steps,
-                    ui_tx.clone(),
-                )
-                .await;
-                match r {
-                    Ok(_) => {
-                        let _ = ui_tx.send(UiEvent::Info(s.usage_line())).await;
-                    }
-                    Err(e) => {
-                        let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                tokio::select! {
+                    r = run_turn_ui(
+                        s.provider.clone(),
+                        &s.registry,
+                        &s.ctx,
+                        &mut s.messages,
+                        &prompt,
+                        s.cfg.agent.max_steps,
+                        ui_tx.clone(),
+                    ) => match r {
+                        Ok(_) => {
+                            let _ = ui_tx.send(UiEvent::Info(s.usage_line())).await;
+                        }
+                        Err(e) => {
+                            let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                            let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
+                        }
+                    },
+                    _ = cancel.notified() => {
+                        let _ = ui_tx.send(UiEvent::Info("Eksekusi rencana dibatalkan (Esc).".into())).await;
                         let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
                     }
                 }
             }
+            TuiCommand::InlineShell(cmd) => match s.handle_inline_shell(&cmd).await {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::Undo => match s.handle_undo() {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::Redo => match s.handle_redo() {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::Memory(arg) => match s.handle_memory(arg.as_deref()) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::Skills => {
+                let _ = ui_tx.send(UiEvent::Menu(s.handle_skills_list())).await;
+            }
+            TuiCommand::UseSkill(arg) => match s.handle_use_skill(arg.as_deref()) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::LearnSkill(arg) => match s.handle_learn_skill(arg.as_deref()) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::InitAgents => match s.handle_init() {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::ExportChat(arg) => match s.handle_export(arg.as_deref()) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
             TuiCommand::ShowModels => {
                 let _ = ui_tx.send(UiEvent::Menu(s.models_menu())).await;
             }
@@ -915,11 +1236,13 @@ async fn interactive_tui(cli: Cli, resume: bool) -> Result<()> {
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TuiCommand>(32);
     let (ui_tx, ui_rx) = tokio::sync::mpsc::channel::<UiEvent>(256);
-    let worker = tokio::spawn(tui_worker(s, cmd_rx, ui_tx));
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let worker = tokio::spawn(tui_worker(s, cmd_rx, ui_tx, cancel.clone()));
     let channels = TuiChannels {
         cmd_tx,
         event_rx: ui_rx,
         approval_rx,
+        cancel,
     };
     let tui_result =
         tokio::task::spawn_blocking(move || selencode::tui::run_blocking(app, channels)).await;
@@ -981,6 +1304,44 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
+            SlashCommand::InlineShell(cmd) => match s.handle_inline_shell(&cmd).await {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Undo => match s.handle_undo() {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Redo => match s.handle_redo() {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Memory(arg) => match s.handle_memory(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Skills => {
+                println!("{}", strip_menu_markup(&s.handle_skills_list()));
+            }
+            SlashCommand::Skill(arg) => match s.handle_use_skill(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Learn(arg) => match s.handle_learn_skill(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Init => match s.handle_init() {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Export(arg) => match s.handle_export(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Details => {
+                println!("Perintah /details hanya berlaku pada mode TUI.");
+            }
             SlashCommand::New => match s.reset_session() {
                 Ok(sid) => println!("Sesi baru dimulai ({sid})."),
                 Err(e) => eprintln!("[error] {e}"),

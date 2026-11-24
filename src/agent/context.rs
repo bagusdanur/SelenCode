@@ -1,5 +1,6 @@
 use crate::providers::{Block, Message, Role, ToolSpec};
-use crate::security::{is_secret_file, resolve_in_sandbox};
+use crate::security::{is_secret_file, redact_secrets, resolve_in_sandbox};
+use crate::store::MemoryItem;
 use crate::tools::file::MAX_READ_BYTES;
 use std::path::Path;
 
@@ -54,6 +55,91 @@ bukan tool bawaan SelenCode — perlakukan hasil dan kemampuannya sebagai milik 
 
 const MAX_AUTO_FILES: usize = 3;
 const MAX_AUTO_BLOCK: usize = 6 * 1024;
+const MAX_AT_FILES: usize = 4;
+const MAX_AT_FILE_BYTES: usize = 20 * 1024;
+const MAX_AT_BLOCK: usize = 40 * 1024;
+const MAX_MEMORY_BLOCK: usize = 2 * 1024;
+
+/// Format memori persisten (global + project) untuk disisipkan ke system prompt.
+pub fn format_memories_section(memories: &[MemoryItem]) -> String {
+    if memories.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n--- Memori tersimpan user (/memory) ---\n");
+    for m in memories {
+        let tag = if m.scope == "global" { "global" } else { "project" };
+        let line = format!("- [{tag}] {}\n", m.content);
+        if out.len() + line.len() > MAX_MEMORY_BLOCK {
+            break;
+        }
+        out.push_str(&line);
+    }
+    out.push_str("--- akhir memori ---\n");
+    out
+}
+
+/// Ekspansi `@path/to/file` di prompt user (ala OpenCode): baca file yang
+/// disebut secara eksplisit dengan awalan `@` di dalam sandbox (tolak file
+/// rahasia & biner, redaksi secret), lalu kembalikan `(blok_lampiran, daftar_file)`.
+pub fn expand_at_mentions(cwd: &Path, prompt: &str) -> (String, Vec<String>) {
+    let mut sections: Vec<String> = Vec::new();
+    let mut attached: Vec<String> = Vec::new();
+    for raw in prompt.split_whitespace() {
+        if attached.len() >= MAX_AT_FILES {
+            break;
+        }
+        let cleaned = raw.trim_start_matches(|c| matches!(c, '"' | '\'' | '(' | '[' | '{'));
+        let Some(after_at) = cleaned.strip_prefix('@') else {
+            continue;
+        };
+        let tok = after_at.trim_end_matches(|c| {
+            matches!(
+                c,
+                '"' | '\'' | '`' | ')' | ']' | '}' | ',' | ';' | ':' | '!' | '?' | '.'
+            )
+        });
+        if tok.is_empty() || attached.iter().any(|s| s == tok) {
+            continue;
+        }
+        let Ok(p) = resolve_in_sandbox(cwd, Path::new(tok)) else {
+            continue;
+        };
+        if !p.is_file() || is_secret_file(&p) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&p) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue; // file biner
+        }
+        let mut text = redact_secrets(&String::from_utf8_lossy(&bytes));
+        if text.len() > MAX_AT_FILE_BYTES {
+            let mut cut = MAX_AT_FILE_BYTES;
+            while cut > 0 && !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+            text.push_str("\n... (dipotong 20KB)");
+        }
+        attached.push(tok.to_string());
+        sections.push(format!("--- @{tok} ---\n{text}"));
+    }
+    if sections.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let mut block = String::from("[File terlampir via @mention]\n");
+    block.push_str(&sections.join("\n\n"));
+    if block.len() > MAX_AT_BLOCK {
+        let mut end = MAX_AT_BLOCK;
+        while end > 0 && !block.is_char_boundary(end) {
+            end -= 1;
+        }
+        block.truncate(end);
+        block.push_str("\n... (total lampiran dipotong 40KB)");
+    }
+    (block, attached)
+}
 
 /// Konteks pintar (Fase 5): deteksi path file kode yang disebut user di
 /// prompt, lalu buat blok outline untuk maks 3 file pertama yang BENAR-BENAR

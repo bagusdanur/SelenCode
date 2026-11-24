@@ -5,6 +5,7 @@ pub mod outline;
 pub mod providers;
 pub mod repl;
 pub mod security;
+pub mod skills;
 pub mod store;
 pub mod tools;
 pub mod tui;

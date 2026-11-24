@@ -49,6 +49,7 @@ pub async fn run_subagent(
         store: None,
         session_id: None,
         plan_state: Arc::new(Mutex::new(Vec::<PlanStep>::new())),
+        undo_stack: parent_ctx.undo_stack.clone(),
     };
     let mut messages = vec![Message::text(
         Role::System,

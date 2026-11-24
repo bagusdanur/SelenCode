@@ -23,6 +23,14 @@ pub struct SessionInfo {
     pub title: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct MemoryItem {
+    pub id: i64,
+    pub scope: String,
+    pub content: String,
+    pub created_at: String,
+}
+
 /// Lokasi DB: env SELENCODE_DB (dipakai tes) atau
 /// ~/.local/share/selencode/selen.db (dirs::data_dir).
 pub fn db_path() -> PathBuf {
@@ -42,6 +50,8 @@ CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session_id TEXT,
                        role TEXT, content TEXT, ts TEXT);
 CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, session_id TEXT, model TEXT,
                     input_tokens INT, output_tokens INT, ts TEXT);
+CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, scope TEXT,
+                    content TEXT, ts TEXT);
 ";
 
 fn now() -> String {
@@ -261,5 +271,45 @@ impl Store {
             i.unwrap_or(0).max(0) as u64,
             o.unwrap_or(0).max(0) as u64,
         ))
+    }
+
+    // ---------- Memori Persisten Lintas Sesi (/memory) ----------
+
+    pub fn add_memory(&self, scope: &str, content: &str) -> Result<i64> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "INSERT INTO memories (scope, content, ts) VALUES (?1, ?2, ?3)",
+            rusqlite::params![scope, content.trim(), now()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Ambil memori untuk `cwd` ini + memori `"global"`, terbaru dulu.
+    pub fn list_memories(&self, cwd: &str, limit: usize) -> Result<Vec<MemoryItem>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, scope, content, ts FROM memories \
+             WHERE scope = 'global' OR scope = ?1 \
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![cwd, limit as i64], |row| {
+            Ok(MemoryItem {
+                id: row.get(0)?,
+                scope: row.get(1)?,
+                content: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn remove_memory(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let n = conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
+        Ok(n > 0)
     }
 }

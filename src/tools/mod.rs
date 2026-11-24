@@ -5,6 +5,7 @@ pub mod outline;
 pub mod plan;
 pub mod search;
 pub mod shell;
+pub mod undo;
 pub mod web;
 
 use crate::config::ShellCfg;
@@ -35,6 +36,8 @@ pub struct Ctx {
     /// Checklist update_plan bersama (Fase 6). Diclone per Ctx — Arc yang
     /// sama menunjuk state yang sama untuk seluruh sesi.
     pub plan_state: Arc<std::sync::Mutex<Vec<plan::PlanStep>>>,
+    /// Riwayat snapshot edit file untuk `/undo` dan `/redo`.
+    pub undo_stack: Arc<std::sync::Mutex<undo::UndoStack>>,
 }
 
 impl Ctx {
@@ -46,6 +49,7 @@ impl Ctx {
             store: None,
             session_id: None,
             plan_state: Arc::new(std::sync::Mutex::new(Vec::new())),
+            undo_stack: Arc::new(std::sync::Mutex::new(undo::UndoStack::default())),
         }
     }
     /// Ganti approver (Fase 4: mode TUI memakai approver berbasis channel).

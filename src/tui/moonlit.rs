@@ -614,7 +614,7 @@ pub fn status_line(
     ];
     if busy {
         spans.push(sp(" │ ", st(FAINT)));
-        spans.push(sp("✦ bekerja…", stb(GOLD)));
+        spans.push(sp("✦ bekerja… (Esc batal)", stb(GOLD)));
     }
     Line::from(spans)
 }

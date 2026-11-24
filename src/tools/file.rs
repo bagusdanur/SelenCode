@@ -162,7 +162,11 @@ impl Tool for WriteFile {
         if is_secret_file(&p) {
             return Err(anyhow!("file '{rel}' ditolak: file rahasia tidak boleh ditulis lewat tool"));
         }
-        let old = std::fs::read_to_string(&p).unwrap_or_default();
+        let before = std::fs::read(&p).ok();
+        let old = before
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
         let diff = unified_diff(&old, content, rel);
         if !ctx.approver.ask(&format!("write_file {rel}"), &diff).await {
             return Ok(format!("Ditolak user — file {rel} TIDAK ditulis."));
@@ -171,6 +175,14 @@ impl Tool for WriteFile {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&p, content)?;
+        if let Ok(mut stack) = ctx.undo_stack.lock() {
+            stack.record(super::undo::FileSnapshot {
+                path: p,
+                rel: rel.to_string(),
+                before,
+                after: content.as_bytes().to_vec(),
+            });
+        }
         Ok(format!("OK: {rel} ditulis ({} byte).", content.len()))
     }
 }
@@ -218,6 +230,14 @@ impl Tool for EditFile {
             return Ok(format!("Ditolak user — file {rel} TIDAK diubah."));
         }
         std::fs::write(&p, &new_text)?;
+        if let Ok(mut stack) = ctx.undo_stack.lock() {
+            stack.record(super::undo::FileSnapshot {
+                path: p,
+                rel: rel.to_string(),
+                before: Some(text.into_bytes()),
+                after: new_text.into_bytes(),
+            });
+        }
         Ok(format!("OK: {rel} diedit."))
     }
 }
