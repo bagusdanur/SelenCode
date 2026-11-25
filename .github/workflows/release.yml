@@ -96,11 +96,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           REPO="${GITHUB_REPOSITORY}"
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --repo "$REPO" --clobber
-            gh release edit "$TAG" --repo "$REPO" --draft=false --title "$TAG"
+            gh release edit "$TAG" --repo "$REPO" --draft=false --latest --title "$TAG"
           else
-            gh release create "$TAG" dist/* --repo "$REPO" --title "$TAG" --generate-notes
+            gh release create "$TAG" dist/* --repo "$REPO" --title "$TAG" --generate-notes --latest
           fi
+          # Verifikasi publikasi benar-benar bukan draft & memuat 3 aset binary!
+          INFO=$(gh release view "$TAG" --repo "$REPO" --json isDraft,url,assets)
+          echo "$INFO"
+          echo "$INFO" | grep -q '"isDraft":false'
+          COUNT=$(echo "$INFO" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['assets']))")
+          test "$COUNT" -ge 3
