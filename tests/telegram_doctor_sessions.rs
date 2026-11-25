@@ -199,7 +199,7 @@ fn telegram_test_action_and_live_progress_html_work() {
     let tool_html = format_telegram_progress_html(2, 15, Some("read_file"), 1, "");
     assert!(tool_html.contains("langkah 2/15"));
     assert!(tool_html.contains("<code>read_file</code>"));
-    assert!(tool_html.contains("1 tool selesai"));
+    assert!(tool_html.contains("1 aksi tool selesai"));
 
     let stream_html = format_telegram_progress_html(3, 15, None, 2, "Halo <world> & teman");
     assert!(stream_html.contains("Mengetik..."));
