@@ -9,13 +9,24 @@ use selencode::repl::{
 };
 use selencode::security::{ApprovalMode, ApprovalRequest};
 use selencode::telegram::{
-    escape_telegram_html, markdown_to_telegram_html, TelegramClient, TgApprovalHub,
-    TELEGRAM_BOT_COMMANDS,
+    escape_telegram_html, format_telegram_progress_html, markdown_to_telegram_html,
+    TelegramClient, TgApprovalHub, TELEGRAM_BOT_COMMANDS,
 };
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+enum IncomingTgPayload {
+    Text(String),
+    Photo {
+        file_id: String,
+        message_id: i64,
+        caption: String,
+        cwd: PathBuf,
+    },
+}
 // ---------- Telegram Bot Gateway (`selen telegram`) ----------
 
 /// Bersihkan akhiran `@nama_bot` pada perintah grup Telegram (mis. `/model@selen_bot 2` -> `/model 2`).
@@ -37,7 +48,9 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
     let cfg = config::load()?;
     let token = cfg.telegram.resolve_token()?;
     let tg = TelegramClient::new(&token)?;
+    let t_conn = Instant::now();
     let me = tg.get_me().await?;
+    let conn_ms = t_conn.elapsed().as_millis();
     let bot_handle = me
         .username
         .clone()
@@ -54,8 +67,9 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
     };
 
     println!("☾ SelenCode Telegram Gateway aktif!");
-    println!("  Bot      : {bot_handle} (id: {})", me.id);
+    println!("  Bot      : {bot_handle} (id: {}) — terhubung ({conn_ms} ms)", me.id);
     println!("  Provider : {prov_name} / {}", pcfg.model);
+    println!("  Config   : {}", config::active_config_path().display());
     println!("  Folder   : {}", cwd.display());
     println!("  Approval : {tg_mode_str}");
     if cfg.telegram.allowed_users.is_empty() {
@@ -72,6 +86,11 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
         println!("  Whitelist: {}", ids.join(", "));
     }
     println!("  Tekan Ctrl+C untuk menghentikan gateway.\n");
+
+    // Bersihkan webhook lama (bila token pernah dipakai app/bot lain) agar long-polling langsung jalan!
+    if let Err(e) = tg.delete_webhook(false).await {
+        eprintln!("  [peringatan] gagal membersihkan webhook lama: {e}");
+    }
 
     // Sinkronkan seluruh daftar perintah `/` ke tombol menu Telegram (`setMyCommands`) secara otomatis.
     match tg.sync_bot_commands().await {
@@ -99,23 +118,44 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
     if offset > 0 {
         println!("  (Antrean pesan lama sebelum startup dilewati; siap menerima pesan baru.)\n");
     }
+    let mut poll_err_streak: u32 = 0;
     loop {
         let updates = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("\n☾ Telegram Gateway dihentikan.");
                 break;
             }
-            res = tg.get_updates(offset, 25) => match res {
-                Ok(u) => u,
+            res = tg.get_updates(offset, 20) => match res {
+                Ok(u) => {
+                    if poll_err_streak > 0 {
+                        println!("[telegram] ✅ koneksi polling Telegram pulih.");
+                        poll_err_streak = 0;
+                    }
+                    u
+                }
                 Err(e) => {
-                    eprintln!("[telegram] gagal polling: {e} (coba lagi 3 detik)");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    poll_err_streak = poll_err_streak.saturating_add(1);
+                    let err_s = e.to_string();
+                    let wait_secs = match poll_err_streak {
+                        1 => 2,
+                        2 => 4,
+                        3 => 8,
+                        _ => 10,
+                    };
+                    if err_s.contains("409") || err_s.contains("Conflict") {
+                        eprintln!(
+                            "[telegram] ⚠ 409 Conflict: bot token ini sedang dipakai instance `selen telegram` lain atau webhook aktif! Hentikan instance lain (coba lagi {wait_secs}s)."
+                        );
+                    } else {
+                        eprintln!("[telegram] gagal polling: {err_s} (coba lagi {wait_secs} detik)");
+                    }
+                    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
                     continue;
                 }
             }
         };
 
-        // Muat ulang config terbaru agar perubahan `/telegram allow` langsung berlaku.
+        // Muat ulang config terbaru agar perubahan `/telegram allow`, `/model`, & `/provider` langsung berlaku.
         let latest_cfg = config::load().unwrap_or_else(|_| cfg.clone());
 
         for upd in updates {
@@ -144,9 +184,13 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 .and_then(|u| u.username.clone().or_else(|| Some(u.first_name.clone())))
                 .unwrap_or_else(|| user_id.to_string());
 
-            // Dukungan pesan teks MAUPUN foto + caption (multimodal vision Telegram!).
-            let text = if let Some(raw_text) = msg.text.clone() {
-                normalize_tg_command(&raw_text)
+            // Tentukan payload ringan (unduh foto dijalankan di dalam task chat agar loop polling tidak macet!).
+            let (payload, display_text) = if let Some(raw_text) = msg.text.clone() {
+                let norm = normalize_tg_command(&raw_text);
+                if norm.is_empty() {
+                    continue;
+                }
+                (IncomingTgPayload::Text(norm.clone()), norm)
             } else if !msg.photo.is_empty() {
                 if !latest_cfg.telegram.is_allowed(user_id, chat_id) {
                     let _ = tg
@@ -160,43 +204,29 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     continue;
                 }
                 let best_photo = msg.photo.last().unwrap();
-                let mut attached_path: Option<String> = None;
-                if let Ok(fi) = tg.get_file(&best_photo.file_id).await {
-                    if let Some(fp) = fi.file_path {
-                        if let Ok(bytes) = tg.download_file_bytes(&fp).await {
-                            if bytes.len() <= 6 * 1024 * 1024 {
-                                let ext = fp.rsplit('.').next().unwrap_or("jpg");
-                                let rel = format!(".selencode/tg_uploads/tg_{}.{ext}", msg.message_id);
-                                let full = cwd.join(&rel);
-                                if let Some(parent) = full.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                if std::fs::write(&full, &bytes).is_ok() {
-                                    attached_path = Some(rel);
-                                }
-                            }
-                        }
-                    }
-                }
                 let caption = msg
                     .caption
                     .as_deref()
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or("Analisis gambar ini dan jelaskan hal penting atau error yang terlihat.");
-                match attached_path {
-                    Some(rel) => format!("@{rel} {caption}"),
-                    None => caption.to_string(),
-                }
+                    .unwrap_or("Analisis gambar ini dan jelaskan hal penting atau error yang terlihat.")
+                    .to_string();
+                let label = format!("[foto] {caption}");
+                (
+                    IncomingTgPayload::Photo {
+                        file_id: best_photo.file_id.clone(),
+                        message_id: msg.message_id,
+                        caption,
+                        cwd: cwd.clone(),
+                    },
+                    label,
+                )
             } else {
                 continue;
             };
-            if text.is_empty() {
-                continue;
-            }
 
             // `/id` selalu dijawab agar pemilik bisa langsung tahu ID untuk whitelist.
-            if text.eq_ignore_ascii_case("/id") {
+            if display_text.eq_ignore_ascii_case("/id") {
                 let allowed_note = if latest_cfg.telegram.is_allowed(user_id, chat_id) {
                     "✅ Sudah ada di whitelist."
                 } else {
@@ -229,7 +259,9 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
             }
 
             // `/cancel` selalu diproses walau chat sedang sibuk — batalkan giliran & approval tertunda!
-            if text.eq_ignore_ascii_case("/cancel") || text.eq_ignore_ascii_case("/stop") {
+            if display_text.eq_ignore_ascii_case("/cancel")
+                || display_text.eq_ignore_ascii_case("/stop")
+            {
                 let cancelled_approvals = hub.cancel_chat_approvals(chat_id);
                 let notify_opt = cancel_tokens
                     .lock()
@@ -278,16 +310,16 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 let _ = tg.send_message(chat_id, &notice).await;
             }
 
-            println!("[telegram] {sender_name} ({chat_id}): {text}");
+            println!("[telegram] {sender_name} ({chat_id}): {display_text}");
             let tg_clone = tg.clone();
             let hub_clone = hub.clone();
             let sessions_clone = sessions.clone();
             let busy_clone = busy_chats.clone();
             let prov_clone = provider_override.clone();
-            let tg_approval_cfg = latest_cfg.telegram.approval.clone();
+            let latest_cfg_clone = latest_cfg.clone();
 
             tokio::spawn(async move {
-                // Pastikan flag busy dibersihkan hanya bila giliran ini masih generasi terbaru.
+                let t_start = Instant::now();
                 let res = handle_telegram_chat_message(
                     tg_clone.clone(),
                     hub_clone,
@@ -297,9 +329,9 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     my_gen,
                     prov_clone,
                     yes_flag,
-                    tg_approval_cfg,
+                    latest_cfg_clone,
                     chat_id,
-                    text,
+                    payload,
                 )
                 .await;
                 if gen_counter.load(Ordering::SeqCst) == my_gen {
@@ -307,10 +339,19 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                         set.remove(&chat_id);
                     }
                 }
-                if let Err(e) = res {
-                    let _ = tg_clone
-                        .send_long_message(chat_id, &format!("❌ Error: {e}"))
-                        .await;
+                match res {
+                    Ok(()) => {
+                        println!(
+                            "[telegram] ✓ selesai ({chat_id}) dalam {:.1}s",
+                            t_start.elapsed().as_secs_f64()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[telegram] ✗ error ({chat_id}): {e}");
+                        let _ = tg_clone
+                            .send_long_message(chat_id, &format!("❌ Error: {e}"))
+                            .await;
+                    }
                 }
             });
         }
@@ -328,10 +369,71 @@ async fn handle_telegram_chat_message(
     my_gen: u64,
     provider_override: Option<String>,
     yes_flag: bool,
-    tg_approval_cfg: String,
+    latest_cfg: config::Config,
     chat_id: i64,
-    text: String,
+    payload: IncomingTgPayload,
 ) -> Result<()> {
+    let is_slash_cmd = match &payload {
+        IncomingTgPayload::Text(t) => t.trim().starts_with('/'),
+        IncomingTgPayload::Photo { .. } => false,
+    };
+
+    // Umpan balik instan (<300ms): nyalakan indikator mengetik + gelembung status progres
+    // SEBELUM Session::build / unduh foto agar chat tidak pernah terasa mati/lambat!
+    let mut progress_msg_id: Option<i64> = None;
+    let tg_typing_init = tg.clone();
+    tokio::spawn(async move {
+        tg_typing_init.send_typing(chat_id).await;
+    });
+    if !is_slash_cmd {
+        let initial_html = match &payload {
+            IncomingTgPayload::Photo { .. } => "🌙 <i>Mengunduh foto &amp; menyiapkan Selena…</i>",
+            IncomingTgPayload::Text(_) => "🌙 <i>Selena sedang berpikir…</i>",
+        };
+        if let Ok(mid) = tg
+            .send_html_message(chat_id, initial_html, "Selena sedang memproses…")
+            .await
+        {
+            progress_msg_id = Some(mid);
+        }
+    }
+
+    // Unduh foto di dalam task chat ini agar loop polling Telegram tidak pernah terblokir.
+    let text = match payload {
+        IncomingTgPayload::Text(t) => t,
+        IncomingTgPayload::Photo {
+            file_id,
+            message_id,
+            caption,
+            cwd,
+        } => {
+            let mut attached_path: Option<String> = None;
+            if let Ok(fi) = tg.get_file(&file_id).await {
+                if let Some(fp) = fi.file_path {
+                    if let Ok(bytes) = tg.download_file_bytes(&fp).await {
+                        if bytes.len() <= 6 * 1024 * 1024 {
+                            let ext = fp.rsplit('.').next().unwrap_or("jpg");
+                            let rel = format!(".selencode/tg_uploads/tg_{message_id}.{ext}");
+                            let full = cwd.join(&rel);
+                            if let Some(parent) = full.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if std::fs::write(&full, &bytes).is_ok() {
+                                attached_path = Some(rel);
+                            }
+                        }
+                    }
+                }
+            }
+            match attached_path {
+                Some(rel) => format!("@{rel} {caption}"),
+                None => caption,
+            }
+        }
+    };
+
+    let tg_approval_cfg = latest_cfg.telegram.approval.clone();
+
     // Ambil atau buat Session khusus untuk chat_id ini.
     let session_arc = {
         let mut map = sessions.lock().await;
@@ -340,7 +442,7 @@ async fn handle_telegram_chat_message(
         } else {
             let (approval_tx, mut approval_rx) =
                 tokio::sync::mpsc::channel::<ApprovalRequest>(16);
-            let s = Session::build(
+            let s = match Session::build(
                 provider_override.as_deref(),
                 yes_flag,
                 false,
@@ -348,7 +450,16 @@ async fn handle_telegram_chat_message(
                 Some(approval_tx),
                 false,
             )
-            .await?;
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(mid) = progress_msg_id {
+                        tg.delete_message(chat_id, mid).await;
+                    }
+                    return Err(e);
+                }
+            };
             let policy = s.ctx.approver.policy();
             if !yes_flag && !tg_approval_cfg.trim().is_empty() {
                 let mode = ApprovalMode::from_config(&tg_approval_cfg, false);
@@ -374,13 +485,35 @@ async fn handle_telegram_chat_message(
 
     // Bila sudah ada pesan baru yang menginterupsi sebelum lock giliran ini didapat, lewati.
     if gen_counter.load(Ordering::SeqCst) != my_gen {
+        if let Some(mid) = progress_msg_id {
+            tg.delete_message(chat_id, mid).await;
+        }
         return Ok(());
     }
     let mut s_guard = session_arc.lock().await;
     if gen_counter.load(Ordering::SeqCst) != my_gen {
+        if let Some(mid) = progress_msg_id {
+            tg.delete_message(chat_id, mid).await;
+        }
         return Ok(());
     }
     let s: &mut Session = &mut *s_guard;
+
+    // Sinkronkan otomatis bila user mengganti router AI / model dari terminal TUI!
+    if provider_override.is_none() {
+        let target_prov = latest_cfg.default_provider.clone();
+        let target_model = latest_cfg
+            .providers
+            .get(&target_prov)
+            .map(|p| p.model.clone());
+        if !target_prov.is_empty()
+            && (target_prov != s.provider_name
+                || target_model.as_deref() != Some(s.pcfg.model.as_str()))
+        {
+            s.cfg = latest_cfg.clone();
+            let _ = s.switch_provider(&target_prov);
+        }
+    }
 
     // Perintah khusus Telegram (/start, /status).
     if text.eq_ignore_ascii_case("/start") {
@@ -573,7 +706,7 @@ async fn handle_telegram_chat_message(
             return Ok(());
         }
         SlashCommand::Telegram(arg) => {
-            let reply = s.handle_telegram(arg.as_deref())?;
+            let reply = s.handle_telegram(arg.as_deref()).await?;
             tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
@@ -657,7 +790,8 @@ async fn handle_telegram_chat_message(
         SlashCommand::NotCommand => {}
     }
 
-    // Giliran agent normal dengan indikator mengetik otomatis setiap 4 detik.
+    // Giliran agent normal dengan indikator mengetik otomatis setiap 4 detik +
+    // pembaruan live pada gelembung progres (maks 1 edit / 1,8 detik agar bebas rate-limit).
     let typing_stop = Arc::new(tokio::sync::Notify::new());
     let typing_stop_clone = typing_stop.clone();
     let tg_typing = tg.clone();
@@ -672,24 +806,81 @@ async fn handle_telegram_chat_message(
     });
 
     let (ui_tx, mut ui_rx) = tokio::sync::mpsc::channel::<UiEvent>(256);
+    let tg_prog = tg.clone();
+    let max_steps_ui = s.cfg.agent.max_steps;
     let collector = tokio::spawn(async move {
         let mut tools: Vec<String> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
+        let mut cur_step: usize = 0;
+        let mut active_tool: Option<String> = None;
+        let mut live_preview = String::new();
+        let mut last_edit = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(Instant::now);
+        let mut last_sent_html = String::new();
+
         while let Some(ev) = ui_rx.recv().await {
+            let mut changed = false;
             match ev {
+                UiEvent::Step { current, .. } => {
+                    cur_step = current;
+                    changed = true;
+                }
+                UiEvent::Token(tok) => {
+                    live_preview.push_str(&tok);
+                    if live_preview.len() > 2400 {
+                        let tail: String = live_preview
+                            .chars()
+                            .rev()
+                            .take(1200)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                        live_preview = tail;
+                    }
+                    changed = true;
+                }
+                UiEvent::ToolStart { name, .. } => {
+                    active_tool = Some(name);
+                    live_preview.clear();
+                    changed = true;
+                }
                 UiEvent::ToolDone {
                     name,
                     summary,
                     is_error,
                 } => {
+                    active_tool = None;
                     let icon = if is_error { "✗" } else { "✓" };
                     let short: String = summary.chars().take(70).collect();
                     tools.push(format!("{icon} {name}: {short}"));
+                    changed = true;
                 }
                 UiEvent::Info(info) if info.contains("Self-improvement") => {
                     notes.push(info);
                 }
                 _ => {}
+            }
+            if changed {
+                if let Some(mid) = progress_msg_id {
+                    if last_edit.elapsed() >= Duration::from_millis(1800) {
+                        let html = format_telegram_progress_html(
+                            cur_step,
+                            max_steps_ui,
+                            active_tool.as_deref(),
+                            tools.len(),
+                            &live_preview,
+                        );
+                        if html != last_sent_html {
+                            let _ = tg_prog
+                                .edit_html_message(chat_id, mid, &html, "Selena sedang memproses…")
+                                .await;
+                            last_sent_html = html;
+                            last_edit = Instant::now();
+                        }
+                    }
+                }
             }
         }
         (tools, notes)
@@ -716,13 +907,26 @@ async fn handle_telegram_chat_message(
         if let Some(syn) = sanitize_interrupted_messages(&mut s.messages) {
             let _ = s.store.save_message(&s.session_id, &syn);
         }
-        // Jangan kirim pesan "dibatalkan" bila pembatalan dipicu oleh pesan interupsi baru.
         if gen_counter.load(Ordering::SeqCst) == my_gen {
-            tg.send_message(chat_id, "🛑 Giliran dibatalkan.").await?;
+            if let Some(mid) = progress_msg_id {
+                let _ = tg.edit_message_text(chat_id, mid, "🛑 Giliran dibatalkan.").await;
+            } else {
+                tg.send_message(chat_id, "🛑 Giliran dibatalkan.").await?;
+            }
+        } else if let Some(mid) = progress_msg_id {
+            tg.delete_message(chat_id, mid).await;
         }
         return Ok(());
     };
-    let answer = turn_res?;
+    let answer = match turn_res {
+        Ok(a) => a,
+        Err(e) => {
+            if let Some(mid) = progress_msg_id {
+                tg.delete_message(chat_id, mid).await;
+            }
+            return Err(e);
+        }
+    };
     let mut answer_md = answer.trim().to_string();
     for note in &notes {
         if !answer_md.is_empty() {
@@ -732,7 +936,7 @@ async fn handle_telegram_chat_message(
     }
 
     // Jika ada aksi tool & jawaban muat 1 pesan HTML, bungkus log tool dalam `<blockquote expandable>`
-    // agar jawaban utama langsung bersih & enak dibaca!
+    // dan edit gelembung progres secara in-place agar transisi cepat & rapi tanpa spam chat!
     if !tools.is_empty() {
         let total_tools = tools.len();
         let shown: Vec<String> = tools
@@ -751,12 +955,37 @@ async fn handle_telegram_chat_message(
             format!("{tool_block}\n\n{body_html}")
         };
         if combined.chars().count() <= 4050 {
+            if let Some(mid) = progress_msg_id {
+                if tg.edit_html_message(chat_id, mid, &combined, &answer_md).await.is_ok() {
+                    return Ok(());
+                }
+                tg.delete_message(chat_id, mid).await;
+            }
             tg.send_html_message(chat_id, &combined, &answer_md).await?;
             return Ok(());
         }
-        // Terlalu panjang untuk 1 pesan -> kirim ringkasan tool dulu, lalu jawaban terpecah rapi.
+        if let Some(mid) = progress_msg_id {
+            tg.delete_message(chat_id, mid).await;
+        }
         tg.send_html_message(chat_id, &tool_block, "Aksi tool selesai.")
             .await?;
+        tg.send_long_markdown(chat_id, &answer_md).await?;
+        return Ok(());
+    }
+
+    let final_html = markdown_to_telegram_html(&answer_md);
+    if !final_html.is_empty() && final_html.chars().count() <= 4050 {
+        if let Some(mid) = progress_msg_id {
+            if tg.edit_html_message(chat_id, mid, &final_html, &answer_md).await.is_ok() {
+                return Ok(());
+            }
+            tg.delete_message(chat_id, mid).await;
+        }
+        tg.send_html_message(chat_id, &final_html, &answer_md).await?;
+        return Ok(());
+    }
+    if let Some(mid) = progress_msg_id {
+        tg.delete_message(chat_id, mid).await;
     }
     tg.send_long_markdown(chat_id, &answer_md).await?;
     Ok(())

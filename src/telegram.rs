@@ -42,6 +42,7 @@ pub fn redact_tg_token(text: &str, token: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TelegramAction {
     Status,
+    Test,
     Setup {
         token_spec: KeySpec,
         user_id: Option<i64>,
@@ -61,6 +62,7 @@ pub fn parse_telegram_action(arg: Option<&str>) -> TelegramAction {
     let tokens: Vec<&str> = arg.split_whitespace().collect();
     match tokens.first().copied().unwrap_or("").to_ascii_lowercase().as_str() {
         "status" | "info" => TelegramAction::Status,
+        "test" | "ping" | "check" => TelegramAction::Test,
         "setup" | "connect" | "set" => {
             let Some(raw_token) = tokens.get(1).copied() else {
                 return TelegramAction::Usage;
@@ -654,33 +656,92 @@ pub struct TgUpdate {
     pub callback_query: Option<TgCallbackQuery>,
 }
 
+/// Format status progres live (diedit in-place di Telegram) agar pengguna langsung melihat
+/// aktivitas Selena tanpa menunggu 30-60 detik dalam diam.
+pub fn format_telegram_progress_html(
+    step: usize,
+    max_steps: usize,
+    active_tool: Option<&str>,
+    tools_done: usize,
+    preview_text: &str,
+) -> String {
+    let step_tag = if step > 0 && max_steps > 0 {
+        format!(" <i>(langkah {step}/{max_steps})</i>")
+    } else {
+        String::new()
+    };
+    let trimmed = preview_text.trim();
+    if !trimmed.is_empty() && active_tool.is_none() {
+        // Ambil maks 700 karakter terakhir agar pratinjau streaming ringan & cepat dirender.
+        let chars: Vec<char> = trimmed.chars().collect();
+        let snippet: String = if chars.len() > 700 {
+            format!("…{}", chars[chars.len() - 700..].iter().collect::<String>())
+        } else {
+            trimmed.to_string()
+        };
+        return format!(
+            "🌙 <b>Selena mengetik…</b>{step_tag}\n\n{}",
+            escape_telegram_html(&snippet)
+        );
+    }
+    let mut out = format!("🌙 <b>Selena sedang bekerja…</b>{step_tag}");
+    if let Some(tool) = active_tool {
+        out.push_str(&format!("\n⚙️ Menjalankan <code>{}</code>…", escape_telegram_html(tool)));
+    } else {
+        out.push_str("\n💭 Menyusun langkah & jawaban…");
+    }
+    if tools_done > 0 {
+        out.push_str(&format!("\n✓ {tools_done} tool selesai"));
+    }
+    out
+}
+
 /// Klien ringan Telegram Bot API berbasis `reqwest`.
+/// Memisahkan klien cepat (`api_http`) dari klien long-polling (`poll_http`) + HTTP/1.1 & TCP keepalive
+/// agar soket zombie di Windows/ISP/NAT tidak pernah menahan pengiriman pesan hingga 60 detik.
 #[derive(Clone)]
 pub struct TelegramClient {
-    http: reqwest::Client,
+    api_http: reqwest::Client,
+    poll_http: reqwest::Client,
     token: String,
     base_url: String,
 }
 
 impl TelegramClient {
     pub fn new(bot_token: &str) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(60))
+        let api_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .tcp_keepalive(Duration::from_secs(15))
+            .pool_idle_timeout(Duration::from_secs(25))
+            .http1_only()
             .build()
-            .context("gagal membuat HTTP client Telegram")?;
+            .context("gagal membuat HTTP API client Telegram")?;
+        let poll_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(15))
+            .pool_idle_timeout(Duration::from_secs(20))
+            .http1_only()
+            .build()
+            .context("gagal membuat HTTP polling client Telegram")?;
         let tok = bot_token.trim().to_string();
         Ok(Self {
-            http,
+            api_http,
+            poll_http,
             base_url: format!("https://api.telegram.org/bot{tok}"),
             token: tok,
         })
     }
 
-    async fn post_json<T: for<'de> Deserialize<'de>>(&self, method: &str, body: Value) -> Result<T> {
+    async fn post_json_with<T: for<'de> Deserialize<'de>>(
+        &self,
+        client: &reqwest::Client,
+        method: &str,
+        body: Value,
+    ) -> Result<T> {
         let url = format!("{}/{method}", self.base_url);
-        let resp = self
-            .http
+        let resp = client
             .post(&url)
             .json(&body)
             .send()
@@ -707,6 +768,27 @@ impl TelegramClient {
         parsed
             .result
             .ok_or_else(|| anyhow!("Telegram API ({method}) mengembalikan result kosong"))
+    }
+
+    async fn post_json<T: for<'de> Deserialize<'de>>(&self, method: &str, body: Value) -> Result<T> {
+        self.post_json_with(&self.api_http, method, body).await
+    }
+
+    /// Hapus webhook lama yang mungkin menempel pada token bot agar long-polling `getUpdates`
+    /// selalu langsung terhubung tanpa gagal `409 Conflict`.
+    pub async fn delete_webhook(&self, drop_pending_updates: bool) -> Result<()> {
+        let _: Value = self
+            .post_json(
+                "deleteWebhook",
+                json!({ "drop_pending_updates": drop_pending_updates }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Ambil status webhook saat ini untuk diagnostik `/telegram test`.
+    pub async fn get_webhook_info(&self) -> Result<Value> {
+        self.post_json("getWebhookInfo", json!({})).await
     }
 
     /// Lewati antrean pesan lama sebelum gateway dinyalakan agar perintah lama
@@ -743,7 +825,7 @@ impl TelegramClient {
     /// Unduh byte mentah file Telegram berdasarkan `file_path` dari `getFile`.
     pub async fn download_file_bytes(&self, file_path: &str) -> Result<Vec<u8>> {
         let url = format!("https://api.telegram.org/file/bot{}/{file_path}", self.token);
-        let resp = self.http.get(&url).send().await.map_err(|e| {
+        let resp = self.api_http.get(&url).send().await.map_err(|e| {
             let clean = redact_tg_token(&e.without_url().to_string(), &self.token);
             anyhow!("gagal mengunduh file Telegram: {clean}")
         })?;
@@ -758,7 +840,8 @@ impl TelegramClient {
     }
 
     pub async fn get_updates(&self, offset: i64, timeout_secs: u64) -> Result<Vec<TgUpdate>> {
-        self.post_json(
+        self.post_json_with(
+            &self.poll_http,
             "getUpdates",
             json!({
                 "offset": offset,
@@ -894,6 +977,51 @@ impl TelegramClient {
             )
             .await?;
         Ok(())
+    }
+
+    /// Edit pesan berformat Telegram HTML in-place (mengabaikan "message is not modified",
+    /// dan fallback otomatis ke teks polos bila tag HTML ditolak).
+    pub async fn edit_html_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        html: &str,
+        plain_fallback: &str,
+    ) -> Result<()> {
+        let res: Result<Value> = self
+            .post_json(
+                "editMessageText",
+                json!({
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": html,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": true,
+                }),
+            )
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("message is not modified") => Ok(()),
+            Err(_) => match self.edit_message_text(chat_id, message_id, plain_fallback).await {
+                Ok(()) => Ok(()),
+                Err(e2) if e2.to_string().contains("message is not modified") => Ok(()),
+                Err(e2) => Err(e2),
+            },
+        }
+    }
+
+    /// Hapus pesan sementara (mis. gelembung status progres) secara best-effort.
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) {
+        let _ = self
+            .post_json::<Value>(
+                "deleteMessage",
+                json!({
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                }),
+            )
+            .await;
     }
 
     pub async fn answer_callback_query(&self, callback_id: &str, text: Option<&str>) -> Result<()> {

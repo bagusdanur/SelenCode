@@ -3,15 +3,15 @@
 //! - Lazy session creation (tidak mengotori SQLite dengan sesi kosong), `delete_session`, `prune_empty_sessions`
 //! - `selen doctor` / `/doctor` diagnostics
 
-use selencode::config::{Config, ProviderCfg};
+use selencode::config::{merge_toml_values, Config, ProviderCfg};
 use selencode::doctor::run_doctor;
 use selencode::providers::{Message, Role};
 use selencode::repl::{parse_slash_command, SlashCommand, COMMANDS};
 use selencode::sandbox::SandboxController;
 use selencode::store::Store;
 use selencode::telegram::{
-    markdown_to_telegram_html, menu_markup_to_telegram_html, split_markdown_for_telegram,
-    TELEGRAM_BOT_COMMANDS,
+    format_telegram_progress_html, markdown_to_telegram_html, menu_markup_to_telegram_html,
+    parse_telegram_action, split_markdown_for_telegram, TelegramAction, TELEGRAM_BOT_COMMANDS,
 };
 use std::path::PathBuf;
 
@@ -153,4 +153,53 @@ fn doctor_command_and_diagnostics_report() {
     assert!(card.contains("SelenCode Doctor"));
     assert!(card.contains("Sandbox v2"));
     let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn global_and_local_config_merge_preserves_router_keys_and_telegram() {
+    let global_val: toml::Value = toml::from_str(
+        r#"
+        default_provider = "9router"
+        [providers.9router]
+        kind = "openai"
+        base_url = "https://router.example/v1"
+        model = "ag/gemini-3-flash"
+        api_key = "sk-rahasia-global"
+        [telegram]
+        bot_token = "123456:ABC_GLOBAL"
+        allowed_users = [111]
+        "#,
+    )
+    .unwrap();
+    let local_val: toml::Value = toml::from_str(
+        r#"
+        [providers.9router]
+        model = "ag/gemini-4-neon-medium"
+        [telegram]
+        allowed_users = [222]
+        "#,
+    )
+    .unwrap();
+    let merged: Config = merge_toml_values(global_val, local_val).try_into().unwrap();
+    assert_eq!(merged.default_provider, "9router");
+    let p = merged.providers.get("9router").unwrap();
+    assert_eq!(p.model, "ag/gemini-4-neon-medium");
+    assert_eq!(p.api_key.as_deref(), Some("sk-rahasia-global"));
+    assert_eq!(merged.telegram.bot_token.as_deref(), Some("123456:ABC_GLOBAL"));
+    assert_eq!(merged.telegram.allowed_users, vec![111, 222]);
+}
+
+#[test]
+fn telegram_test_action_and_live_progress_html_work() {
+    assert_eq!(parse_telegram_action(Some("test")), TelegramAction::Test);
+    assert_eq!(parse_telegram_action(Some("ping")), TelegramAction::Test);
+
+    let tool_html = format_telegram_progress_html(2, 15, Some("read_file"), 1, "");
+    assert!(tool_html.contains("langkah 2/15"));
+    assert!(tool_html.contains("<code>read_file</code>"));
+    assert!(tool_html.contains("1 tool selesai"));
+
+    let stream_html = format_telegram_progress_html(3, 15, None, 2, "Halo <world> & teman");
+    assert!(stream_html.contains("Selena mengetik"));
+    assert!(stream_html.contains("Halo &lt;world&gt; &amp; teman"));
 }

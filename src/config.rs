@@ -480,20 +480,108 @@ fn default_shell_timeout() -> u64 {
     120
 }
 
-/// Urutan pencarian config: ./selencode.toml dulu, lalu ~/.config/selencode/config.toml
+/// Lokasi config global lintas-folder (Windows: `%APPDATA%\selencode\config.toml`,
+/// Linux/Termux: `~/.config/selencode/config.toml`).
+pub fn global_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|cfg| cfg.join("selencode").join("config.toml"))
+}
+
+/// Lokasi config lokal di folder proyek saat ini (`./selencode.toml`).
+pub fn local_config_path() -> PathBuf {
+    PathBuf::from("./selencode.toml")
+}
+
+/// Urutan pencarian config: ./selencode.toml dan config global lintas-folder.
 pub fn candidate_paths() -> Vec<PathBuf> {
-    let mut v = vec![PathBuf::from("./selencode.toml")];
-    if let Some(cfg) = dirs::config_dir() {
-        v.push(cfg.join("selencode").join("config.toml"));
+    let mut v = vec![local_config_path()];
+    if let Some(g) = global_config_path() {
+        v.push(g);
     }
     v
 }
 
-pub fn load() -> Result<Config> {
-    for p in candidate_paths() {
-        if p.exists() {
-            return load_from(&p);
+/// Gabungkan 2 nilai TOML (`base` = global, `overlay` = lokal `./selencode.toml`) secara rekursif:
+/// - Key di `overlay` menimpa key yang sama di `base`, tetapi key milik global yang TIDAK ada di
+///   `overlay` (mis. `[telegram]`, `[providers.*]` lain, `api_key`) tetap dipertahankan!
+/// - Khusus `telegram.allowed_users`, kedua daftar digabung tanpa duplikat.
+pub fn merge_toml_values(base: toml::Value, overlay: toml::Value) -> toml::Value {
+    match (base, overlay) {
+        (toml::Value::Table(mut base_tbl), toml::Value::Table(over_tbl)) => {
+            for (k, v) in over_tbl {
+                if k == "allowed_users" {
+                    if let (Some(toml::Value::Array(mut b_arr)), toml::Value::Array(o_arr)) =
+                        (base_tbl.remove(&k), v.clone())
+                    {
+                        for item in o_arr {
+                            if !b_arr.contains(&item) {
+                                b_arr.push(item);
+                            }
+                        }
+                        base_tbl.insert(k, toml::Value::Array(b_arr));
+                        continue;
+                    }
+                }
+                match base_tbl.remove(&k) {
+                    Some(b_val) => {
+                        base_tbl.insert(k, merge_toml_values(b_val, v));
+                    }
+                    None => {
+                        base_tbl.insert(k, v);
+                    }
+                }
+            }
+            toml::Value::Table(base_tbl)
         }
+        (_, over) => over,
+    }
+}
+
+fn same_canonical_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
+}
+
+fn load_merged_config() -> Result<Option<Config>> {
+    let local_p = local_config_path();
+    let global_p = global_config_path();
+    let has_local = local_p.exists();
+    let has_global = global_p.as_ref().map(|p| p.exists()).unwrap_or(false);
+
+    match (has_global, has_local) {
+        (true, true) => {
+            let gp = global_p.unwrap();
+            if same_canonical_path(&gp, &local_p) {
+                return Ok(Some(load_from(&gp)?));
+            }
+            let g_txt = std::fs::read_to_string(&gp)
+                .with_context(|| format!("gagal membaca config {}", gp.display()))?;
+            let l_txt = std::fs::read_to_string(&local_p)
+                .with_context(|| format!("gagal membaca config {}", local_p.display()))?;
+            let g_val: toml::Value = toml::from_str(&g_txt)
+                .with_context(|| format!("config {} tidak valid", gp.display()))?;
+            let l_val: toml::Value = toml::from_str(&l_txt)
+                .with_context(|| format!("config {} tidak valid", local_p.display()))?;
+            let merged = merge_toml_values(g_val, l_val);
+            let cfg: Config = merged.try_into().with_context(|| {
+                format!(
+                    "gagal menggabungkan config {} + {}",
+                    gp.display(),
+                    local_p.display()
+                )
+            })?;
+            Ok(Some(cfg))
+        }
+        (true, false) => Ok(Some(load_from(&global_p.unwrap())?)),
+        (false, true) => Ok(Some(load_from(&local_p)?)),
+        (false, false) => Ok(None),
+    }
+}
+
+pub fn load() -> Result<Config> {
+    if let Some(cfg) = load_merged_config()? {
+        return Ok(cfg);
     }
     #[cfg(windows)]
     let env_hint = r#"$env:SELENCODE_ROUTER_KEY="isi-api-key-kamu""#;
@@ -501,7 +589,7 @@ pub fn load() -> Result<Config> {
     let env_hint = r#"export SELENCODE_ROUTER_KEY="isi-api-key-kamu""#;
     let cfg_path = active_config_path();
     Err(anyhow!(
-        "Config SelenCode tidak ditemukan. Jalankan `selen` untuk setup interaktif otomatis, atau buat file:\n  ./selencode.toml\n  {}\n\nContoh set API key di terminal:\n  {env_hint}",
+        "Config SelenCode tidak ditemukan. Jalankan `selen` untuk setup interaktif otomatis, atau buat file:\n  {}\n  ./selencode.toml\n\nContoh set API key di terminal:\n  {env_hint}",
         cfg_path.display()
     ))
 }
@@ -510,12 +598,10 @@ pub fn load() -> Result<Config> {
 /// (provider kosong) agar TUI bisa langsung membuka Wizard Setup Provider tanpa crash!
 /// Bila file config ADA tetapi rusak/tidak valid, tetap kembalikan `Err`.
 pub fn load_or_empty() -> Result<(Config, bool)> {
-    for p in candidate_paths() {
-        if p.exists() {
-            return Ok((load_from(&p)?, true));
-        }
+    match load_merged_config()? {
+        Some(cfg) => Ok((cfg, true)),
+        None => Ok((Config::empty(), false)),
     }
-    Ok((Config::empty(), false))
 }
 
 pub fn load_from(path: &std::path::Path) -> Result<Config> {
@@ -526,24 +612,36 @@ pub fn load_from(path: &std::path::Path) -> Result<Config> {
     Ok(cfg)
 }
 
-/// Path config aktif yang sedang dipakai (atau lokasi global default untuk penyimpanan).
+/// Path config utama (mengutamakan lokasi global agar setelan router AI & Telegram
+/// selalu persisten lintas folder di Windows, Linux, maupun Termux).
 pub fn active_config_path() -> PathBuf {
-    for p in candidate_paths() {
-        if p.exists() {
-            return p;
+    if let Some(g) = global_config_path() {
+        if g.exists() {
+            return g;
         }
     }
-    if let Some(cfg) = dirs::config_dir() {
-        return cfg.join("selencode").join("config.toml");
+    let local = local_config_path();
+    if local.exists() {
+        return local;
     }
-    PathBuf::from("./selencode.toml")
+    global_config_path().unwrap_or(local)
 }
 
-/// Simpan config ke path aktif (membuat folder induk bila perlu).
+/// Simpan config secara persisten ke lokasi global (`%APPDATA%\selencode\config.toml` di Windows /
+/// `~/.config/selencode/config.toml` di Unix) agar tidak hilang saat berpindah folder.
+/// Bila `./selencode.toml` lokal juga ada di folder saat ini, ikut disinkronkan agar tidak menimpa
+/// pengaturan router AI / model / Telegram terbaru.
 pub fn save(cfg: &Config) -> Result<PathBuf> {
-    let path = active_config_path();
-    save_to(cfg, &path)?;
-    Ok(path)
+    let local = local_config_path();
+    if let Some(global) = global_config_path() {
+        save_to(cfg, &global)?;
+        if local.exists() && !same_canonical_path(&global, &local) {
+            let _ = save_to(cfg, &local);
+        }
+        return Ok(global);
+    }
+    save_to(cfg, &local)?;
+    Ok(local)
 }
 
 pub fn save_to(cfg: &Config, path: &std::path::Path) -> Result<()> {

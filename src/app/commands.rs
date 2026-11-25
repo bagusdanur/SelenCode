@@ -21,8 +21,9 @@ pub(crate) enum ResumeOutcome {
     Switched(ResumedSessionData),
 }
 
-impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
-    pub(crate) fn handle_telegram(&mut self, arg: Option<&str>) -> Result<String> {
+impl Session {
+    /// Tangani `/telegram [status|test|setup|allow|rm|approve|off]`.
+    pub(crate) async fn handle_telegram(&mut self, arg: Option<&str>) -> Result<String> {
         // Sinkronkan bagian `[telegram]` terbaru dari disk agar edit terminal & bot tidak saling timpa.
         if let Ok(fresh) = config::load() {
             self.cfg.telegram = fresh.telegram;
@@ -56,16 +57,57 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                 } else {
                     self.cfg.telegram.approval.clone()
                 };
+                let cfg_path = config::active_config_path();
                 Ok(format!(
                     "# Telegram Gateway SelenCode\n\
                      * bot token | {tok_state} | dari @BotFather\n\
                      > allowed_users | {users_str} | whitelist ID Telegram\n\
                      > approval | {appr} | ask / edits / auto\n\
+                     > config | {} | persisten lintas folder\n\
                      ---\n\
+                     ! Cek koneksi bot:   /telegram test\n\
                      ! Pasang cepat:      /telegram setup <BOT_TOKEN> <USER_ID>\n\
                      ! Tambah/hapus ID:   /telegram allow <USER_ID>   |   /telegram rm <USER_ID>\n\
                      ! Mode izin bot:     /telegram approve <ask|edits|auto>   |   Matikan: /telegram off\n\
-                     ! Jalankan gateway:  ketik `selen telegram` di terminal (bisa di PC/Termux), lalu chat bot kamu!"
+                     ! Jalankan gateway:  ketik `selen telegram` di terminal terpisah agar bot aktif menerima chat!",
+                    cfg_path.display()
+                ))
+            }
+            TelegramAction::Test => {
+                let token = self.cfg.telegram.resolve_token()?;
+                let tg = selencode::telegram::TelegramClient::new(&token)?;
+                let t0 = std::time::Instant::now();
+                let me = tg.get_me().await?;
+                let ms = t0.elapsed().as_millis();
+                let handle = me
+                    .username
+                    .as_deref()
+                    .map(|u| format!("@{u}"))
+                    .unwrap_or_else(|| me.first_name.clone());
+                let webhook_note = match tg.get_webhook_info().await {
+                    Ok(v) => {
+                        let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("");
+                        if url.is_empty() {
+                            "tidak ada webhook (siap long-polling)".to_string()
+                        } else {
+                            format!("webhook aktif ({url}) — akan dibersihkan otomatis saat `selen telegram` mulai")
+                        }
+                    }
+                    Err(_) => "tidak diperiksa".to_string(),
+                };
+                let wl = if self.cfg.telegram.allowed_users.is_empty() {
+                    "KOSONG (kirim `/id` ke bot lalu `/telegram allow <ID>`)"
+                } else {
+                    "siap"
+                };
+                Ok(format!(
+                    "# Uji Koneksi Telegram Berhasil ✅\n\
+                     * bot | {handle} (id: {}) | respons {ms} ms\n\
+                     > webhook | {webhook_note}\n\
+                     > whitelist | {wl}\n\
+                     ---\n\
+                     ! Jalankan `selen telegram` di terminal untuk mulai menerima & membalas chat Telegram.",
+                    me.id
                 ))
             }
             TelegramAction::Setup {
@@ -167,6 +209,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
             TelegramAction::Usage => Ok(
                 "# Cara Pakai /telegram\n\
                  > /telegram | (cek status) | lihat token, whitelist, & mode approval\n\
+                 > /telegram test | | uji koneksi & latensi bot ke Telegram API\n\
                  > /telegram setup | <BOT_TOKEN> [USER_ID] | simpan token @BotFather (+ whitelist ID opsional)\n\
                  > /telegram allow | <USER_ID> | izinkan user/chat Telegram tertentu\n\
                  > /telegram rm | <USER_ID> | hapus user dari whitelist\n\

@@ -561,7 +561,7 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
-            TuiCommand::Telegram(arg) => match s.handle_telegram(arg.as_deref()) {
+            TuiCommand::Telegram(arg) => match s.handle_telegram(arg.as_deref()).await {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
                 }

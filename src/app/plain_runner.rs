@@ -149,7 +149,7 @@ pub(crate) async fn interactive_plain(
                     eprintln!("[error] {e}");
                 }
             }
-            SlashCommand::Telegram(arg) => match s.handle_telegram(arg.as_deref()) {
+            SlashCommand::Telegram(arg) => match s.handle_telegram(arg.as_deref()).await {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
