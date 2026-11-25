@@ -27,6 +27,10 @@ pub enum SlashCommand {
     Checkpoint(Option<String>),
     /// /rollback [id] — pulihkan perubahan SelenCode ke checkpoint terpilih (aman dari konflik eksternal).
     Rollback(Option<String>),
+    /// /worktree [new <label> | diff <id> | apply <id> | rm <id>] — Git Worktree transaksional (Fase 6).
+    Worktree(Option<String>),
+    /// /mcp — status server MCP & matriks dukungan protokol (Fase 7).
+    Mcp,
     /// /verify [check | test | lint | all] — jalankan validasi proyek otomatis & tampilkan diagnostik.
     Verify(Option<String>),
     /// /index [query] atau /context [query] — lihat indeks repositori inkremental & uji pencarian konteks relevan.
@@ -151,6 +155,18 @@ pub const COMMANDS: &[CommandDef] = &[
         args: "[id]",
         desc: "pulihkan perubahan SelenCode ke checkpoint (aman konflik)",
         takes_args: true,
+    },
+    CommandDef {
+        cmd: "/worktree",
+        args: "[new / diff / apply / rm]",
+        desc: "isolasi refactor besar lewat Git Worktree & preview diff aman",
+        takes_args: true,
+    },
+    CommandDef {
+        cmd: "/mcp",
+        args: "",
+        desc: "lihat server MCP & fitur protokol yang didukung",
+        takes_args: false,
     },
     CommandDef {
         cmd: "/verify",
@@ -322,6 +338,8 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/redo" => SlashCommand::Redo,
         "/checkpoint" | "/cp" => SlashCommand::Checkpoint(rest),
         "/rollback" => SlashCommand::Rollback(rest),
+        "/worktree" | "/wt" => SlashCommand::Worktree(rest),
+        "/mcp" => SlashCommand::Mcp,
         "/verify" => SlashCommand::Verify(rest),
         "/index" | "/context" => SlashCommand::Index(rest),
         "/jobs" | "/bg" => SlashCommand::Jobs(rest),

@@ -167,6 +167,17 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
+            TuiCommand::Worktree(arg) => match s.handle_worktree(arg.as_deref()) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::McpStatus => {
+                let _ = ui_tx.send(UiEvent::Menu(s.handle_mcp_status())).await;
+            }
             TuiCommand::Verify(arg) => match s.handle_verify(arg.as_deref()).await {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;

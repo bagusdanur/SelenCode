@@ -160,6 +160,13 @@ pub(crate) async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
+            SlashCommand::Worktree(arg) => match s.handle_worktree(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Mcp => {
+                println!("{}", strip_menu_markup(&s.handle_mcp_status()));
+            }
             SlashCommand::Verify(arg) => match s.handle_verify(arg.as_deref()).await {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),

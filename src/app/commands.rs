@@ -235,7 +235,143 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                 out.push_str(&format!("! dilewati (konflik eksternal): {c}\n"));
             }
         }
+        out.push_str("---\n! Disarankan jalankan `/verify check` untuk memastikan workspace sehat pasca-rollback.");
         Ok(out)
+    }
+
+    pub(crate) fn handle_worktree(&self, arg: Option<&str>) -> Result<String> {
+        use selencode::worktree;
+        let Some(raw) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let list = worktree::list_worktrees(&self.ctx.cwd)?;
+            let mut out = format!("# Transactional Git Worktree ({} aktif)\n", list.len());
+            if list.is_empty() {
+                out.push_str("! Belum ada worktree SelenCode aktif di repository ini.\n");
+            } else {
+                for w in list {
+                    let short_sha: String = w.base_commit.chars().take(7).collect();
+                    out.push_str(&format!(
+                        "* {} | {} ({short_sha}) | {}\n",
+                        w.id,
+                        w.branch,
+                        w.path.display()
+                    ));
+                }
+            }
+            out.push_str("---\n");
+            out.push_str("! Buat baru:      /worktree new <label>\n");
+            out.push_str("! Preview diff:   /worktree diff <id>\n");
+            out.push_str("! Terapkan aman:  /worktree apply <id>  (otomatis buat checkpoint + blokir konflik user)\n");
+            out.push_str("! Hapus:          /worktree rm <id>");
+            return Ok(out);
+        };
+        if let Some(rest) = raw
+            .strip_prefix("new ")
+            .or_else(|| raw.strip_prefix("create "))
+        {
+            let info = worktree::create_isolated_worktree(&self.ctx.cwd, rest.trim())?;
+            return Ok(format!(
+                "# Git Worktree Terisolasi Dibuat\n\
+                 * {} | branch {} | base {}\n\
+                 > path | {} |\n\
+                 ! Preview perubahan: /worktree diff {}   ·   Terapkan: /worktree apply {}",
+                info.id,
+                info.branch,
+                info.base_commit.chars().take(7).collect::<String>(),
+                info.path.display(),
+                info.id,
+                info.id
+            ));
+        }
+        if let Some(rest) = raw.strip_prefix("diff ").or_else(|| raw.strip_prefix("preview ")) {
+            let prev = worktree::preview_diff(&self.ctx.cwd, rest.trim())?;
+            let mut out = format!(
+                "# Preview Diff Worktree {} ({})\n\
+                 * diubah | {} file | dihapus: {} file\n",
+                prev.id,
+                prev.branch,
+                prev.changed_files.len(),
+                prev.deleted_files.len()
+            );
+            if !prev.user_dirty_conflicts.is_empty() {
+                out.push_str(&format!(
+                    "! KONFLIK file kotor pengguna: {} (apply akan diblokir sampai diselesaikan)\n",
+                    prev.user_dirty_conflicts.join(", ")
+                ));
+            }
+            if !prev.diff_text.trim().is_empty() {
+                out.push_str("---\n");
+                for line in prev.diff_text.lines().take(35) {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            return Ok(out);
+        }
+        if let Some(rest) = raw
+            .strip_prefix("apply ")
+            .or_else(|| raw.strip_prefix("merge "))
+        {
+            let rep = worktree::apply_worktree_to_main(
+                &self.ctx.cwd,
+                rest.trim(),
+                &self.ctx.undo_stack,
+            )?;
+            return Ok(format!(
+                "# Worktree Diterapkan (Checkpoint #{})\n\
+                 * {} | {} file diterapkan · {} dihapus | aman di-rollback\n\
+                 ! Rollback kapan saja: /rollback {}   ·   Verifikasi: /verify",
+                rep.checkpoint_id,
+                rep.id,
+                rep.applied_files.len(),
+                rep.deleted_files.len(),
+                rep.checkpoint_id
+            ));
+        }
+        if let Some(rest) = raw
+            .strip_prefix("rm ")
+            .or_else(|| raw.strip_prefix("del "))
+            .or_else(|| raw.strip_prefix("discard "))
+        {
+            let id = rest.trim();
+            worktree::discard_worktree(&self.ctx.cwd, id)?;
+            return Ok(format!(
+                "# Worktree Dihapus\n> {id} | worktree & branch sementara dihapus bersih"
+            ));
+        }
+        anyhow::bail!("subperintah `/worktree {raw}` tidak dikenal. Ketik `/worktree` untuk cara pakai.")
+    }
+
+    pub(crate) fn handle_mcp_status(&self) -> String {
+        use selencode::mcp::client::{
+            PROTOCOL_VERSION, SUPPORTED_MCP_FEATURES, UNSUPPORTED_MCP_FEATURES,
+        };
+        let mcp_tools: Vec<String> = self
+            .registry
+            .names()
+            .into_iter()
+            .filter(|n| n.starts_with("mcp__"))
+            .collect();
+        let mut out = format!(
+            "# Status Kompatibilitas MCP (spec {PROTOCOL_VERSION})\n\
+             * server terpasang | {} di config | {} tool MCP aktif\n",
+            self.cfg.mcp_servers.len(),
+            mcp_tools.len()
+        );
+        for srv in &self.cfg.mcp_servers {
+            let trust = if srv.trust { "trust=true" } else { "approval aktif" };
+            out.push_str(&format!(
+                "> {} | {} | {trust} · timeout {}s\n",
+                srv.name, srv.command, srv.timeout_secs
+            ));
+        }
+        out.push_str("---\n");
+        for f in SUPPORTED_MCP_FEATURES {
+            out.push_str(&format!("* didukung | {f} |\n"));
+        }
+        for u in UNSUPPORTED_MCP_FEATURES {
+            out.push_str(&format!("! belum didukung: {u}\n"));
+        }
+        out
     }
 
     pub(crate) async fn handle_verify(&self, arg: Option<&str>) -> Result<String> {

@@ -89,6 +89,8 @@ pub enum TuiCommand {
     Redo,
     Checkpoint(Option<String>),
     Rollback(Option<String>),
+    Worktree(Option<String>),
+    McpStatus,
     Verify(Option<String>),
     Index(Option<String>),
     Jobs(Option<String>),
@@ -1700,6 +1702,12 @@ fn submit(
         }
         SlashCommand::Rollback(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Rollback(arg));
+        }
+        SlashCommand::Worktree(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Worktree(arg));
+        }
+        SlashCommand::Mcp => {
+            send_cmd(app, cmd_tx, TuiCommand::McpStatus);
         }
         SlashCommand::Verify(arg) => {
             if app.busy {

@@ -459,6 +459,17 @@ async fn handle_telegram_chat_message(
                 .await?;
             return Ok(());
         }
+        SlashCommand::Worktree(arg) => {
+            let reply = s.handle_worktree(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Mcp => {
+            tg.send_long_message(chat_id, &strip_menu_markup(&s.handle_mcp_status()))
+                .await?;
+            return Ok(());
+        }
         SlashCommand::Verify(arg) => {
             let reply = s.handle_verify(arg.as_deref()).await?;
             tg.send_long_message(chat_id, &strip_menu_markup(&reply))
