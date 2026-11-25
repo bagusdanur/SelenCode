@@ -225,6 +225,9 @@ fn child_ctx_for_role(parent_ctx: &Ctx) -> Ctx {
         skills: parent_ctx.skills.clone(),
         auto_skills: false,
         self_correct: false,
+        asker: Arc::new(crate::tools::ask::UserAsker::non_interactive()),
+        ask_timeout_secs: parent_ctx.ask_timeout_secs,
+        router_telemetry: None,
     }
 }
 

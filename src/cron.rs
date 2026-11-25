@@ -13,7 +13,7 @@ use crate::config::ShellCfg;
 use crate::providers::router::is_retryable_error;
 use crate::providers::{Provider, ToolSpec};
 use crate::sandbox::SandboxController;
-use crate::security::{redact_secrets, Approver};
+use crate::security::{is_forbidden_command, redact_secrets, Approver};
 use crate::store::{CronJobRecord, Store};
 use crate::tools::file::{EditFile, ListFiles, ReadFile, WriteFile};
 use crate::tools::outline::Outline;
@@ -28,7 +28,6 @@ use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveTime, TimeZone, U
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::process::Command;
 
 pub const CRON_GATEWAY_NOTE: &str =
     "Catatan: job terjadwal hanya berjalan selama proses gateway Telegram (`selen telegram`) hidup.";
@@ -184,7 +183,7 @@ pub fn compute_next_run_after(spec: &str, now_utc: DateTime<Utc>) -> Result<Stri
             chosen.with_timezone(&Utc)
         }
     };
-    Ok(next_utc.to_rfc3339_opts(chrono::SecondsFormat::Seconds, true))
+    Ok(next_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 /// Kebijakan skip-missed saat gateway baru menyala:
@@ -281,18 +280,15 @@ impl Tool for AllowlistedShellTool {
                 self.allowlist.join(", ")
             ));
         }
-        ctx.sandbox.check_shell_allowed(command)?;
-        let mut cmd = if cfg!(windows) {
-            let mut c = Command::new("cmd");
-            c.args(["/C", command]);
-            c
-        } else {
-            let mut c = Command::new("sh");
-            c.args(["-c", command]);
-            c
-        };
-        cmd.current_dir(&ctx.cwd).kill_on_drop(true);
-        ctx.sandbox.prepare_shell_command(&mut cmd, &ctx.cwd, false)?;
+        if is_forbidden_command(command) {
+            return Err(anyhow!(
+                "perintah ditolak demi keamanan (pola terlarang): {command}"
+            ));
+        }
+        let mut cmd = ctx
+            .sandbox
+            .prepare_shell_command("cron_shell", command, &ctx.cwd)?;
+        cmd.kill_on_drop(true);
         let (code, output) = run_timed(&mut cmd, self.timeout_secs.max(10)).await?;
         let cleaned = truncate_output(redact_secrets(&output), MAX_TOOL_OUTPUT);
         Ok(format!(

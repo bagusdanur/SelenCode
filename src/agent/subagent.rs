@@ -60,6 +60,9 @@ pub async fn run_subagent(
         skills: parent_ctx.skills.clone(),
         auto_skills: false,
         self_correct: false,
+        asker: Arc::new(crate::tools::ask::UserAsker::non_interactive()),
+        ask_timeout_secs: parent_ctx.ask_timeout_secs,
+        router_telemetry: None,
     };
     let mut messages = vec![Message::text(
         Role::System,

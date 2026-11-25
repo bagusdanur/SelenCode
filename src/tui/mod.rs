@@ -1758,12 +1758,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(ask) = &app.pending_ask {
         let area = centered_rect(76, 56, frame.area());
         frame.render_widget(Clear, area);
-        let modal_bg = moonlit::CARD;
+        let modal_bg = moonlit::BG;
         let block = Block::default()
             .title(" Pertanyaan dari Selena (Klarifikasi) ")
             .title_style(
                 Style::default()
-                    .fg(moonlit::LAVENDER)
+                    .fg(moonlit::LAV)
                     .add_modifier(Modifier::BOLD),
             )
             .borders(Borders::ALL)
@@ -1784,7 +1784,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         lines.push(Line::from(Span::styled(
             format!("  {}", ask.question),
             Style::default()
-                .fg(moonlit::STARLIGHT)
+                .fg(moonlit::LILAC)
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));

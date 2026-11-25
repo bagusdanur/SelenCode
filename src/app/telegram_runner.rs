@@ -154,7 +154,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                         selencode::sandbox::default_audit_log_path(),
                     ));
                     let run_started = chrono::Utc::now()
-                        .to_rfc3339_opts(chrono::SecondsFormat::Seconds, true);
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                     let next_slot = selencode::cron::compute_next_run_after(
                         &job.schedule_spec,
                         chrono::Utc::now(),

@@ -319,7 +319,7 @@ async fn bagian3_cron_schedule_persistence_skip_missed_and_security_fence() {
     let dir = temp_dir("b3");
     let db_path = dir.join("selen.db");
     let past_ts = (chrono::Utc::now() - chrono::Duration::minutes(10))
-        .to_rfc3339_opts(chrono::SecondsFormat::Seconds, true);
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     {
         let store = Store::open_at(&db_path).unwrap();
         let job = store
