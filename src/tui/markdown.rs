@@ -1,11 +1,14 @@
 //! Renderer Markdown ringan untuk jawaban Selena di TUI (murni Rust, tanpa
 //! dependensi eksternal). Mengubah heading, **bold**, *italic*, `kode inline`,
 //! daftar bernomor/bullet, blockquote, garis pemisah, dan blok kode ```...```
-//! menjadi baris Ratatui berpalet Moonlit ungu yang rapi dan mudah dibaca.
+//! menjadi baris Ratatui berpalet Moonlit ungu yang rapi, terbungkus per kata,
+//! dengan garis tepi `│` utuh dan hanging-indent presisi di desktop & HP Termux.
 
 use super::moonlit::{BORDER, CYAN_MOON, DEEP, DIM, FAINT, LAV, LILAC, SILVER, VIOLET};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+
+const CODE_INLINE_BG: Color = Color::Rgb(34, 24, 62);
 
 fn st(c: Color) -> Style {
     Style::default().fg(c)
@@ -15,13 +18,152 @@ fn stb(c: Color) -> Style {
     Style::default().fg(c).add_modifier(Modifier::BOLD)
 }
 
-fn rail() -> Span<'static> {
-    Span::styled("  │ ".to_string(), st(FAINT))
+fn rail(narrow: bool) -> Span<'static> {
+    let s = if narrow { " │ " } else { "  │ " };
+    Span::styled(s.to_string(), st(BORDER))
 }
 
-/// Render teks Markdown jawaban assistant menjadi baris Ratatui bergaya Moonlit.
-/// Aman dipakai saat streaming (fence kode yang belum ditutup tetap rapi).
-pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+/// Pecah rangkaian `Span` berwarna agar muat dalam `max_width` kolom secara
+/// utuh per kata, dengan `first_prefix` pada baris pertama dan `cont_prefix`
+/// pada baris lanjutan (menjaga garis tepi `│` & hanging-indent tetap lurus!).
+pub fn wrap_styled_spans(
+    first_prefix: Vec<Span<'static>>,
+    cont_prefix: Vec<Span<'static>>,
+    body: Vec<Span<'static>>,
+    max_width: usize,
+) -> Vec<Line<'static>> {
+    let limit = max_width.max(20);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = first_prefix;
+    let mut cur_w = spans_width(&cur);
+    let mut on_first_line = true;
+
+    let push_styled = |line: &mut Vec<Span<'static>>, text: &str, style: Style| {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(last) = line.last_mut() {
+            if last.style == style {
+                last.content.to_mut().push_str(text);
+                return;
+            }
+        }
+        line.push(Span::styled(text.to_string(), style));
+    };
+
+    // Pecah body menjadi token (kata atau spasi) sambil mempertahankan Style tiap span.
+    let mut tokens: Vec<(String, Style, bool)> = Vec::new();
+    for sp in body {
+        let style = sp.style;
+        let text = sp.content.as_ref();
+        let mut buf = String::new();
+        let mut in_ws: Option<bool> = None;
+        for ch in text.chars() {
+            let ws = ch.is_whitespace();
+            if in_ws == Some(ws) {
+                buf.push(ch);
+            } else {
+                if !buf.is_empty() {
+                    tokens.push((std::mem::take(&mut buf), style, in_ws.unwrap_or(false)));
+                }
+                buf.push(ch);
+                in_ws = Some(ws);
+            }
+        }
+        if !buf.is_empty() {
+            tokens.push((buf, style, in_ws.unwrap_or(false)));
+        }
+    }
+
+    let first_prefix_w = cur_w;
+    let cont_prefix_w = spans_width(&cont_prefix);
+
+    for (tok, style, is_ws) in tokens {
+        let tlen = tok.chars().count();
+        let line_prefix_w = if on_first_line {
+            first_prefix_w
+        } else {
+            cont_prefix_w
+        };
+        let at_line_start = cur_w == line_prefix_w;
+
+        if is_ws {
+            // Jangan taruh spasi di awal baris baru hasil wrap.
+            if at_line_start {
+                continue;
+            }
+            if cur_w + tlen <= limit {
+                push_styled(&mut cur, &tok, style);
+                cur_w += tlen;
+            } else {
+                // Spasi menyentuh batas kanan -> pindah baris baru.
+                lines.push(Line::from(cur));
+                cur = cont_prefix.clone();
+                cur_w = cont_prefix_w;
+                on_first_line = false;
+            }
+            continue;
+        }
+
+        if cur_w + tlen <= limit {
+            push_styled(&mut cur, &tok, style);
+            cur_w += tlen;
+            continue;
+        }
+
+        // Kata tidak muat di sisa baris saat ini -> pindah baris baru bila bukan di awal baris.
+        if !at_line_start {
+            lines.push(Line::from(cur));
+            cur = cont_prefix.clone();
+            cur_w = cont_prefix_w;
+            on_first_line = false;
+        }
+
+        let avail = limit.saturating_sub(cur_w).max(6);
+        if tlen <= avail {
+            push_styled(&mut cur, &tok, style);
+            cur_w += tlen;
+        } else {
+            // Kata tunggal lebih panjang dari lebar baris (URL/path): pecah aman per karakter UTF-8.
+            let mut chunk = String::new();
+            let mut clen = 0usize;
+            for ch in tok.chars() {
+                let cap = limit.saturating_sub(cur_w).max(6);
+                if clen >= cap {
+                    push_styled(&mut cur, &chunk, style);
+                    chunk.clear();
+                    clen = 0;
+                    lines.push(Line::from(cur));
+                    cur = cont_prefix.clone();
+                    cur_w = cont_prefix_w;
+                    on_first_line = false;
+                }
+                chunk.push(ch);
+                clen += 1;
+            }
+            if !chunk.is_empty() {
+                push_styled(&mut cur, &chunk, style);
+                cur_w += clen;
+            }
+        }
+    }
+
+    lines.push(Line::from(cur));
+    lines
+}
+
+/// Render teks Markdown jawaban assistant menjadi baris Ratatui bergaya Moonlit
+/// yang sudah dibungkus rapi sesuai lebar terminal `width` (aman di HP Termux
+/// maupun desktop, menjaga garis tepi `│` & hanging-indent tidak pernah patah).
+pub fn render_markdown_width(text: &str, width: u16) -> Vec<Line<'static>> {
+    let narrow = width < 72;
+    let max_w = (width as usize).saturating_sub(1).clamp(24, 110);
+    let inner_code_w = max_w.saturating_sub(if narrow { 6 } else { 7 }).max(16);
+
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut in_code = false;
     let mut blank_run = 0usize;
@@ -36,32 +178,41 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 in_code = true;
                 let lang = rest.trim();
                 let header = if lang.is_empty() {
-                    vec![rail(), Span::styled("╭─ kode ────────────────────", st(BORDER))]
-                } else {
+                    let dashes = inner_code_w.saturating_sub(7).max(4);
                     vec![
-                        rail(),
+                        rail(narrow),
+                        Span::styled(format!("╭─ kode {}", "─".repeat(dashes)), st(BORDER)),
+                    ]
+                } else {
+                    let dashes = inner_code_w
+                        .saturating_sub(4 + lang.chars().count())
+                        .max(3);
+                    vec![
+                        rail(narrow),
                         Span::styled("╭─ ", st(BORDER)),
                         Span::styled(lang.to_string(), stb(LAV)),
-                        Span::styled(" ────────────────────", st(BORDER)),
+                        Span::styled(format!(" {}", "─".repeat(dashes)), st(BORDER)),
                     ]
                 };
                 out.push(Line::from(header));
             } else {
                 in_code = false;
                 out.push(Line::from(vec![
-                    rail(),
-                    Span::styled("╰───────────────────────────", st(BORDER)),
+                    rail(narrow),
+                    Span::styled(format!("╰{}", "─".repeat(inner_code_w)), st(BORDER)),
                 ]));
             }
             continue;
         }
 
         if in_code {
-            out.push(Line::from(vec![
-                rail(),
-                Span::styled("│ ", st(BORDER)),
-                Span::styled(raw.to_string(), st(CYAN_MOON)),
-            ]));
+            let pfx = vec![rail(narrow), Span::styled("│ ", st(BORDER))];
+            if raw.is_empty() {
+                out.push(Line::from(pfx));
+            } else {
+                let code_spans = vec![Span::styled(raw.to_string(), st(CYAN_MOON))];
+                out.extend(wrap_styled_spans(pfx.clone(), pfx, code_spans, max_w));
+            }
             continue;
         }
 
@@ -69,7 +220,7 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
         if raw.trim().is_empty() {
             blank_run += 1;
             if blank_run == 1 && !out.is_empty() {
-                out.push(Line::from(vec![rail()]));
+                out.push(Line::from(vec![rail(narrow)]));
             }
             continue;
         }
@@ -78,77 +229,95 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
         // Horizontal rule (--- / *** / ___)
         if is_hr(trimmed) {
             out.push(Line::from(vec![
-                rail(),
-                Span::styled("────────────────────────────────", st(FAINT)),
+                rail(narrow),
+                Span::styled("─".repeat(inner_code_w), st(FAINT)),
             ]));
             continue;
         }
 
         // Heading (# / ## / ###)
         if let Some((level, heading)) = parse_heading(trimmed) {
+            if !out.is_empty() {
+                let last_empty_rail = out.last().map(|l| l.spans.len() == 1).unwrap_or(false);
+                if !last_empty_rail {
+                    out.push(Line::from(vec![rail(narrow)]));
+                }
+            }
             let (bullet, color) = match level {
                 1 => ("◆ ", LILAC),
                 2 => ("▸ ", VIOLET),
                 _ => ("· ", LAV),
             };
-            let mut spans = vec![rail(), Span::styled(bullet.to_string(), stb(color))];
-            spans.extend(parse_inline(heading, stb(color)));
-            out.push(Line::from(spans));
+            let first_pfx = vec![rail(narrow), Span::styled(bullet.to_string(), stb(color))];
+            let cont_pfx = vec![rail(narrow), Span::raw("  ")];
+            let body = parse_inline(heading, stb(color));
+            out.extend(wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
             continue;
         }
 
         // Blockquote (> ...)
         if let Some(quote) = trimmed.strip_prefix("> ").or_else(|| trimmed.strip_prefix('>')) {
-            let mut spans = vec![rail(), Span::styled("▎ ", st(DEEP))];
-            spans.extend(parse_inline(
+            let pfx = vec![rail(narrow), Span::styled("▎ ", st(DEEP))];
+            let body = parse_inline(
                 quote.trim_start(),
                 st(DIM).add_modifier(Modifier::ITALIC),
-            ));
-            out.push(Line::from(spans));
+            );
+            out.extend(wrap_styled_spans(pfx.clone(), pfx, body, max_w));
             continue;
         }
 
-        // Unordered list (- / * / +)
+        // Unordered list (- / * / +) dengan hanging-indent rapi
         let indent = raw.len() - trimmed.len();
         if let Some(rest) = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
             .or_else(|| trimmed.strip_prefix("+ "))
         {
-            let pad = " ".repeat((indent / 2).min(4) * 2);
-            let mut spans = vec![
-                rail(),
-                Span::raw(pad),
+            let pad_len = (indent / 2).min(3) * 2;
+            let pad = " ".repeat(pad_len);
+            let first_pfx = vec![
+                rail(narrow),
+                Span::raw(pad.clone()),
                 Span::styled("• ", stb(VIOLET)),
             ];
-            spans.extend(parse_inline(rest, st(SILVER)));
-            out.push(Line::from(spans));
+            let cont_pfx = vec![rail(narrow), Span::raw(format!("{pad}  "))];
+            let body = parse_inline(rest, st(SILVER));
+            out.extend(wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
             continue;
         }
 
-        // Ordered list (1. / 2. / 10.)
+        // Ordered list (1. / 2. / 10.) dengan hanging-indent rapi
         if let Some((num, rest)) = parse_ordered_item(trimmed) {
-            let pad = " ".repeat((indent / 2).min(4) * 2);
-            let mut spans = vec![
-                rail(),
+            let pad_len = (indent / 2).min(3) * 2;
+            let pad = " ".repeat(pad_len);
+            let num_prefix = format!("{num}. ");
+            let hang = " ".repeat(pad_len + num_prefix.chars().count());
+            let first_pfx = vec![
+                rail(narrow),
                 Span::raw(pad),
-                Span::styled(format!("{num}. "), stb(VIOLET)),
+                Span::styled(num_prefix, stb(VIOLET)),
             ];
-            spans.extend(parse_inline(rest, st(SILVER)));
-            out.push(Line::from(spans));
+            let cont_pfx = vec![rail(narrow), Span::raw(hang)];
+            let body = parse_inline(rest, st(SILVER));
+            out.extend(wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
             continue;
         }
 
-        // Paragraf biasa dengan inline markdown
-        let mut spans = vec![rail()];
-        spans.extend(parse_inline(raw, st(SILVER)));
-        out.push(Line::from(spans));
+        // Paragraf biasa dengan inline markdown & wrap menjaga garis tepi `│`
+        let pfx = vec![rail(narrow)];
+        let body = parse_inline(raw.trim_end(), st(SILVER));
+        out.extend(wrap_styled_spans(pfx.clone(), pfx, body, max_w));
     }
 
     if out.is_empty() {
-        out.push(Line::from(vec![rail()]));
+        out.push(Line::from(vec![rail(narrow)]));
     }
     out
+}
+
+/// Render teks Markdown jawaban assistant dengan lebar baku desktop (96 kolom).
+pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
+    render_markdown_width(text, 96)
 }
 
 fn is_hr(s: &str) -> bool {
@@ -207,7 +376,7 @@ pub fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
                     flush(&mut spans, &mut buf, base);
                     spans.push(Span::styled(
                         code.to_string(),
-                        Style::default().fg(CYAN_MOON),
+                        Style::default().fg(CYAN_MOON).bg(CODE_INLINE_BG),
                     ));
                     i += rel_end + 2;
                     continue;

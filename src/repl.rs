@@ -553,7 +553,7 @@ pub fn help_menu_markup() -> String {
     out.push_str("> /model rm 2 | /model clear | hapus 1 model (#2) atau bersihkan semua daftar\n");
     out.push_str("> /models | [kata_cari] | intip katalog API lalu ambil 1-per-1: /model add 1 3\n");
     out.push_str("---\n");
-    out.push_str("! Hentikan task: /stop atau tekan Esc saat Selena bekerja.\n");
+    out.push_str("! Interupsi cepat: ketik pesan baru + Enter saat Selena bekerja, atau /stop / Esc.\n");
     out.push_str("! Telegram Bot:  /telegram setup <TOKEN> <USER_ID> lalu jalankan `selen telegram`.\n");
     out.push_str("! File & shell:  @src/main.rs (lampirkan file) · !cargo test (shell instan).\n");
     out.push_str("! Keyboard TUI:  / + ↑↓ + Tab palette · Alt+Enter baris baru · Ctrl+C keluar.");

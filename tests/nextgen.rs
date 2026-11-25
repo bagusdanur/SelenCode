@@ -471,4 +471,31 @@ fn model_clear_help_panduan_dan_telegram_gateway_helpers() {
         selencode::agent::context::format_context_compact(2_500),
         "2.5k"
     );
+
+    // 9. Sanitize pesan setelah interupsi di tengah tool_call (cegah HTTP 400 provider)
+    use selencode::agent::context::sanitize_interrupted_messages;
+    let mut msgs = vec![
+        Message::text(Role::User, "tolong cek file"),
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                selencode::providers::Block::ToolUse {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    args: json!({"path": "a.rs"}),
+                },
+                selencode::providers::Block::ToolUse {
+                    id: "call_2".into(),
+                    name: "run_shell".into(),
+                    args: json!({"command": "cargo test"}),
+                },
+            ],
+        },
+    ];
+    let syn = sanitize_interrupted_messages(&mut msgs).expect("harus sisipkan ToolResult sintetis");
+    assert_eq!(syn.role, Role::Tool);
+    assert_eq!(syn.content.len(), 2);
+    assert_eq!(msgs.len(), 3);
+    // Pemanggilan kedua saat ekor bukan dangling ToolUse tidak menambah apa pun.
+    assert!(sanitize_interrupted_messages(&mut msgs).is_none());
 }

@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use selencode::agent::context::{
     calc_context_pct, compact_messages, estimate_tokens, format_context_compact,
-    infer_model_context_limit,
+    infer_model_context_limit, sanitize_interrupted_messages,
 };
 use selencode::agent::plan::{approved_plan_prompt, extract_plan, TurnMode};
 use selencode::agent::ui::ModelPickerData;
@@ -34,6 +34,7 @@ use selencode::tui::app::App;
 use selencode::tui::{ModelPickerCmd, TuiChannels, TuiCommand};
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1680,10 +1681,11 @@ async fn tui_worker(
     mut cmd_rx: tokio::sync::mpsc::Receiver<TuiCommand>,
     ui_tx: tokio::sync::mpsc::Sender<UiEvent>,
     cancel: Arc<tokio::sync::Notify>,
+    interrupt_pending: Arc<AtomicBool>,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            TuiCommand::Prompt(prompt) => {
+            TuiCommand::Prompt(prompt) | TuiCommand::InterruptPrompt(prompt) => {
                 tokio::select! {
                     r = run_turn_ui(
                         s.provider.clone(),
@@ -1703,8 +1705,13 @@ async fn tui_worker(
                         }
                     },
                     _ = cancel.notified() => {
-                        let _ = ui_tx.send(UiEvent::Info("Giliran dibatalkan oleh user (Esc).".into())).await;
-                        let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
+                        if let Some(syn) = sanitize_interrupted_messages(&mut s.messages) {
+                            let _ = s.store.save_message(&s.session_id, &syn);
+                        }
+                        if !interrupt_pending.swap(false, Ordering::SeqCst) {
+                            let _ = ui_tx.send(UiEvent::Info("Giliran dihentikan.".into())).await;
+                            let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
+                        }
                     }
                 }
             }
@@ -1741,8 +1748,13 @@ async fn tui_worker(
                         }
                     },
                     _ = cancel.notified() => {
-                        let _ = ui_tx.send(UiEvent::Info("Giliran plan dibatalkan (Esc).".into())).await;
-                        let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
+                        if let Some(syn) = sanitize_interrupted_messages(&mut s.messages) {
+                            let _ = s.store.save_message(&s.session_id, &syn);
+                        }
+                        if !interrupt_pending.swap(false, Ordering::SeqCst) {
+                            let _ = ui_tx.send(UiEvent::Info("Giliran plan dihentikan.".into())).await;
+                            let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
+                        }
                     }
                 }
             }
@@ -1767,8 +1779,13 @@ async fn tui_worker(
                         }
                     },
                     _ = cancel.notified() => {
-                        let _ = ui_tx.send(UiEvent::Info("Eksekusi rencana dibatalkan (Esc).".into())).await;
-                        let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
+                        if let Some(syn) = sanitize_interrupted_messages(&mut s.messages) {
+                            let _ = s.store.save_message(&s.session_id, &syn);
+                        }
+                        if !interrupt_pending.swap(false, Ordering::SeqCst) {
+                            let _ = ui_tx.send(UiEvent::Info("Eksekusi rencana dihentikan.".into())).await;
+                            let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
+                        }
                     }
                 }
             }
@@ -2114,12 +2131,20 @@ async fn interactive_tui(cli: Cli, resume: bool) -> Result<()> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TuiCommand>(32);
     let (ui_tx, ui_rx) = tokio::sync::mpsc::channel::<UiEvent>(256);
     let cancel = Arc::new(tokio::sync::Notify::new());
-    let worker = tokio::spawn(tui_worker(s, cmd_rx, ui_tx, cancel.clone()));
+    let interrupt_pending = Arc::new(AtomicBool::new(false));
+    let worker = tokio::spawn(tui_worker(
+        s,
+        cmd_rx,
+        ui_tx,
+        cancel.clone(),
+        interrupt_pending.clone(),
+    ));
     let channels = TuiChannels {
         cmd_tx,
         event_rx: ui_rx,
         approval_rx,
         cancel,
+        interrupt_pending,
     };
     let tui_result =
         tokio::task::spawn_blocking(move || selencode::tui::run_blocking(app, channels)).await;
@@ -2330,19 +2355,6 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
 
 // ---------- Telegram Bot Gateway (`selen telegram`) ----------
 
-struct BusyChatGuard {
-    set: Arc<std::sync::Mutex<HashSet<i64>>>,
-    chat_id: i64,
-}
-
-impl Drop for BusyChatGuard {
-    fn drop(&mut self) {
-        if let Ok(mut g) = self.set.lock() {
-            g.remove(&self.chat_id);
-        }
-    }
-}
-
 /// Bersihkan akhiran `@nama_bot` pada perintah grup Telegram (mis. `/model@selen_bot 2` -> `/model 2`).
 fn normalize_tg_command(raw: &str) -> String {
     let t = raw.trim();
@@ -2404,6 +2416,8 @@ async fn run_telegram_gateway(cli: Cli) -> Result<()> {
     let busy_chats: Arc<std::sync::Mutex<HashSet<i64>>> =
         Arc::new(std::sync::Mutex::new(HashSet::new()));
     let cancel_tokens: Arc<std::sync::Mutex<HashMap<i64, Arc<tokio::sync::Notify>>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let chat_gens: Arc<std::sync::Mutex<HashMap<i64, Arc<AtomicU64>>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let provider_override = cli.provider.clone();
     let yes_flag = cli.yes;
@@ -2517,27 +2531,36 @@ async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 continue;
             }
 
-            // Cegah 2 giliran tumpang tindih pada chat yang sama.
-            let acquired = {
-                let mut set = busy_chats.lock().expect("busy_chats poisoned");
-                set.insert(chat_id)
-            };
-            if !acquired {
-                let _ = tg
-                    .send_message(
-                        chat_id,
-                        "⏳ Selena masih mengerjakan permintaan sebelumnya di chat ini. Kirim `/cancel` jika ingin membatalkan.",
-                    )
-                    .await;
-                continue;
-            }
-
             let cancel_notify = {
                 let mut map = cancel_tokens.lock().expect("cancel_tokens poisoned");
                 map.entry(chat_id)
                     .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
                     .clone()
             };
+            let gen_counter = {
+                let mut map = chat_gens.lock().expect("chat_gens poisoned");
+                map.entry(chat_id)
+                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                    .clone()
+            };
+            let my_gen = gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
+
+            // Interupsi mulus ala OpenCode/Hermes: bila chat sedang sibuk, langsung
+            // batalkan giliran & approval lama lalu jalankan pesan baru!
+            let was_busy = {
+                let mut set = busy_chats.lock().expect("busy_chats poisoned");
+                !set.insert(chat_id)
+            };
+            if was_busy {
+                let dropped = hub.cancel_chat_approvals(chat_id);
+                cancel_notify.notify_waiters();
+                let notice = if dropped > 0 {
+                    format!("⚡ Menginterupsi giliran sebelumnya ({dropped} approval dibatalkan) — memproses pesan barumu…")
+                } else {
+                    "⚡ Menginterupsi giliran sebelumnya — memproses pesan barumu…".to_string()
+                };
+                let _ = tg.send_message(chat_id, &notice).await;
+            }
 
             println!("[telegram] {sender_name} ({chat_id}): {text}");
             let tg_clone = tg.clone();
@@ -2548,23 +2571,27 @@ async fn run_telegram_gateway(cli: Cli) -> Result<()> {
             let tg_approval_cfg = latest_cfg.telegram.approval.clone();
 
             tokio::spawn(async move {
-                let _guard = BusyChatGuard {
-                    set: busy_clone,
-                    chat_id,
-                };
-                if let Err(e) = handle_telegram_chat_message(
+                // Pastikan flag busy dibersihkan hanya bila giliran ini masih generasi terbaru.
+                let res = handle_telegram_chat_message(
                     tg_clone.clone(),
                     hub_clone,
                     sessions_clone,
                     cancel_notify,
+                    gen_counter.clone(),
+                    my_gen,
                     prov_clone,
                     yes_flag,
                     tg_approval_cfg,
                     chat_id,
                     text,
                 )
-                .await
-                {
+                .await;
+                if gen_counter.load(Ordering::SeqCst) == my_gen {
+                    if let Ok(mut set) = busy_clone.lock() {
+                        set.remove(&chat_id);
+                    }
+                }
+                if let Err(e) = res {
                     let _ = tg_clone
                         .send_long_message(chat_id, &format!("❌ Error: {e}"))
                         .await;
@@ -2581,6 +2608,8 @@ async fn handle_telegram_chat_message(
     hub: Arc<TgApprovalHub>,
     sessions: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>>,
     cancel: Arc<tokio::sync::Notify>,
+    gen_counter: Arc<AtomicU64>,
+    my_gen: u64,
     provider_override: Option<String>,
     yes_flag: bool,
     tg_approval_cfg: String,
@@ -2626,7 +2655,14 @@ async fn handle_telegram_chat_message(
         }
     };
 
+    // Bila sudah ada pesan baru yang menginterupsi sebelum lock giliran ini didapat, lewati.
+    if gen_counter.load(Ordering::SeqCst) != my_gen {
+        return Ok(());
+    }
     let mut s_guard = session_arc.lock().await;
+    if gen_counter.load(Ordering::SeqCst) != my_gen {
+        return Ok(());
+    }
     let s: &mut Session = &mut *s_guard;
 
     // Perintah khusus Telegram (/start, /status).
@@ -2858,7 +2894,13 @@ async fn handle_telegram_chat_message(
     let (tools, notes) = collector.await.unwrap_or_default();
 
     let Some(turn_res) = turn_res else {
-        tg.send_message(chat_id, "🛑 Giliran dibatalkan.").await?;
+        if let Some(syn) = sanitize_interrupted_messages(&mut s.messages) {
+            let _ = s.store.save_message(&s.session_id, &syn);
+        }
+        // Jangan kirim pesan "dibatalkan" bila pembatalan dipicu oleh pesan interupsi baru.
+        if gen_counter.load(Ordering::SeqCst) == my_gen {
+            tg.send_message(chat_id, "🛑 Giliran dibatalkan.").await?;
+        }
         return Ok(());
     };
     let answer = turn_res?;

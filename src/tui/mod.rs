@@ -31,6 +31,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io::stdout;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -60,6 +61,8 @@ pub enum ModelPickerCmd {
 #[derive(Debug)]
 pub enum TuiCommand {
     Prompt(String),
+    /// Interupsi giliran yang sedang berjalan dan langsung jalankan prompt baru (ala OpenCode/Hermes).
+    InterruptPrompt(String),
     /// Giliran plan mode (Fase 6): baca-saja, diakhiri rencana.
     PromptPlan(String),
     /// Jalankan rencana yang sudah disetujui user (teks rencana utuh).
@@ -101,8 +104,10 @@ pub struct TuiChannels {
     pub cmd_tx: mpsc::Sender<TuiCommand>,
     pub event_rx: mpsc::Receiver<UiEvent>,
     pub approval_rx: mpsc::Receiver<ApprovalRequest>,
-    /// Sinyal pembatalan giliran saat user menekan `Esc` ketika agent sibuk.
+    /// Sinyal pembatalan giliran saat user menekan `Esc` / `/stop` / interupsi ketika agent sibuk.
     pub cancel: Arc<Notify>,
+    /// True bila pembatalan dipicu oleh pesan interupsi baru (worker langsung lanjut ke giliran baru).
+    pub interrupt_pending: Arc<AtomicBool>,
 }
 
 // ---------- gambar ----------
@@ -412,6 +417,10 @@ fn display_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     // Sambutan Moonlit menempel di awal transkrip & ikut bergulir.
     let mut out: Vec<Line<'static>> = app.welcome.clone().unwrap_or_default();
     let mut prev_kind: Option<LineKind> = None;
+    let narrow = width < 72;
+    let indent = if narrow { " " } else { "  " };
+    let max_w = (width as usize).saturating_sub(1).clamp(24, 110);
+    let inner_w = max_w.saturating_sub(indent.len()).max(20);
 
     for l in &app.lines {
         match l.kind {
@@ -421,26 +430,32 @@ fn display_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 }
                 let mut first = true;
                 for part in l.text.lines() {
-                    let (bar, prompt) = if first {
-                        ("  ┃ ", "❯ ")
-                    } else {
-                        ("  ┃ ", "  ")
-                    };
-                    out.push(Line::from(vec![
-                        Span::styled(bar.to_string(), Style::default().fg(moonlit::DEEP)),
+                    let first_pfx = vec![
                         Span::styled(
-                            prompt.to_string(),
+                            format!("{indent}┃ "),
+                            Style::default().fg(moonlit::DEEP),
+                        ),
+                        Span::styled(
+                            if first { "❯ " } else { "  " }.to_string(),
                             Style::default()
                                 .fg(moonlit::VIOLET)
                                 .add_modifier(Modifier::BOLD),
                         ),
+                    ];
+                    let cont_pfx = vec![
                         Span::styled(
-                            part.to_string(),
-                            Style::default()
-                                .fg(moonlit::SILVER)
-                                .add_modifier(Modifier::BOLD),
+                            format!("{indent}┃ "),
+                            Style::default().fg(moonlit::DEEP),
                         ),
-                    ]));
+                        Span::raw("  "),
+                    ];
+                    let body = vec![Span::styled(
+                        part.to_string(),
+                        Style::default()
+                            .fg(moonlit::SILVER)
+                            .add_modifier(Modifier::BOLD),
+                    )];
+                    out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
                     first = false;
                 }
             }
@@ -449,9 +464,14 @@ fn display_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     if !out.is_empty() {
                         out.push(Line::from(""));
                     }
+                    let dashes = inner_w.saturating_sub(12).clamp(4, 56);
                     out.push(Line::from(vec![
                         Span::styled(
-                            "  ☾ ".to_string(),
+                            format!("{indent}╭─ "),
+                            Style::default().fg(moonlit::BORDER),
+                        ),
+                        Span::styled(
+                            "☾ ".to_string(),
                             Style::default()
                                 .fg(moonlit::VIOLET)
                                 .add_modifier(Modifier::BOLD),
@@ -462,9 +482,13 @@ fn display_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                                 .fg(moonlit::LILAC)
                                 .add_modifier(Modifier::BOLD),
                         ),
+                        Span::styled(
+                            format!(" {}", "─".repeat(dashes)),
+                            Style::default().fg(moonlit::BORDER),
+                        ),
                     ]));
                 }
-                out.extend(markdown::render_markdown(&l.text));
+                out.extend(markdown::render_markdown_width(&l.text, width));
             }
             LineKind::Tool => {
                 let (icon, color) = match l.tool_state {
@@ -476,22 +500,27 @@ fn display_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 if !app.show_tool_details {
                     let label = l.tool_name.as_deref().unwrap_or("tool");
                     out.push(Line::from(vec![
-                        Span::styled(format!("  {icon} "), Style::default().fg(color)),
+                        Span::styled(format!("{indent}{icon} "), Style::default().fg(color)),
                         Span::styled(label.to_string(), Style::default().fg(moonlit::LAV)),
                         Span::styled(" (ringkas · /details)", Style::default().fg(moonlit::FAINT)),
                     ]));
                 } else {
                     let mut first = true;
                     for part in l.text.lines() {
-                        let prefix = if first {
-                            format!("  {icon} ")
-                        } else {
-                            "    ".to_string()
-                        };
-                        out.push(Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(color)),
-                            Span::styled(part.to_string(), Style::default().fg(moonlit::DIM)),
-                        ]));
+                        let first_pfx = vec![Span::styled(
+                            if first {
+                                format!("{indent}{icon} ")
+                            } else {
+                                format!("{indent}  ")
+                            },
+                            Style::default().fg(color),
+                        )];
+                        let cont_pfx = vec![Span::raw(format!("{indent}  "))];
+                        let body = vec![Span::styled(
+                            part.to_string(),
+                            Style::default().fg(moonlit::DIM),
+                        )];
+                        out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
                         first = false;
                     }
                 }
@@ -501,26 +530,55 @@ fn display_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     out.push(Line::from(""));
                 }
                 for part in l.text.lines() {
-                    out.push(Line::from(vec![
-                        Span::styled("  ┃ ".to_string(), Style::default().fg(moonlit::VIOLET)),
-                        Span::styled(part.to_string(), Style::default().fg(moonlit::LAV)),
-                    ]));
+                    let pfx = vec![Span::styled(
+                        format!("{indent}┃ "),
+                        Style::default().fg(moonlit::VIOLET),
+                    )];
+                    let body = vec![Span::styled(
+                        part.to_string(),
+                        Style::default().fg(moonlit::LAV),
+                    )];
+                    out.extend(markdown::wrap_styled_spans(pfx.clone(), pfx, body, max_w));
                 }
             }
             LineKind::Info => {
                 let is_usage = l.text.starts_with("token sesi ini:");
                 for (idx, part) in l.text.lines().enumerate() {
                     if is_usage {
-                        out.push(Line::from(vec![
-                            Span::styled("  ╰─ ".to_string(), Style::default().fg(moonlit::FAINT)),
-                            Span::styled(part.to_string(), Style::default().fg(moonlit::DIM)),
-                        ]));
+                        let first_pfx = vec![Span::styled(
+                            format!("{indent}╰─ "),
+                            Style::default().fg(moonlit::BORDER),
+                        )];
+                        let cont_pfx = vec![Span::raw(format!("{indent}   "))];
+                        let body = vec![Span::styled(
+                            part.to_string(),
+                            Style::default().fg(moonlit::DIM),
+                        )];
+                        out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
                     } else {
-                        let prefix = if idx == 0 { "  · " } else { "    " };
-                        out.push(Line::from(vec![
-                            Span::styled(prefix.to_string(), Style::default().fg(moonlit::VIOLET)),
-                            Span::styled(part.to_string(), Style::default().fg(moonlit::DIM)),
-                        ]));
+                        let is_interrupt = part.starts_with('⚡');
+                        let first_pfx = vec![Span::styled(
+                            if idx == 0 {
+                                format!("{indent}· ")
+                            } else {
+                                format!("{indent}  ")
+                            },
+                            Style::default().fg(if is_interrupt {
+                                moonlit::GOLD
+                            } else {
+                                moonlit::VIOLET
+                            }),
+                        )];
+                        let cont_pfx = vec![Span::raw(format!("{indent}  "))];
+                        let body = vec![Span::styled(
+                            part.to_string(),
+                            Style::default().fg(if is_interrupt {
+                                moonlit::LAV
+                            } else {
+                                moonlit::DIM
+                            }),
+                        )];
+                        out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
                     }
                 }
             }
@@ -532,11 +590,20 @@ fn display_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             }
             LineKind::Error => {
                 for (idx, part) in l.text.lines().enumerate() {
-                    let prefix = if idx == 0 { "  ✖ [error] " } else { "            " };
-                    out.push(Line::from(vec![
-                        Span::styled(prefix.to_string(), Style::default().fg(moonlit::ROSE)),
-                        Span::styled(part.to_string(), Style::default().fg(moonlit::ROSE)),
-                    ]));
+                    let first_pfx = vec![Span::styled(
+                        if idx == 0 {
+                            format!("{indent}✖ [error] ")
+                        } else {
+                            format!("{indent}          ")
+                        },
+                        Style::default().fg(moonlit::ROSE),
+                    )];
+                    let cont_pfx = vec![Span::raw(format!("{indent}  "))];
+                    let body = vec![Span::styled(
+                        part.to_string(),
+                        Style::default().fg(moonlit::ROSE),
+                    )];
+                    out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
                 }
             }
         }
@@ -646,11 +713,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ));
     frame.render_widget(status, chunks[1]);
 
-    // Input: bingkai BORDER (ungu Moonlit); prompt "❯" violet tebal di sel
-    // kiri dalam bingkai; textarea tanpa bingkai di sisanya.
-    let input_block = Block::default()
+    // Input: bingkai BORDER (atau VIOLET saat sibuk + petunjuk interupsi ala OpenCode/Hermes).
+    let mut input_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(moonlit::BORDER));
+        .border_style(Style::default().fg(if app.busy {
+            moonlit::VIOLET
+        } else {
+            moonlit::BORDER
+        }));
+    if app.busy {
+        let busy_title = if area.width < 68 {
+            " ⚡ bekerja… ketik untuk interupsi · /stop "
+        } else {
+            " ⚡ Selena bekerja… ketik pesan + Enter untuk interupsi · Esc / /stop "
+        };
+        input_block = input_block
+            .title(busy_title)
+            .title_style(Style::default().fg(moonlit::GOLD).add_modifier(Modifier::BOLD));
+    }
     let inner = input_block.inner(chunks[2]);
     frame.render_widget(input_block, chunks[2]);
     let cols = Layout::default()
@@ -1273,7 +1353,12 @@ fn send_cmd(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>, cmd: TuiCommand) {
     }
 }
 
-fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>, cancel: &Arc<Notify>) {
+fn submit(
+    app: &mut App,
+    cmd_tx: &mpsc::Sender<TuiCommand>,
+    cancel: &Arc<Notify>,
+    interrupt_pending: &Arc<AtomicBool>,
+) {
     let raw = app.take_input();
     let text = raw.trim().to_string();
     if text.is_empty() {
@@ -1284,6 +1369,7 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>, cancel: &Arc<Notify>
             app.should_quit = true;
         }
         SlashCommand::Stop => {
+            interrupt_pending.store(false, Ordering::SeqCst);
             let (was_busy, dropped, had_plan) = app.stop_all_active();
             cancel.notify_waiters();
             if was_busy || dropped > 0 || had_plan {
@@ -1392,10 +1478,26 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TuiCommand>, cancel: &Arc<Notify>
             ));
         }
         SlashCommand::NotCommand => {
+            // Interupsi mulus ala OpenCode & Hermes: saat Selena sibuk, mengirim pesan
+            // baru langsung menghentikan giliran/tool aktif dan memproses instruksi baru!
             if app.busy {
-                app.info(
-                    "Selena masih bekerja — tekan Esc untuk membatalkan atau tunggu selesai.",
-                );
+                let dropped = app.cancel_all_approvals();
+                app.pending_plan = None;
+                app.plan_next = false;
+                if dropped > 0 {
+                    app.info(format!(
+                        "⚡ Menginterupsi giliran aktif ({dropped} approval dibatalkan) — melanjutkan instruksi baru…"
+                    ));
+                } else {
+                    app.info("⚡ Menginterupsi giliran aktif — melanjutkan instruksi baru…");
+                }
+                app.push_user(&text);
+                app.busy = true;
+                // Urutan penting: tandai & kirim perintah dulu, BARU picu cancel.notify_waiters()
+                // agar worker tidak sempat mengirim TurnDone palsu sebelum giliran baru mulai.
+                interrupt_pending.store(true, Ordering::SeqCst);
+                send_cmd(app, cmd_tx, TuiCommand::InterruptPrompt(text));
+                cancel.notify_waiters();
                 return;
             }
             // Konfirmasi rencana yang menunggu (Fase 6): input berikutnya
@@ -1432,6 +1534,7 @@ fn handle_key(
     app: &mut App,
     cmd_tx: &mpsc::Sender<TuiCommand>,
     cancel: &Arc<Notify>,
+    interrupt_pending: &Arc<AtomicBool>,
     key: KeyEvent,
 ) {
     if key.kind == KeyEventKind::Release {
@@ -1676,6 +1779,7 @@ fn handle_key(
     }
     // Esc saat Selena sedang bekerja -> batalkan giliran & approval tengah jalan tanpa keluar!
     if key.code == KeyCode::Esc && app.busy {
+        interrupt_pending.store(false, Ordering::SeqCst);
         app.cancel_all_approvals();
         cancel.notify_waiters();
         app.info("Membatalkan semua task & giliran (Esc)…");
@@ -1727,7 +1831,7 @@ fn handle_key(
                     app.input.insert_str(item.cmd);
                 }
                 app.palette_idx = 0;
-                submit(app, cmd_tx, cancel);
+                submit(app, cmd_tx, cancel, interrupt_pending);
                 return;
             }
             _ => {}
@@ -1737,7 +1841,7 @@ fn handle_key(
     match key.code {
         KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
             app.palette_idx = 0;
-            submit(app, cmd_tx, cancel);
+            submit(app, cmd_tx, cancel, interrupt_pending);
         }
         KeyCode::PageUp => {
             let p = app.page_size();
@@ -1778,7 +1882,9 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
             }
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
-                    Event::Key(key) => handle_key(&mut app, &ch.cmd_tx, &ch.cancel, key),
+                    Event::Key(key) => {
+                        handle_key(&mut app, &ch.cmd_tx, &ch.cancel, &ch.interrupt_pending, key)
+                    }
                     Event::Mouse(m) => match m.kind {
                         MouseEventKind::ScrollUp => {
                             if app.approval.is_some() {

@@ -160,3 +160,42 @@ fn halo() {}
     let partial_text: String = partial.iter().map(|s| s.content.as_ref()).collect();
     assert_eq!(partial_text, "sedang **ketik");
 }
+
+#[test]
+fn markdown_mobile_50_kolom_garis_tepi_utuh_dan_hanging_indent_rapi() {
+    use selencode::tui::markdown::render_markdown_width;
+
+    let src = "\
+Uyyy! Aku **Selena**, agent coding di terminal. Ini beberapa hal yang bisa aku bantu:
+
+- **Baca & jelajahi project**: lihat daftar file, cari teks/regex di codebase, dan baca struktur file kode biar cepat paham.
+- **Git helper**: cek `git status`, `git diff`, dan bikin commit kalau kamu minta.
+
+```rust
+fn contoh_panjang_sekali(argumen_pertama: &str, argumen_kedua: &str) -> bool { true }
+```";
+
+    let lines = render_markdown_width(src, 50);
+    assert!(lines.len() >= 8, "teks panjang harus terbungkus ke banyak baris");
+    for l in &lines {
+        let s = l.to_string();
+        assert!(
+            l.width() <= 50,
+            "baris markdown mobile meluber (>50): {s:?}"
+        );
+        assert!(
+            s.starts_with(" │ "),
+            "setiap baris hasil wrap wajib menjaga garis tepi ` │ `: {s:?}"
+        );
+    }
+    // Baris lanjutan bullet harus punya hanging-indent (" │   ...") agar sejajar rapi di bawah teks.
+    let bullet_idx = lines
+        .iter()
+        .position(|l| l.to_string().contains("• Baca"))
+        .expect("baris bullet ada");
+    let next_line = lines[bullet_idx + 1].to_string();
+    assert!(
+        next_line.starts_with(" │   "),
+        "baris lanjutan bullet harus ber-indent sejajar: {next_line:?}"
+    );
+}

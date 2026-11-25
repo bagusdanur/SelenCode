@@ -363,6 +363,41 @@ pub fn calc_context_pct(tokens: usize, limit: usize) -> u8 {
     ((tokens.saturating_mul(100) + limit - 1) / limit).min(100) as u8
 }
 
+/// Pastikan riwayat `messages` tetap valid setelah giliran diinterupsi/dibatalkan
+/// di tengah eksekusi tool: bila pesan terakhir adalah `Assistant` dengan
+/// `ToolUse` yang belum punya `ToolResult`, sisipkan `ToolResult` sintetis
+/// agar provider (OpenAI / Anthropic / Gemini) tidak menolak giliran berikutnya (HTTP 400).
+pub fn sanitize_interrupted_messages(messages: &mut Vec<Message>) -> Option<Message> {
+    let last = messages.last()?;
+    if last.role != Role::Assistant {
+        return None;
+    }
+    let dangling_ids: Vec<String> = last
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            Block::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    if dangling_ids.is_empty() {
+        return None;
+    }
+    let synthetic = Message {
+        role: Role::Tool,
+        content: dangling_ids
+            .into_iter()
+            .map(|id| Block::ToolResult {
+                id,
+                content: "[dibatalkan/diinterupsi oleh user sebelum selesai]".to_string(),
+                is_error: true,
+            })
+            .collect(),
+    };
+    messages.push(synthetic.clone());
+    Some(synthetic)
+}
+
 /// Compaction memicu bila estimasi melewati 80% batas konteks.
 pub fn needs_compaction(messages: &[Message], limit_tokens: usize) -> bool {
     limit_tokens > 0 && estimate_tokens(messages) > limit_tokens * 80 / 100
