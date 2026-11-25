@@ -29,9 +29,12 @@ pub struct Config {
     /// Konfigurasi Guard (dedup, loop guard, & rem Self-correction, `[guard]`).
     #[serde(default, skip_serializing_if = "GuardCfg::is_default")]
     pub guard: GuardCfg,
-    /// Konfigurasi model aux murah untuk kompresi riwayat (`[aux]`).
+    /// Konfigurasi model aux murah untuk kompresi riwayat & background review (`[aux]`).
     #[serde(default, skip_serializing_if = "AuxCfg::is_empty")]
     pub aux: AuxCfg,
+    /// Konfigurasi Background Self-Improvement Review (`[review]`, v0.5.1).
+    #[serde(default, skip_serializing_if = "ReviewCfg::is_default")]
+    pub review: ReviewCfg,
     /// Anggaran hasil tool: cap per tool, spillover ke file, & budget per turn (`[tool_budget]`).
     #[serde(default, skip_serializing_if = "ToolBudgetCfg::is_default")]
     pub tool_budget: ToolBudgetCfg,
@@ -88,12 +91,16 @@ impl GuardCfg {
     }
 }
 
-/// Konfigurasi model tambahan murah untuk meringkas konteks (`[aux]`).
+/// Konfigurasi model tambahan murah untuk meringkas konteks & background review (`[aux]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuxCfg {
-    /// Nama model termurah untuk meringkas riwayat (kosong = pakai model utama).
+    /// Nama model termurah untuk meringkas riwayat (kosong = pakai model utama saat kompresi).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_model: Option<String>,
+    /// Nama model opsional untuk Background Self-Improvement Review (v0.5.1).
+    /// Kosong = ikut `compression_model`; bila keduanya kosong, background review dilewati.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_model: Option<String>,
 }
 
 impl AuxCfg {
@@ -102,6 +109,76 @@ impl AuxCfg {
             .as_deref()
             .map(|s| s.trim().is_empty())
             .unwrap_or(true)
+            && self
+                .review_model
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+    }
+
+    /// Model efektif untuk background review: `review_model` -> `compression_model` -> `None` (lewati).
+    pub fn effective_review_model(&self) -> Option<&str> {
+        self.review_model
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.compression_model
+                    .as_deref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+            })
+    }
+}
+
+/// Konfigurasi Background Self-Improvement Review (`[review]`, v0.5.1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewCfg {
+    /// Aktifkan background self-improvement review (default: true; tetap butuh `[aux]` model terisi).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Batas anggaran total token per 1 kali jalan background review (default konservatif: 6.000).
+    #[serde(default = "default_review_max_tokens")]
+    pub max_tokens: u64,
+    /// Cooldown minimum per sesi dalam menit (default: 30 menit).
+    #[serde(default = "default_review_cooldown_mins")]
+    pub cooldown_mins: u64,
+    /// Picu review berkala setiap N giliran tuntas dalam sesi panjang (default: 15).
+    #[serde(default = "default_review_turns_interval")]
+    pub turns_interval: usize,
+    /// Jumlah panggilan tool minimum agar sesi dianggap substantif (default: 5).
+    #[serde(default = "default_review_min_tool_calls")]
+    pub min_tool_calls: usize,
+}
+
+fn default_review_max_tokens() -> u64 {
+    6_000
+}
+fn default_review_cooldown_mins() -> u64 {
+    30
+}
+fn default_review_turns_interval() -> usize {
+    15
+}
+fn default_review_min_tool_calls() -> usize {
+    5
+}
+
+impl Default for ReviewCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_tokens: default_review_max_tokens(),
+            cooldown_mins: default_review_cooldown_mins(),
+            turns_interval: default_review_turns_interval(),
+            min_tool_calls: default_review_min_tool_calls(),
+        }
+    }
+}
+
+impl ReviewCfg {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -720,6 +797,7 @@ impl Config {
             hooks: Vec::new(),
             guard: GuardCfg::default(),
             aux: AuxCfg::default(),
+            review: ReviewCfg::default(),
             tool_budget: ToolBudgetCfg::default(),
             skills: SkillsCfg::default(),
         }

@@ -102,6 +102,13 @@ pub(crate) async fn interactive_plain(
         "{}",
         selencode::tui::moonlit::plain_banner(&s.provider_name, &s.pcfg.model)
     );
+    // Tampilkan laporan Background Self-Improvement Review tertunda dari sesi sebelumnya (v0.5.1).
+    let cwd_str_init = s.ctx.cwd.to_string_lossy().to_string();
+    if let Ok(pending_reports) = s.store.take_undelivered_review_reports(&cwd_str_init) {
+        for rep in pending_reports {
+            println!("{rep}");
+        }
+    }
     let mut plan_next = cli.plan;
     if plan_next {
         println!("Mode plan aktif untuk giliran pertama (--plan).");
@@ -232,6 +239,10 @@ pub(crate) async fn interactive_plain(
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
+            SlashCommand::Review(arg) => match s.handle_review(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
             SlashCommand::Skill(arg) => match s.handle_use_skill(arg.as_deref()) {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
@@ -259,10 +270,26 @@ pub(crate) async fn interactive_plain(
             SlashCommand::Details => {
                 println!("Perintah /details hanya berlaku pada mode TUI.");
             }
-            SlashCommand::New => match s.reset_session() {
-                Ok(sid) => println!("Sesi baru dimulai ({sid})."),
-                Err(e) => eprintln!("[error] {e}"),
-            },
+            SlashCommand::New => {
+                if let Some(job) = s.prepare_bg_review_job(true) {
+                    tokio::spawn(async move {
+                        if let Ok(Ok(Some(outcome))) = tokio::time::timeout(
+                            std::time::Duration::from_secs(20),
+                            job.run(true),
+                        )
+                        .await
+                        {
+                            if let Some(msg) = outcome.report_message {
+                                eprintln!("\n{msg}");
+                            }
+                        }
+                    });
+                }
+                match s.reset_session() {
+                    Ok(sid) => println!("Sesi baru dimulai ({sid})."),
+                    Err(e) => eprintln!("[error] {e}"),
+                }
+            }
             SlashCommand::Compact => {
                 println!("{}", strip_menu_markup(&s.compact_now()));
             }
@@ -363,9 +390,31 @@ pub(crate) async fn interactive_plain(
                 )
                 .await
                 {
-                    Ok(_) => println!("[{}]", s.usage_line()),
+                    Ok(_) => {
+                        println!("[{}]", s.usage_line());
+                        s.turns_since_review += 1;
+                        if let Some(job) = s.prepare_bg_review_job(false) {
+                            tokio::spawn(async move {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(20),
+                                    job.run(false),
+                                )
+                                .await;
+                            });
+                        }
+                    }
                     Err(e) => eprintln!("[error] {e}"),
                 }
+            }
+        }
+    }
+    // Akhir sesi REPL polos (`/exit` atau EOF): jalankan background review bila substantif.
+    if let Some(job) = s.prepare_bg_review_job(true) {
+        if let Ok(Ok(Some(outcome))) =
+            tokio::time::timeout(std::time::Duration::from_secs(15), job.run(true)).await
+        {
+            if let Some(msg) = outcome.report_message {
+                println!("\n{msg}");
             }
         }
     }

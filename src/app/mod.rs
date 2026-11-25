@@ -176,3 +176,51 @@ pub(crate) fn make_routed_provider(
     Ok(Arc::new(router))
 }
 
+/// Bangun provider khusus Background Self-Improvement Review memakai `[aux] review_model`
+/// (atau fallback `[aux] compression_model`). Mengembalikan `None` bila keduanya kosong —
+/// TIDAK pernah diam-diam memakai model utama yang mahal.
+pub(crate) fn make_aux_review_provider(
+    cfg: &Config,
+    primary_name: &str,
+    primary_cfg: &ProviderCfg,
+) -> Option<Arc<dyn Provider>> {
+    let spec = cfg.aux.effective_review_model()?.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let (target_prov, mut target_cfg, key) = match spec.split_once(':') {
+        Some((pname, model_id))
+            if !pname.trim().is_empty()
+                && !model_id.trim().is_empty()
+                && cfg.providers.contains_key(pname.trim()) =>
+        {
+            let Ok((n, mut p, k)) = cfg.resolve_provider(Some(pname.trim())) else {
+                return None;
+            };
+            p.model = model_id.trim().to_string();
+            (n, p, k)
+        }
+        _ => {
+            let Ok((n, mut p, k)) = cfg.resolve_provider(Some(primary_name)) else {
+                let Ok((n2, mut p2, k2)) = cfg.resolve_provider(None) else {
+                    return None;
+                };
+                p2.model = spec.to_string();
+                let mut rev_cfg = cfg.clone();
+                rev_cfg.agent.max_output_tokens =
+                    (cfg.review.max_tokens.min(1200).max(256)) as u32;
+                return make_provider(&rev_cfg, &n2, &p2, &k2).ok();
+            };
+            p.base_url = primary_cfg.base_url.clone().or(p.base_url);
+            p.model = spec.to_string();
+            (n, p, k)
+        }
+    };
+    let mut rev_cfg = cfg.clone();
+    rev_cfg.agent.max_output_tokens = (cfg.review.max_tokens.min(1200).max(256)) as u32;
+    if target_cfg.model.trim().is_empty() {
+        target_cfg.model = spec.to_string();
+    }
+    make_provider(&rev_cfg, &target_prov, &target_cfg, &key).ok()
+}
+

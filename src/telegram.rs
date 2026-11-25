@@ -127,6 +127,21 @@ pub fn parse_callback_approval(data: &str) -> Option<(u64, ApprovalDecision)> {
     Some((id, decision))
 }
 
+/// Parse payload `callback_data` tombol review staging (`rv:<id>:a|d`).
+pub fn parse_callback_review(data: &str) -> Option<(i64, bool)> {
+    let mut parts = data.trim().split(':');
+    if parts.next()? != "rv" {
+        return None;
+    }
+    let id = parts.next()?.parse::<i64>().ok()?;
+    let approve = match parts.next()? {
+        "a" => true,
+        "d" => false,
+        _ => return None,
+    };
+    Some((id, approve))
+}
+
 /// Potong teks panjang menjadi beberapa potongan aman UTF-8 <= `max_chars`
 /// karakter (mengutamakan batas baris `\n` agar blok kode tidak pecah di tengah baris).
 pub fn split_telegram_chunks(text: &str, max_chars: usize) -> Vec<String> {
@@ -206,6 +221,7 @@ pub const TELEGRAM_BOT_COMMANDS: &[(&str, &str)] = &[
     ("undo", "Batalkan edit file terakhir"),
     ("redo", "Ulangi edit yang dibatalkan"),
     ("task", "Kelola tugas panjang lintas sesi"),
+    ("review", "Lihat & putuskan usulan background review"),
     ("jobs", "Pantau proses latar belakang"),
     ("route", "Info & budget Dynamic Model Routing"),
     ("lsp", "Diagnostik & navigasi kode LSP"),

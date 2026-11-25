@@ -55,11 +55,14 @@ async fn tui_worker(
     cancel: Arc<tokio::sync::Notify>,
     interrupt_pending: Arc<AtomicBool>,
 ) {
+    let active_turn = Arc::new(AtomicBool::new(false));
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             TuiCommand::Prompt(prompt) | TuiCommand::InterruptPrompt(prompt) => {
                 let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
                 let _ = s.store.record_prompt_history(&cwd_str, &prompt);
+                active_turn.store(true, Ordering::SeqCst);
+                let mut turn_ok = false;
                 tokio::select! {
                     r = run_turn_ui(
                         s.provider.clone(),
@@ -71,6 +74,7 @@ async fn tui_worker(
                         ui_tx.clone(),
                     ) => match r {
                         Ok(_) => {
+                            turn_ok = true;
                             let _ = ui_tx.send(UiEvent::Info(s.usage_line())).await;
                         }
                         Err(e) => {
@@ -86,6 +90,26 @@ async fn tui_worker(
                             let _ = ui_tx.send(UiEvent::Info("Giliran dihentikan.".into())).await;
                             let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
                         }
+                    }
+                }
+                active_turn.store(false, Ordering::SeqCst);
+                if turn_ok {
+                    s.turns_since_review += 1;
+                    if let Some(job) = s.prepare_bg_review_job(false) {
+                        let ui_bg = ui_tx.clone();
+                        let active_bg = active_turn.clone();
+                        tokio::spawn(async move {
+                            if active_bg.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            if let Ok(Ok(Some(outcome))) =
+                                tokio::time::timeout(Duration::from_secs(20), job.run(true)).await
+                            {
+                                if let Some(msg) = outcome.report_message {
+                                    let _ = ui_bg.send(UiEvent::Info(msg)).await;
+                                }
+                            }
+                        });
                     }
                 }
             }
@@ -306,6 +330,14 @@ async fn tui_worker(
                 }
             },
             TuiCommand::Skills(arg) => match s.handle_skills(arg.as_deref()).await {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::Review(arg) => match s.handle_review(arg.as_deref()) {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
                 }
@@ -569,20 +601,38 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
-            TuiCommand::NewSession => match s.reset_session() {
-                Ok(sid) => {
-                    let _ = ui_tx
-                        .send(UiEvent::SessionReset {
-                            session_id: sid,
-                            provider: s.provider_name.clone(),
-                            model: s.pcfg.model.clone(),
-                        })
-                        .await;
+            TuiCommand::NewSession => {
+                if let Some(job) = s.prepare_bg_review_job(true) {
+                    let ui_bg = ui_tx.clone();
+                    let active_bg = active_turn.clone();
+                    tokio::spawn(async move {
+                        if active_bg.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        if let Ok(Ok(Some(outcome))) =
+                            tokio::time::timeout(Duration::from_secs(20), job.run(true)).await
+                        {
+                            if let Some(msg) = outcome.report_message {
+                                let _ = ui_bg.send(UiEvent::Info(msg)).await;
+                            }
+                        }
+                    });
                 }
-                Err(e) => {
-                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                match s.reset_session() {
+                    Ok(sid) => {
+                        let _ = ui_tx
+                            .send(UiEvent::SessionReset {
+                                session_id: sid,
+                                provider: s.provider_name.clone(),
+                                model: s.pcfg.model.clone(),
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                    }
                 }
-            },
+            }
             TuiCommand::CompactContext => {
                 let card = s.compact_now();
                 let _ = ui_tx.send(UiEvent::Menu(card)).await;
@@ -619,7 +669,13 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
-            TuiCommand::Shutdown => break,
+            TuiCommand::Shutdown => {
+                // Jalankan review latar akhir sesi bila substantif (disimpan agar tampil di sesi berikutnya).
+                if let Some(job) = s.prepare_bg_review_job(true) {
+                    let _ = tokio::time::timeout(Duration::from_secs(10), job.run(false)).await;
+                }
+                break;
+            }
         }
     }
 }
@@ -672,6 +728,11 @@ pub(crate) async fn interactive_tui(
     if let Some(note) = &s.resumed_note {
         app.info(note.clone());
     }
+    if let Ok(pending_reports) = s.store.take_undelivered_review_reports(&cwd_str) {
+        for rep in pending_reports {
+            app.info(rep);
+        }
+    }
     if cli.plan {
         app.info("Mode plan aktif untuk giliran pertama (--plan).");
     }
@@ -712,8 +773,8 @@ pub(crate) async fn interactive_tui(
     let tui_result =
         tokio::task::spawn_blocking(move || selencode::tui::run_blocking(app, channels)).await;
     // run_blocking mengirim TuiCommand::Shutdown sebelum kembali; beri worker
-    // waktu singkat menyelesaikan giliran yang mungkin masih berjalan.
-    let _ = tokio::time::timeout(Duration::from_secs(2), worker).await;
+    // waktu menyelesaikan giliran / background review akhir sesi bila aktif.
+    let _ = tokio::time::timeout(Duration::from_secs(12), worker).await;
     match tui_result {
         Ok(r) => r,
         Err(e) => anyhow::bail!("task TUI panik: {e}"),

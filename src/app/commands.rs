@@ -1359,6 +1359,123 @@ impl Session {
         }
     }
 
+    /// Tangani `/review [pending | approve <id> | discard <id> | status]` (v0.5.1).
+    pub(crate) fn handle_review(&mut self, arg: Option<&str>) -> Result<String> {
+        let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
+        let raw = arg.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let Some(cmd) = raw else {
+            return self.format_pending_review_menu(&cwd_str);
+        };
+        let lower = cmd.to_ascii_lowercase();
+        if matches!(lower.as_str(), "pending" | "list" | "ls") {
+            return self.format_pending_review_menu(&cwd_str);
+        }
+        if matches!(lower.as_str(), "status" | "stats" | "info") {
+            let model_str = self
+                .cfg
+                .aux
+                .effective_review_model()
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "(kosong — background review dilewati)".to_string());
+            let runs = self.store.list_recent_review_runs(&cwd_str, 5).unwrap_or_default();
+            let pending = self
+                .store
+                .list_review_proposals(Some(&cwd_str), Some("pending"), 20)
+                .unwrap_or_default();
+            let mut out = format!(
+                "# Status Background Self-Improvement Review\n\
+                 * aktif | {} | model aux: {model_str}\n\
+                 > batas | max_tokens={} · cooldown={} mnt · interval={} giliran · min_tool={}\n\
+                 > staging | {} usulan menunggu persetujuan\n",
+                if self.cfg.review.enabled { "ya" } else { "nonaktif" },
+                self.cfg.review.max_tokens,
+                self.cfg.review.cooldown_mins,
+                self.cfg.review.turns_interval,
+                self.cfg.review.min_tool_calls,
+                pending.len()
+            );
+            if !runs.is_empty() {
+                out.push_str("---\n");
+                for r in runs {
+                    let note = if r.report_text.is_empty() {
+                        "(tanpa perubahan)".to_string()
+                    } else {
+                        r.report_text
+                    };
+                    out.push_str(&format!(
+                        "> {} | {} ({} in / {} out) | {note}\n",
+                        &r.created_at.chars().take(19).collect::<String>(),
+                        r.model,
+                        r.input_tokens,
+                        r.output_tokens
+                    ));
+                }
+            }
+            out.push_str("---\n! Lihat staging: /review pending   ·   Setujui: /review approve <id>   ·   Buang: /review discard <id>");
+            return Ok(out);
+        }
+        if let Some(rest) = lower
+            .strip_prefix("approve ")
+            .or_else(|| lower.strip_prefix("ok "))
+            .or_else(|| lower.strip_prefix("yes "))
+        {
+            let id = rest
+                .trim()
+                .trim_start_matches('#')
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("ID proposal tidak valid: '{rest}'. Contoh: /review approve 1"))?;
+            let msg = selencode::agent::apply_staged_proposal(&self.store, &self.ctx.cwd, id)?;
+            return Ok(format!("# Usulan Review Disetujui\n* #{id} | {msg} | selesai"));
+        }
+        if let Some(rest) = lower
+            .strip_prefix("discard ")
+            .or_else(|| lower.strip_prefix("reject "))
+            .or_else(|| lower.strip_prefix("rm "))
+            .or_else(|| lower.strip_prefix("del "))
+        {
+            let id = rest
+                .trim()
+                .trim_start_matches('#')
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("ID proposal tidak valid: '{rest}'. Contoh: /review discard 1"))?;
+            let msg = selencode::agent::discard_staged_proposal(&self.store, id)?;
+            return Ok(format!("# Usulan Review Dibuang\n> #{id} | {msg} | data utuh"));
+        }
+        Ok("# Cara Pakai /review\n\
+            > /review pending | | lihat usulan hapus/timpa yang menunggu persetujuan\n\
+            > /review approve <id> | | terapkan usulan staging tertentu\n\
+            > /review discard <id> | | buang usulan tanpa mengubah data asli\n\
+            > /review status | | lihat model aux, anggaran, & riwayat biaya token review"
+            .to_string())
+    }
+
+    fn format_pending_review_menu(&self, cwd_str: &str) -> Result<String> {
+        let items = self
+            .store
+            .list_review_proposals(Some(cwd_str), Some("pending"), 20)?;
+        if items.is_empty() {
+            return Ok(
+                "# Usulan Review Tertunda (0)\n\
+                 ! Tidak ada usulan hapus/timpa memory atau skill yang menunggu persetujuan.\n\
+                 ! Cek konfigurasi & biaya review: /review status"
+                    .to_string(),
+            );
+        }
+        let mut out = format!("# Usulan Review Tertunda ({})\n", items.len());
+        for p in &items {
+            let detail = selencode::agent::review::format_proposal_detail(p);
+            for (idx, line) in detail.lines().enumerate() {
+                if idx == 0 {
+                    out.push_str(&format!("* #{} | {} ({}) | {}\n", p.id, p.kind, p.target, p.summary));
+                } else {
+                    out.push_str(&format!("  {line}\n"));
+                }
+            }
+        }
+        out.push_str("---\n! Setujui: /review approve <id>   ·   Buang: /review discard <id>");
+        Ok(out)
+    }
+
     pub(crate) fn handle_use_skill(&mut self, arg: Option<&str>) -> Result<String> {
         let name = arg
             .map(|s| s.trim())

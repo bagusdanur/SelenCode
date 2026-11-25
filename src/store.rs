@@ -244,6 +244,39 @@ pub struct SessionTokenMetricsSummary {
     pub total_deduped: usize,
 }
 
+/// Proposal perubahan berbahaya/destruktif dari Background Review yang ditahan di staging (v0.5.1).
+/// Hanya berlaku setelah pengguna menyetujui lewat `/review approve <id>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewProposal {
+    pub id: i64,
+    pub session_id: String,
+    pub cwd: String,
+    /// `delete_memory` | `overwrite_memory` | `delete_skill` | `overwrite_skill`
+    pub kind: String,
+    /// ID memori (mis. `"12"`) atau nama skill (mis. `"raw-downloader"`).
+    pub target: String,
+    pub summary: String,
+    pub payload_json: String,
+    /// `pending` | `approved` | `discarded`
+    pub status: String,
+    pub created_at: String,
+    pub resolved_at: String,
+}
+
+/// Catatan satu kali jalan Background Self-Improvement Review (cooldown + laporan tertunda CLI).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewRunRecord {
+    pub id: i64,
+    pub session_id: String,
+    pub cwd: String,
+    pub model: String,
+    pub report_text: String,
+    pub delivered: bool,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub created_at: String,
+}
+
 /// Lokasi DB: env SELENCODE_DB (dipakai tes) atau
 /// ~/.local/share/selencode/selen.db (dirs::data_dir).
 pub fn db_path() -> PathBuf {
@@ -262,7 +295,8 @@ CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, cwd TEXT, provider TEX
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session_id TEXT,
                        role TEXT, content TEXT, ts TEXT);
 CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, session_id TEXT, model TEXT,
-                    input_tokens INT, output_tokens INT, ts TEXT);
+                    input_tokens INT, output_tokens INT, ts TEXT,
+                    kind TEXT NOT NULL DEFAULT 'main');
 CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, scope TEXT,
                     content TEXT, ts TEXT,
                     category TEXT NOT NULL DEFAULT 'general',
@@ -292,6 +326,17 @@ CREATE TABLE IF NOT EXISTS call_token_metrics (id INTEGER PRIMARY KEY, session_i
                     actual_input_tokens INT NOT NULL DEFAULT 0, actual_output_tokens INT NOT NULL DEFAULT 0,
                     active_tools_count INT NOT NULL DEFAULT 0,
                     pruned_count INT NOT NULL DEFAULT 0, deduped_count INT NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS review_proposals (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                    cwd TEXT NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL,
+                    summary TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL, resolved_at TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS review_runs (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                    cwd TEXT NOT NULL, model TEXT NOT NULL,
+                    report_text TEXT NOT NULL DEFAULT '',
+                    delivered INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INT NOT NULL DEFAULT 0, output_tokens INT NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL);
 ";
 
 fn now() -> String {
@@ -393,6 +438,7 @@ impl Store {
         let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
         conn.execute_batch(SCHEMA).context("gagal membuat skema sesi")?;
         migrate_memories_schema(&conn)?;
+        migrate_usage_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             pending_sessions: Mutex::new(HashMap::new()),
@@ -823,10 +869,68 @@ impl Store {
         let conn = self.conn.lock().expect("mutex store poisoned");
         self.materialize_if_pending(&conn, session_id)?;
         conn.execute(
-            "INSERT INTO usage (session_id, model, input_tokens, output_tokens, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO usage (session_id, model, input_tokens, output_tokens, ts, kind) VALUES (?1, ?2, ?3, ?4, ?5, 'main')",
             rusqlite::params![session_id, model, input_tokens as i64, output_tokens as i64, now()],
         )?;
         Ok(())
+    }
+
+    /// Catat biaya token Background Self-Improvement Review secara TERPISAH dari jalur utama (v0.5.1).
+    /// Memakai `session_id = "review:<orig_session_id>"` dan `kind = 'review'` agar query jalur utama
+    /// (`WHERE session_id = <orig_session_id>`) tidak pernah terkotori, namun tetap teraudit di tabel `usage`.
+    pub fn record_review_usage(
+        &self,
+        orig_session_id: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()> {
+        let review_sid = format!("review:{orig_session_id}");
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "INSERT INTO usage (session_id, model, input_tokens, output_tokens, ts, kind) VALUES (?1, ?2, ?3, ?4, ?5, 'review')",
+            rusqlite::params![review_sid, model, input_tokens as i64, output_tokens as i64, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Ringkasan biaya token review (total_in, total_out, jumlah_jalan) untuk satu sesi asal.
+    pub fn review_usage_for_session(&self, orig_session_id: &str) -> Result<(u64, u64, usize)> {
+        let review_sid = format!("review:{orig_session_id}");
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let (i, o, n): (Option<i64>, Option<i64>, i64) = conn.query_row(
+            "SELECT SUM(input_tokens), SUM(output_tokens), COUNT(*) FROM usage WHERE session_id = ?1 AND kind = 'review'",
+            rusqlite::params![review_sid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok((
+            i.unwrap_or(0).max(0) as u64,
+            o.unwrap_or(0).max(0) as u64,
+            n.max(0) as usize,
+        ))
+    }
+
+    /// Daftar catatan biaya token background review terbaru dari tabel `usage` (`kind = 'review'`).
+    pub fn list_review_usage(&self, limit: usize) -> Result<Vec<(String, String, u64, u64, String)>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT session_id, model, input_tokens, output_tokens, ts FROM usage \
+             WHERE kind = 'review' ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?.max(0) as u64,
+                r.get::<_, i64>(3)?.max(0) as u64,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// Total (input, output) token satu sesi.
@@ -951,10 +1055,267 @@ impl Store {
         Ok(out)
     }
 
+    pub fn get_memory(&self, id: i64) -> Result<Option<MemoryItem>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, scope, category, content, ts, updated_at FROM memories WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![id], |row| {
+            let ts: String = row.get(4)?;
+            let upd: String = row.get::<_, String>(5).unwrap_or_default();
+            Ok(MemoryItem {
+                id: row.get(0)?,
+                scope: row.get(1)?,
+                category: row.get::<_, String>(2).unwrap_or_else(|_| "general".to_string()),
+                content: row.get(3)?,
+                created_at: ts.clone(),
+                updated_at: if upd.is_empty() { ts } else { upd },
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn remove_memory(&self, id: i64) -> Result<bool> {
         let conn = self.conn.lock().expect("mutex store poisoned");
         let n = conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
         Ok(n > 0)
+    }
+
+    // ---------- Background Self-Improvement Review: Staging & Cooldown (v0.5.1) ----------
+
+    pub fn create_review_proposal(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        kind: &str,
+        target: &str,
+        summary: &str,
+        payload_json: &str,
+    ) -> Result<i64> {
+        let safe_summary = crate::security::redact_secrets(summary.trim());
+        let safe_payload = crate::security::redact_secrets(payload_json);
+        let ts = now();
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        // Hindari duplikat proposal `pending` identik untuk (cwd, kind, target).
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM review_proposals WHERE cwd = ?1 AND kind = ?2 AND target = ?3 AND status = 'pending' LIMIT 1",
+                rusqlite::params![cwd, kind, target],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        conn.execute(
+            "INSERT INTO review_proposals (session_id, cwd, kind, target, summary, payload_json, status, created_at, resolved_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, '')",
+            rusqlite::params![session_id, cwd, kind, target, safe_summary, safe_payload, ts],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_review_proposals(
+        &self,
+        cwd: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ReviewProposal>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut out = Vec::new();
+        let mapper = |r: &rusqlite::Row<'_>| -> rusqlite::Result<ReviewProposal> {
+            Ok(ReviewProposal {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                cwd: r.get(2)?,
+                kind: r.get(3)?,
+                target: r.get(4)?,
+                summary: r.get(5)?,
+                payload_json: r.get(6)?,
+                status: r.get(7)?,
+                created_at: r.get(8)?,
+                resolved_at: r.get(9)?,
+            })
+        };
+        match (cwd, status) {
+            (Some(c), Some(st)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, session_id, cwd, kind, target, summary, payload_json, status, created_at, resolved_at \
+                     FROM review_proposals WHERE cwd = ?1 AND status = ?2 ORDER BY id DESC LIMIT ?3",
+                )?;
+                for r in stmt.query_map(rusqlite::params![c, st, limit as i64], mapper)? {
+                    out.push(r?);
+                }
+            }
+            (Some(c), None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, session_id, cwd, kind, target, summary, payload_json, status, created_at, resolved_at \
+                     FROM review_proposals WHERE cwd = ?1 ORDER BY id DESC LIMIT ?2",
+                )?;
+                for r in stmt.query_map(rusqlite::params![c, limit as i64], mapper)? {
+                    out.push(r?);
+                }
+            }
+            (None, Some(st)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, session_id, cwd, kind, target, summary, payload_json, status, created_at, resolved_at \
+                     FROM review_proposals WHERE status = ?1 ORDER BY id DESC LIMIT ?2",
+                )?;
+                for r in stmt.query_map(rusqlite::params![st, limit as i64], mapper)? {
+                    out.push(r?);
+                }
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, session_id, cwd, kind, target, summary, payload_json, status, created_at, resolved_at \
+                     FROM review_proposals ORDER BY id DESC LIMIT ?1",
+                )?;
+                for r in stmt.query_map(rusqlite::params![limit as i64], mapper)? {
+                    out.push(r?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_review_proposal(&self, id: i64) -> Result<Option<ReviewProposal>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, cwd, kind, target, summary, payload_json, status, created_at, resolved_at \
+             FROM review_proposals WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![id], |r| {
+            Ok(ReviewProposal {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                cwd: r.get(2)?,
+                kind: r.get(3)?,
+                target: r.get(4)?,
+                summary: r.get(5)?,
+                payload_json: r.get(6)?,
+                status: r.get(7)?,
+                created_at: r.get(8)?,
+                resolved_at: r.get(9)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn resolve_review_proposal(&self, id: i64, new_status: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let n = conn.execute(
+            "UPDATE review_proposals SET status = ?2, resolved_at = ?3 WHERE id = ?1 AND status = 'pending'",
+            rusqlite::params![id, new_status, now()],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn is_review_in_cooldown(&self, session_id: &str, cooldown_mins: u64) -> Result<bool> {
+        if cooldown_mins == 0 {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let last_ts: Option<String> = conn
+            .query_row(
+                "SELECT created_at FROM review_runs WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![session_id],
+                |r| r.get(0),
+            )
+            .ok();
+        let Some(ts) = last_ts else {
+            return Ok(false);
+        };
+        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&ts) else {
+            return Ok(false);
+        };
+        let elapsed = chrono::Utc::now().signed_duration_since(parsed.with_timezone(&chrono::Utc));
+        Ok(elapsed.num_seconds() < (cooldown_mins as i64) * 60)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_review_run(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        model: &str,
+        report_text: &str,
+        delivered: bool,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<i64> {
+        let safe_report = crate::security::redact_secrets(report_text.trim());
+        let del_int: i64 = if delivered || safe_report.is_empty() { 1 } else { 0 };
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "INSERT INTO review_runs (session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                session_id,
+                cwd,
+                model,
+                safe_report,
+                del_int,
+                input_tokens as i64,
+                output_tokens as i64,
+                now()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Ambil semua laporan review latar yang belum sempat ditampilkan ke CLI/TUI dan tandai sudah terkirim.
+    pub fn take_undelivered_review_reports(&self, cwd: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, report_text FROM review_runs \
+             WHERE cwd = ?1 AND delivered = 0 AND report_text != '' ORDER BY id ASC LIMIT 10",
+        )?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(rusqlite::params![cwd], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        let mut out = Vec::new();
+        for (id, text) in rows {
+            let _ = conn.execute(
+                "UPDATE review_runs SET delivered = 1 WHERE id = ?1",
+                rusqlite::params![id],
+            );
+            out.push(text);
+        }
+        Ok(out)
+    }
+
+    pub fn list_recent_review_runs(&self, cwd: &str, limit: usize) -> Result<Vec<ReviewRunRecord>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, created_at \
+             FROM review_runs WHERE cwd = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![cwd, limit as i64], |r| {
+            Ok(ReviewRunRecord {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                cwd: r.get(2)?,
+                model: r.get(3)?,
+                report_text: r.get(4)?,
+                delivered: r.get::<_, i64>(5).unwrap_or(0) != 0,
+                input_tokens: r.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
+                output_tokens: r.get::<_, i64>(7).unwrap_or(0).max(0) as u64,
+                created_at: r.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     // ---------- Long-Horizon Task Persistence Lintas Sesi (/task, Tahap 5) ----------
@@ -1273,6 +1634,23 @@ fn migrate_memories_schema(conn: &Connection) -> Result<()> {
             [],
         )
         .context("gagal migrasi kolom updated_at pada tabel memories")?;
+    }
+    Ok(())
+}
+
+/// Migrasi aman tabel `usage` untuk menambahkan kolom `kind` (`'main'` | `'review'` | dll.).
+fn migrate_usage_schema(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(usage)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !cols.iter().any(|c| c == "kind") {
+        conn.execute(
+            "ALTER TABLE usage ADD COLUMN kind TEXT NOT NULL DEFAULT 'main'",
+            [],
+        )
+        .context("gagal migrasi kolom kind pada tabel usage")?;
     }
     Ok(())
 }

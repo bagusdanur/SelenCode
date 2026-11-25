@@ -100,6 +100,7 @@ pub enum TuiCommand {
     Task(Option<String>),
     Memory(Option<String>),
     Skills(Option<String>),
+    Review(Option<String>),
     UseSkill(Option<String>),
     LearnSkill(Option<String>),
     InitAgents,
@@ -1908,6 +1909,9 @@ fn submit(
         }
         SlashCommand::Skills(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Skills(arg));
+        }
+        SlashCommand::Review(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Review(arg));
         }
         SlashCommand::Skill(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::UseSkill(arg));

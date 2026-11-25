@@ -62,6 +62,20 @@ async fn main() -> Result<()> {
                     s.cfg.agent.max_steps,
                 )
                 .await?;
+                // Background Self-Improvement Review (v0.5.1): jalankan pasca-sesi selesai
+                // hanya bila `[aux]` review/compression model terpasang & sesi substantif.
+                if let Some(job) = s.prepare_bg_review_job(true) {
+                    if let Ok(Ok(Some(outcome))) = tokio::time::timeout(
+                        std::time::Duration::from_secs(20),
+                        job.run(true),
+                    )
+                    .await
+                    {
+                        if let Some(msg) = outcome.report_message {
+                            eprintln!("\n{msg}");
+                        }
+                    }
+                }
             }
             Ok(())
         }
@@ -88,6 +102,15 @@ async fn main() -> Result<()> {
                 "{}",
                 selencode::repl::strip_menu_markup(&s.handle_doctor())
             );
+            Ok(())
+        }
+        Some(Commands::Review { args }) => {
+            let mut s =
+                Session::build(cli.provider.as_deref(), cli.yes, false, None, None, true).await?;
+            let joined = args.join(" ");
+            let arg = (!joined.trim().is_empty()).then_some(joined.as_str());
+            let card = s.handle_review(arg)?;
+            println!("{}", selencode::repl::strip_menu_markup(&card));
             Ok(())
         }
         Some(Commands::Update) => selencode::update::run().await,

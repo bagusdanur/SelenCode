@@ -49,6 +49,8 @@ pub enum SlashCommand {
     Memory(Option<String>),
     /// /skills | /skills auto | /skills review | /skills show <nama> | /skills rm <nama>
     Skills(Option<String>),
+    /// /review [pending | approve <id> | discard <id> | status] — kelola usulan background review (v0.5.1).
+    Review(Option<String>),
     /// /skill <nama> — aktifkan instruksi skill ke sesi ini.
     Skill(Option<String>),
     /// /learn <nama> <instruksi> — simpan skill baru ke `.selencode/skills/`.
@@ -225,6 +227,12 @@ pub const COMMANDS: &[CommandDef] = &[
         takes_args: true,
     },
     CommandDef {
+        cmd: "/review",
+        args: "[pending / approve <id> / discard <id> / status]",
+        desc: "lihat & putuskan usulan staging background review",
+        takes_args: true,
+    },
+    CommandDef {
         cmd: "/skill",
         args: "<nama>",
         desc: "aktifkan skill ke percakapan saat ini",
@@ -357,6 +365,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/task" | "/tasks" => SlashCommand::Task(rest),
         "/memory" => SlashCommand::Memory(rest),
         "/skills" => SlashCommand::Skills(rest),
+        "/review" => SlashCommand::Review(rest),
         "/skill" => SlashCommand::Skill(rest),
         "/learn" => SlashCommand::Learn(rest),
         "/init" => SlashCommand::Init,

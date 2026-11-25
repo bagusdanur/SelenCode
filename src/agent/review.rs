@@ -1,28 +1,39 @@
-//! Self-improvement review otonom pasca-giliran (ala Hermes Agent).
-//!
-//! Sesudah giliran kerja yang substansial (>= 3 panggilan tool), Selena meninjau
-//! singkat apa yang baru dikerjakan: apakah ada workflow reusable, pola bug-fix,
-//! atau perbaikan terhadap skill yang sudah ada di `.selencode/skills/`.
-//! - Bila layak -> memanggil `manage_skill` (`create` atau `patch`) dan
-//!   mengembalikan ringkasan ala Hermes:
-//!   `Self-improvement review: Skill '<nama>' patched` (atau `created`).
-//! - Bila tugas biasa / sepele -> model menjawab `NONE` tanpa memanggil tool,
-//!   sehingga tidak ada notifikasi yang mengganggu user.
+//! Self-improvement review untuk SelenCode:
+//! - Background Self-Improvement Review (v0.5.1): berjalan di latar (non-blocking)
+//!   setelah sesi berakhir atau setiap N giliran tuntas, memakai model aux murah
+//!   (`[aux] review_model` -> fallback `[aux] compression_model` -> lewati bila kosong),
+//!   mematuhi anggaran `[review] max_tokens` dan cooldown 30 menit per sesi,
+//!   menerapkan patch aman secara langsung, dan menahan seluruh aksi hapus/timpa ke
+//!   staging `review_proposals` untuk persetujuan pengguna (`/review pending|approve|discard`).
+//! - Tetap mempertahankan `run_self_improvement_review` dan `AUTO_REVIEW_MIN_TOOLS`
+//!   untuk kompatibilitas mundur perintah manual `/skills review` & tes existing.
 
+use crate::agent::context::{analyze_token_breakdown, prune_old_tool_outputs};
+use crate::config::Config;
 use crate::providers::{Block, Message, Provider, Role, StreamEvent};
-use crate::skills::list_skills;
+use crate::security::{is_secret_file, redact_secrets};
+use crate::skills::{
+    format_skills_index, list_skills, parse_skill_frontmatter, remove_skill, render_skill_markdown,
+    sanitize_skill_name, scan_skills_with_warnings, skill_file_path_for,
+};
+use crate::store::{normalize_memory_category, ReviewProposal, Store};
 use crate::tools::skill::ManageSkill;
 use crate::tools::{Ctx, Tool};
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
+use similar::{ChangeTag, TextDiff};
+use std::collections::HashSet;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Jumlah minimum panggilan tool dalam 1 giliran sebelum review otomatis dipicu.
-/// Dinaikkan ke 6 agar tugas rutin 3–5 tool tidak membakar 1 panggilan LLM ekstra (~2.900 token)
-/// hanya untuk menjawab `NONE`.
+/// Jumlah minimum panggilan tool untuk helper review manual lama (kompatibilitas mundur tes).
 pub const AUTO_REVIEW_MIN_TOOLS: usize = 6;
 
 const MAX_DIGEST_BYTES: usize = 6 * 1024;
+const MAX_REF_FILE_BYTES: usize = 4 * 1024;
+
+// ---------- Legacy manual helper (`/skills review` & tes kompatibilitas mundur) ----------
 
 fn build_turn_digest(messages: &[Message]) -> String {
     let mut out = String::new();
@@ -68,7 +79,7 @@ fn build_turn_digest(messages: &[Message]) -> String {
     out
 }
 
-/// Jalankan 1 kali review self-improvement terhadap riwayat `messages`.
+/// Jalankan 1 kali review self-improvement manual terhadap riwayat `messages`.
 /// Mengembalikan `Ok(Some("Self-improvement review: Skill '<nama>' created|patched"))`
 /// bila ada skill yang dibuat/diperbarui, atau `Ok(None)` bila tidak perlu.
 pub async fn run_self_improvement_review(
@@ -93,7 +104,7 @@ pub async fn run_self_improvement_review(
             .join("\n")
     };
 
-    let sys = "Kamu adalah modul self-improvement review milik SelenCode (seperti Hermes Agent).\n\
+    let sys = "Kamu adalah modul self-improvement review milik SelenCode.\n\
 Tugasmu: tinjau singkat ringkasan pekerjaan yang baru saja selesai.\n\
 Aturan KETAT:\n\
 1. Jika pekerjaan barusan mengungkap prosedur reusable, workaround penting, pola scraper/API/build/deploy spesifik project, atau memperbaiki kekurangan pada skill yang sudah ada -> panggil tool `manage_skill` dengan `action: \"create\"` (skill baru, nama kebab-case deskriptif) atau `action: \"patch\"` (perbarui skill lama di katalog).\n\
@@ -110,7 +121,7 @@ Aturan KETAT:\n\
     ];
     let skill_tool = ManageSkill;
     let specs = vec![skill_tool.spec()];
-    let breakdown = crate::agent::context::analyze_token_breakdown(&review_msgs, &specs, 1);
+    let breakdown = analyze_token_breakdown(&review_msgs, &specs, 1);
     let (tx, _rx) = mpsc::channel::<StreamEvent>(64);
     let reply = provider.stream_chat(&review_msgs, &specs, tx).await?;
 
@@ -122,7 +133,6 @@ Aturan KETAT:\n\
         if let Some(u) = reply.usage {
             let _ = store.record_usage(sid, provider.model_name(), u.input_tokens, u.output_tokens);
         }
-        // Catat juga ke `call_token_metrics` agar jumlah baris selalu 100% sinkron dengan tabel `usage`!
         let _ = store.record_call_token_metric(&crate::store::CallTokenMetric {
             session_id: sid.clone(),
             model: provider.model_name().to_string(),
@@ -152,7 +162,6 @@ Aturan KETAT:\n\
             continue;
         }
         if let Ok(out) = skill_tool.run(call.args.clone(), ctx).await {
-            // out format: "Skill '<name>' created|patched (...)."
             let short = out
                 .split(" (")
                 .next()
@@ -167,4 +176,1190 @@ Aturan KETAT:\n\
     } else {
         Ok(Some(events.join(" · ")))
     }
+}
+
+// ---------- Background Self-Improvement Review Engine (v0.5.1) ----------
+
+/// Alasan mengapa background review dilewati sebelum memanggil provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewSkipReason {
+    Disabled,
+    NoAuxModelConfigured,
+    CooldownActive,
+    TrivialSession,
+    BudgetExceeded,
+}
+
+/// Satu perubahan aman yang langsung diterapkan oleh background review.
+#[derive(Debug, Clone)]
+pub struct AppliedReviewChange {
+    pub kind: String,
+    pub target: String,
+    pub reason: String,
+    pub diff: Option<String>,
+}
+
+/// Hasil satu kali jalan background review.
+#[derive(Debug, Clone)]
+pub struct BgReviewOutcome {
+    pub applied: Vec<AppliedReviewChange>,
+    pub staged_ids: Vec<i64>,
+    /// Tepat satu pesan ringkas bergaya `💾 Self-improvement review: ...` bila ada hasil,
+    /// atau `None` bila tidak ada temuan (anti-spam).
+    pub report_message: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub model: String,
+}
+
+/// Hitung total panggilan tool (`Block::ToolUse`) pada riwayat sesi.
+pub fn count_tool_calls_in_messages(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|m| m.role == Role::Assistant)
+        .flat_map(|m| m.content.iter())
+        .filter(|b| matches!(b, Block::ToolUse { .. }))
+        .count()
+}
+
+/// Hitung jumlah giliran pengguna tuntas dalam sesi.
+pub fn count_user_turns_in_messages(messages: &[Message]) -> usize {
+    messages.iter().filter(|m| m.role == Role::User).count()
+}
+
+/// Deteksi adanya koreksi atau penegasan prosedur dari pengguna di tengah sesi.
+pub fn has_user_correction(messages: &[Message]) -> bool {
+    const CORRECTION_CUES: &[&str] = &[
+        "salah",
+        "keliru",
+        "bukan di",
+        "bukan itu",
+        "bukan begitu",
+        "bukan pakai",
+        "harusnya",
+        "seharusnya",
+        "yang benar",
+        "path yang benar",
+        "folder yang benar",
+        "koreksi",
+        "jangan pakai",
+        "jangan gunakan",
+        "selalu pakai",
+        "selalu gunakan",
+        "mulai sekarang",
+        "sudah usang",
+        "tidak dipakai lagi",
+        "sudah tidak dipakai",
+        "sudah pindah",
+        "sudah diganti",
+        "ganti jadi",
+        "wrong",
+        "not there",
+        "instead of",
+        "actually use",
+        "correct path",
+        "should be",
+        "don't use",
+        "do not use",
+        "always use",
+        "never use",
+        "outdated",
+        "obsolete",
+        "no longer used",
+    ];
+
+    let user_texts: Vec<String> = messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase()
+        })
+        .collect();
+
+    for (idx, text) in user_texts.iter().enumerate() {
+        let matches_cue = CORRECTION_CUES.iter().any(|cue| text.contains(cue));
+        // Koreksi di giliran ke-2 dst. selalu dihitung; di giliran pertama hanya bila jelas
+        // memuat penegasan koreksi / catatan usang / aturan permanen.
+        if idx > 0 && matches_cue {
+            return true;
+        }
+        if idx == 0
+            && (text.contains("sudah usang")
+                || text.contains("tidak dipakai lagi")
+                || text.contains("outdated")
+                || text.contains("obsolete")
+                || text.contains("koreksi")
+                || text.contains("yang benar")
+                || text.contains("mulai sekarang")
+                || text.contains("selalu pakai")
+                || text.contains("jangan pakai"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Apakah sesi mengandung kerja substantif: minimal `min_tool_calls` (default 5)
+/// ATAU ada koreksi/penegasan prosedur dari pengguna?
+pub fn is_session_substantive(messages: &[Message], min_tool_calls: usize) -> bool {
+    let min_tc = min_tool_calls.max(1);
+    count_tool_calls_in_messages(messages) >= min_tc || has_user_correction(messages)
+}
+
+/// Cek semua prasyarat pemicu background review sebelum memanggil provider aux.
+pub fn check_review_eligibility(
+    cfg: &Config,
+    store: &Store,
+    session_id: &str,
+    messages: &[Message],
+) -> std::result::Result<String, ReviewSkipReason> {
+    if !cfg.review.enabled {
+        return Err(ReviewSkipReason::Disabled);
+    }
+    let Some(model) = cfg.aux.effective_review_model() else {
+        return Err(ReviewSkipReason::NoAuxModelConfigured);
+    };
+    if !is_session_substantive(messages, cfg.review.min_tool_calls) {
+        return Err(ReviewSkipReason::TrivialSession);
+    }
+    if store
+        .is_review_in_cooldown(session_id, cfg.review.cooldown_mins)
+        .unwrap_or(false)
+    {
+        return Err(ReviewSkipReason::CooldownActive);
+    }
+    Ok(model.to_string())
+}
+
+fn build_unified_diff(title: &str, old: &str, new: &str) -> String {
+    let diff = TextDiff::from_lines(old, new);
+    let mut out = format!("diff {title}\n");
+    let mut shown = 0usize;
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            ChangeTag::Delete => "-",
+            ChangeTag::Insert => "+",
+            ChangeTag::Equal => " ",
+        };
+        if shown < 100 {
+            out.push_str(sign);
+            out.push_str(change.value());
+            if !change.value().ends_with('\n') {
+                out.push('\n');
+            }
+            shown += 1;
+        }
+    }
+    out
+}
+
+fn strip_frontmatter(raw: &str) -> &str {
+    let text = raw.trim_start_matches('\u{feff}');
+    if let Some(rest) = text.strip_prefix("---") {
+        if let Some(after_first_nl) = rest.find('\n').map(|i| &rest[i + 1..]) {
+            if let Some(end_idx) = after_first_nl.find("\n---") {
+                let after = &after_first_nl[end_idx + 4..];
+                return after.trim_start_matches(['\r', '\n']);
+            }
+        }
+    }
+    text
+}
+
+/// Rakit masukan review yang hemat token & teredaksi:
+/// 1) Transkrip sesi SESUDAH `prune_old_tool_outputs` (tidak pernah memuat ulang tool result raksasa).
+/// 2) Indeks skill Tingkat-1 + isi skill yang relevan dengan sesi ini.
+/// 3) Catatan memory pengguna/proyek yang ada (dengan `#id`).
+pub fn build_pruned_review_prompt(
+    cwd: &Path,
+    store: &Store,
+    messages: &[Message],
+    max_tokens: u64,
+) -> (String, String) {
+    let mut pruned = messages.to_vec();
+    let _ = prune_old_tool_outputs(&mut pruned, 2);
+
+    // Alokasi karakter konservatif agar total prompt + respons muat dalam `max_tokens`.
+    // 1 token ~ 3 karakter; sisakan ~45% untuk system prompt + JSON output.
+    let usable_tokens = (max_tokens as usize).saturating_mul(55) / 100;
+    let total_char_budget = usable_tokens.saturating_mul(3).clamp(1800, 14_000);
+    let transcript_budget = total_char_budget * 55 / 100;
+    let skills_budget = total_char_budget * 25 / 100;
+    let mem_budget = total_char_budget * 20 / 100;
+
+    let mut transcript = String::new();
+    let mut mentioned_skills: HashSet<String> = HashSet::new();
+    for m in &pruned {
+        if m.role == Role::System {
+            continue;
+        }
+        let role = match m.role {
+            Role::User => "USER",
+            Role::Assistant => "SELENA",
+            Role::Tool => "TOOL",
+            Role::System => continue,
+        };
+        for b in &m.content {
+            let raw_line = match b {
+                Block::Text(t) => {
+                    let s: String = t.chars().take(480).collect();
+                    format!("[{role}] {s}\n")
+                }
+                Block::Image { media_type, .. } => format!("[{role}] [image:{media_type}]\n"),
+                Block::ToolUse { name, args, .. } => {
+                    if name == "skill_view" || name == "skill_edit" {
+                        if let Some(sname) = args.get("name").and_then(|v| v.as_str()) {
+                            mentioned_skills.insert(sname.to_ascii_lowercase());
+                        }
+                    }
+                    let a: String = args.to_string().chars().take(220).collect();
+                    format!("[CALL] {name} {a}\n")
+                }
+                Block::ToolResult {
+                    content, is_error, ..
+                } => {
+                    let first_two: String = content
+                        .lines()
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                        .chars()
+                        .take(200)
+                        .collect();
+                    let tag = if *is_error { "ERR" } else { "OK" };
+                    format!("[RESULT {tag}] {first_two}\n")
+                }
+            };
+            let safe_line = redact_secrets(&raw_line);
+            if transcript.chars().count() + safe_line.chars().count() > transcript_budget {
+                break;
+            }
+            transcript.push_str(&safe_line);
+        }
+    }
+
+    let transcript_lower = transcript.to_ascii_lowercase();
+    let scan = scan_skills_with_warnings(cwd);
+    let mut skills_section = if scan.skills.is_empty() {
+        "(belum ada skill)".to_string()
+    } else {
+        redact_secrets(&format_skills_index(&scan.skills))
+    };
+
+    // Tambahkan isi skill relevan (yang dibuka atau disebut di transkrip, maks 3 skill).
+    let mut relevant_bodies = String::new();
+    let mut loaded = 0usize;
+    for s in &scan.skills {
+        if loaded >= 3 {
+            break;
+        }
+        let sname_low = s.name.to_ascii_lowercase();
+        let is_relevant = mentioned_skills.contains(&sname_low)
+            || transcript_lower.contains(&sname_low)
+            || s.tags
+                .iter()
+                .any(|t| t.len() >= 3 && transcript_lower.contains(&t.to_ascii_lowercase()));
+        if !is_relevant {
+            continue;
+        }
+        if let Ok(raw) = std::fs::read_to_string(&s.path) {
+            let safe = redact_secrets(&raw);
+            let cut: String = safe.chars().take(1600).collect();
+            let block = format!("\n--- SKILL `{}` ({}) ---\n{}\n", s.name, s.scope, cut);
+            if skills_section.chars().count() + relevant_bodies.chars().count() + block.chars().count()
+                <= skills_budget + 1200
+            {
+                relevant_bodies.push_str(&block);
+                loaded += 1;
+            }
+        }
+    }
+    if !relevant_bodies.is_empty() {
+        skills_section.push_str("\nIsi skill relevan:");
+        skills_section.push_str(&relevant_bodies);
+    }
+
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let memories = store.list_memories(&cwd_str, 30).unwrap_or_default();
+    let mut mem_section = String::new();
+    if memories.is_empty() {
+        mem_section.push_str("(belum ada catatan memory)");
+    } else {
+        for m in &memories {
+            let scope = if m.scope == "global" {
+                "global"
+            } else {
+                "project"
+            };
+            let line = redact_secrets(&format!(
+                "- #{} [{} | {}] {}\n",
+                m.id, m.category, scope, m.content
+            ));
+            if mem_section.chars().count() + line.chars().count() > mem_budget {
+                break;
+            }
+            mem_section.push_str(&line);
+        }
+    }
+
+    let sys = "Kamu adalah modul Background Self-Improvement Review milik SelenCode.\n\
+Tugasmu: tinjau transkrip sesi yang sudah selesai, skill relevan, dan catatan memory yang ada.\n\
+Keluarkan HANYA objek JSON valid tanpa teks lain:\n\
+{\"actions\": [...]}\n\
+Jenis aksi yang didukung:\n\
+1. {\"action\":\"patch_skill\",\"skill\":\"<nama-kebab>\",\"old_snippet\":\"<potongan lama persis dari SKILL.md>\",\"new_snippet\":\"<potongan baru>\",\"append_section\":\"<opsional: tambahan seksi baru jika tidak mengganti snippet>\",\"reason\":\"<alasan singkat <=60 char>\"}\n\
+   (Hanya untuk memperbaiki langkah salah/kurang pada skill yang SUDAH ada berdasarkan bukti sesi.)\n\
+2. {\"action\":\"add_skill_reference\",\"skill\":\"<nama-kebab>\",\"ref_path\":\"references/<nama>.md\",\"content\":\"<markdown singkat>\",\"reason\":\"<alasan singkat>\"}\n\
+   (Hanya menambah file referensi BARU di dalam folder skill yang ada.)\n\
+3. {\"action\":\"add_memory\",\"category\":\"arch|commands|conventions|decisions|issues|tasks|general\",\"scope\":\"project|global\",\"content\":\"<fakta sempit & konkret tanpa rahasia>\",\"reason\":\"<alasan singkat>\"}\n\
+   (Hanya menambah catatan BARU yang faktual & sempit dari preferensi/prosedur pengguna di sesi ini.)\n\
+4. {\"action\":\"delete_memory\",\"memory_id\":123,\"reason\":\"<alasan singkat mengapa usang>\"}\n\
+   (Usulan hapus memory lama yang terbukti usang — akan otomatis masuk staging persetujuan pengguna.)\n\
+5. {\"action\":\"overwrite_memory\",\"memory_id\":123,\"category\":\"...\",\"new_content\":\"...\",\"reason\":\"<alasan singkat>\"}\n\
+   (Usulan timpa memory lama — akan otomatis masuk staging persetujuan pengguna.)\n\
+6. {\"action\":\"delete_skill\",\"skill\":\"<nama-kebab>\",\"reason\":\"<alasan singkat>\"}\n\
+7. {\"action\":\"overwrite_skill\",\"skill\":\"<nama-kebab>\",\"body\":\"<isi baru lengkap>\",\"reason\":\"<alasan singkat>\"}\n\
+Aturan KETAT:\n\
+- DILARANG menyentuh kode/config/file proyek pengguna — hanya skill & memory SelenCode.\n\
+- DILARANG menyimpan rahasia, token, password, atau API key.\n\
+- Jika tidak ada koreksi, fakta prosedur baru, atau memory usang yang benar-benar terbukti di sesi ini -> kembalikan persis: {\"actions\":[]}";
+
+    let user = format!(
+        "=== INDEKS & SKILL RELEVAN ===\n{skills_section}\n\n\
+         === CATATAN MEMORY SAAT INI ===\n{mem_section}\n\n\
+         === TRANSKRIP SESI (PRUNED) ===\n{transcript}\n\n\
+         Analisa sesi ini dan kembalikan HANYA JSON {{\"actions\":[...]}}."
+    );
+
+    (sys.to_string(), user)
+}
+
+#[derive(Debug, Deserialize)]
+struct ReviewPlanResponse {
+    #[serde(default)]
+    actions: Vec<ReviewAction>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum ReviewAction {
+    PatchSkill {
+        skill: String,
+        #[serde(default)]
+        old_snippet: Option<String>,
+        #[serde(default)]
+        new_snippet: Option<String>,
+        #[serde(default)]
+        append_section: Option<String>,
+        #[serde(default)]
+        reason: String,
+    },
+    AddSkillReference {
+        skill: String,
+        ref_path: String,
+        content: String,
+        #[serde(default)]
+        reason: String,
+    },
+    AddMemory {
+        #[serde(default = "default_general_cat")]
+        category: String,
+        #[serde(default = "default_project_scope")]
+        scope: String,
+        content: String,
+        #[serde(default)]
+        reason: String,
+    },
+    DeleteMemory {
+        memory_id: i64,
+        #[serde(default)]
+        reason: String,
+    },
+    OverwriteMemory {
+        memory_id: i64,
+        #[serde(default)]
+        category: Option<String>,
+        new_content: String,
+        #[serde(default)]
+        reason: String,
+    },
+    DeleteSkill {
+        skill: String,
+        #[serde(default)]
+        reason: String,
+    },
+    OverwriteSkill {
+        skill: String,
+        body: String,
+        #[serde(default)]
+        reason: String,
+    },
+}
+
+fn default_general_cat() -> String {
+    "general".to_string()
+}
+fn default_project_scope() -> String {
+    "project".to_string()
+}
+
+/// Ekstrak JSON dari jawaban model (tahan terhadap blok pagar ```json ... ```).
+fn extract_json_object(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Some(trimmed);
+    }
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            if end > start {
+                return Some(&trimmed[start..=end]);
+            }
+        }
+    }
+    None
+}
+
+fn short_reason(raw: &str, fallback: &str) -> String {
+    let clean = redact_secrets(raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if clean.is_empty() {
+        return fallback.to_string();
+    }
+    let count = clean.chars().count();
+    if count <= 64 {
+        clean
+    } else {
+        let head: String = clean.chars().take(63).collect();
+        format!("{head}…")
+    }
+}
+
+fn validate_safe_ref_path(raw_ref: &str) -> Result<String> {
+    let norm = raw_ref.trim().replace('\\', "/");
+    if norm.is_empty() {
+        anyhow::bail!("ref_path kosong");
+    }
+    let p = Path::new(&norm);
+    if p.is_absolute()
+        || p.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        anyhow::bail!("ref_path tidak aman: {raw_ref}");
+    }
+    if !(norm.starts_with("references/")
+        || norm.starts_with("templates/")
+        || norm.starts_with("scripts/"))
+    {
+        anyhow::bail!("ref_path harus di bawah references/, templates/, atau scripts/");
+    }
+    if is_secret_file(p) {
+        anyhow::bail!("ref_path file rahasia ditolak");
+    }
+    Ok(norm)
+}
+
+/// Jalankan Background Self-Improvement Review (v0.5.1) secara aman & non-blocking.
+/// - Tidak pernah mengembalikan error fatal ke pengguna (gagal provider / parse / anggaran habis -> diam & log).
+/// - Selalu mencatat pemakaian token review secara terpisah di tabel `usage` (`kind='review'`).
+/// - Aksi aman (`patch_skill`, `add_skill_reference` baru, `add_memory` baru) langsung diterapkan.
+/// - Aksi hapus/timpa (`delete_memory`, `overwrite_memory`, `delete_skill`, `overwrite_skill`)
+///   SELALU ditahan ke staging `review_proposals` sampai disetujui via `/review approve <id>`.
+pub async fn run_background_review(
+    provider: Arc<dyn Provider>,
+    cfg: &Config,
+    store: &Store,
+    cwd: &Path,
+    session_id: &str,
+    messages: &[Message],
+    mark_delivered: bool,
+) -> Result<Option<BgReviewOutcome>> {
+    if check_review_eligibility(cfg, store, session_id, messages).is_err() {
+        return Ok(None);
+    }
+
+    let max_tokens = cfg.review.max_tokens.max(1000);
+    let (sys, user) = build_pruned_review_prompt(cwd, store, messages, max_tokens);
+    let review_msgs = vec![
+        Message::text(Role::System, sys),
+        Message::text(Role::User, user),
+    ];
+
+    // Guard anggaran token sebelum memanggil provider: sisakan ruang minimal 200 token untuk output JSON.
+    let est = analyze_token_breakdown(&review_msgs, &[], 0).total_tokens() as u64;
+    if est.saturating_add(200) > max_tokens {
+        eprintln!(
+            "[review] dilewati: estimasi input ({est}) melampaui anggaran [review] max_tokens ({max_tokens})"
+        );
+        return Ok(None);
+    }
+
+    let (tx, _rx) = mpsc::channel::<StreamEvent>(32);
+    let reply = match provider.stream_chat(&review_msgs, &[], tx).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[review] gagal memanggil model review (diam): {e}");
+            return Ok(None);
+        }
+    };
+
+    let model_name = provider.model_name().to_string();
+    let (in_tok, out_tok) = reply
+        .usage
+        .map(|u| (u.input_tokens, u.output_tokens))
+        .unwrap_or((est, 0));
+
+    // Catat biaya review TERPISAH di tabel `usage` (`kind='review'`, `session_id="review:<sid>"`).
+    let _ = store.record_review_usage(session_id, &model_name, in_tok, out_tok);
+
+    // Jika total token aktual melewati anggaran keras (> 125% max_tokens), catat run & berhenti diam-diam.
+    let cwd_str = cwd.to_string_lossy().to_string();
+    if in_tok.saturating_add(out_tok) > max_tokens.saturating_mul(5) / 4 {
+        eprintln!(
+            "[review] anggaran token terlampaui ({} > {}), menghentikan evaluasi diam-diam",
+            in_tok + out_tok,
+            max_tokens
+        );
+        let _ = store.record_review_run(session_id, &cwd_str, &model_name, "", true, in_tok, out_tok);
+        return Ok(None);
+    }
+
+    let Some(json_str) = extract_json_object(&reply.text) else {
+        eprintln!("[review] output model bukan JSON valid (diam)");
+        let _ = store.record_review_run(session_id, &cwd_str, &model_name, "", true, in_tok, out_tok);
+        return Ok(None);
+    };
+
+    let parsed: ReviewPlanResponse = match serde_json::from_str(json_str) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[review] gagal parse JSON review (diam): {e}");
+            let _ = store.record_review_run(session_id, &cwd_str, &model_name, "", true, in_tok, out_tok);
+            return Ok(None);
+        }
+    };
+
+    let mut applied: Vec<AppliedReviewChange> = Vec::new();
+    let mut staged_ids: Vec<i64> = Vec::new();
+    let mut staged_kinds: Vec<String> = Vec::new();
+
+    for action in parsed.actions.into_iter().take(6) {
+        match action {
+            ReviewAction::PatchSkill {
+                skill,
+                old_snippet,
+                new_snippet,
+                append_section,
+                reason,
+            } => {
+                let Ok(clean_name) = sanitize_skill_name(&skill) else {
+                    continue;
+                };
+                let existing = scan_skills_with_warnings(cwd)
+                    .skills
+                    .into_iter()
+                    .find(|s| s.name == clean_name);
+                let Some(info) = existing else {
+                    continue;
+                };
+                let Ok(old_raw) = std::fs::read_to_string(&info.path) else {
+                    continue;
+                };
+                let old_fm = parse_skill_frontmatter(&old_raw).ok();
+                let old_body = strip_frontmatter(&old_raw).trim().to_string();
+                let desc = old_fm
+                    .as_ref()
+                    .map(|f| f.description.clone())
+                    .unwrap_or_else(|| info.summary.clone());
+                let ver = old_fm.as_ref().and_then(|f| f.version.clone());
+                let tags = old_fm
+                    .as_ref()
+                    .map(|f| f.tags.clone())
+                    .unwrap_or_default();
+
+                let mut patched_body: Option<String> = None;
+                let mut destructive_overwrite = false;
+
+                if let (Some(old_sn), Some(new_sn)) = (
+                    old_snippet.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                    new_snippet.as_deref().map(str::trim),
+                ) {
+                    if old_body.contains(old_sn) {
+                        let safe_new = redact_secrets(new_sn);
+                        let candidate = old_body.replacen(old_sn, &safe_new, 1);
+                        let old_lines = old_body.lines().count().max(1);
+                        let new_lines = candidate.lines().count();
+                        // Guard: menghapus >50% baris isi skill lama dianggap timpa/destruktif -> STAGING!
+                        if new_lines * 2 < old_lines {
+                            destructive_overwrite = true;
+                            patched_body = Some(candidate);
+                        } else if candidate != old_body {
+                            patched_body = Some(candidate);
+                        }
+                    } else if !new_sn.is_empty() {
+                        // Snippet tidak ditemukan persis -> jangan timpa diam-diam; tahan ke staging jika berniat mengganti.
+                        if append_section
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .is_none()
+                        {
+                            let safe_append = redact_secrets(new_sn);
+                            patched_body = Some(format!("{old_body}\n\n{safe_append}"));
+                        }
+                    }
+                }
+
+                if patched_body.is_none() {
+                    if let Some(app) = append_section
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        let safe_app = redact_secrets(app);
+                        if !old_body.contains(&safe_app) {
+                            patched_body = Some(format!("{old_body}\n\n{safe_app}"));
+                        }
+                    }
+                }
+
+                let Some(new_body) = patched_body else {
+                    continue;
+                };
+                let Ok(new_md) =
+                    render_skill_markdown(&clean_name, &desc, &new_body, ver.as_deref(), &tags)
+                else {
+                    continue;
+                };
+                if new_md == old_raw {
+                    continue;
+                }
+                let rel_display = info
+                    .path
+                    .strip_prefix(cwd)
+                    .unwrap_or(&info.path)
+                    .display()
+                    .to_string();
+                let diff = build_unified_diff(&rel_display, &old_raw, &new_md);
+                let rsn = short_reason(&reason, "perbaikan dari sesi");
+
+                if destructive_overwrite {
+                    let payload = serde_json::json!({
+                        "skill": clean_name,
+                        "path": info.path.to_string_lossy(),
+                        "new_markdown": new_md,
+                        "diff": diff,
+                        "reason": rsn,
+                    })
+                    .to_string();
+                    if let Ok(pid) = store.create_review_proposal(
+                        session_id,
+                        &cwd_str,
+                        "overwrite_skill",
+                        &clean_name,
+                        &format!("Timpa skill '{clean_name}' ({rsn})"),
+                        &payload,
+                    ) {
+                        staged_ids.push(pid);
+                        staged_kinds.push("timpa skill".to_string());
+                    }
+                } else if std::fs::write(&info.path, &new_md).is_ok() {
+                    applied.push(AppliedReviewChange {
+                        kind: "patch_skill".to_string(),
+                        target: clean_name,
+                        reason: rsn,
+                        diff: Some(diff),
+                    });
+                }
+            }
+            ReviewAction::AddSkillReference {
+                skill,
+                ref_path,
+                content,
+                reason,
+            } => {
+                let Ok(clean_name) = sanitize_skill_name(&skill) else {
+                    continue;
+                };
+                let Ok(norm_ref) = validate_safe_ref_path(&ref_path) else {
+                    continue;
+                };
+                let safe_content = format!("{}\n", redact_secrets(content.trim()));
+                if safe_content.trim().is_empty() || safe_content.len() > MAX_REF_FILE_BYTES {
+                    continue;
+                }
+                let Some(info) = scan_skills_with_warnings(cwd)
+                    .skills
+                    .into_iter()
+                    .find(|s| s.name == clean_name)
+                else {
+                    continue;
+                };
+                let target = info.dir.join(&norm_ref);
+                let rsn = short_reason(&reason, "tambah file referensi");
+                if target.exists() {
+                    // File referensi sudah ada -> DILARANG menimpa tanpa persetujuan -> masuk STAGING!
+                    let old_ref = std::fs::read_to_string(&target).unwrap_or_default();
+                    if old_ref == safe_content {
+                        continue;
+                    }
+                    let diff = build_unified_diff(&norm_ref, &old_ref, &safe_content);
+                    let payload = serde_json::json!({
+                        "skill": clean_name,
+                        "ref_path": norm_ref,
+                        "path": target.to_string_lossy(),
+                        "new_content": safe_content,
+                        "diff": diff,
+                        "reason": rsn,
+                    })
+                    .to_string();
+                    if let Ok(pid) = store.create_review_proposal(
+                        session_id,
+                        &cwd_str,
+                        "overwrite_skill",
+                        &format!("{clean_name}/{norm_ref}"),
+                        &format!("Timpa referensi '{norm_ref}' pada skill '{clean_name}' ({rsn})"),
+                        &payload,
+                    ) {
+                        staged_ids.push(pid);
+                        staged_kinds.push("timpa referensi skill".to_string());
+                    }
+                } else {
+                    if let Some(parent) = target.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::write(&target, &safe_content).is_ok() {
+                        let diff = build_unified_diff(&norm_ref, "", &safe_content);
+                        applied.push(AppliedReviewChange {
+                            kind: "add_skill_reference".to_string(),
+                            target: format!("{clean_name}/{norm_ref}"),
+                            reason: rsn,
+                            diff: Some(diff),
+                        });
+                    }
+                }
+            }
+            ReviewAction::AddMemory {
+                category,
+                scope,
+                content,
+                reason,
+            } => {
+                let safe_content = redact_secrets(content.trim());
+                if safe_content.is_empty() || safe_content.chars().count() > 320 {
+                    continue;
+                }
+                let existing = store.list_memories(&cwd_str, 50).unwrap_or_default();
+                if existing
+                    .iter()
+                    .any(|m| m.content.eq_ignore_ascii_case(&safe_content))
+                {
+                    continue;
+                }
+                let scope_key = if scope.eq_ignore_ascii_case("global") {
+                    "global"
+                } else {
+                    cwd_str.as_str()
+                };
+                if let Ok(mid) = store.add_memory_categorized(scope_key, &category, &safe_content) {
+                    applied.push(AppliedReviewChange {
+                        kind: "add_memory".to_string(),
+                        target: format!("#{mid}"),
+                        reason: short_reason(&reason, &safe_content),
+                        diff: None,
+                    });
+                }
+            }
+            ReviewAction::DeleteMemory { memory_id, reason } => {
+                let Ok(Some(mem)) = store.get_memory(memory_id) else {
+                    continue;
+                };
+                let rsn = short_reason(&reason, "catatan memory usang");
+                let payload = serde_json::json!({
+                    "memory_id": mem.id,
+                    "scope": mem.scope,
+                    "category": mem.category,
+                    "old_content": mem.content,
+                    "reason": rsn,
+                })
+                .to_string();
+                if let Ok(pid) = store.create_review_proposal(
+                    session_id,
+                    &cwd_str,
+                    "delete_memory",
+                    &mem.id.to_string(),
+                    &format!("Hapus memory #{} ({rsn})", mem.id),
+                    &payload,
+                ) {
+                    staged_ids.push(pid);
+                    staged_kinds.push("hapus memory".to_string());
+                }
+            }
+            ReviewAction::OverwriteMemory {
+                memory_id,
+                category,
+                new_content,
+                reason,
+            } => {
+                let Ok(Some(mem)) = store.get_memory(memory_id) else {
+                    continue;
+                };
+                let safe_new = redact_secrets(new_content.trim());
+                if safe_new.is_empty() || safe_new == mem.content {
+                    continue;
+                }
+                let rsn = short_reason(&reason, "perbarui isi memory");
+                let payload = serde_json::json!({
+                    "memory_id": mem.id,
+                    "old_category": mem.category,
+                    "new_category": category.as_deref().map(normalize_memory_category).unwrap_or(&mem.category),
+                    "old_content": mem.content,
+                    "new_content": safe_new,
+                    "reason": rsn,
+                })
+                .to_string();
+                if let Ok(pid) = store.create_review_proposal(
+                    session_id,
+                    &cwd_str,
+                    "overwrite_memory",
+                    &mem.id.to_string(),
+                    &format!("Timpa memory #{} ({rsn})", mem.id),
+                    &payload,
+                ) {
+                    staged_ids.push(pid);
+                    staged_kinds.push("timpa memory".to_string());
+                }
+            }
+            ReviewAction::DeleteSkill { skill, reason } => {
+                let Ok(clean_name) = sanitize_skill_name(&skill) else {
+                    continue;
+                };
+                let Some(info) = scan_skills_with_warnings(cwd)
+                    .skills
+                    .into_iter()
+                    .find(|s| s.name == clean_name)
+                else {
+                    continue;
+                };
+                let rsn = short_reason(&reason, "skill sudah tidak relevan");
+                let payload = serde_json::json!({
+                    "skill": clean_name,
+                    "scope": info.scope,
+                    "path": info.path.to_string_lossy(),
+                    "reason": rsn,
+                })
+                .to_string();
+                if let Ok(pid) = store.create_review_proposal(
+                    session_id,
+                    &cwd_str,
+                    "delete_skill",
+                    &clean_name,
+                    &format!("Hapus skill '{clean_name}' ({rsn})"),
+                    &payload,
+                ) {
+                    staged_ids.push(pid);
+                    staged_kinds.push("hapus skill".to_string());
+                }
+            }
+            ReviewAction::OverwriteSkill {
+                skill,
+                body,
+                reason,
+            } => {
+                let Ok(clean_name) = sanitize_skill_name(&skill) else {
+                    continue;
+                };
+                let Some(info) = scan_skills_with_warnings(cwd)
+                    .skills
+                    .into_iter()
+                    .find(|s| s.name == clean_name)
+                else {
+                    continue;
+                };
+                let old_raw = std::fs::read_to_string(&info.path).unwrap_or_default();
+                let old_fm = parse_skill_frontmatter(&old_raw).ok();
+                let desc = old_fm
+                    .as_ref()
+                    .map(|f| f.description.clone())
+                    .unwrap_or_else(|| info.summary.clone());
+                let ver = old_fm.as_ref().and_then(|f| f.version.clone());
+                let tags = old_fm.as_ref().map(|f| f.tags.clone()).unwrap_or_default();
+                let safe_body = redact_secrets(body.trim());
+                if safe_body.is_empty() {
+                    continue;
+                }
+                let Ok(new_md) =
+                    render_skill_markdown(&clean_name, &desc, &safe_body, ver.as_deref(), &tags)
+                else {
+                    continue;
+                };
+                if new_md == old_raw {
+                    continue;
+                }
+                let rel_display = info
+                    .path
+                    .strip_prefix(cwd)
+                    .unwrap_or(&info.path)
+                    .display()
+                    .to_string();
+                let diff = build_unified_diff(&rel_display, &old_raw, &new_md);
+                let rsn = short_reason(&reason, "tulis ulang isi skill");
+                let payload = serde_json::json!({
+                    "skill": clean_name,
+                    "path": info.path.to_string_lossy(),
+                    "new_markdown": new_md,
+                    "diff": diff,
+                    "reason": rsn,
+                })
+                .to_string();
+                if let Ok(pid) = store.create_review_proposal(
+                    session_id,
+                    &cwd_str,
+                    "overwrite_skill",
+                    &clean_name,
+                    &format!("Timpa skill '{clean_name}' ({rsn})"),
+                    &payload,
+                ) {
+                    staged_ids.push(pid);
+                    staged_kinds.push("timpa skill".to_string());
+                }
+            }
+        }
+    }
+
+    let report_message = format_review_report(&applied, &staged_ids, &staged_kinds);
+    let _ = store.record_review_run(
+        session_id,
+        &cwd_str,
+        &model_name,
+        report_message.as_deref().unwrap_or(""),
+        mark_delivered,
+        in_tok,
+        out_tok,
+    );
+
+    if report_message.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(BgReviewOutcome {
+        applied,
+        staged_ids,
+        report_message,
+        input_tokens: in_tok,
+        output_tokens: out_tok,
+        model: model_name,
+    }))
+}
+
+fn format_review_report(
+    applied: &[AppliedReviewChange],
+    staged_ids: &[i64],
+    staged_kinds: &[String],
+) -> Option<String> {
+    if applied.is_empty() && staged_ids.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for ch in applied {
+        match ch.kind.as_str() {
+            "patch_skill" => {
+                parts.push(format!("Skill '{}' patched ({})", ch.target, ch.reason));
+            }
+            "add_skill_reference" => {
+                parts.push(format!("Referensi '{}' ditambahkan ({})", ch.target, ch.reason));
+            }
+            "add_memory" => {
+                parts.push(format!("Memory {} ditambahkan ({})", ch.target, ch.reason));
+            }
+            _ => {
+                parts.push(format!("{} ({})", ch.target, ch.reason));
+            }
+        }
+    }
+    if !staged_ids.is_empty() {
+        let label = if staged_ids.len() == 1 {
+            format!(
+                "1 usulan {} menunggu persetujuanmu — /review pending",
+                staged_kinds
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("perubahan")
+            )
+        } else {
+            format!(
+                "{} usulan hapus/timpa menunggu persetujuanmu — /review pending",
+                staged_ids.len()
+            )
+        };
+        parts.push(label);
+    }
+    Some(format!("💾 Self-improvement review: {}", parts.join(" · ")))
+}
+
+/// Terapkan 1 proposal staging yang disetujui pengguna (`/review approve <id>`).
+pub fn apply_staged_proposal(store: &Store, cwd: &Path, proposal_id: i64) -> Result<String> {
+    let prop = store
+        .get_review_proposal(proposal_id)?
+        .ok_or_else(|| anyhow!("proposal #{proposal_id} tidak ditemukan"))?;
+    if prop.status != "pending" {
+        anyhow::bail!(
+            "proposal #{proposal_id} sudah diproses (status: {})",
+            prop.status
+        );
+    }
+    let payload: serde_json::Value =
+        serde_json::from_str(&prop.payload_json).unwrap_or_else(|_| serde_json::json!({}));
+
+    let result_msg = match prop.kind.as_str() {
+        "delete_memory" => {
+            let mid = payload
+                .get("memory_id")
+                .and_then(|v| v.as_i64())
+                .or_else(|| prop.target.parse::<i64>().ok())
+                .ok_or_else(|| anyhow!("memory_id tidak valid pada proposal #{proposal_id}"))?;
+            let removed = store.remove_memory(mid)?;
+            if removed {
+                format!("Proposal #{proposal_id} disetujui: memory #{mid} berhasil dihapus.")
+            } else {
+                format!("Proposal #{proposal_id} ditandai disetujui (memory #{mid} sudah tidak ada).")
+            }
+        }
+        "overwrite_memory" => {
+            let mid = payload
+                .get("memory_id")
+                .and_then(|v| v.as_i64())
+                .or_else(|| prop.target.parse::<i64>().ok())
+                .ok_or_else(|| anyhow!("memory_id tidak valid pada proposal #{proposal_id}"))?;
+            let new_content = payload
+                .get("new_content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("new_content hilang pada proposal #{proposal_id}"))?;
+            let new_cat = payload.get("new_category").and_then(|v| v.as_str());
+            let updated = store.update_memory(mid, new_cat, new_content)?;
+            if updated {
+                format!("Proposal #{proposal_id} disetujui: memory #{mid} berhasil diperbarui.")
+            } else {
+                format!("Proposal #{proposal_id} ditandai disetujui (memory #{mid} sudah tidak ada).")
+            }
+        }
+        "delete_skill" => {
+            let sname = payload
+                .get("skill")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&prop.target);
+            let removed = remove_skill(cwd, sname)?;
+            if removed {
+                format!("Proposal #{proposal_id} disetujui: skill '{sname}' dihapus.")
+            } else {
+                format!("Proposal #{proposal_id} ditandai disetujui (skill proyek '{sname}' tidak ditemukan).")
+            }
+        }
+        "overwrite_skill" => {
+            let sname = payload
+                .get("skill")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&prop.target);
+            if let (Some(ref_path), Some(new_content)) = (
+                payload.get("ref_path").and_then(|v| v.as_str()),
+                payload.get("new_content").and_then(|v| v.as_str()),
+            ) {
+                let norm_ref = validate_safe_ref_path(ref_path)?;
+                let clean = sanitize_skill_name(sname)?;
+                let skill_dir = scan_skills_with_warnings(cwd)
+                    .skills
+                    .into_iter()
+                    .find(|s| s.name == clean)
+                    .map(|s| s.dir)
+                    .ok_or_else(|| anyhow!("skill '{clean}' tidak ditemukan"))?;
+                let target = skill_dir.join(&norm_ref);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&target, redact_secrets(new_content))
+                    .with_context(|| format!("gagal menulis {}", target.display()))?;
+                format!(
+                    "Proposal #{proposal_id} disetujui: referensi '{norm_ref}' pada skill '{clean}' diperbarui."
+                )
+            } else if let Some(new_md) = payload.get("new_markdown").and_then(|v| v.as_str()) {
+                let clean = sanitize_skill_name(sname)?;
+                let target = scan_skills_with_warnings(cwd)
+                    .skills
+                    .into_iter()
+                    .find(|s| s.name == clean)
+                    .map(|s| s.path)
+                    .unwrap_or_else(|| {
+                        skill_file_path_for(cwd, &clean, None)
+                            .unwrap_or_else(|_| cwd.join(".selencode/skills").join(&clean).join("SKILL.md"))
+                    });
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&target, redact_secrets(new_md))
+                    .with_context(|| format!("gagal menulis {}", target.display()))?;
+                format!("Proposal #{proposal_id} disetujui: skill '{clean}' berhasil diperbarui.")
+            } else {
+                anyhow::bail!("payload overwrite_skill tidak lengkap pada proposal #{proposal_id}");
+            }
+        }
+        other => anyhow::bail!("jenis proposal tidak dikenal: '{other}'"),
+    };
+
+    store.resolve_review_proposal(proposal_id, "approved")?;
+    Ok(result_msg)
+}
+
+/// Tolak/buang 1 proposal staging tanpa menyentuh memory/skill (`status = 'discarded'`).
+pub fn discard_staged_proposal(store: &Store, proposal_id: i64) -> Result<String> {
+    let prop = store
+        .get_review_proposal(proposal_id)?
+        .ok_or_else(|| anyhow!("proposal #{proposal_id} tidak ditemukan"))?;
+    if prop.status != "pending" {
+        anyhow::bail!(
+            "proposal #{proposal_id} sudah diproses (status: {})",
+            prop.status
+        );
+    }
+    store.resolve_review_proposal(proposal_id, "discarded")?;
+    Ok(format!(
+        "Proposal #{proposal_id} ({} `{}`) dibuang — data asli tetap utuh.",
+        prop.kind, prop.target
+    ))
+}
+
+/// Format satu proposal menjadi baris ringkas yang mudah dibaca di CLI/TUI/Telegram.
+pub fn format_proposal_detail(prop: &ReviewProposal) -> String {
+    let payload: serde_json::Value =
+        serde_json::from_str(&prop.payload_json).unwrap_or_else(|_| serde_json::json!({}));
+    let mut out = format!(
+        "#{} [{}] target `{}` — {}",
+        prop.id, prop.kind, prop.target, prop.summary
+    );
+    if let Some(old_c) = payload.get("old_content").and_then(|v| v.as_str()) {
+        let short: String = old_c.chars().take(120).collect();
+        out.push_str(&format!("\n  lama: {short}"));
+    }
+    if let Some(new_c) = payload.get("new_content").and_then(|v| v.as_str()) {
+        let short: String = new_c.chars().take(120).collect();
+        out.push_str(&format!("\n  baru: {short}"));
+    }
+    if let Some(diff) = payload.get("diff").and_then(|v| v.as_str()) {
+        let snippet: String = diff.lines().take(8).collect::<Vec<_>>().join("\n  ");
+        out.push_str(&format!("\n  {snippet}"));
+    }
+    out
 }

@@ -1,4 +1,4 @@
-use super::make_routed_provider;
+use super::{make_aux_review_provider, make_routed_provider};
 use anyhow::Result;
 use selencode::agent::context::{
     compact_messages, estimate_tokens, format_context_compact, infer_model_context_limit,
@@ -44,6 +44,36 @@ pub(crate) struct Session {
     pub(crate) setup_reason: Option<String>,
     /// Telemetri latensi, biaya, retry, fallback, & error Dynamic Model Routing (Tahap 3).
     pub(crate) router_telemetry: Arc<std::sync::Mutex<RouterTelemetry>>,
+    /// Jumlah giliran tuntas sejak background review terakhir pada sesi ini (pemicu tiap 15 giliran).
+    pub(crate) turns_since_review: usize,
+}
+
+/// Snapshot ringan yang siap dijalankan di task latar (`tokio::spawn`) untuk Background Review v0.5.1.
+pub(crate) struct BgReviewJob {
+    provider: Arc<dyn Provider>,
+    cfg: Config,
+    store: Arc<Store>,
+    cwd: std::path::PathBuf,
+    session_id: String,
+    messages: Vec<Message>,
+}
+
+impl BgReviewJob {
+    pub(crate) async fn run(
+        self,
+        mark_delivered: bool,
+    ) -> Result<Option<selencode::agent::BgReviewOutcome>> {
+        selencode::agent::run_background_review(
+            self.provider,
+            &self.cfg,
+            &self.store,
+            &self.cwd,
+            &self.session_id,
+            &self.messages,
+            mark_delivered,
+        )
+        .await
+    }
 }
 
 /// Hasil pemulihan sesi saat user menjalankan `/resume <nomor>`.
@@ -248,6 +278,7 @@ impl Session {
             needs_setup,
             setup_reason,
             router_telemetry,
+            turns_since_review: 0,
         })
     }
 
@@ -846,10 +877,44 @@ impl Session {
         self.session_id = new_id.clone();
         self.ctx.session_id = Some(new_id.clone());
         self.messages.clear();
+        self.turns_since_review = 0;
         if let Ok(mut plan) = self.ctx.plan_state.lock() {
             plan.clear();
         }
         Ok(new_id)
+    }
+
+    /// Siapkan pekerjaan Background Self-Improvement Review bila memenuhi pemicu & syarat (v0.5.1):
+    /// - `end_of_session = true`: dipicu saat sesi berakhir (`/exit`, `/new`, `selen run` selesai).
+    /// - `end_of_session = false`: dipicu setiap `cfg.review.turns_interval` (default 15) giliran tuntas.
+    /// - Mengembalikan `None` bila `[aux]` review/compression model kosong, sesi trivial, atau masih cooldown.
+    pub(crate) fn prepare_bg_review_job(&mut self, end_of_session: bool) -> Option<BgReviewJob> {
+        if !end_of_session {
+            let interval = self.cfg.review.turns_interval;
+            if interval == 0 || self.turns_since_review < interval {
+                return None;
+            }
+        }
+        if selencode::agent::check_review_eligibility(
+            &self.cfg,
+            &self.store,
+            &self.session_id,
+            &self.messages,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let aux_prov = make_aux_review_provider(&self.cfg, &self.provider_name, &self.pcfg)?;
+        self.turns_since_review = 0;
+        Some(BgReviewJob {
+            provider: aux_prov,
+            cfg: self.cfg.clone(),
+            store: self.store.clone(),
+            cwd: self.ctx.cwd.clone(),
+            session_id: self.session_id.clone(),
+            messages: self.messages.clone(),
+        })
     }
 
     /// Beralih & lanjutkan sesi tersimpan berdasarkan nomor urut (`1..=10`) atau prefix ID.

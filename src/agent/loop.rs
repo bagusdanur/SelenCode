@@ -490,27 +490,11 @@ async fn run_turn_inner(
                     }
                 }
             }
-            // Self-improvement review otonom (ala Hermes Agent): bila giliran
-            // kerja substansial (>= 3 tool call), evaluasi singkat apakah perlu
-            // create/patch skill di `.selencode/skills/`.
-            if ctx.auto_skills
-                && mode == TurnMode::Execute
-                && tool_calls_executed >= super::review::AUTO_REVIEW_MIN_TOOLS
-                && !skill_touched_in_turn
-            {
-                if let Ok(Some(note)) =
-                    super::review::run_self_improvement_review(provider.clone(), ctx, messages)
-                        .await
-                {
-                    let msg = format!("✦ {note}");
-                    match &ui {
-                        Some(tx) => {
-                            let _ = tx.send(UiEvent::Info(msg)).await;
-                        }
-                        None => eprintln!("[selen] {msg}"),
-                    }
-                }
-            }
+            // Background Self-Improvement Review (v0.5.1) kini dijalankan di latar
+            // sesudah sesi berakhir atau setiap 15 giliran tuntas oleh runner (CLI/TUI/Telegram)
+            // memakai model aux (`[aux] review_model` / `compression_model`), tidak lagi
+            // memblokir giliran aktif ataupun memakai model utama secara diam-diam.
+            let _ = (tool_calls_executed, skill_touched_in_turn);
             if let Some(tx) = &ui {
                 let reported = reply
                     .usage

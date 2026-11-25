@@ -420,6 +420,7 @@ fn config_save_load_and_direct_api_key_fallback() {
         hooks: Vec::new(),
         guard: Default::default(),
         aux: Default::default(),
+        review: Default::default(),
         tool_budget: Default::default(),
         skills: Default::default(),
     };

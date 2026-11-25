@@ -10,7 +10,7 @@ use selencode::repl::{
 use selencode::security::{ApprovalMode, ApprovalRequest};
 use selencode::telegram::{
     escape_telegram_html, format_telegram_progress_html, markdown_to_telegram_html,
-    TelegramClient, TgApprovalHub, TELEGRAM_BOT_COMMANDS,
+    parse_callback_review, TelegramClient, TgApprovalHub, TELEGRAM_BOT_COMMANDS,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -167,7 +167,33 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
             if let Some(cb) = upd.callback_query {
                 let chat_id = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
                 if latest_cfg.telegram.is_allowed(cb.from.id, chat_id) {
-                    let _ = hub.handle_callback(&tg, &cb).await;
+                    if let Some((prop_id, approve)) = cb.data.as_deref().and_then(parse_callback_review) {
+                        let res_msg = match selencode::store::Store::open() {
+                            Ok(st) => {
+                                if approve {
+                                    selencode::agent::apply_staged_proposal(&st, &cwd, prop_id)
+                                } else {
+                                    selencode::agent::discard_staged_proposal(&st, prop_id)
+                                }
+                            }
+                            Err(e) => Err(e),
+                        };
+                        match res_msg {
+                            Ok(done_txt) => {
+                                let toast = if approve { "Usulan disetujui" } else { "Usulan dibuang" };
+                                let _ = tg.answer_callback_query(&cb.id, Some(toast)).await;
+                                let _ = tg.send_message(chat_id, &done_txt).await;
+                            }
+                            Err(e) => {
+                                let _ = tg
+                                    .answer_callback_query(&cb.id, Some("Sudah diproses atau tidak ditemukan"))
+                                    .await;
+                                let _ = tg.send_message(chat_id, &format!("Review #{prop_id}: {e}")).await;
+                            }
+                        }
+                    } else {
+                        let _ = hub.handle_callback(&tg, &cb).await;
+                    }
                 } else {
                     let _ = tg
                         .answer_callback_query(&cb.id, Some("Akses ditolak (tidak di whitelist)."))
@@ -327,6 +353,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     tg_clone.clone(),
                     hub_clone,
                     sessions_clone,
+                    busy_clone.clone(),
                     active_prog_clone.clone(),
                     cancel_notify,
                     gen_counter.clone(),
@@ -372,6 +399,7 @@ async fn handle_telegram_chat_message(
     tg: TelegramClient,
     hub: Arc<TgApprovalHub>,
     sessions: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>>,
+    busy_chats: Arc<std::sync::Mutex<HashSet<i64>>>,
     active_progress: Arc<std::sync::Mutex<HashMap<i64, i64>>>,
     cancel: Arc<tokio::sync::Notify>,
     gen_counter: Arc<AtomicU64>,
@@ -619,6 +647,9 @@ async fn handle_telegram_chat_message(
             return Ok(());
         }
         SlashCommand::New => {
+            if let Some(job) = s.prepare_bg_review_job(true) {
+                spawn_telegram_bg_review(tg.clone(), chat_id, busy_chats.clone(), job);
+            }
             let sid = s.reset_session()?;
             let short: String = sid.chars().take(10).collect();
             tg.send_html_message(
@@ -636,6 +667,41 @@ async fn handle_telegram_chat_message(
         }
         SlashCommand::Skills(arg) => {
             let reply = s.handle_skills(arg.as_deref()).await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
+            return Ok(());
+        }
+        SlashCommand::Review(arg) => {
+            let reply = s.handle_review(arg.as_deref())?;
+            let is_pending_view = arg
+                .as_deref()
+                .map(|a| {
+                    let l = a.trim().to_ascii_lowercase();
+                    l.is_empty() || matches!(l.as_str(), "pending" | "list" | "ls")
+                })
+                .unwrap_or(true);
+            if is_pending_view {
+                let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+                let pending = s
+                    .store
+                    .list_review_proposals(Some(&cwd_str), Some("pending"), 5)
+                    .unwrap_or_default();
+                if !pending.is_empty() {
+                    let html = selencode::telegram::menu_markup_to_telegram_html(&reply);
+                    let plain = selencode::repl::strip_menu_markup(&reply);
+                    let rows: Vec<Vec<(String, String)>> = pending
+                        .iter()
+                        .map(|p| {
+                            vec![
+                                (format!("Setujui #{}", p.id), format!("rv:{}:a", p.id)),
+                                (format!("Buang #{}", p.id), format!("rv:{}:d", p.id)),
+                            ]
+                        })
+                        .collect();
+                    tg.send_html_message_with_keyboard(chat_id, &html, &plain, rows)
+                        .await?;
+                    return Ok(());
+                }
+            }
             tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
@@ -1029,6 +1095,61 @@ async fn handle_telegram_chat_message(
             let _ = tg.edit_message_text(chat_id, mid, &done_line).await;
         }
     }
+
+    // Background Self-Improvement Review (v0.5.1): picu di latar setiap 15 giliran tuntas
+    // (tidak pernah memblokir giliran aktif; laporan dikirim sebagai pesan baru Telegram).
+    s.turns_since_review += 1;
+    if let Some(job) = s.prepare_bg_review_job(false) {
+        spawn_telegram_bg_review(tg.clone(), chat_id, busy_chats.clone(), job);
+    }
     Ok(())
+}
+
+/// Jalankan Background Self-Improvement Review di latar untuk chat Telegram (v0.5.1).
+/// Menunggu sampai giliran aktif tidak sibuk, lalu mengirim TEPAT SATU pesan baru bila ada hasil.
+fn spawn_telegram_bg_review(
+    tg: TelegramClient,
+    chat_id: i64,
+    busy_chats: Arc<std::sync::Mutex<HashSet<i64>>>,
+    job: super::session::BgReviewJob,
+) {
+    tokio::spawn(async move {
+        // Beri jeda singkat agar flag busy giliran selesai dilepas, dan pastikan tidak jalan
+        // bersamaan dengan giliran aktif.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        if busy_chats
+            .lock()
+            .map(|set| set.contains(&chat_id))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let Ok(Ok(Some(outcome))) = tokio::time::timeout(Duration::from_secs(30), job.run(true)).await
+        else {
+            return;
+        };
+        let Some(report) = outcome.report_message else {
+            return;
+        };
+        let html = escape_telegram_html(&report);
+        if outcome.staged_ids.is_empty() {
+            let _ = tg.send_html_message(chat_id, &html, &report).await;
+        } else {
+            let rows: Vec<Vec<(String, String)>> = outcome
+                .staged_ids
+                .iter()
+                .take(4)
+                .map(|id| {
+                    vec![
+                        (format!("Setujui #{id}"), format!("rv:{id}:a")),
+                        (format!("Buang #{id}"), format!("rv:{id}:d")),
+                    ]
+                })
+                .collect();
+            let _ = tg
+                .send_html_message_with_keyboard(chat_id, &html, &report, rows)
+                .await;
+        }
+    });
 }
 

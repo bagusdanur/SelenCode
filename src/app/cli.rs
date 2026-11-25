@@ -51,6 +51,11 @@ pub enum Commands {
     },
     /// Cek kesehatan instalasi, provider, SQLite, Git, LSP, Sandbox, & Telegram
     Doctor,
+    /// Kelola usulan Background Self-Improvement Review (`selen review pending|approve <id>|discard <id>|status`)
+    Review {
+        /// Subperintah: pending, approve <id>, discard <id>, status
+        args: Vec<String>,
+    },
     /// Perbarui selen ke rilis terbaru dari GitHub Releases
     Update,
 }
