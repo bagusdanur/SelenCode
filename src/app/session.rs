@@ -10,7 +10,7 @@ use selencode::providers::router::RouterTelemetry;
 use selencode::providers::{Message, Provider, UnconfiguredProvider};
 use selencode::repl::{
     classify_key_spec, parse_model_action, parse_provider_action, KeySpec, ModelAction,
-    ProviderAction, PROVIDER_PRESETS,
+    ProviderAction,
 };
 use selencode::security::{ApprovalMode, ApprovalPolicy, ApprovalRequest, Approver};
 use selencode::store::Store;

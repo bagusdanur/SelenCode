@@ -1,5 +1,6 @@
 use super::session::Session;
 use anyhow::Result;
+use selencode::agent::context::{calc_context_pct, estimate_tokens, format_context_compact};
 use selencode::agent::run_self_improvement_review;
 use selencode::config;
 use selencode::providers::router::TaskKind;

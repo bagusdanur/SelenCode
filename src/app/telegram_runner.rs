@@ -8,7 +8,7 @@ use selencode::repl::{
     help_menu_markup, parse_model_action, parse_slash_command, strip_menu_markup, ModelAction,
     SlashCommand,
 };
-use selencode::security::ApprovalRequest;
+use selencode::security::{ApprovalMode, ApprovalRequest};
 use selencode::telegram::{TelegramClient, TgApprovalHub};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
