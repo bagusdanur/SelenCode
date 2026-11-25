@@ -100,6 +100,7 @@ jobs:
           REPO="${GITHUB_REPOSITORY}"
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --repo "$REPO" --clobber
+            gh release edit "$TAG" --repo "$REPO" --draft=false --title "$TAG"
           else
             gh release create "$TAG" dist/* --repo "$REPO" --title "$TAG" --generate-notes
           fi
