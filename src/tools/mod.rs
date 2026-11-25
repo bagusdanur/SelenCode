@@ -7,6 +7,7 @@ pub mod search;
 pub mod shell;
 pub mod skill;
 pub mod undo;
+pub mod verify;
 pub mod web;
 
 use crate::config::ShellCfg;
@@ -43,6 +44,10 @@ pub struct Ctx {
     /// Default false di Ctx::new agar tes mock tidak memicu panggilan ekstra;
     /// Session::build mengisinya dari `cfg.agent.auto_skills` (default true).
     pub auto_skills: bool,
+    /// Aktifkan Self-Correction Engine & Automatic Verification Gate setelah edit kode
+    /// (Tahap 1). Default false di Ctx::new agar tes mock lama tidak berubah;
+    /// Session::build mengisinya dari `cfg.agent.self_correct` (default true).
+    pub self_correct: bool,
 }
 
 impl Ctx {
@@ -56,10 +61,15 @@ impl Ctx {
             plan_state: Arc::new(std::sync::Mutex::new(Vec::new())),
             undo_stack: Arc::new(std::sync::Mutex::new(undo::UndoStack::default())),
             auto_skills: false,
+            self_correct: false,
         }
     }
     pub fn with_auto_skills(mut self, enabled: bool) -> Self {
         self.auto_skills = enabled;
+        self
+    }
+    pub fn with_self_correct(mut self, enabled: bool) -> Self {
+        self.self_correct = enabled;
         self
     }
     /// Ganti approver (Fase 4: mode TUI memakai approver berbasis channel).
@@ -195,6 +205,7 @@ pub fn default_registry_with_shell(shell_cfg: &ShellCfg) -> Registry {
         .register(Arc::new(web::FetchUrl))
         .register(Arc::new(plan::UpdatePlan))
         .register(Arc::new(skill::ManageSkill))
+        .register(Arc::new(verify::VerifyProject::new(shell_cfg.timeout_secs)))
 }
 
 /// Registry BACA-SAJA (Fase 6): persis daftar agent::plan::READ_ONLY_TOOLS.

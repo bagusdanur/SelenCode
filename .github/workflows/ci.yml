@@ -58,7 +58,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Jalankan tes di Windows
-        run: cargo test --test moonlit --test tui_app --test update --test nextgen --test fase2 --test fase3 --test fase6 --test loop_mock --test tools_file --test outline
+        run: cargo test --test moonlit --test tui_app --test update --test nextgen --test stage1_reliability --test fase2 --test fase3 --test fase6 --test loop_mock --test tools_file --test outline
       - name: Build preview selen.exe (Windows)
         run: cargo build --release
       - uses: actions/upload-artifact@v4

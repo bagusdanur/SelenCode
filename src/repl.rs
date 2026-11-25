@@ -21,6 +21,12 @@ pub enum SlashCommand {
     Undo,
     /// /redo — terapkan ulang edit/tulis file yang baru di-undo.
     Redo,
+    /// /checkpoint [label] — buat atau lihat daftar checkpoint transaksional.
+    Checkpoint(Option<String>),
+    /// /rollback [id] — pulihkan perubahan SelenCode ke checkpoint terpilih (aman dari konflik eksternal).
+    Rollback(Option<String>),
+    /// /verify [check | test | lint | all] — jalankan validasi proyek otomatis & tampilkan diagnostik.
+    Verify(Option<String>),
     /// /memory | /memory add <teks> | /memory global <teks> | /memory rm <id>
     Memory(Option<String>),
     /// /skills | /skills auto | /skills review | /skills show <nama> | /skills rm <nama>
@@ -113,6 +119,24 @@ pub const COMMANDS: &[CommandDef] = &[
         args: "",
         desc: "terapkan ulang perubahan yang baru di-undo",
         takes_args: false,
+    },
+    CommandDef {
+        cmd: "/checkpoint",
+        args: "[label]",
+        desc: "buat atau lihat daftar checkpoint transaksional",
+        takes_args: true,
+    },
+    CommandDef {
+        cmd: "/rollback",
+        args: "[id]",
+        desc: "pulihkan perubahan SelenCode ke checkpoint (aman konflik)",
+        takes_args: true,
+    },
+    CommandDef {
+        cmd: "/verify",
+        args: "[check / test / lint]",
+        desc: "validasi otomatis proyek & ekstrak error terstruktur",
+        takes_args: true,
     },
     CommandDef {
         cmd: "/memory",
@@ -239,6 +263,9 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/telegram" | "/tg" => SlashCommand::Telegram(rest),
         "/undo" => SlashCommand::Undo,
         "/redo" => SlashCommand::Redo,
+        "/checkpoint" | "/cp" => SlashCommand::Checkpoint(rest),
+        "/rollback" => SlashCommand::Rollback(rest),
+        "/verify" => SlashCommand::Verify(rest),
         "/memory" => SlashCommand::Memory(rest),
         "/skills" => SlashCommand::Skills(rest),
         "/skill" => SlashCommand::Skill(rest),

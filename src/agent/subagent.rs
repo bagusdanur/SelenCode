@@ -51,6 +51,7 @@ pub async fn run_subagent(
         plan_state: Arc::new(Mutex::new(Vec::<PlanStep>::new())),
         undo_stack: parent_ctx.undo_stack.clone(),
         auto_skills: false,
+        self_correct: false,
     };
     let mut messages = vec![Message::text(
         Role::System,

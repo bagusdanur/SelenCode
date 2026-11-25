@@ -232,6 +232,7 @@ impl Session {
             .with_approver(approver)
             .with_context_limit(init_ctx_limit)
             .with_auto_skills(cfg.agent.auto_skills)
+            .with_self_correct(cfg.agent.self_correct)
             .with_store(store.clone(), session_id.clone());
         // Delegate (Fase 6): subagent memakai provider sesi saat build;
         // ganti provider via /model TIDAK mengganti provider subagent
@@ -1151,6 +1152,84 @@ impl Session {
         }
     }
 
+    fn handle_checkpoint(&self, arg: Option<&str>) -> Result<String> {
+        let mut stack = self.ctx.undo_stack.lock().expect("undo_stack poisoned");
+        let label = arg.map(|s| s.trim()).filter(|s| !s.is_empty());
+        if let Some(lbl) = label {
+            if !lbl.eq_ignore_ascii_case("list") && !lbl.eq_ignore_ascii_case("ls") {
+                let id = stack.begin_checkpoint(lbl.to_string());
+                return Ok(format!(
+                    "# Checkpoint Transaksional Dibuat (#{id})\n\
+                     * #{id} | {lbl} | titik aman aktif\n\
+                     ! Gunakan `/rollback {id}` kapan saja untuk memulihkan perubahan SelenCode ke titik ini."
+                ));
+            }
+        }
+        let cps = stack.list_checkpoints();
+        if cps.is_empty() {
+            return Ok(
+                "# Daftar Checkpoint\n\
+                 ! Belum ada checkpoint tersimpan.\n\
+                 ! Buat manual: /checkpoint <label>   (atau otomatis dibuat di awal giliran edit kode)"
+                    .to_string(),
+            );
+        }
+        let mut out = format!("# Daftar Checkpoint ({} tersimpan)\n", cps.len());
+        for (cp, count) in cps.iter().rev().take(15) {
+            out.push_str(&format!(
+                "> #{} | {} | {} · {} perubahan sejak titik ini\n",
+                cp.id, cp.label, cp.created_at, count
+            ));
+        }
+        out.push_str("---\n");
+        out.push_str("! Rollback ke checkpoint: /rollback <id>   |   Buat baru: /checkpoint <label>");
+        Ok(out)
+    }
+
+    fn handle_rollback(&self, arg: Option<&str>) -> Result<String> {
+        let target_id = match arg.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            Some(s) => {
+                let clean = s.trim_start_matches('#');
+                let n = clean
+                    .parse::<usize>()
+                    .map_err(|_| anyhow::anyhow!("ID checkpoint tidak valid: '{s}'. Contoh: /rollback 1"))?;
+                Some(n)
+            }
+            None => None,
+        };
+        let mut stack = self.ctx.undo_stack.lock().expect("undo_stack poisoned");
+        let report = stack.rollback_to(target_id)?;
+        let mut out = format!(
+            "# Rollback ke Checkpoint #{} ({})\n",
+            report.checkpoint_id, report.label
+        );
+        if report.restored.is_empty() {
+            out.push_str("> status | 0 file dipulihkan | tidak ada perubahan SelenCode sejak checkpoint ini\n");
+        } else {
+            for item in &report.restored {
+                out.push_str(&format!("* pulih | {item} |\n"));
+            }
+        }
+        if !report.skipped_conflicts.is_empty() {
+            out.push_str("---\n");
+            for c in &report.skipped_conflicts {
+                out.push_str(&format!("! dilewati (konflik eksternal): {c}\n"));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn handle_verify(&self, arg: Option<&str>) -> Result<String> {
+        let scope = arg.map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or("all");
+        let report = selencode::tools::verify::run_verify_plan(
+            &self.ctx.cwd,
+            scope,
+            self.cfg.shell.timeout_secs.max(120),
+        )
+        .await?;
+        Ok(report.format_menu_card())
+    }
+
     fn providers_menu(&self) -> String {
         let mut out = format!(
             "# Manajemen Provider (config: {})\n",
@@ -1813,6 +1892,30 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
+            TuiCommand::Checkpoint(arg) => match s.handle_checkpoint(arg.as_deref()) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::Rollback(arg) => match s.handle_rollback(arg.as_deref()) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::Verify(arg) => match s.handle_verify(arg.as_deref()).await {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
             TuiCommand::Memory(arg) => match s.handle_memory(arg.as_deref()) {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
@@ -2221,6 +2324,18 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                 Err(e) => eprintln!("[error] {e}"),
             },
             SlashCommand::Redo => match s.handle_redo() {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Checkpoint(arg) => match s.handle_checkpoint(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Rollback(arg) => match s.handle_rollback(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Verify(arg) => match s.handle_verify(arg.as_deref()).await {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
@@ -2775,6 +2890,24 @@ async fn handle_telegram_chat_message(
         }
         SlashCommand::Redo => {
             let reply = s.handle_redo()?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Checkpoint(arg) => {
+            let reply = s.handle_checkpoint(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Rollback(arg) => {
+            let reply = s.handle_rollback(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Verify(arg) => {
+            let reply = s.handle_verify(arg.as_deref()).await?;
             tg.send_long_message(chat_id, &strip_menu_markup(&reply))
                 .await?;
             return Ok(());

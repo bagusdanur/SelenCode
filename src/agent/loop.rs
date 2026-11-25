@@ -10,6 +10,7 @@ use super::context::{
     auto_outline, build_system_prompt, compact_messages, estimate_tokens, expand_at_mentions,
     format_memories_section, needs_compaction,
 };
+use super::corrector::{LoopGuard, SelfCorrectState};
 use super::plan::{is_read_only, TurnMode, PLAN_NOTE};
 use super::ui::UiEvent;
 
@@ -201,6 +202,19 @@ async fn run_turn_inner(
     let mut have_usage = false;
     let mut tool_calls_executed = 0usize;
     let mut skill_touched_in_turn = false;
+    let turn_checkpoint_id = if ctx.self_correct && mode == TurnMode::Execute {
+        let short_label: String = user_prompt.trim().chars().take(40).collect();
+        let label = if short_label.is_empty() {
+            "giliran agent".to_string()
+        } else {
+            format!("giliran: {short_label}")
+        };
+        ctx.undo_stack.lock().ok().map(|mut st| st.begin_checkpoint(label))
+    } else {
+        None
+    };
+    let mut loop_guard = LoopGuard::new();
+    let mut corrector = SelfCorrectState::new(turn_checkpoint_id);
 
     for step in 0..max_steps {
         // Compaction konteks (Fase 2): ringkas riwayat lama bila estimasi
@@ -301,6 +315,44 @@ async fn run_turn_inner(
         }
 
         if reply.tool_calls.is_empty() {
+            // Self-Correction Gate (Tahap 1): bila file kode baru diubah tetapi belum
+            // diverifikasi (atau verifikasi terakhir gagal), arahkan agent memverifikasi
+            // & memperbaiki sebelum menyatakan selesai (maks MAX_REPAIR_ATTEMPTS siklus).
+            if ctx.self_correct && mode == TurnMode::Execute {
+                if let Some(gate_msg) = corrector.completion_gate(max_steps.saturating_sub(step + 1)) {
+                    let info = format!(
+                        "✦ Self-correction ({}/{}): memverifikasi perubahan sebelum selesai…",
+                        corrector.repair_attempts,
+                        super::corrector::MAX_REPAIR_ATTEMPTS
+                    );
+                    match &ui {
+                        Some(tx) => {
+                            let _ = tx.send(UiEvent::Info(info)).await;
+                        }
+                        None => eprintln!("[selen] {info}"),
+                    }
+                    messages.push(Message::text(Role::User, gate_msg));
+                    continue;
+                }
+            }
+            if let Some(cp_id) = turn_checkpoint_id {
+                if corrector.edited_files.is_empty() {
+                    if let Ok(mut st) = ctx.undo_stack.lock() {
+                        st.discard_empty_checkpoint(cp_id);
+                    }
+                } else {
+                    let note = format!(
+                        "✦ Checkpoint #{cp_id} tersimpan ({} file diubah · /rollback {cp_id} untuk batalkan)",
+                        corrector.edited_files.len()
+                    );
+                    match &ui {
+                        Some(tx) => {
+                            let _ = tx.send(UiEvent::Info(note)).await;
+                        }
+                        None => eprintln!("[selen] {note}"),
+                    }
+                }
+            }
             // Self-improvement review otonom (ala Hermes Agent): bila giliran
             // kerja substansial (>= 3 tool call), evaluasi singkat apakah perlu
             // create/patch skill di `.selencode/skills/`.
@@ -371,7 +423,7 @@ async fn run_turn_inner(
             // tidak pernah ditampilkan mentah ke user lokal oleh loop (hanya
             // nama tool di stderr / ringkasan teredaksi di TUI), jadi redaksi
             // di sini murni melindungi sisi provider.
-            let (content, is_error) =
+            let (mut content, is_error) =
                 if mode == TurnMode::Plan && !is_read_only(&call.name) {
                     // Penegakan plan mode (Fase 6): model tetap memanggil
                     // tool menulis (halusinasi) -> tolak TANPA menjalankan.
@@ -392,6 +444,18 @@ async fn run_turn_inner(
                         None => (format!("ERROR: tool '{}' tidak dikenal", call.name), true),
                     }
                 };
+            corrector.observe_tool(&call.name, &call.args, &content, is_error);
+            if let Some(warn) = loop_guard.record(&call.name, &call.args, is_error).hint_message() {
+                content.push_str("\n\n");
+                content.push_str(&warn);
+                let note = format!("✦ Loop/stagnasi terdeteksi pada `{}` — meminta strategi baru…", call.name);
+                match &ui {
+                    Some(tx) => {
+                        let _ = tx.send(UiEvent::Info(note)).await;
+                    }
+                    None => eprintln!("[selen] {note}"),
+                }
+            }
             if let Some(tx) = &ui {
                 let _ = tx
                     .send(UiEvent::ToolDone {
@@ -457,6 +521,13 @@ async fn run_turn_inner(
                         .await;
                 }
                 None => eprintln!("[selen] max_steps ({max_steps}) tercapai — berhenti."),
+            }
+        }
+    }
+    if let Some(cp_id) = turn_checkpoint_id {
+        if corrector.edited_files.is_empty() {
+            if let Ok(mut st) = ctx.undo_stack.lock() {
+                st.discard_empty_checkpoint(cp_id);
             }
         }
     }

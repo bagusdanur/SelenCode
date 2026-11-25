@@ -1,4 +1,5 @@
 pub mod context;
+pub mod corrector;
 pub mod plan;
 pub mod review;
 pub mod subagent;

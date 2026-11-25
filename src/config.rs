@@ -154,6 +154,9 @@ pub struct AgentCfg {
     /// Review self-improvement otomatis pasca-giliran kompleks (ala Hermes Agent).
     #[serde(default = "default_auto_skills")]
     pub auto_skills: bool,
+    /// Self-Correction Engine & Automatic Verification Gate setelah edit kode (Tahap 1).
+    #[serde(default = "default_self_correct")]
+    pub self_correct: bool,
 }
 
 impl Default for AgentCfg {
@@ -165,11 +168,16 @@ impl Default for AgentCfg {
             context_limit_tokens: default_context_limit_tokens(),
             max_parallel_subagents: default_max_parallel_subagents(),
             auto_skills: default_auto_skills(),
+            self_correct: default_self_correct(),
         }
     }
 }
 
 fn default_auto_skills() -> bool {
+    true
+}
+
+fn default_self_correct() -> bool {
     true
 }
 

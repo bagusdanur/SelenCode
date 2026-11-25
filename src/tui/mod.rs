@@ -82,6 +82,9 @@ pub enum TuiCommand {
     Telegram(Option<String>),
     Undo,
     Redo,
+    Checkpoint(Option<String>),
+    Rollback(Option<String>),
+    Verify(Option<String>),
     Memory(Option<String>),
     Skills(Option<String>),
     UseSkill(Option<String>),
@@ -1412,6 +1415,19 @@ fn submit(
         }
         SlashCommand::Redo => {
             send_cmd(app, cmd_tx, TuiCommand::Redo);
+        }
+        SlashCommand::Checkpoint(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Checkpoint(arg));
+        }
+        SlashCommand::Rollback(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Rollback(arg));
+        }
+        SlashCommand::Verify(arg) => {
+            if app.busy {
+                app.error("Tunggu giliran saat ini selesai atau gunakan /stop dulu.");
+            } else {
+                send_cmd(app, cmd_tx, TuiCommand::Verify(arg));
+            }
         }
         SlashCommand::Memory(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Memory(arg));
