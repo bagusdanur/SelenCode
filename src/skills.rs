@@ -125,11 +125,11 @@ Gunakan disiplin hemat token ala Hermes Agent (Progressive Disclosure):
 4. Verifikasi CUKUP 1 KALI dengan perintah paling langsung (jalankan program atau test yang sudah ada); bila lulus langsung selesai.
 5. Jangan membuat file test baru, `git init`, atau membaca file di luar ruang lingkup pertanyaan user.";
 
-/// Pasang skill bawaan `hemat-token` ke `.selencode/skills/hemat-token.md`.
+/// Pasang skill bawaan `save-token` ke `.selencode/skills/save-token.md`.
 pub fn install_token_efficiency_skill(cwd: &Path) -> Result<PathBuf> {
     let (path, _, _) = upsert_skill(
         cwd,
-        "hemat-token",
+        "save-token",
         Some("Disiplin hemat token & langkah minimal ala Hermes Agent"),
         TOKEN_EFFICIENCY_SKILL_BODY,
     )?;

@@ -1226,17 +1226,20 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                 }
             }
             out.push_str("---\n");
-            out.push_str("! Pasang skill hemat token: /skills hemat   ·   Review otomatis: /skills review\n");
+            out.push_str("! Pasang skill save token:  /skills save-token   ·   Review otomatis: /skills review\n");
             out.push_str("! Lihat / hapus skill:      /skills show <nama>   ·   /skills rm <nama>\n");
             out.push_str("! Pakai / buat manual:      /skill <nama>   ·   /learn <nama> <instruksi>");
             return Ok(out);
         };
 
-        if arg.eq_ignore_ascii_case("hemat") || arg.eq_ignore_ascii_case("hemat-token") {
+        if arg.eq_ignore_ascii_case("save-token")
+            || arg.eq_ignore_ascii_case("save token")
+            || arg.eq_ignore_ascii_case("save")
+        {
             let p = selencode::skills::install_token_efficiency_skill(&self.ctx.cwd)?;
             return Ok(format!(
-                "# Skill `hemat-token` Terpasang\n\
-                 * lokasi | {} | siap dipakai via `/skill hemat-token`\n\
+                "# Skill `save-token` Terpasang\n\
+                 * lokasi | {} | siap dipakai via `/skill save-token`\n\
                  ! Mengikuti pola Progressive Disclosure Hermes Agent (langkah & pembacaan minimal).",
                 p.display()
             ));

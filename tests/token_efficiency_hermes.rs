@@ -141,11 +141,11 @@ async fn activate_toolset_dynamically_expands_tools_mid_turn() {
     assert_eq!(counts.len(), 2);
     assert!(counts[1] > counts[0] + 6, "jumlah tool harus bertambah setelah aktivasi: {counts:?}");
 
-    // Pastikan skill bawaan `hemat-token` bisa dipasang & dibaca via Tier-2 load_skill!
+    // Pastikan skill bawaan `save-token` bisa dipasang & dibaca via Tier-2 load_skill!
     let p = selencode::skills::install_token_efficiency_skill(&cwd).unwrap();
     assert!(p.is_file());
-    let (info, body) = selencode::skills::load_skill(&cwd, "hemat-token").unwrap();
-    assert_eq!(info.name, "hemat-token");
+    let (info, body) = selencode::skills::load_skill(&cwd, "save-token").unwrap();
+    assert_eq!(info.name, "save-token");
     assert!(body.contains("Progressive Disclosure"));
 
     let _ = std::fs::remove_dir_all(&cwd);
