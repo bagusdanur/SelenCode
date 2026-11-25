@@ -31,6 +31,21 @@ pub enum Commands {
     Resume,
     /// Jalankan Telegram Bot Gateway untuk chat & coding jarak jauh dari Telegram
     Telegram,
+    /// Jalankan Agent Benchmark Engine untuk mengukur & membandingkan kualitas model
+    Bench {
+        /// File JSON suite benchmark kustom (opsional; default memakai suite bawaan 5 kategori)
+        #[arg(long)]
+        suite: Option<String>,
+        /// Filter task berdasarkan ID atau kategori (coding/bug_fix/refactoring/test_gen/tool_usage)
+        #[arg(long)]
+        filter: Option<String>,
+        /// Simpan laporan hasil benchmark ke file JSON (opsional)
+        #[arg(long)]
+        out: Option<String>,
+        /// Tampilkan riwayat perbandingan benchmark tersimpan tanpa menjalankan benchmark baru
+        #[arg(long)]
+        history: bool,
+    },
     /// Perbarui selen ke rilis terbaru dari GitHub Releases
     Update,
 }

@@ -1,3 +1,4 @@
+pub mod bench_runner;
 pub mod cli;
 pub mod commands;
 pub mod plain_runner;

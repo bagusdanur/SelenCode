@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod benchmark;
 pub mod config;
 pub mod context_index;
 pub mod lsp;

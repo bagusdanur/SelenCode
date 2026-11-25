@@ -67,6 +67,21 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Resume) => interactive(cli, true).await,
         Some(Commands::Telegram) => run_telegram_gateway(cli).await,
+        Some(Commands::Bench {
+            suite,
+            filter,
+            out,
+            history,
+        }) => {
+            app::bench_runner::run_bench_cli(
+                cli.provider.as_deref(),
+                suite.as_deref(),
+                filter.as_deref(),
+                out.as_deref(),
+                history,
+            )
+            .await
+        }
         Some(Commands::Update) => selencode::update::run().await,
         None => interactive(cli, false).await,
     }

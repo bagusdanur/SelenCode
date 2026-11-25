@@ -198,6 +198,11 @@ CREATE TABLE IF NOT EXISTS long_tasks (id TEXT PRIMARY KEY, cwd TEXT NOT NULL,
                     tokens_used INT NOT NULL DEFAULT 0,
                     token_budget INT NOT NULL DEFAULT 200000,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS benchmark_runs (id TEXT PRIMARY KEY, ts TEXT NOT NULL,
+                    selen_version TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+                    task_success_rate REAL NOT NULL, test_pass_rate REAL NOT NULL,
+                    regression_rate REAL NOT NULL, total_elapsed_ms INT NOT NULL,
+                    report_json TEXT NOT NULL);
 ";
 
 fn now() -> String {
@@ -664,6 +669,47 @@ impl Store {
         let conn = self.conn.lock().expect("mutex store poisoned");
         let n = conn.execute("DELETE FROM long_tasks WHERE id = ?1", rusqlite::params![id.trim()])?;
         Ok(n > 0)
+    }
+
+    // ---------- Benchmark History Persistence (Fase 4) ----------
+
+    pub fn save_benchmark_run(&self, report: &crate::benchmark::BenchRunReport) -> Result<()> {
+        let json = serde_json::to_string(report)?;
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "INSERT OR REPLACE INTO benchmark_runs \
+             (id, ts, selen_version, provider, model, task_success_rate, test_pass_rate, regression_rate, total_elapsed_ms, report_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                report.run_id,
+                report.timestamp,
+                report.selen_version,
+                report.provider,
+                report.model,
+                report.task_success_rate,
+                report.test_pass_rate,
+                report.regression_rate,
+                report.total_elapsed_ms as i64,
+                json
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_benchmark_runs(&self, limit: usize) -> Result<Vec<crate::benchmark::BenchRunReport>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT report_json FROM benchmark_runs ORDER BY ts DESC, rowid DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let s = r?;
+            if let Ok(rep) = serde_json::from_str::<crate::benchmark::BenchRunReport>(&s) {
+                out.push(rep);
+            }
+        }
+        Ok(out)
     }
 }
 
