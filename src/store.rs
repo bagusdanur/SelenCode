@@ -1478,7 +1478,8 @@ impl Store {
                 "SELECT id, name, schedule_spec, prompt, cwd, allowed_shell_json, allow_write, enabled, chat_id, last_run_at, next_run_at, last_status, last_summary, created_at \
                  FROM cron_jobs WHERE id = ?1",
             )?;
-            if let Some(r) = stmt.query_map(rusqlite::params![id], row_to_cron_job)?.next() {
+            let mut rows = stmt.query_map(rusqlite::params![id], row_to_cron_job)?;
+            if let Some(r) = rows.next() {
                 return Ok(Some(r?));
             }
         }
@@ -1486,10 +1487,12 @@ impl Store {
             "SELECT id, name, schedule_spec, prompt, cwd, allowed_shell_json, allow_write, enabled, chat_id, last_run_at, next_run_at, last_status, last_summary, created_at \
              FROM cron_jobs WHERE LOWER(name) = LOWER(?1)",
         )?;
-        match stmt.query_map(rusqlite::params![key], row_to_cron_job)?.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
-        }
+        let mut rows = stmt.query_map(rusqlite::params![key], row_to_cron_job)?;
+        let found = match rows.next() {
+            Some(r) => Some(r?),
+            None => None,
+        };
+        Ok(found)
     }
 
     pub fn remove_cron_job(&self, name_or_id: &str) -> Result<bool> {
