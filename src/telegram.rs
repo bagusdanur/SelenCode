@@ -183,6 +183,393 @@ pub fn split_telegram_chunks(text: &str, max_chars: usize) -> Vec<String> {
     out
 }
 
+/// Daftar lengkap perintah `/` Telegram yang disinkronkan otomatis lewat `setMyCommands`.
+/// Setiap nama mengikuti aturan resmi Telegram: huruf kecil `a-z`, angka `0-9`, `_` (maks 32 karakter).
+pub const TELEGRAM_BOT_COMMANDS: &[(&str, &str)] = &[
+    ("start", "Mulai & panduan cepat SelenCode"),
+    ("help", "Daftar lengkap semua perintah"),
+    ("status", "Info sesi, provider, & kapasitas konteks"),
+    ("new", "Mulai sesi percakapan baru"),
+    ("resume", "Lihat 10 sesi bernomor & lanjutkan sesi"),
+    ("sessions", "Daftar 10 sesi terakhir di folder ini"),
+    ("model", "Pilih atau kelola model AI"),
+    ("models", "Cari katalog model dari API provider"),
+    ("provider", "Kelola provider AI & API key"),
+    ("approve", "Atur mode persetujuan (ask/edits/auto)"),
+    ("sandbox", "Atur mode & isolasi Security Sandbox v2"),
+    ("verify", "Jalankan cek build, test, & lint proyek"),
+    ("worktree", "Isolasi refactor lewat Git Worktree"),
+    ("checkpoint", "Simpan checkpoint untuk rollback aman"),
+    ("rollback", "Pulihkan perubahan ke checkpoint"),
+    ("undo", "Batalkan edit file terakhir"),
+    ("redo", "Ulangi edit yang dibatalkan"),
+    ("task", "Kelola tugas panjang lintas sesi"),
+    ("jobs", "Pantau proses latar belakang"),
+    ("route", "Info & budget Dynamic Model Routing"),
+    ("lsp", "Diagnostik & navigasi kode LSP"),
+    ("index", "Cari konteks kode repositori"),
+    ("memory", "Kelola memori proyek persisten"),
+    ("skills", "Daftar & cari skill agen"),
+    ("skill", "Aktifkan skill ke percakapan"),
+    ("learn", "Simpan pelajaran jadi skill baru"),
+    ("mcp", "Status server & fitur protokol MCP"),
+    ("doctor", "Cek kesehatan instalasi & lingkungan"),
+    ("compact", "Ringkas riwayat konteks manual"),
+    ("export", "Ekspor percakapan ke Markdown"),
+    ("stop", "Hentikan giliran agent yang berjalan"),
+    ("id", "Tampilkan User ID & Chat ID Telegram"),
+];
+
+/// Escape karakter khusus HTML untuk Telegram `parse_mode: "HTML"`.
+pub fn escape_telegram_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Format inline Markdown (code span, link, bold, strikethrough, italic) ke Telegram HTML aman.
+fn format_inline_md_to_html(line: &str) -> String {
+    // 1. Pisahkan inline `code` terlebih dahulu agar simbol `*` / `_` di dalam kode tidak ikut terformat.
+    let mut result = String::with_capacity(line.len() + 16);
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    let mut i = 0usize;
+    let mut plain_buf = String::new();
+
+    while i < n {
+        if chars[i] == '`' {
+            // Cari penutup backtick pada baris yang sama.
+            if let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == '`') {
+                if !plain_buf.is_empty() {
+                    result.push_str(&format_non_code_inline(&plain_buf));
+                    plain_buf.clear();
+                }
+                let code_str: String = chars[i + 1..i + 1 + rel_end].iter().collect();
+                result.push_str("<code>");
+                result.push_str(&escape_telegram_html(&code_str));
+                result.push_str("</code>");
+                i = i + 2 + rel_end;
+                continue;
+            }
+        }
+        plain_buf.push(chars[i]);
+        i += 1;
+    }
+    if !plain_buf.is_empty() {
+        result.push_str(&format_non_code_inline(&plain_buf));
+    }
+    result
+}
+
+fn format_non_code_inline(s: &str) -> String {
+    let escaped = escape_telegram_html(s);
+    // Link Markdown: [label](https://...)
+    let mut out = String::with_capacity(escaped.len() + 16);
+    let bytes = escaped.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // [label](url)
+        if bytes[i] == b'[' {
+            if let Some(close_br) = escaped[i + 1..].find("](") {
+                let label_start = i + 1;
+                let label_end = label_start + close_br;
+                let url_start = label_end + 2;
+                if let Some(close_par) = escaped[url_start..].find(')') {
+                    let url = &escaped[url_start..url_start + close_par];
+                    if url.starts_with("http://") || url.starts_with("https://") {
+                        let label = &escaped[label_start..label_end];
+                        let safe_url = url.replace('"', "&quot;");
+                        out.push_str(&format!("<a href=\"{safe_url}\">{label}</a>"));
+                        i = url_start + close_par + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // **bold**
+        if escaped[i..].starts_with("**") {
+            if let Some(end) = escaped[i + 2..].find("**") {
+                if end > 0 {
+                    let inner = &escaped[i + 2..i + 2 + end];
+                    out.push_str("<b>");
+                    out.push_str(inner);
+                    out.push_str("</b>");
+                    i = i + 4 + end;
+                    continue;
+                }
+            }
+        }
+        // ~~strike~~
+        if escaped[i..].starts_with("~~") {
+            if let Some(end) = escaped[i + 2..].find("~~") {
+                if end > 0 {
+                    let inner = &escaped[i + 2..i + 2 + end];
+                    out.push_str("<s>");
+                    out.push_str(inner);
+                    out.push_str("</s>");
+                    i = i + 4 + end;
+                    continue;
+                }
+            }
+        }
+        // *italic* (jangan makan spasi segera setelah `*`)
+        if bytes[i] == b'*' && !escaped[i..].starts_with("**") {
+            if let Some(next_ch) = escaped[i + 1..].chars().next() {
+                if !next_ch.is_whitespace() {
+                    if let Some(end) = escaped[i + 1..].find('*') {
+                        let inner = &escaped[i + 1..i + 1 + end];
+                        if !inner.is_empty() && !inner.ends_with(char::is_whitespace) {
+                            out.push_str("<i>");
+                            out.push_str(inner);
+                            out.push_str("</i>");
+                            i = i + 2 + end;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        let ch = escaped[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Konversi jawaban Markdown LLM menjadi Telegram HTML yang rapi, terstruktur, & mudah dibaca di HP.
+pub fn markdown_to_telegram_html(md: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_code = false;
+    let mut code_lang = String::new();
+    let mut code_lines: Vec<String> = Vec::new();
+    let mut quote_lines: Vec<String> = Vec::new();
+
+    let flush_quote = |quotes: &mut Vec<String>, dst: &mut Vec<String>| {
+        if !quotes.is_empty() {
+            dst.push(format!("<blockquote>{}</blockquote>", quotes.join("\n")));
+            quotes.clear();
+        }
+    };
+
+    for raw_line in md.lines() {
+        let trimmed = raw_line.trim();
+        if let Some(fence_rest) = trimmed.strip_prefix("```") {
+            flush_quote(&mut quote_lines, &mut out);
+            if in_code {
+                let body = escape_telegram_html(&code_lines.join("\n"));
+                if code_lang.is_empty() {
+                    out.push(format!("<pre><code>{body}</code></pre>"));
+                } else {
+                    let lang = escape_telegram_html(&code_lang);
+                    out.push(format!("<pre><code class=\"language-{lang}\">{body}</code></pre>"));
+                }
+                code_lines.clear();
+                code_lang.clear();
+                in_code = false;
+            } else {
+                code_lang = fence_rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '+')
+                    .collect();
+                in_code = true;
+            }
+            continue;
+        }
+
+        if in_code {
+            code_lines.push(raw_line.to_string());
+            continue;
+        }
+
+        // Blockquote `> ...`
+        if let Some(q) = trimmed.strip_prefix("> ") {
+            quote_lines.push(format_inline_md_to_html(q));
+            continue;
+        } else if trimmed == ">" {
+            quote_lines.push(String::new());
+            continue;
+        } else {
+            flush_quote(&mut quote_lines, &mut out);
+        }
+
+        // Garis pemisah horizontal (`---`, `***`, `___`)
+        if trimmed.len() >= 3
+            && (trimmed.chars().all(|c| c == '-')
+                || trimmed.chars().all(|c| c == '*')
+                || trimmed.chars().all(|c| c == '_'))
+        {
+            out.push("──────────────".to_string());
+            continue;
+        }
+
+        // Heading Markdown (`#`, `##`, `###`, `####`) -> judul tebal rapi tanpa `###` mentah.
+        if trimmed.starts_with('#') {
+            let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+            if hashes <= 6 {
+                let rest = trimmed[hashes..].trim();
+                if !rest.is_empty() {
+                    let icon = if hashes == 1 { "📌 " } else { "▸ " };
+                    out.push(format!("{icon}<b>{}</b>", format_inline_md_to_html(rest)));
+                    continue;
+                }
+            }
+        }
+
+        // Daftar bullet (`- ...` atau `* ...`, termasuk nested)
+        let indent = raw_line.chars().take_while(|&c| c == ' ').count();
+        let after_indent = &raw_line[indent..];
+        if let Some(item) = after_indent
+            .strip_prefix("- ")
+            .or_else(|| after_indent.strip_prefix("* "))
+        {
+            let bullet = if indent >= 2 { "  ◦ " } else { "• " };
+            out.push(format!("{bullet}{}", format_inline_md_to_html(item)));
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            // Cegah baris kosong bertumpuk berlebihan.
+            if out.last().map(|s| !s.is_empty()).unwrap_or(false) {
+                out.push(String::new());
+            }
+            continue;
+        }
+
+        out.push(format_inline_md_to_html(raw_line));
+    }
+
+    flush_quote(&mut quote_lines, &mut out);
+    if in_code {
+        let body = escape_telegram_html(&code_lines.join("\n"));
+        out.push(format!("<pre><code>{body}</code></pre>"));
+    }
+
+    out.join("\n").trim().to_string()
+}
+
+/// Konversi kartu menu SelenCode (`# Judul`, `* a | b | c`, `> a | b | c`, `---`, `! catatan`)
+/// menjadi kartu HTML Telegram yang bersih, rapi, dan enak dibaca di layar HP.
+pub fn menu_markup_to_telegram_html(markup: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for raw in markup.lines() {
+        let t = raw.trim();
+        if t.is_empty() {
+            if out.last().map(|s| !s.is_empty()).unwrap_or(false) {
+                out.push(String::new());
+            }
+            continue;
+        }
+        if let Some(title) = t.strip_prefix("# ") {
+            out.push(format!("🌙 <b>{}</b>", escape_telegram_html(title.trim())));
+            continue;
+        }
+        if t == "---" {
+            out.push("──────────────".to_string());
+            continue;
+        }
+        if let Some(note) = t.strip_prefix("! ") {
+            out.push(format!("💡 <i>{}</i>", format_inline_md_to_html(note.trim())));
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("* ").or_else(|| t.strip_prefix("> ")) {
+            let icon = if t.starts_with("* ") { "✦" } else { "•" };
+            let cols: Vec<&str> = rest.split('|').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            match cols.as_slice() {
+                [c1] => out.push(format!("{icon} <b>{}</b>", escape_telegram_html(c1))),
+                [c1, c2] => out.push(format!(
+                    "{icon} <b>{}</b> — {}",
+                    escape_telegram_html(c1),
+                    escape_telegram_html(c2)
+                )),
+                [c1, c2, rest_cols @ ..] => {
+                    let tail = rest_cols.join(" · ");
+                    out.push(format!(
+                        "{icon} <b>{}</b> — {}\n   <i>{}</i>",
+                        escape_telegram_html(c1),
+                        escape_telegram_html(c2),
+                        escape_telegram_html(&tail)
+                    ));
+                }
+                _ => out.push(format!("{icon} {}", escape_telegram_html(rest))),
+            }
+            continue;
+        }
+        out.push(format_inline_md_to_html(raw));
+    }
+    out.join("\n").trim().to_string()
+}
+
+/// Pecah teks Markdown panjang menjadi potongan <= `max_chars` karakter dengan tetap
+/// menutup & membuka ulang pagar blok kode ```` ``` ```` bila pemotongan jatuh di tengah blok kode.
+pub fn split_markdown_for_telegram(md: &str, max_chars: usize) -> Vec<String> {
+    let limit = max_chars.max(256);
+    let trimmed = md.trim();
+    if trimmed.is_empty() {
+        return vec!["(selesai tanpa output teks)".to_string()];
+    }
+    if trimmed.chars().count() <= limit {
+        return vec![trimmed.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let mut cur_chars = 0usize;
+    let mut open_fence: Option<String> = None;
+
+    for line in trimmed.split_inclusive('\n') {
+        let line_trim = line.trim();
+        let line_chars = line.chars().count();
+        // Sisakan ruang cadangan 32 char untuk penutup fence bila diperlukan.
+        if cur_chars + line_chars + 32 > limit && !cur.trim().is_empty() {
+            if open_fence.is_some() {
+                if !cur.ends_with('\n') {
+                    cur.push('\n');
+                }
+                cur.push_str("```");
+            }
+            chunks.push(cur.trim_end().to_string());
+            cur.clear();
+            cur_chars = 0;
+            if let Some(ref lang) = open_fence {
+                let reopen = format!("```{lang}\n");
+                cur_chars = reopen.chars().count();
+                cur.push_str(&reopen);
+            }
+        }
+        if let Some(rest) = line_trim.strip_prefix("```") {
+            if open_fence.is_some() {
+                open_fence = None;
+            } else {
+                open_fence = Some(rest.trim().to_string());
+            }
+        }
+        if line_chars > limit {
+            for part in split_telegram_chunks(line, limit.saturating_sub(32)) {
+                chunks.push(part);
+            }
+            continue;
+        }
+        cur.push_str(line);
+        cur_chars += line_chars;
+    }
+    if !cur.trim().is_empty() {
+        chunks.push(cur.trim_end().to_string());
+    }
+    if chunks.is_empty() {
+        chunks.push("(selesai tanpa output teks)".to_string());
+    }
+    chunks
+}
+
 /// Potong string aman UTF-8 maksimal `max_chars` karakter.
 pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     let count = s.chars().count();
@@ -217,6 +604,24 @@ pub struct TgChat {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct TgPhotoSize {
+    pub file_id: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TgFileInfo {
+    pub file_id: String,
+    #[serde(default)]
+    pub file_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct TgMessage {
     pub message_id: i64,
     pub chat: TgChat,
@@ -224,6 +629,10 @@ pub struct TgMessage {
     pub from: Option<TgUser>,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub caption: Option<String>,
+    #[serde(default)]
+    pub photo: Vec<TgPhotoSize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -313,6 +722,41 @@ impl TelegramClient {
         self.post_json("getMe", json!({})).await
     }
 
+    /// Sinkronkan daftar lengkap menu perintah `/` ke Telegram Bot API (`setMyCommands`)
+    /// agar pengguna langsung melihat seluruh perintah SelenCode saat mengetik `/` di Telegram.
+    pub async fn sync_bot_commands(&self) -> Result<()> {
+        let commands: Vec<Value> = TELEGRAM_BOT_COMMANDS
+            .iter()
+            .map(|(cmd, desc)| json!({ "command": cmd, "description": desc }))
+            .collect();
+        let _: Value = self
+            .post_json("setMyCommands", json!({ "commands": commands }))
+            .await?;
+        Ok(())
+    }
+
+    /// Ambil metadata file Telegram (`getFile`) untuk mengunduh foto/lampiran pengguna.
+    pub async fn get_file(&self, file_id: &str) -> Result<TgFileInfo> {
+        self.post_json("getFile", json!({ "file_id": file_id })).await
+    }
+
+    /// Unduh byte mentah file Telegram berdasarkan `file_path` dari `getFile`.
+    pub async fn download_file_bytes(&self, file_path: &str) -> Result<Vec<u8>> {
+        let url = format!("https://api.telegram.org/file/bot{}/{file_path}", self.token);
+        let resp = self.http.get(&url).send().await.map_err(|e| {
+            let clean = redact_tg_token(&e.without_url().to_string(), &self.token);
+            anyhow!("gagal mengunduh file Telegram: {clean}")
+        })?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("unduh file Telegram ditolak (HTTP {})", resp.status()));
+        }
+        let bytes = resp.bytes().await.map_err(|e| {
+            let clean = redact_tg_token(&e.without_url().to_string(), &self.token);
+            anyhow!("gagal membaca byte file Telegram: {clean}")
+        })?;
+        Ok(bytes.to_vec())
+    }
+
     pub async fn get_updates(&self, offset: i64, timeout_secs: u64) -> Result<Vec<TgUpdate>> {
         self.post_json(
             "getUpdates",
@@ -336,6 +780,71 @@ impl TelegramClient {
             )
             .await?;
         Ok(msg.message_id)
+    }
+
+    /// Kirim pesan berformat Telegram HTML dengan fallback otomatis ke teks polos bila HTML ditolak.
+    pub async fn send_html_message(
+        &self,
+        chat_id: i64,
+        html: &str,
+        plain_fallback: &str,
+    ) -> Result<i64> {
+        let res: Result<TgMessage> = self
+            .post_json(
+                "sendMessage",
+                json!({
+                    "chat_id": chat_id,
+                    "text": html,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": true,
+                }),
+            )
+            .await;
+        match res {
+            Ok(msg) => Ok(msg.message_id),
+            Err(_) => self.send_message(chat_id, plain_fallback).await,
+        }
+    }
+
+    /// Kirim teks Markdown panjang secara rapi sebagai Telegram HTML (terpecah aman per chunk + fallback).
+    pub async fn send_long_markdown(&self, chat_id: i64, markdown: &str) -> Result<()> {
+        // Sisakan margin karena tag HTML (`<b>`, `<code>`, `&amp;`) memperpanjang teks sedikit.
+        for chunk in split_markdown_for_telegram(markdown, 3200) {
+            let html = markdown_to_telegram_html(&chunk);
+            if html.chars().count() <= 4050 {
+                self.send_html_message(chat_id, &html, &chunk).await?;
+            } else {
+                for sub in split_telegram_chunks(&chunk, TELEGRAM_MAX_CHARS) {
+                    let sub_html = markdown_to_telegram_html(&sub);
+                    if sub_html.chars().count() <= 4050 {
+                        self.send_html_message(chat_id, &sub_html, &sub).await?;
+                    } else {
+                        self.send_message(chat_id, &sub).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Kirim kartu menu SelenCode sebagai kartu Telegram HTML rapi (otomatis terpecah & fallback aman).
+    pub async fn send_menu_markup(&self, chat_id: i64, markup: &str) -> Result<()> {
+        let plain = crate::repl::strip_menu_markup(markup);
+        let html = menu_markup_to_telegram_html(markup);
+        if html.chars().count() <= 4050 {
+            self.send_html_message(chat_id, &html, &plain).await?;
+            return Ok(());
+        }
+        for chunk in split_telegram_chunks(markup, 2800) {
+            let chunk_html = menu_markup_to_telegram_html(&chunk);
+            let chunk_plain = crate::repl::strip_menu_markup(&chunk);
+            if chunk_html.chars().count() <= 4050 {
+                self.send_html_message(chat_id, &chunk_html, &chunk_plain).await?;
+            } else {
+                self.send_message(chat_id, &chunk_plain).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Kirim pesan panjang secara otomatis terpecah agar tidak melewati batas 4096 karakter.

@@ -91,6 +91,7 @@ pub enum TuiCommand {
     Rollback(Option<String>),
     Worktree(Option<String>),
     McpStatus,
+    Doctor,
     Verify(Option<String>),
     Index(Option<String>),
     Jobs(Option<String>),
@@ -1708,6 +1709,9 @@ fn submit(
         }
         SlashCommand::Mcp => {
             send_cmd(app, cmd_tx, TuiCommand::McpStatus);
+        }
+        SlashCommand::Doctor => {
+            send_cmd(app, cmd_tx, TuiCommand::Doctor);
         }
         SlashCommand::Verify(arg) => {
             if app.busy {

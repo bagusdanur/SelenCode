@@ -2,8 +2,17 @@ use crate::providers::{Block, Message, Role};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+#[derive(Debug, Clone)]
+struct PendingSessionMeta {
+    cwd: String,
+    provider: String,
+    model: String,
+    title: String,
+}
 
 /// Penyimpanan sesi SQLite (Fase 3, Blueprint Bagian 9).
 /// Skema persis blueprint: sessions / messages / usage.
@@ -12,6 +21,9 @@ use std::sync::Mutex;
 /// tool sudah teredaksi sebelum masuk pesan, lihat agent/loop.rs).
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Metadata sesi interaktif baru yang belum memiliki pesan (lazy persistence:
+    /// baru ditulis ke SQLite saat pesan/usage pertama benar-benar disimpan).
+    pending_sessions: Mutex<HashMap<String, PendingSessionMeta>>,
 }
 
 #[derive(Debug, Clone)]
@@ -244,7 +256,8 @@ CREATE TABLE IF NOT EXISTS model_perf (route_id TEXT NOT NULL, task_kind TEXT NO
 ";
 
 fn now() -> String {
-    chrono::Utc::now().to_rfc3339()
+    // Presisi nanodetik tetap (UTC Z) agar pengurutan ORDER BY created_at DESC 100% deterministik.
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
 fn role_str(r: Role) -> &'static str {
@@ -332,7 +345,83 @@ impl Store {
         migrate_memories_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            pending_sessions: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Daftarkan sesi interaktif baru secara lazy (belum menulis row kosong ke SQLite
+    /// sampai pesan/usage pertama dikirim — mencegah daftar `/resume` penuh sesi `0 msg`).
+    pub fn register_lazy_session(
+        &self,
+        cwd: &str,
+        provider: &str,
+        model: &str,
+        title: &str,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        if let Ok(mut pending) = self.pending_sessions.lock() {
+            pending.insert(
+                id.clone(),
+                PendingSessionMeta {
+                    cwd: cwd.to_string(),
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    title: title.to_string(),
+                },
+            );
+        }
+        id
+    }
+
+    /// Pastikan sesi lazy sudah tercatat di tabel `sessions` sebelum menyimpan pesan/usage/judul.
+    fn materialize_if_pending(&self, conn: &Connection, session_id: &str) -> Result<()> {
+        let meta = self
+            .pending_sessions
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(session_id));
+        if let Some(m) = meta {
+            conn.execute(
+                "INSERT OR IGNORE INTO sessions (id, cwd, provider, model, created_at, title) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![session_id, m.cwd, m.provider, m.model, now(), m.title],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Hapus 1 sesi beserta seluruh pesan & catatan usage-nya dari SQLite.
+    pub fn delete_session(&self, session_id: &str) -> Result<bool> {
+        if let Ok(mut pending) = self.pending_sessions.lock() {
+            if pending.remove(session_id).is_some() {
+                return Ok(true);
+            }
+        }
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        conn.execute(
+            "DELETE FROM usage WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        let n = conn.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Bersihkan sesi kosong lama (`0 msg` dengan judul placeholder) agar daftar `/resume` rapi.
+    pub fn prune_empty_sessions(&self, cwd: &str, keep_session_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let n = conn.execute(
+            "DELETE FROM sessions WHERE cwd = ?1 AND id != ?2 \
+             AND (title = '' OR title = '(sesi baru)') \
+             AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = sessions.id)",
+            rusqlite::params![cwd, keep_session_id],
+        )?;
+        Ok(n)
     }
 
     /// Buat sesi baru; mengembalikan id sesi (uuid).
@@ -354,6 +443,13 @@ impl Store {
 
     /// Perbarui provider/model sesi (dipakai perintah /model).
     pub fn update_session_provider(&self, session_id: &str, provider: &str, model: &str) -> Result<()> {
+        if let Ok(mut pending) = self.pending_sessions.lock() {
+            if let Some(m) = pending.get_mut(session_id) {
+                m.provider = provider.to_string();
+                m.model = model.to_string();
+                return Ok(());
+            }
+        }
         let conn = self.conn.lock().expect("mutex store poisoned");
         conn.execute(
             "UPDATE sessions SET provider = ?2, model = ?3 WHERE id = ?1",
@@ -369,6 +465,7 @@ impl Store {
             return Ok(());
         }
         let conn = self.conn.lock().expect("mutex store poisoned");
+        self.materialize_if_pending(&conn, session_id)?;
         conn.execute(
             "UPDATE sessions SET title = ?2 WHERE id = ?1",
             rusqlite::params![session_id, clean],
@@ -390,6 +487,7 @@ impl Store {
     pub fn save_message(&self, session_id: &str, msg: &Message) -> Result<()> {
         let content = blocks_to_json(&msg.content);
         let conn = self.conn.lock().expect("mutex store poisoned");
+        self.materialize_if_pending(&conn, session_id)?;
         conn.execute(
             "INSERT INTO messages (session_id, role, content, ts) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![session_id, role_str(msg.role), content, now()],
@@ -556,6 +654,7 @@ impl Store {
         output_tokens: u64,
     ) -> Result<()> {
         let conn = self.conn.lock().expect("mutex store poisoned");
+        self.materialize_if_pending(&conn, session_id)?;
         conn.execute(
             "INSERT INTO usage (session_id, model, input_tokens, output_tokens, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![session_id, model, input_tokens as i64, output_tokens as i64, now()],

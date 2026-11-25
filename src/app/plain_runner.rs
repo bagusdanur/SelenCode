@@ -180,6 +180,9 @@ pub(crate) async fn interactive_plain(
             SlashCommand::Mcp => {
                 println!("{}", strip_menu_markup(&s.handle_mcp_status()));
             }
+            SlashCommand::Doctor => {
+                println!("{}", strip_menu_markup(&s.handle_doctor()));
+            }
             SlashCommand::Verify(arg) => match s.handle_verify(arg.as_deref()).await {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),

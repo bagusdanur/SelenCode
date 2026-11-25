@@ -82,6 +82,14 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Commands::Doctor) => {
+            let s = Session::build(cli.provider.as_deref(), cli.yes, false, None, None, true).await?;
+            println!(
+                "{}",
+                selencode::repl::strip_menu_markup(&s.handle_doctor())
+            );
+            Ok(())
+        }
         Some(Commands::Update) => selencode::update::run().await,
         None => interactive(cli, false, None).await,
     }

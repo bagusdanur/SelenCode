@@ -5,11 +5,13 @@ use selencode::agent::context::sanitize_interrupted_messages;
 use selencode::agent::{run_turn_counted, run_turn_ui, UiEvent};
 use selencode::config;
 use selencode::repl::{
-    help_menu_markup, parse_model_action, parse_slash_command, strip_menu_markup, ModelAction,
-    SlashCommand,
+    help_menu_markup, parse_model_action, parse_slash_command, ModelAction, SlashCommand,
 };
 use selencode::security::{ApprovalMode, ApprovalRequest};
-use selencode::telegram::{TelegramClient, TgApprovalHub};
+use selencode::telegram::{
+    escape_telegram_html, markdown_to_telegram_html, TelegramClient, TgApprovalHub,
+    TELEGRAM_BOT_COMMANDS,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -70,6 +72,15 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
         println!("  Whitelist: {}", ids.join(", "));
     }
     println!("  Tekan Ctrl+C untuk menghentikan gateway.\n");
+
+    // Sinkronkan seluruh daftar perintah `/` ke tombol menu Telegram (`setMyCommands`) secara otomatis.
+    match tg.sync_bot_commands().await {
+        Ok(()) => println!(
+            "  Menu `/` : {} perintah berhasil disinkronkan ke Telegram.",
+            TELEGRAM_BOT_COMMANDS.len()
+        ),
+        Err(e) => eprintln!("  [peringatan] gagal sinkronkan menu `/` Telegram: {e}"),
+    }
 
     let hub = TgApprovalHub::new();
     let sessions: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>> =
@@ -329,40 +340,47 @@ async fn handle_telegram_chat_message(
 
     // Perintah khusus Telegram (/start, /status).
     if text.eq_ignore_ascii_case("/start") {
-        let msg = format!(
-            "☾ Halo! Aku Selena dari SelenCode.\n\
-             Provider: {} / {}\n\
-             Folder: {}\n\n\
-             Kirim pesan coding apa saja langsung di chat ini!\n\
-             Perintah cepat:\n\
-             • /model — lihat daftar model bernomor\n\
-             • /model 2 · /model add <id> · /model clear\n\
-             • /models [cari] — intip katalog API\n\
-             • /approve [ask|edits|auto] — atur mode izin\n\
-             • /new — mulai sesi baru · /status — info sesi\n\
-             • /help — semua perintah",
+        let start_html = format!(
+            "🌙 <b>Selena — SelenCode v{}</b>\n\
+             ──────────────\n\
+             ✦ <b>Provider:</b> <code>{}</code> / <code>{}</code>\n\
+             ✦ <b>Folder:</b> <code>{}</code>\n\n\
+             Kirim pesan coding apa saja langsung di chat ini!\n\n\
+             ▸ <b>Perintah Populer</b>\n\
+             • /resume — 10 sesi terakhir bernomor &amp; lanjutkan sesi\n\
+             • /model — pilih atau kelola model AI\n\
+             • /verify — cek build, test, &amp; lint proyek\n\
+             • /worktree — isolasi refactor aman pakai Git Worktree\n\
+             • /sandbox · /approve — atur keamanan &amp; izin tool\n\
+             • /doctor · /mcp · /route — diagnostik &amp; status sistem\n\
+             • /help — semua perintah lengkap",
+            env!("CARGO_PKG_VERSION"),
+            escape_telegram_html(&s.provider_name),
+            escape_telegram_html(&s.pcfg.model),
+            escape_telegram_html(&s.ctx.cwd.display().to_string())
+        );
+        let plain = format!(
+            "Selena — SelenCode v{}\nProvider: {} / {}\nFolder: {}\nKetik /help untuk semua perintah.",
+            env!("CARGO_PKG_VERSION"),
             s.provider_name,
             s.pcfg.model,
             s.ctx.cwd.display()
         );
-        tg.send_long_message(chat_id, &msg).await?;
+        tg.send_html_message(chat_id, &start_html, &plain).await?;
         return Ok(());
     }
     if text.eq_ignore_ascii_case("/status") {
-        let info = strip_menu_markup(&s.session_info_menu());
-        tg.send_long_message(chat_id, &info).await?;
+        tg.send_menu_markup(chat_id, &s.session_info_menu()).await?;
         return Ok(());
     }
 
     match parse_slash_command(&text) {
         SlashCommand::Help => {
-            tg.send_long_message(chat_id, &strip_menu_markup(&help_menu_markup()))
-                .await?;
+            tg.send_menu_markup(chat_id, &help_menu_markup()).await?;
             return Ok(());
         }
         SlashCommand::Model(None) => {
-            tg.send_long_message(chat_id, &strip_menu_markup(&s.models_menu()))
-                .await?;
+            tg.send_menu_markup(chat_id, &s.models_menu()).await?;
             return Ok(());
         }
         SlashCommand::Model(Some(arg)) => {
@@ -371,139 +389,126 @@ async fn handle_telegram_chat_message(
             } else {
                 s.apply_model_arg(&arg)?
             };
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Models(filter) => {
             let reply = s.fetch_remote_models_menu(filter.as_deref()).await?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Provider(arg) => {
             let reply = s.handle_provider(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Approve(arg) => {
             let reply = s.handle_approve(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Sandbox(arg) => {
             let reply = s.handle_sandbox(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::New => {
             let sid = s.reset_session()?;
-            tg.send_message(chat_id, &format!("✨ Sesi baru dimulai ({sid})."))
-                .await?;
+            let short: String = sid.chars().take(10).collect();
+            tg.send_html_message(
+                chat_id,
+                &format!("✨ <b>Sesi baru dimulai</b> (<code>{short}</code>)."),
+                &format!("Sesi baru dimulai ({short})."),
+            )
+            .await?;
             return Ok(());
         }
         SlashCommand::Compact => {
             let reply = s.compact_now();
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Skills(arg) => {
             let reply = s.handle_skills(arg.as_deref()).await?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Skill(arg) => {
             let reply = s.handle_use_skill(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Learn(arg) => {
             let reply = s.handle_learn_skill(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Memory(arg) => {
             let reply = s.handle_memory(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Undo => {
             let reply = s.handle_undo()?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Redo => {
             let reply = s.handle_redo()?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Checkpoint(arg) => {
             let reply = s.handle_checkpoint(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Rollback(arg) => {
             let reply = s.handle_rollback(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Worktree(arg) => {
             let reply = s.handle_worktree(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Mcp => {
-            tg.send_long_message(chat_id, &strip_menu_markup(&s.handle_mcp_status()))
-                .await?;
+            tg.send_menu_markup(chat_id, &s.handle_mcp_status()).await?;
+            return Ok(());
+        }
+        SlashCommand::Doctor => {
+            tg.send_menu_markup(chat_id, &s.handle_doctor()).await?;
             return Ok(());
         }
         SlashCommand::Verify(arg) => {
             let reply = s.handle_verify(arg.as_deref()).await?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Index(arg) => {
             let reply = s.handle_index(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Jobs(arg) => {
             let reply = s.handle_jobs(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Route(arg) => {
             let reply = s.handle_route(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Lsp(arg) => {
             let reply = s.handle_lsp(arg.as_deref()).await?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Task(arg) => {
             let (card, resume_prompt) = s.handle_task(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&card))
-                .await?;
+            tg.send_menu_markup(chat_id, &card).await?;
             if let Some(prompt) = resume_prompt {
                 let res = run_turn_counted(
                     s.provider.clone(),
@@ -519,61 +524,69 @@ async fn handle_telegram_chat_message(
                 } else {
                     res.0
                 };
-                tg.send_long_message(chat_id, &reply_text).await?;
+                tg.send_long_markdown(chat_id, &reply_text).await?;
             }
             return Ok(());
         }
         SlashCommand::Telegram(arg) => {
             let reply = s.handle_telegram(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Sessions => {
             let reply = s.sessions_menu()?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Resume(arg) => {
-            let reply = match s.handle_resume(arg.as_deref())? {
-                super::commands::ResumeOutcome::Menu(card) => strip_menu_markup(&card),
+            match s.handle_resume(arg.as_deref())? {
+                super::commands::ResumeOutcome::Menu(card) => {
+                    tg.send_menu_markup(chat_id, &card).await?;
+                }
                 super::commands::ResumeOutcome::Switched(data) => {
-                    let mut out = format!(
-                        "Melanjutkan sesi: \"{}\" ({}) — {} pesan dimuat.",
-                        data.title,
-                        data.session_id.chars().take(10).collect::<String>(),
-                        data.total_messages
+                    let short: String = data.session_id.chars().take(10).collect();
+                    let mut html = format!(
+                        "🌙 <b>Melanjutkan Sesi</b>\n\
+                         ✦ <b>{}</b> (<code>{short}</code>)\n\
+                         <i>{} pesan dimuat · model {}</i>",
+                        escape_telegram_html(&data.title),
+                        data.total_messages,
+                        escape_telegram_html(&data.model)
+                    );
+                    let mut plain = format!(
+                        "Melanjutkan sesi: \"{}\" ({short}) — {} pesan dimuat.",
+                        data.title, data.total_messages
                     );
                     if !data.preview_lines.is_empty() {
-                        out.push_str("\n\nCuplikan terakhir:");
-                        for (role, text) in data.preview_lines {
-                            let tag = if role == "user" { "User" } else { "Selena" };
-                            out.push_str(&format!("\n- {tag}: {text}"));
+                        html.push_str("\n\n<blockquote expandable><b>💬 Cuplikan Terakhir</b>");
+                        for (role, text) in &data.preview_lines {
+                            let tag = if role == "user" { "Kamu" } else { "Selena" };
+                            html.push_str(&format!(
+                                "\n<b>{tag}:</b> {}",
+                                escape_telegram_html(text)
+                            ));
+                            plain.push_str(&format!("\n- {tag}: {text}"));
                         }
+                        html.push_str("</blockquote>");
                     }
-                    out
+                    tg.send_html_message(chat_id, &html, &plain).await?;
                 }
-            };
-            tg.send_long_message(chat_id, &reply).await?;
+            }
             return Ok(());
         }
         SlashCommand::Init => {
             let reply = s.handle_init()?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Export(arg) => {
             let reply = s.handle_export(arg.as_deref())?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::InlineShell(cmd) => {
             let reply = s.handle_inline_shell(&cmd).await?;
-            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
-                .await?;
+            tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Exit | SlashCommand::Details | SlashCommand::Plan | SlashCommand::Setup => {
@@ -666,18 +679,42 @@ async fn handle_telegram_chat_message(
         return Ok(());
     };
     let answer = turn_res?;
-    let mut final_msg = String::new();
+    let mut answer_md = answer.trim().to_string();
+    for note in &notes {
+        if !answer_md.is_empty() {
+            answer_md.push_str("\n\n");
+        }
+        answer_md.push_str(&format!("> {note}"));
+    }
+
+    // Jika ada aksi tool & jawaban muat 1 pesan HTML, bungkus log tool dalam `<blockquote expandable>`
+    // agar jawaban utama langsung bersih & enak dibaca!
     if !tools.is_empty() {
-        let shown: Vec<String> = tools.into_iter().take(8).collect();
-        final_msg.push_str("🔧 Aksi:\n");
-        final_msg.push_str(&shown.join("\n"));
-        final_msg.push_str("\n\n");
+        let total_tools = tools.len();
+        let shown: Vec<String> = tools
+            .into_iter()
+            .take(10)
+            .map(|t| escape_telegram_html(&t))
+            .collect();
+        let tool_block = format!(
+            "<blockquote expandable><b>🔧 Aksi Tool ({total_tools})</b>\n{}</blockquote>",
+            shown.join("\n")
+        );
+        let body_html = markdown_to_telegram_html(&answer_md);
+        let combined = if body_html.is_empty() {
+            tool_block.clone()
+        } else {
+            format!("{tool_block}\n\n{body_html}")
+        };
+        if combined.chars().count() <= 4050 {
+            tg.send_html_message(chat_id, &combined, &answer_md).await?;
+            return Ok(());
+        }
+        // Terlalu panjang untuk 1 pesan -> kirim ringkasan tool dulu, lalu jawaban terpecah rapi.
+        tg.send_html_message(chat_id, &tool_block, "Aksi tool selesai.")
+            .await?;
     }
-    final_msg.push_str(answer.trim());
-    for note in notes {
-        final_msg.push_str(&format!("\n\n{note}"));
-    }
-    tg.send_long_message(chat_id, &final_msg).await?;
+    tg.send_long_markdown(chat_id, &answer_md).await?;
     Ok(())
 }
 

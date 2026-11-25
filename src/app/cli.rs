@@ -49,6 +49,8 @@ pub enum Commands {
         #[arg(long)]
         history: bool,
     },
+    /// Cek kesehatan instalasi, provider, SQLite, Git, LSP, Sandbox, & Telegram
+    Doctor,
     /// Perbarui selen ke rilis terbaru dari GitHub Releases
     Update,
 }

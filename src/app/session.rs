@@ -151,13 +151,21 @@ impl Session {
                 }
                 None => {
                     let title = Self::title_from(first_prompt.unwrap_or(""));
-                    let id = store.create_session(&cwd_str, &name, &pcfg.model, &title)?;
+                    let id = if first_prompt.is_some() {
+                        store.create_session(&cwd_str, &name, &pcfg.model, &title)?
+                    } else {
+                        store.register_lazy_session(&cwd_str, &name, &pcfg.model, &title)
+                    };
                     (id, Vec::new(), None)
                 }
             }
         } else {
             let title = Self::title_from(first_prompt.unwrap_or(""));
-            let id = store.create_session(&cwd_str, &name, &pcfg.model, &title)?;
+            let id = if first_prompt.is_some() {
+                store.create_session(&cwd_str, &name, &pcfg.model, &title)?
+            } else {
+                store.register_lazy_session(&cwd_str, &name, &pcfg.model, &title)
+            };
             (id, Vec::new(), None)
         };
         let resumed_note = resumed_title.map(|(title, created)| {
@@ -814,15 +822,15 @@ impl Session {
         }
     }
 
-    /// Mulai sesi baru yang bersih (/new).
+    /// Mulai sesi baru yang bersih (/new) secara lazy (tidak membuat row kosong sampai ada pesan).
     pub(crate) fn reset_session(&mut self) -> Result<String> {
         let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
-        let new_id = self.store.create_session(
+        let new_id = self.store.register_lazy_session(
             &cwd_str,
             &self.provider_name,
             &self.pcfg.model,
             "(sesi baru)",
-        )?;
+        );
         self.session_id = new_id.clone();
         self.ctx.session_id = Some(new_id.clone());
         self.messages.clear();

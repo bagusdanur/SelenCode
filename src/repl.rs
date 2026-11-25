@@ -31,6 +31,8 @@ pub enum SlashCommand {
     Worktree(Option<String>),
     /// /mcp — status server MCP & matriks dukungan protokol (Fase 7).
     Mcp,
+    /// /doctor — diagnostik kesehatan instalasi, provider, Git, LSP, Sandbox, & Telegram.
+    Doctor,
     /// /verify [check | test | lint | all] — jalankan validasi proyek otomatis & tampilkan diagnostik.
     Verify(Option<String>),
     /// /index [query] atau /context [query] — lihat indeks repositori inkremental & uji pencarian konteks relevan.
@@ -169,6 +171,12 @@ pub const COMMANDS: &[CommandDef] = &[
         takes_args: false,
     },
     CommandDef {
+        cmd: "/doctor",
+        args: "",
+        desc: "cek kesehatan provider, SQLite, Git, LSP, & sandbox",
+        takes_args: false,
+    },
+    CommandDef {
         cmd: "/verify",
         args: "[check / test / lint]",
         desc: "validasi otomatis proyek & ekstrak error terstruktur",
@@ -278,8 +286,8 @@ pub const COMMANDS: &[CommandDef] = &[
     },
     CommandDef {
         cmd: "/resume",
-        args: "[nomor / info]",
-        desc: "tampilkan 10 sesi terakhir bernomor & lanjutkan sesi",
+        args: "[nomor / rm / info]",
+        desc: "tampilkan 10 sesi terakhir bernomor & lanjutkan/hapus sesi",
         takes_args: true,
     },
     CommandDef {
@@ -340,6 +348,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/rollback" => SlashCommand::Rollback(rest),
         "/worktree" | "/wt" => SlashCommand::Worktree(rest),
         "/mcp" => SlashCommand::Mcp,
+        "/doctor" => SlashCommand::Doctor,
         "/verify" => SlashCommand::Verify(rest),
         "/index" | "/context" => SlashCommand::Index(rest),
         "/jobs" | "/bg" => SlashCommand::Jobs(rest),

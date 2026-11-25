@@ -179,6 +179,9 @@ async fn tui_worker(
             TuiCommand::McpStatus => {
                 let _ = ui_tx.send(UiEvent::Menu(s.handle_mcp_status())).await;
             }
+            TuiCommand::Doctor => {
+                let _ = ui_tx.send(UiEvent::Menu(s.handle_doctor())).await;
+            }
             TuiCommand::Verify(arg) => match s.handle_verify(arg.as_deref()).await {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;

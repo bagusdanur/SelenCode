@@ -349,6 +349,18 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
         anyhow::bail!("subperintah `/worktree {raw}` tidak dikenal. Ketik `/worktree` untuk cara pakai.")
     }
 
+    pub(crate) fn handle_doctor(&self) -> String {
+        selencode::doctor::run_doctor(
+            &self.cfg,
+            &self.ctx.cwd,
+            &self.provider_name,
+            &self.pcfg,
+            &self.store,
+            &self.ctx.sandbox,
+        )
+        .format_menu_card()
+    }
+
     pub(crate) fn handle_mcp_status(&self) -> String {
         use selencode::mcp::client::{
             PROTOCOL_VERSION, SUPPORTED_MCP_FEATURES, UNSUPPORTED_MCP_FEATURES,
@@ -1463,10 +1475,12 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
     /// Kartu daftar 10 sesi terakhir cwd ini bernomor (`#1..#10`) dengan judul kontekstual.
     pub(crate) fn sessions_menu(&self) -> Result<String> {
         let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
+        // Bersihkan sesi kosong 0-pesan lama agar daftar 10 sesi selalu berisi percakapan nyata.
+        let _ = self.store.prune_empty_sessions(&cwd_str, &self.session_id);
         let list = self.store.list_sessions(&cwd_str, 10)?;
         if list.is_empty() {
             return Ok(
-                "# Sesi Tersimpan\n! Belum ada sesi tersimpan untuk folder ini.".to_string(),
+                "# Sesi Tersimpan\n! Belum ada sesi tersimpan untuk folder ini (sesi baru otomatis tersimpan setelah pesan pertama dikirim).".to_string(),
             );
         }
         let mut out = format!("# {} Sesi Terakhir di Folder Ini\n", list.len());
@@ -1484,15 +1498,16 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
             ));
         }
         out.push_str("---\n");
-        out.push_str("! Lanjutkan sesi:  /resume <nomor>   (contoh: /resume 1)\n");
+        out.push_str("! Lanjutkan sesi:  /resume <nomor>   ·   Hapus sesi: /resume rm <nomor>\n");
         out.push_str("! Info sesi aktif: /resume info   ·   Ubah judul: /resume rename <judul baru>\n");
         out.push_str("! Dari terminal:   selen resume <nomor>");
         Ok(out)
     }
 
-    /// Tangani `/resume [nomor | info | rename <judul>]`:
+    /// Tangani `/resume [nomor | rm <nomor> | info | rename <judul>]`:
     /// - Tanpa argumen -> daftar 10 sesi terakhir bernomor (`#1..#10`)
     /// - `info` -> detail sesi aktif
+    /// - `rm <nomor>` -> hapus sesi terpilih dari SQLite
     /// - `rename <judul>` -> ubah judul sesi aktif di SQLite
     /// - `<nomor>` atau `<prefix_id>` -> lanjutkan & muat ulang sesi terpilih
     pub(crate) fn handle_resume(
@@ -1507,6 +1522,25 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
         }
         if raw.eq_ignore_ascii_case("list") || raw.eq_ignore_ascii_case("ls") {
             return Ok(ResumeOutcome::Menu(self.sessions_menu()?));
+        }
+        if let Some(rest) = raw
+            .strip_prefix("rm ")
+            .or_else(|| raw.strip_prefix("del "))
+            .or_else(|| raw.strip_prefix("delete "))
+        {
+            let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
+            let target = self.store.resolve_session(&cwd_str, rest.trim(), 10)?;
+            if target.id == self.session_id {
+                anyhow::bail!(
+                    "tidak bisa menghapus sesi yang sedang aktif; mulai sesi baru (`/new`) atau pindah dulu."
+                );
+            }
+            self.store.delete_session(&target.id)?;
+            return Ok(ResumeOutcome::Menu(format!(
+                "# Sesi Dihapus\n> {} | \"{}\" | seluruh pesan & histori usage sesi dihapus",
+                target.id.chars().take(10).collect::<String>(),
+                target.title
+            )));
         }
         if let Some(rest) = raw
             .strip_prefix("rename ")
