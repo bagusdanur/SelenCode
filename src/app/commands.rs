@@ -5,7 +5,7 @@ use selencode::agent::run_self_improvement_review;
 use selencode::config;
 use selencode::providers::router::TaskKind;
 use selencode::providers::{Message, Role};
-use selencode::repl::{strip_menu_markup, PROVIDER_PRESETS};
+use selencode::repl::{strip_menu_markup, KeySpec, PROVIDER_PRESETS};
 use selencode::security::{is_forbidden_command, redact_secrets, ApprovalMode};
 use selencode::skills::{
     export_conversation_md, init_agents_md, list_skills, load_skill, remove_skill, save_skill,
