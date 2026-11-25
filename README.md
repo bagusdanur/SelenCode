@@ -5,9 +5,8 @@ Agent coding di terminal seperti Claude Code, ditulis full Rust, jalan sebagai
 **Selena**. Otak = API cloud (OpenAI-compatible),
 tangan = tool lokal (file, search, shell, git).
 
-Blueprint lengkap: lihat `BLUEPRINT.md`. Status: **Fase 0–7 selesai — blueprint tuntas**
-(lihat `HASIL-FASE-0-1.md` s/d `HASIL-FASE-7.md`, plus `HASIL-9ROUTER.md` untuk
-tes live pertama ke provider 9Router). Cara pasang di Termux: lihat `TERMUX.md`.
+Blueprint lengkap: lihat `docs/BLUEPRINT.md`. Status: **Fase 0–7 + Upgrade Tahap 1–5 selesai**
+(laporan tiap fase tersimpan rapi di `docs/reports/`). Cara pasang di Termux: lihat `docs/TERMUX.md`.
 
 ## Pasang Cepat (1 Perintah)
 
@@ -172,7 +171,4 @@ cargo test
 
 ## Belum dikerjakan
 
-Tidak ada — Fase 0–7 blueprint selesai. Workflow rilis Termux
-(`.github/workflows/release.yml`) baru terbukti saat tag `v*` pertama
-di-push ke repo GitHub (project ini belum di-git-init; lihat
-`HASIL-FASE-7.md`).
+Tidak ada — Fase 0–7 blueprint & Upgrade Tahap 1–5 selesai (arsip laporan ada di `docs/reports/`).
