@@ -534,10 +534,27 @@ fn display_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                             Style::default().fg(color),
                         )];
                         let cont_pfx = vec![Span::raw(format!("{indent}  "))];
-                        let body = vec![Span::styled(
-                            part.to_string(),
-                            Style::default().fg(moonlit::DIM),
-                        )];
+                        // Warnai baris diff unified (`+`, `-`, `@@`, `diff --git`) agar perubahan kode langsung terbaca!
+                        let part_style = if !first
+                            && (part.starts_with("+++ ")
+                                || part.starts_with("--- ")
+                                || part.starts_with("diff --git "))
+                        {
+                            Style::default()
+                                .fg(moonlit::CYAN_MOON)
+                                .add_modifier(Modifier::BOLD)
+                        } else if !first && part.starts_with("@@") {
+                            Style::default()
+                                .fg(moonlit::VIOLET)
+                                .add_modifier(Modifier::BOLD)
+                        } else if !first && part.starts_with('+') {
+                            Style::default().fg(moonlit::MINT)
+                        } else if !first && part.starts_with('-') {
+                            Style::default().fg(moonlit::ROSE)
+                        } else {
+                            Style::default().fg(moonlit::DIM)
+                        };
+                        let body = vec![Span::styled(part.to_string(), part_style)];
                         out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
                         first = false;
                     }
@@ -856,6 +873,73 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     .title(" ☾ Menu Perintah (↑↓ pilih · Tab isi · Enter) "),
             );
             frame.render_widget(widget, popup);
+        } else if let Some((_, at_q)) = app::extract_at_query(&cur_input) {
+            let matches = app::filter_workspace_files(&app.workspace_files, &at_q, 10);
+            if !matches.is_empty() && chunks[0].height >= 5 {
+                if app.at_palette_idx >= matches.len() {
+                    app.at_palette_idx = 0;
+                }
+                let h = (matches.len() as u16 + 2)
+                    .min(chunks[0].height.saturating_sub(1))
+                    .min(10);
+                let w = chunks[0].width.saturating_sub(2).min(78).max(24);
+                let popup = Rect {
+                    x: chunks[0].x + 1,
+                    y: chunks[0].y + chunks[0].height.saturating_sub(h),
+                    width: w,
+                    height: h,
+                };
+                frame.render_widget(Clear, popup);
+                let max_rows = h.saturating_sub(2) as usize;
+                let start = if app.at_palette_idx >= max_rows {
+                    app.at_palette_idx + 1 - max_rows
+                } else {
+                    0
+                };
+                let mut flines: Vec<Line<'static>> = Vec::new();
+                for (idx, path) in matches.iter().enumerate().skip(start).take(max_rows) {
+                    let selected = idx == app.at_palette_idx;
+                    let bg = if selected {
+                        Style::default().bg(Color::Rgb(42, 26, 78))
+                    } else {
+                        Style::default()
+                    };
+                    let prefix = if selected {
+                        Span::styled(" ❯ ", bg.fg(moonlit::GOLD).add_modifier(Modifier::BOLD))
+                    } else {
+                        Span::styled("   ", bg)
+                    };
+                    flines.push(Line::from(vec![
+                        prefix,
+                        Span::styled("@", bg.fg(moonlit::CYAN_MOON)),
+                        Span::styled(
+                            path.clone(),
+                            bg.fg(if selected {
+                                moonlit::LILAC
+                            } else {
+                                moonlit::LAV
+                            })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                        ),
+                    ]));
+                }
+                let widget = Paragraph::new(flines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(moonlit::CYAN_MOON))
+                        .title_style(
+                            Style::default()
+                                .fg(moonlit::LILAC)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .title(" ☾ Sisipkan File @ (↑↓ pilih · Tab/Enter isi) "),
+                );
+                frame.render_widget(widget, popup);
+            }
         }
     }
 
@@ -1646,6 +1730,7 @@ fn submit(
     if text.is_empty() {
         return;
     }
+    app.push_history(&text);
     match parse_slash_command(&text) {
         SlashCommand::Exit => {
             app.should_quit = true;
@@ -2242,11 +2327,53 @@ fn handle_key(
             }
             _ => {}
         }
+    } else if let Some((_, at_q)) = app::extract_at_query(&cur_input) {
+        let matches = app::filter_workspace_files(&app.workspace_files, &at_q, 10);
+        if !matches.is_empty() {
+            let len = matches.len();
+            if app.at_palette_idx >= len {
+                app.at_palette_idx = 0;
+            }
+            match key.code {
+                KeyCode::Up => {
+                    app.at_palette_idx = if app.at_palette_idx == 0 {
+                        len - 1
+                    } else {
+                        app.at_palette_idx - 1
+                    };
+                    return;
+                }
+                KeyCode::Down => {
+                    app.at_palette_idx = (app.at_palette_idx + 1) % len;
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
+                    let chosen = &matches[app.at_palette_idx];
+                    let filled = app::complete_at_mention(&cur_input, chosen);
+                    app.input = app::new_textarea();
+                    app.input.insert_str(&filled);
+                    app.at_palette_idx = 0;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Navigasi riwayat prompt persisten (↑ / ↓) saat input 1 baris dan tidak ada popup aktif.
+    if app.input.lines().len() <= 1 && key.modifiers == KeyModifiers::NONE {
+        if key.code == KeyCode::Up && app.history_up() {
+            return;
+        }
+        if key.code == KeyCode::Down && app.history_down() {
+            return;
+        }
     }
 
     match key.code {
         KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
             app.palette_idx = 0;
+            app.at_palette_idx = 0;
             submit(app, cmd_tx, cancel, interrupt_pending);
         }
         KeyCode::PageUp => {
@@ -2260,6 +2387,8 @@ fn handle_key(
         _ => {
             app.input.input(key);
             app.palette_idx = 0;
+            app.at_palette_idx = 0;
+            app.history_pos = None;
         }
     }
 }

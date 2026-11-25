@@ -593,16 +593,88 @@ pub struct App {
     pub last_viewport: usize,
     /// Indeks item terpilih pada popup live `/` command palette.
     pub palette_idx: usize,
+    /// Indeks item terpilih pada popup `@file` fuzzy autocomplete.
+    pub at_palette_idx: usize,
+    /// Daftar path relatif file workspace untuk `@file` autocomplete cepat.
+    pub workspace_files: Vec<String>,
+    /// Riwayat prompt persisten lintas sesi (terlama -> terbaru) untuk navigasi `↑`/`↓`.
+    pub prompt_history: Vec<String>,
+    /// Posisi navigasi riwayat prompt saat ini (`None` = sedang mengetik draft baru).
+    pub history_pos: Option<usize>,
+    /// Simpanan draft input sebelum user menekan panah atas.
+    pub history_draft: String,
     /// Tampilkan argumen & ringkasan tool secara penuh (toggle via `/details`).
     pub show_tool_details: bool,
 }
 
 pub fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
-    ta.set_placeholder_text("Tanya apa saja…");
+    ta.set_placeholder_text("Tanya apa saja… (ketik / untuk perintah, @ untuk sisipkan file)");
     ta.set_placeholder_style(Style::default().fg(moonlit::DIM));
     ta.set_cursor_line_style(ratatui::style::Style::default());
     ta
+}
+
+/// Ekstrak token `@query` aktif di akhir baris input untuk popup `@file` autocomplete.
+/// Mengembalikan `(byte_offset_at, query_tanpa_at)`.
+pub fn extract_at_query(input: &str) -> Option<(usize, String)> {
+    if input.contains('\n') || input.trim_start().starts_with('/') {
+        return None;
+    }
+    let last_ws = input.rfind(char::is_whitespace);
+    let token_start = last_ws.map(|i| i + 1).unwrap_or(0);
+    let token = &input[token_start..];
+    let rest = token.strip_prefix('@')?;
+    Some((token_start, rest.to_string()))
+}
+
+fn is_fuzzy_subseq(haystack: &str, needle: &str) -> bool {
+    let mut it = haystack.chars();
+    for nc in needle.chars() {
+        if !it.any(|hc| hc == nc) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Filter & urutkan daftar file workspace berdasarkan query fuzzy `@file`.
+pub fn filter_workspace_files(files: &[String], query: &str, max_results: usize) -> Vec<String> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return files.iter().take(max_results).cloned().collect();
+    }
+    let mut scored: Vec<(u8, usize, &String)> = files
+        .iter()
+        .filter_map(|p| {
+            let low = p.to_ascii_lowercase();
+            let fname = low.rsplit('/').next().unwrap_or(&low);
+            if fname.starts_with(&q) {
+                Some((0u8, p.len(), p))
+            } else if low.contains(&q) {
+                Some((1u8, p.len(), p))
+            } else if is_fuzzy_subseq(&low, &q) {
+                Some((2u8, p.len(), p))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(b.2)));
+    scored
+        .into_iter()
+        .take(max_results)
+        .map(|(_, _, p)| p.clone())
+        .collect()
+}
+
+/// Ganti token `@query` di akhir input dengan `@{selected} `.
+pub fn complete_at_mention(input: &str, selected: &str) -> String {
+    if let Some((start, _)) = extract_at_query(input) {
+        format!("{}@{selected} ", &input[..start])
+    } else {
+        format!("{input}@{selected} ")
+    }
 }
 
 impl App {
@@ -649,8 +721,72 @@ impl App {
             last_total_lines: 0,
             last_viewport: 0,
             palette_idx: 0,
+            at_palette_idx: 0,
+            workspace_files: Vec::new(),
+            prompt_history: Vec::new(),
+            history_pos: None,
+            history_draft: String::new(),
             show_tool_details: true,
         }
+    }
+
+    /// Catat prompt ke riwayat memori (menghindari duplikat beruntun, maks 200).
+    pub fn push_history(&mut self, text: &str) {
+        let clean = text.trim();
+        if clean.is_empty() {
+            return;
+        }
+        if self.prompt_history.last().map(|s| s.as_str()) != Some(clean) {
+            self.prompt_history.push(clean.to_string());
+            if self.prompt_history.len() > 200 {
+                let extra = self.prompt_history.len() - 200;
+                self.prompt_history.drain(0..extra);
+            }
+        }
+        self.history_pos = None;
+        self.history_draft.clear();
+    }
+
+    /// Mundur ke prompt sebelumnya pada riwayat (`↑`). Mengembalikan `true` jika teks input berubah.
+    pub fn history_up(&mut self) -> bool {
+        if self.prompt_history.is_empty() {
+            return false;
+        }
+        let next_pos = match self.history_pos {
+            None => {
+                self.history_draft = self.input.lines().join("\n");
+                self.prompt_history.len() - 1
+            }
+            Some(0) => return false,
+            Some(p) => p - 1,
+        };
+        self.history_pos = Some(next_pos);
+        let item = self.prompt_history[next_pos].clone();
+        self.input = new_textarea();
+        self.input.insert_str(&item);
+        true
+    }
+
+    /// Maju ke prompt lebih baru atau kembali ke draft awal (`↓`). Mengembalikan `true` jika teks berubah.
+    pub fn history_down(&mut self) -> bool {
+        let Some(pos) = self.history_pos else {
+            return false;
+        };
+        if pos + 1 < self.prompt_history.len() {
+            let next_pos = pos + 1;
+            self.history_pos = Some(next_pos);
+            let item = self.prompt_history[next_pos].clone();
+            self.input = new_textarea();
+            self.input.insert_str(&item);
+        } else {
+            self.history_pos = None;
+            let draft = self.history_draft.clone();
+            self.input = new_textarea();
+            if !draft.is_empty() {
+                self.input.insert_str(&draft);
+            }
+        }
+        true
     }
 
     /// Info untuk layar sambutan Moonlit, dari state sesi saat ini.

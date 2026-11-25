@@ -13,6 +13,39 @@ use selencode::tui::{ModelPickerCmd, TuiChannels, TuiCommand};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+/// Kumpulkan path relatif file workspace (hormati `.gitignore`) untuk `@file` autocomplete TUI.
+fn collect_workspace_files(cwd: &std::path::Path, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let walker = ignore::WalkBuilder::new(cwd)
+        .hidden(false)
+        .git_ignore(true)
+        .max_depth(Some(6))
+        .build();
+    for entry in walker.flatten() {
+        if out.len() >= limit {
+            break;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(cwd) else {
+            continue;
+        };
+        let rel_s = rel.to_string_lossy().replace('\\', "/");
+        if rel_s.starts_with(".git/")
+            || rel_s.starts_with(".selencode/")
+            || rel_s.starts_with("target/")
+            || rel_s.starts_with("node_modules/")
+        {
+            continue;
+        }
+        out.push(rel_s);
+    }
+    out.sort();
+    out
+}
+
 /// Worker TUI: memiliki Session, menerima TuiCommand, mengirim UiEvent.
 /// Loop agent berjalan di task ini; UI (thread blocking) hanya menggambar.
 async fn tui_worker(
@@ -25,6 +58,8 @@ async fn tui_worker(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             TuiCommand::Prompt(prompt) | TuiCommand::InterruptPrompt(prompt) => {
+                let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+                let _ = s.store.record_prompt_history(&cwd_str, &prompt);
                 tokio::select! {
                     r = run_turn_ui(
                         s.provider.clone(),
@@ -55,6 +90,8 @@ async fn tui_worker(
                 }
             }
             TuiCommand::PromptPlan(prompt) => {
+                let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+                let _ = s.store.record_prompt_history(&cwd_str, &prompt);
                 tokio::select! {
                     r = run_turn_ui_mode(
                         s.provider.clone(),
@@ -628,6 +665,9 @@ pub(crate) async fn interactive_tui(
     app.context_pct = calc_context_pct(app.context_used, app.context_limit);
     app.approval_policy = Some(s.ctx.approver.policy());
     app.resumed = s.resumed_note.is_some();
+    let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+    app.prompt_history = s.store.load_prompt_history(&cwd_str, 100).unwrap_or_default();
+    app.workspace_files = collect_workspace_files(&s.ctx.cwd, 1500);
     app.plan_next = cli.plan;
     if let Some(note) = &s.resumed_note {
         app.info(note.clone());

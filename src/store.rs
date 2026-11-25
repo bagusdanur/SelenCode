@@ -253,6 +253,8 @@ CREATE TABLE IF NOT EXISTS model_perf (route_id TEXT NOT NULL, task_kind TEXT NO
                     total_latency_ms INT NOT NULL DEFAULT 0, total_tokens INT NOT NULL DEFAULT 0,
                     total_cost_usd REAL NOT NULL DEFAULT 0.0, updated_at TEXT NOT NULL,
                     PRIMARY KEY (route_id, task_kind));
+CREATE TABLE IF NOT EXISTS prompt_history (id INTEGER PRIMARY KEY, cwd TEXT NOT NULL,
+                    prompt TEXT NOT NULL, ts TEXT NOT NULL);
 ";
 
 fn now() -> String {
@@ -422,6 +424,50 @@ impl Store {
             rusqlite::params![cwd, keep_session_id],
         )?;
         Ok(n)
+    }
+
+    /// Simpan 1 entri riwayat prompt untuk navigasi `↑`/`↓` lintas sesi di TUI.
+    /// Melewati duplikat beruntun & menjaga maksimal 200 entri terbaru per folder.
+    pub fn record_prompt_history(&self, cwd: &str, prompt: &str) -> Result<()> {
+        let clean = prompt.trim();
+        if clean.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let last: Option<String> = conn
+            .query_row(
+                "SELECT prompt FROM prompt_history WHERE cwd = ?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![cwd],
+                |row| row.get(0),
+            )
+            .ok();
+        if last.as_deref() == Some(clean) {
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT INTO prompt_history (cwd, prompt, ts) VALUES (?1, ?2, ?3)",
+            rusqlite::params![cwd, clean, now()],
+        )?;
+        let _ = conn.execute(
+            "DELETE FROM prompt_history WHERE cwd = ?1 AND id NOT IN \
+             (SELECT id FROM prompt_history WHERE cwd = ?1 ORDER BY id DESC LIMIT 200)",
+            rusqlite::params![cwd],
+        );
+        Ok(())
+    }
+
+    /// Muat riwayat prompt tersimpan (urutan terlama -> terbaru) untuk navigasi `↑`/`↓`.
+    pub fn load_prompt_history(&self, cwd: &str, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT prompt FROM prompt_history WHERE cwd = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let mut rows: Vec<String> = stmt
+            .query_map(rusqlite::params![cwd, limit as i64], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows.reverse();
+        Ok(rows)
     }
 
     /// Buat sesi baru; mengembalikan id sesi (uuid).
