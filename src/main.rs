@@ -24,8 +24,8 @@ use std::io::IsTerminal;
 #[tokio::main]
 async fn main() -> Result<()> {
     selencode::update::cleanup_old_binary();
-    let cli = Cli::parse();
-    match cli.command {
+    let mut cli = Cli::parse();
+    match cli.command.take() {
         Some(Commands::Run { prompt }) => {
             let prompt = prompt.join(" ");
             if prompt.trim().is_empty() {
