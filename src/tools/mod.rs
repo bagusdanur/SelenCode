@@ -4,12 +4,14 @@ pub mod file;
 pub mod git;
 pub mod lsp;
 pub mod memory;
+pub mod orchestrate;
 pub mod outline;
 pub mod plan;
 pub mod retrieve;
 pub mod search;
 pub mod shell;
 pub mod skill;
+pub mod task;
 pub mod undo;
 pub mod verify;
 pub mod web;
@@ -234,6 +236,7 @@ pub fn default_registry_with_shell(shell_cfg: &ShellCfg) -> Registry {
         .register(Arc::new(plan::UpdatePlan))
         .register(Arc::new(skill::ManageSkill))
         .register(Arc::new(memory::ManageMemory))
+        .register(Arc::new(task::ManageTask))
         .register(Arc::new(verify::VerifyProject::new(shell_cfg.timeout_secs)))
 }
 

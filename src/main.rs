@@ -7,7 +7,8 @@ use selencode::agent::context::{
 use selencode::agent::plan::{approved_plan_prompt, extract_plan, TurnMode};
 use selencode::agent::ui::ModelPickerData;
 use selencode::agent::{
-    run_self_improvement_review, run_turn, run_turn_mode, run_turn_ui, run_turn_ui_mode, UiEvent,
+    run_self_improvement_review, run_turn, run_turn_counted, run_turn_mode, run_turn_ui,
+    run_turn_ui_mode, UiEvent,
 };
 use selencode::config::{self, Config, ProviderCfg};
 use selencode::providers::anthropic::AnthropicProvider;
@@ -31,6 +32,7 @@ use selencode::telegram::{
     parse_telegram_action, TelegramAction, TelegramClient, TgApprovalHub,
 };
 use selencode::tools::delegate::Delegate;
+use selencode::tools::orchestrate::Orchestrate;
 use selencode::tools::{default_registry_with_shell, read_only_registry, Ctx, Registry};
 use selencode::tui::app::{App, SetupResult, SetupWizardState, SETUP_PRESETS};
 use selencode::tui::{ModelPickerCmd, TuiChannels, TuiCommand};
@@ -366,13 +368,17 @@ impl Session {
         // Delegate (Fase 6): subagent memakai provider sesi saat build;
         // ganti provider via /model TIDAK mengganti provider subagent
         // (dicatat di HASIL-FASE-6). Registry anak selalu baca-saja.
-        let mut registry = default_registry_with_shell(&cfg.shell).register(Arc::new(
-            Delegate::new(
+        let mut registry = default_registry_with_shell(&cfg.shell)
+            .register(Arc::new(Delegate::new(
                 provider.clone(),
                 Arc::new(read_only_registry()),
                 cfg.agent.max_parallel_subagents,
-            ),
-        ));
+            )))
+            .register(Arc::new(Orchestrate::new(
+                provider.clone(),
+                cfg.shell.clone(),
+                cfg.agent.max_parallel_subagents,
+            )));
         // Tool MCP (Fase 7): HANYA registry induk mode Execute — tidak ikut
         // registry baca-saja plan/subagent. Server yang gagal start dilewati
         // dengan peringatan stderr; build_mcp_tools tidak mengembalikan Err,
@@ -1874,6 +1880,151 @@ impl Session {
         Ok(self.ctx.lsp_manager.format_status_card())
     }
 
+    /// Kelola Long-Horizon Tasks persisten lintas sesi (`/task`).
+    /// Mengembalikan `(kartu_menu, optional_resume_prompt)` — bila user menjalankan
+    /// `/task resume <id>`, `optional_resume_prompt` berisi prompt pemulihan lengkap.
+    fn handle_task(&self, arg: Option<&str>) -> Result<(String, Option<String>)> {
+        let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
+        let Some(raw) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let list = self.store.list_long_tasks(&cwd_str, 20)?;
+            let mut out = String::from("# Long-Horizon Tasks (Lintas Sesi)\n");
+            if list.is_empty() {
+                out.push_str("! Belum ada tugas panjang tersimpan di folder ini.\n");
+            } else {
+                for t in list {
+                    let mark = if t.status == "in_progress" { "*" } else { ">" };
+                    let goal_short: String = t.goal.chars().take(52).collect();
+                    out.push_str(&format!(
+                        "{mark} {} | {} · {}/{} | {goal_short}\n",
+                        t.id,
+                        t.status,
+                        t.completed_steps(),
+                        t.steps.len()
+                    ));
+                }
+            }
+            out.push_str("---\n");
+            out.push_str("! Buat tugas:   /task new <tujuan>\n");
+            out.push_str("! Lihat detail: /task show <id>\n");
+            out.push_str("! Jeda:         /task pause <id> [catatan]\n");
+            out.push_str("! Lanjutkan:    /task resume <id>   ·   Hapus: /task rm <id>");
+            return Ok((out, None));
+        };
+
+        if let Some(rest) = raw
+            .strip_prefix("new ")
+            .or_else(|| raw.strip_prefix("create "))
+            .or_else(|| raw.strip_prefix("add "))
+        {
+            let goal = rest.trim();
+            let rec = self.store.create_long_task(&cwd_str, goal, &[], 200_000)?;
+            let card = format!(
+                "# Long-Horizon Task Dibuat\n\
+                 * {} | {} langkah | budget {} token\n\
+                 > tujuan | {} |\n\
+                 ---\n\
+                 ! Jalankan / lanjutkan kapan saja: /task resume {}",
+                rec.id,
+                rec.steps.len(),
+                rec.token_budget,
+                rec.goal,
+                rec.id
+            );
+            return Ok((card, None));
+        }
+
+        if let Some(rest) = raw
+            .strip_prefix("show ")
+            .or_else(|| raw.strip_prefix("get "))
+        {
+            let tid = rest.trim();
+            let rec = self
+                .store
+                .get_long_task(tid)?
+                .ok_or_else(|| anyhow::anyhow!("task '{tid}' tidak ditemukan"))?;
+            let mut out = format!(
+                "# Detail Task {} ({})\n\
+                 * progres | {}/{} langkah | {}/{} token\n\
+                 > tujuan | {} |\n\
+                 > checkpoint | {} |\n\
+                 ---\n",
+                rec.id,
+                rec.status,
+                rec.completed_steps(),
+                rec.steps.len(),
+                rec.tokens_used,
+                rec.token_budget,
+                rec.goal,
+                rec.checkpoint_note
+            );
+            for s in &rec.steps {
+                let mark = if s.status == "done" { "*" } else { ">" };
+                out.push_str(&format!(
+                    "{mark} #{} [{}] | {} | {}\n",
+                    s.id, s.status, s.role, s.title
+                ));
+            }
+            out.push_str(&format!("---\n! Lanjutkan tugas ini: /task resume {}", rec.id));
+            return Ok((out, None));
+        }
+
+        if let Some(rest) = raw.strip_prefix("pause ") {
+            let mut parts = rest.trim().splitn(2, char::is_whitespace);
+            let tid = parts.next().unwrap_or("").trim();
+            let note = parts
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Dijeda manual oleh user");
+            let rec = self
+                .store
+                .save_long_task_checkpoint(tid, Some("paused"), None, Some(note), 0)?
+                .ok_or_else(|| anyhow::anyhow!("task '{tid}' tidak ditemukan"))?;
+            return Ok((
+                format!(
+                    "# Task Dijeda & Disimpan\n* {} | paused | {}\n! Lanjutkan nanti: /task resume {}",
+                    rec.id, rec.checkpoint_note, rec.id
+                ),
+                None,
+            ));
+        }
+
+        if let Some(rest) = raw.strip_prefix("resume ") {
+            let tid = rest.trim();
+            let rec = self
+                .store
+                .save_long_task_checkpoint(
+                    tid,
+                    Some("in_progress"),
+                    None,
+                    Some("Dilanjutkan oleh user"),
+                    0,
+                )?
+                .ok_or_else(|| anyhow::anyhow!("task '{tid}' tidak ditemukan"))?;
+            let resume_prompt = rec.build_resume_prompt();
+            let card = format!(
+                "# Melanjutkan Long-Horizon Task {}\n\
+                 * status | in_progress ({}/{}) | {}\n\
+                 ! Mengirim konteks pemulihan ke Selena…",
+                rec.id,
+                rec.completed_steps(),
+                rec.steps.len(),
+                rec.goal
+            );
+            return Ok((card, Some(resume_prompt)));
+        }
+
+        if let Some(rest) = raw.strip_prefix("rm ").or_else(|| raw.strip_prefix("del ")) {
+            let tid = rest.trim();
+            if self.store.delete_long_task(tid)? {
+                return Ok((format!("# Task Dihapus\n> {tid} | dihapus"), None));
+            }
+            anyhow::bail!("task '{tid}' tidak ditemukan");
+        }
+
+        anyhow::bail!("subperintah `/task {raw}` tidak dikenal. Ketik `/task` untuk melihat daftar & cara pakai.")
+    }
+
     fn handle_memory(&self, arg: Option<&str>) -> Result<String> {
         let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
         let Some(arg) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
@@ -2498,6 +2649,44 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
+            TuiCommand::Task(arg) => match s.handle_task(arg.as_deref()) {
+                Ok((card, resume_prompt)) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                    if let Some(prompt) = resume_prompt {
+                        tokio::select! {
+                            r = run_turn_ui(
+                                s.provider.clone(),
+                                &s.registry,
+                                &s.ctx,
+                                &mut s.messages,
+                                &prompt,
+                                s.cfg.agent.max_steps,
+                                ui_tx.clone(),
+                            ) => match r {
+                                Ok(_) => {
+                                    let _ = ui_tx.send(UiEvent::Info(s.usage_line())).await;
+                                }
+                                Err(e) => {
+                                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                                    let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
+                                }
+                            },
+                            _ = cancel.notified() => {
+                                if let Some(syn) = sanitize_interrupted_messages(&mut s.messages) {
+                                    let _ = s.store.save_message(&s.session_id, &syn);
+                                }
+                                if !interrupt_pending.swap(false, Ordering::SeqCst) {
+                                    let _ = ui_tx.send(UiEvent::Info("Eksekusi task dihentikan.".into())).await;
+                                    let _ = ui_tx.send(UiEvent::TurnDone { usage: None }).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
             TuiCommand::Memory(arg) => match s.handle_memory(arg.as_deref()) {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
@@ -3044,6 +3233,27 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
             },
             SlashCommand::Lsp(arg) => match s.handle_lsp(arg.as_deref()).await {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Task(arg) => match s.handle_task(arg.as_deref()) {
+                Ok((card, resume_prompt)) => {
+                    println!("{}", strip_menu_markup(&card));
+                    if let Some(prompt) = resume_prompt {
+                        match run_turn(
+                            s.provider.clone(),
+                            &s.registry,
+                            &s.ctx,
+                            &mut s.messages,
+                            &prompt,
+                            s.cfg.agent.max_steps,
+                        )
+                        .await
+                        {
+                            Ok(_) => println!("[{}]", s.usage_line()),
+                            Err(e) => eprintln!("[error] {e}"),
+                        }
+                    }
+                }
                 Err(e) => eprintln!("[error] {e}"),
             },
             SlashCommand::Memory(arg) => match s.handle_memory(arg.as_deref()) {
@@ -3670,6 +3880,29 @@ async fn handle_telegram_chat_message(
             let reply = s.handle_lsp(arg.as_deref()).await?;
             tg.send_long_message(chat_id, &strip_menu_markup(&reply))
                 .await?;
+            return Ok(());
+        }
+        SlashCommand::Task(arg) => {
+            let (card, resume_prompt) = s.handle_task(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&card))
+                .await?;
+            if let Some(prompt) = resume_prompt {
+                let res = run_turn_counted(
+                    s.provider.clone(),
+                    &s.registry,
+                    &s.ctx,
+                    &mut s.messages,
+                    &prompt,
+                    s.cfg.agent.max_steps,
+                )
+                .await?;
+                let reply_text = if res.0.trim().is_empty() {
+                    "(task dilanjutkan tanpa ringkasan teks)".to_string()
+                } else {
+                    res.0
+                };
+                tg.send_long_message(chat_id, &reply_text).await?;
+            }
             return Ok(());
         }
         SlashCommand::Telegram(arg) => {

@@ -94,6 +94,7 @@ pub enum TuiCommand {
     Jobs(Option<String>),
     Route(Option<String>),
     Lsp(Option<String>),
+    Task(Option<String>),
     Memory(Option<String>),
     Skills(Option<String>),
     UseSkill(Option<String>),
@@ -1716,6 +1717,9 @@ fn submit(
         }
         SlashCommand::Lsp(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Lsp(arg));
+        }
+        SlashCommand::Task(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Task(arg));
         }
         SlashCommand::Memory(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Memory(arg));

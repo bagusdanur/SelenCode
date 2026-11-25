@@ -1,6 +1,7 @@
 use crate::providers::{Block, Message, Role};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -86,6 +87,88 @@ pub struct MemoryItem {
     pub updated_at: String,
 }
 
+/// Satu langkah dalam Long-Horizon Task persisten lintas sesi (Tahap 5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LongTaskStep {
+    pub id: usize,
+    pub title: String,
+    /// Peran yang direkomendasikan: `planner` | `researcher` | `coder` | `tester` | `reviewer`
+    #[serde(default = "default_step_role")]
+    pub role: String,
+    /// `pending` | `in_progress` | `done` | `blocked` | `failed`
+    #[serde(default = "default_step_status")]
+    pub status: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
+fn default_step_role() -> String {
+    "coder".to_string()
+}
+
+fn default_step_status() -> String {
+    "pending".to_string()
+}
+
+/// State persisten tugas jangka panjang (Long-Horizon Task Execution, Tahap 5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LongTaskRecord {
+    pub id: String,
+    pub cwd: String,
+    pub goal: String,
+    /// `pending` | `in_progress` | `paused` | `completed` | `failed`
+    pub status: String,
+    pub steps: Vec<LongTaskStep>,
+    pub checkpoint_note: String,
+    pub tokens_used: u64,
+    pub token_budget: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl LongTaskRecord {
+    pub fn completed_steps(&self) -> usize {
+        self.steps.iter().filter(|s| s.status == "done").count()
+    }
+
+    /// Bangun prompt pemulihan lintas sesi yang ringkas dan siap dilanjutkan agent.
+    pub fn build_resume_prompt(&self) -> String {
+        let mut out = format!(
+            "[PEMULIHAN LONG-HORIZON TASK: {}]\n\
+             Tujuan utama: {}\n\
+             Status terakhir: {} ({}/{} langkah selesai)\n\
+             Pemakaian token: {} / {} token\n",
+            self.id,
+            self.goal,
+            self.status,
+            self.completed_steps(),
+            self.steps.len(),
+            self.tokens_used,
+            self.token_budget
+        );
+        if !self.checkpoint_note.trim().is_empty() {
+            out.push_str(&format!("Catatan checkpoint terakhir: {}\n", self.checkpoint_note));
+        }
+        out.push_str("\nChecklist langkah:\n");
+        for s in &self.steps {
+            let note = if s.notes.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", s.notes.trim())
+            };
+            out.push_str(&format!(
+                "{}. [{}] ({}) {}{}\n",
+                s.id, s.status, s.role, s.title, note
+            ));
+        }
+        out.push_str(
+            "\nInstruksi: Lanjutkan dari langkah yang belum selesai (jangan mengulang langkah `done`), \
+             perbarui progress dengan tool `manage_task` (action=\"checkpoint\"), dan verifikasi hasil akhir."
+        );
+        out
+    }
+}
+
 /// Lokasi DB: env SELENCODE_DB (dipakai tes) atau
 /// ~/.local/share/selencode/selen.db (dirs::data_dir).
 pub fn db_path() -> PathBuf {
@@ -109,6 +192,12 @@ CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, scope TEXT,
                     content TEXT, ts TEXT,
                     category TEXT NOT NULL DEFAULT 'general',
                     updated_at TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS long_tasks (id TEXT PRIMARY KEY, cwd TEXT NOT NULL,
+                    goal TEXT NOT NULL, status TEXT NOT NULL,
+                    steps_json TEXT NOT NULL, checkpoint_note TEXT NOT NULL,
+                    tokens_used INT NOT NULL DEFAULT 0,
+                    token_budget INT NOT NULL DEFAULT 200000,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 ";
 
 fn now() -> String {
@@ -444,6 +533,196 @@ impl Store {
         let n = conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
         Ok(n > 0)
     }
+
+    // ---------- Long-Horizon Task Persistence Lintas Sesi (/task, Tahap 5) ----------
+
+    pub fn create_long_task(
+        &self,
+        cwd: &str,
+        goal: &str,
+        steps: &[LongTaskStep],
+        token_budget: u64,
+    ) -> Result<LongTaskRecord> {
+        let clean_goal = crate::security::redact_secrets(goal.trim());
+        if clean_goal.is_empty() {
+            anyhow::bail!("tujuan (goal) tugas tidak boleh kosong");
+        }
+        let short_uuid = uuid::Uuid::new_v4().simple().to_string();
+        let id = format!("task-{}", &short_uuid[..8]);
+        let ts = now();
+        let budget = if token_budget == 0 { 200_000 } else { token_budget };
+        let steps_vec = if steps.is_empty() {
+            default_long_task_steps(&clean_goal)
+        } else {
+            steps.to_vec()
+        };
+        let steps_json = serde_json::to_string(&steps_vec)?;
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "INSERT INTO long_tasks (id, cwd, goal, status, steps_json, checkpoint_note, tokens_used, token_budget, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                id,
+                cwd,
+                clean_goal,
+                "pending",
+                steps_json,
+                "Tugas dibuat — siap dimulai",
+                0i64,
+                budget as i64,
+                ts,
+                ts
+            ],
+        )?;
+        Ok(LongTaskRecord {
+            id,
+            cwd: cwd.to_string(),
+            goal: clean_goal,
+            status: "pending".to_string(),
+            steps: steps_vec,
+            checkpoint_note: "Tugas dibuat — siap dimulai".to_string(),
+            tokens_used: 0,
+            token_budget: budget,
+            created_at: ts.clone(),
+            updated_at: ts,
+        })
+    }
+
+    pub fn get_long_task(&self, id: &str) -> Result<Option<LongTaskRecord>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, cwd, goal, status, steps_json, checkpoint_note, tokens_used, token_budget, created_at, updated_at \
+             FROM long_tasks WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![id.trim()], row_to_long_task)?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_long_tasks(&self, cwd: &str, limit: usize) -> Result<Vec<LongTaskRecord>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, cwd, goal, status, steps_json, checkpoint_note, tokens_used, token_budget, created_at, updated_at \
+             FROM long_tasks WHERE cwd = ?1 ORDER BY updated_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![cwd, limit as i64], row_to_long_task)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn save_long_task_checkpoint(
+        &self,
+        id: &str,
+        status: Option<&str>,
+        steps: Option<&[LongTaskStep]>,
+        checkpoint_note: Option<&str>,
+        add_tokens: u64,
+    ) -> Result<Option<LongTaskRecord>> {
+        let Some(mut rec) = self.get_long_task(id)? else {
+            return Ok(None);
+        };
+        if let Some(st) = status.map(str::trim).filter(|s| !s.is_empty()) {
+            let norm = match st.to_ascii_lowercase().as_str() {
+                "pending" | "in_progress" | "paused" | "completed" | "failed" => {
+                    st.to_ascii_lowercase()
+                }
+                "done" => "completed".to_string(),
+                _ => rec.status.clone(),
+            };
+            rec.status = norm;
+        }
+        if let Some(new_steps) = steps {
+            rec.steps = new_steps.to_vec();
+        }
+        if let Some(note) = checkpoint_note.map(str::trim).filter(|s| !s.is_empty()) {
+            rec.checkpoint_note = crate::security::redact_secrets(note);
+        }
+        rec.tokens_used = rec.tokens_used.saturating_add(add_tokens);
+        rec.updated_at = now();
+        let steps_json = serde_json::to_string(&rec.steps)?;
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "UPDATE long_tasks SET status = ?2, steps_json = ?3, checkpoint_note = ?4, tokens_used = ?5, updated_at = ?6 WHERE id = ?1",
+            rusqlite::params![
+                rec.id,
+                rec.status,
+                steps_json,
+                rec.checkpoint_note,
+                rec.tokens_used as i64,
+                rec.updated_at
+            ],
+        )?;
+        Ok(Some(rec))
+    }
+
+    pub fn delete_long_task(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let n = conn.execute("DELETE FROM long_tasks WHERE id = ?1", rusqlite::params![id.trim()])?;
+        Ok(n > 0)
+    }
+}
+
+fn default_long_task_steps(goal: &str) -> Vec<LongTaskStep> {
+    let short: String = goal.chars().take(60).collect();
+    vec![
+        LongTaskStep {
+            id: 1,
+            title: format!("Rencanakan pemecahan tugas: {short}"),
+            role: "planner".to_string(),
+            status: "pending".to_string(),
+            notes: String::new(),
+        },
+        LongTaskStep {
+            id: 2,
+            title: "Telusuri kode, simbol, & ketergantungan terkait".to_string(),
+            role: "researcher".to_string(),
+            status: "pending".to_string(),
+            notes: String::new(),
+        },
+        LongTaskStep {
+            id: 3,
+            title: "Implementasikan perubahan kode seminimal & sebersih mungkin".to_string(),
+            role: "coder".to_string(),
+            status: "pending".to_string(),
+            notes: String::new(),
+        },
+        LongTaskStep {
+            id: 4,
+            title: "Jalankan build, test, & cek regresi".to_string(),
+            role: "tester".to_string(),
+            status: "pending".to_string(),
+            notes: String::new(),
+        },
+        LongTaskStep {
+            id: 5,
+            title: "Tinjau git diff, keamanan, & validasi akhir".to_string(),
+            role: "reviewer".to_string(),
+            status: "pending".to_string(),
+            notes: String::new(),
+        },
+    ]
+}
+
+fn row_to_long_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<LongTaskRecord> {
+    let steps_json: String = row.get(4)?;
+    let steps: Vec<LongTaskStep> = serde_json::from_str(&steps_json).unwrap_or_default();
+    Ok(LongTaskRecord {
+        id: row.get(0)?,
+        cwd: row.get(1)?,
+        goal: row.get(2)?,
+        status: row.get(3)?,
+        steps,
+        checkpoint_note: row.get(5)?,
+        tokens_used: row.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
+        token_budget: row.get::<_, i64>(7).unwrap_or(200_000).max(0) as u64,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
 }
 
 /// Migrasi aman tabel `memories` dari database SelenCode versi lama.
