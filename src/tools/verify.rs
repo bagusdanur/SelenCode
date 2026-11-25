@@ -69,6 +69,23 @@ pub struct Diagnostic {
     pub snippet: Option<String>,
 }
 
+/// Cek cepat apakah workspace memiliki penanda proyek yang didukung `verify_project`
+/// (`Cargo.toml`, `package.json`, `pyproject.toml`, `setup.py`, `pytest.ini`, `go.mod`, `Makefile`).
+pub fn has_project_markers(cwd: &Path) -> bool {
+    [
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+        "pytest.ini",
+        "go.mod",
+        "Makefile",
+        "makefile",
+    ]
+    .iter()
+    .any(|m| cwd.join(m).exists())
+}
+
 /// Deteksi jenis proyek & susun langkah validasi aman sesuai `scope`:
 /// `"check"` (cepat: type-check/compile), `"test"` (unit/integration tests),
 /// `"lint"` (clippy/lint), atau `"all"` (check + test).
@@ -908,9 +925,15 @@ impl Tool for VerifyProject {
         }
     }
 
+    fn needs_approval(&self, _args: &Value) -> bool {
+        // P0.2: verify_project menjalankan script/command milik proyek (cargo/npm/pytest/make)
+        // sehingga WAJIB melewati gerbang persetujuan user (kecuali auto-approve aktif).
+        true
+    }
+
     async fn run(&self, args: Value, ctx: &Ctx) -> Result<String> {
         let scope = str_arg(&args, "scope").unwrap_or("all");
-        let changed: Vec<String> = args
+        let mut changed: Vec<String> = args
             .get("changed_files")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -919,6 +942,42 @@ impl Tool for VerifyProject {
                     .collect()
             })
             .unwrap_or_default();
+        // P1.7: bila model lupa mengirim `changed_files`, lengkapi otomatis dari `UndoStack` sesi.
+        if changed.is_empty() {
+            if let Ok(st) = ctx.undo_stack.lock() {
+                for rel in st.recent_edited_files(12) {
+                    if !changed.contains(&rel) {
+                        changed.push(rel);
+                    }
+                }
+            }
+        }
+        let plan = detect_targeted_plan(&ctx.cwd, scope, &changed);
+        // Live-test P3: di folder polos tanpa penanda proyek, lewati verifikasi secara netral
+        // tanpa menjalankan shell atau memicu percobaan perbaikan palsu.
+        if plan.steps.is_empty() {
+            return Ok(
+                "Info: tidak ada penanda proyek (Cargo.toml/package.json/pyproject.toml/go.mod/Makefile) di folder ini — verifikasi proyek otomatis dilewati (tidak perlu membuat file test atau menjalankan git init)."
+                    .to_string(),
+            );
+        }
+        // P0.2: minta persetujuan eksplisit menampilkan daftar perintah proyek yang akan dieksekusi.
+        let detail = plan
+            .steps
+            .iter()
+            .map(|s| format!("- {}: {}", s.name, s.command))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !ctx
+            .approver
+            .ask(
+                &format!("verify_project ({}, scope={scope})", plan.kind.label()),
+                &detail,
+            )
+            .await
+        {
+            return Ok("Ditolak user — verifikasi proyek TIDAK dijalankan.".into());
+        }
         let report = run_verify_plan_with_sandbox(
             &ctx.cwd,
             scope,

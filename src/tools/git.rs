@@ -25,7 +25,7 @@ async fn ensure_repo(ctx: &Ctx) -> Result<()> {
     let (code, out) = git_cmd(ctx, &["rev-parse", "--is-inside-work-tree"]).await?;
     if code != Some(0) || !out.trim().starts_with("true") {
         return Err(anyhow!(
-            "bukan repo git: folder {} tidak berada di dalam repo git",
+            "bukan repo git: folder {} tidak berada di dalam repo git (info saja — JANGAN jalankan `git init` kecuali diminta user)",
             ctx.cwd.display()
         ));
     }

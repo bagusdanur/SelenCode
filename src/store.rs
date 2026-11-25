@@ -643,14 +643,16 @@ impl Store {
         Ok(list)
     }
 
-    /// Cari sesi berdasarkan nomor urut (`1..=limit`, boleh diawali `#`) atau prefix ID sesi.
+    /// Cari sesi berdasarkan nomor urut (`#1..=#10` atau `1..=10`) atau prefix ID sesi (termasuk prefix UUID numerik).
     pub fn resolve_session(
         &self,
         cwd: &str,
         target: &str,
         limit: usize,
     ) -> Result<SessionInfo> {
-        let clean = target.trim().trim_start_matches('#').trim();
+        let raw = target.trim();
+        let explicit_index = raw.starts_with('#');
+        let clean = raw.trim_start_matches('#').trim();
         if clean.is_empty() {
             anyhow::bail!("nomor atau ID sesi tidak boleh kosong");
         }
@@ -658,17 +660,23 @@ impl Store {
         if list.is_empty() {
             anyhow::bail!("belum ada sesi tersimpan untuk folder ini");
         }
-        if clean.chars().all(|c| c.is_ascii_digit()) {
-            let idx: usize = clean
-                .parse()
-                .with_context(|| format!("nomor sesi '{target}' tidak valid"))?;
-            if idx == 0 || idx > list.len() {
-                anyhow::bail!(
-                    "nomor sesi #{idx} di luar jangkauan (tersedia 1..={}). Ketik /resume untuk melihat daftar.",
-                    list.len()
-                );
+        let is_all_digits = clean.chars().all(|c| c.is_ascii_digit());
+        if is_all_digits {
+            if let Ok(idx) = clean.parse::<usize>() {
+                if idx >= 1 && idx <= list.len() {
+                    return Ok(list[idx - 1].clone());
+                }
+                if explicit_index || idx == 0 {
+                    anyhow::bail!(
+                        "nomor sesi #{idx} di luar jangkauan (tersedia 1..={}). Ketik /resume untuk melihat daftar.",
+                        list.len()
+                    );
+                }
+            } else if explicit_index {
+                anyhow::bail!("nomor sesi '{target}' tidak valid");
             }
-            return Ok(list[idx - 1].clone());
+            // P1.2: string angka panjang (mis. prefix UUID `70135330` yang kebetulan semua digit)
+            // jatuh ke pencocokan prefix ID sebelum menolak!
         }
         if let Some(found) = list
             .into_iter()
@@ -694,6 +702,11 @@ impl Store {
         })?;
         if let Some(r) = rows.next() {
             return Ok(r?);
+        }
+        if is_all_digits {
+            anyhow::bail!(
+                "nomor/ID sesi '{target}' tidak ditemukan (daftar tersedia 1..={limit}). Ketik /resume untuk melihat daftar."
+            );
         }
         anyhow::bail!("sesi '{target}' tidak ditemukan di folder ini. Ketik /resume untuk melihat 10 sesi terakhir.")
     }

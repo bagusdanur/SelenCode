@@ -15,10 +15,10 @@ use crate::providers::{Provider, ToolSpec};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 pub struct Orchestrate {
-    provider: Arc<dyn Provider>,
+    provider: Arc<RwLock<Arc<dyn Provider>>>,
     shell_cfg: ShellCfg,
     max_parallel_researchers: usize,
 }
@@ -26,6 +26,16 @@ pub struct Orchestrate {
 impl Orchestrate {
     pub fn new(
         provider: Arc<dyn Provider>,
+        shell_cfg: ShellCfg,
+        max_parallel_researchers: usize,
+    ) -> Self {
+        Self::new_shared(Arc::new(RwLock::new(provider)), shell_cfg, max_parallel_researchers)
+    }
+
+    /// Konstruktor dengan handle provider bersama agar pergantian `/model` di sesi induk
+    /// otomatis ikut memperbarui provider `orchestrate` (P2.2).
+    pub fn new_shared(
+        provider: Arc<RwLock<Arc<dyn Provider>>>,
         shell_cfg: ShellCfg,
         max_parallel_researchers: usize,
     ) -> Self {
@@ -118,8 +128,13 @@ impl Tool for Orchestrate {
             max_parallel_researchers: self.max_parallel_researchers,
         };
         let task_id = str_arg(&args, "task_id");
+        let active_provider = self
+            .provider
+            .read()
+            .expect("shared provider lock poisoned")
+            .clone();
         let report = run_orchestration(
-            self.provider.clone(),
+            active_provider,
             &self.shell_cfg,
             ctx,
             &stages,

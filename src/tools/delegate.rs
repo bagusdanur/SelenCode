@@ -12,13 +12,13 @@ use crate::providers::{Provider, ToolSpec};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::Semaphore;
 
 pub const MAX_DELEGATE_TASKS: usize = 5;
 
 pub struct Delegate {
-    provider: Arc<dyn Provider>,
+    provider: Arc<RwLock<Arc<dyn Provider>>>,
     child_registry: Arc<Registry>,
     max_parallel: usize,
 }
@@ -28,6 +28,16 @@ impl Delegate {
     /// `child_registry` WAJIB registry baca-saja (tools::read_only_registry).
     pub fn new(
         provider: Arc<dyn Provider>,
+        child_registry: Arc<Registry>,
+        max_parallel: usize,
+    ) -> Self {
+        Self::new_shared(Arc::new(RwLock::new(provider)), child_registry, max_parallel)
+    }
+
+    /// Konstruktor dengan handle provider bersama agar pergantian `/model` di sesi induk
+    /// otomatis ikut memperbarui provider subagent `delegate` (P2.2).
+    pub fn new_shared(
+        provider: Arc<RwLock<Arc<dyn Provider>>>,
         child_registry: Arc<Registry>,
         max_parallel: usize,
     ) -> Self {
@@ -94,10 +104,15 @@ bisa menulis file / menjalankan shell / commit — jangan delegasikan perubahan.
             prompts.push(p);
         }
 
+        let active_provider = self
+            .provider
+            .read()
+            .expect("shared provider lock poisoned")
+            .clone();
         let semaphore = Arc::new(Semaphore::new(self.max_parallel));
         let mut futs = Vec::new();
         for prompt in prompts.iter() {
-            let provider = self.provider.clone();
+            let provider = active_provider.clone();
             let registry = self.child_registry.clone();
             let ctx = ctx.clone();
             let sem = semaphore.clone();
@@ -126,7 +141,7 @@ bisa menulis file / menjalankan shell / commit — jangan delegasikan perubahan.
                     {
                         let _ = store.record_usage(
                             sid,
-                            self.provider.model_name(),
+                            active_provider.model_name(),
                             u.input_tokens,
                             u.output_tokens,
                         );

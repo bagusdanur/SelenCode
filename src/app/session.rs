@@ -25,6 +25,8 @@ pub(crate) struct Session {
     pub(crate) provider_name: String,
     pub(crate) pcfg: ProviderCfg,
     pub(crate) provider: Arc<dyn Provider>,
+    /// Handle provider bersama untuk subagent (`delegate` & `orchestrate`) agar `/model` ikut menyinkronkannya (P2.2).
+    pub(crate) shared_provider: Arc<std::sync::RwLock<Arc<dyn Provider>>>,
     pub(crate) ctx: Ctx,
     pub(crate) registry: Registry,
     pub(crate) store: Arc<Store>,
@@ -204,17 +206,17 @@ impl Session {
             .with_sandbox(sandbox)
             .with_hooks(hooks)
             .with_store(store.clone(), session_id.clone());
-        // Delegate (Fase 6): subagent memakai provider sesi saat build;
-        // ganti provider via /model TIDAK mengganti provider subagent
-        // (dicatat di HASIL-FASE-6). Registry anak selalu baca-saja.
+        // P2.2: subagent `delegate` & `orchestrate` berbagi handle `shared_provider`
+        // sehingga ganti provider/model lewat `/model` otomatis memperbarui subagent juga!
+        let shared_provider = Arc::new(std::sync::RwLock::new(provider.clone()));
         let mut registry = default_registry_with_shell(&cfg.shell)
-            .register(Arc::new(Delegate::new(
-                provider.clone(),
+            .register(Arc::new(Delegate::new_shared(
+                shared_provider.clone(),
                 Arc::new(read_only_registry()),
                 cfg.agent.max_parallel_subagents,
             )))
-            .register(Arc::new(Orchestrate::new(
-                provider.clone(),
+            .register(Arc::new(Orchestrate::new_shared(
+                shared_provider.clone(),
                 cfg.shell.clone(),
                 cfg.agent.max_parallel_subagents,
             )));
@@ -230,6 +232,7 @@ impl Session {
             provider_name: name,
             pcfg,
             provider,
+            shared_provider,
             ctx,
             registry,
             store,
@@ -318,6 +321,9 @@ impl Session {
             &api_key,
             self.router_telemetry.clone(),
         )?;
+        if let Ok(mut guard) = self.shared_provider.write() {
+            *guard = provider.clone();
+        }
         self.provider = provider;
         self.provider_name = name.to_string();
         self.pcfg = pcfg;

@@ -73,6 +73,20 @@ impl UndoStack {
         self.redo.len()
     }
 
+    /// Daftar path relatif unik yang baru diubah (terbaru dulu, maks `limit`), dipakai `verify_project`.
+    pub fn recent_edited_files(&self, limit: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for snap in self.undo.iter().rev() {
+            if !out.contains(&snap.rel) {
+                out.push(snap.rel.clone());
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     /// Buat checkpoint baru pada posisi `undo` saat ini.
     pub fn begin_checkpoint(&mut self, label: impl Into<String>) -> usize {
         self.next_cp_id += 1;

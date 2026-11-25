@@ -103,52 +103,130 @@ pub fn decode_message(line: &str) -> Result<Value> {
     Ok(serde_json::from_str(line)?)
 }
 
-/// Validasi argumen tool terhadap JSON Schema `inputSchema` sebelum dikirim ke server MCP.
-/// Mencegah server eksternal crash atau hang akibat argumen tidak valid dari model.
+/// Validasi argumen tool secara rekursif terhadap JSON Schema `inputSchema` sebelum dikirim
+/// ke server MCP (mendukung `type`, `required`, `properties`, `additionalProperties: false`,
+/// `items`, `minItems`/`maxItems`, `enum`, `minimum`/`maximum`, `minLength`/`maxLength`).
 pub fn validate_tool_args(schema: &Value, args: &Value) -> Result<()> {
-    let Some(obj) = args.as_object() else {
-        if schema.get("type").and_then(|v| v.as_str()) == Some("object") {
-            return Err(anyhow!("argumen tool MCP harus berupa objek JSON"));
-        }
-        return Ok(());
-    };
+    validate_schema_node(schema, args, "$")
+}
 
-    if let Some(reqs) = schema.get("required").and_then(|v| v.as_array()) {
-        for r in reqs {
-            if let Some(key) = r.as_str() {
-                match obj.get(key) {
-                    None | Some(Value::Null) => {
-                        return Err(anyhow!(
-                            "validasi schema MCP gagal: field wajib '{key}' tidak ada atau null"
-                        ));
-                    }
-                    _ => {}
-                }
+fn validate_schema_node(schema: &Value, val: &Value, path: &str) -> Result<()> {
+    // 1. Cek `enum`
+    if let Some(allowed) = schema.get("enum").and_then(|v| v.as_array()) {
+        if !allowed.iter().any(|a| a == val) {
+            return Err(anyhow!(
+                "validasi schema MCP gagal pada '{path}': nilai tidak ada di daftar enum"
+            ));
+        }
+    }
+
+    // 2. Cek `type`
+    if let Some(expected) = schema.get("type").and_then(|v| v.as_str()) {
+        let ok = match expected {
+            "string" => val.is_string(),
+            "integer" => val.as_i64().is_some() || val.as_u64().is_some(),
+            "number" => val.is_number(),
+            "boolean" => val.is_boolean(),
+            "array" => val.is_array(),
+            "object" => val.is_object(),
+            "null" => val.is_null(),
+            _ => true,
+        };
+        if !ok {
+            return Err(anyhow!(
+                "validasi schema MCP gagal: field '{path}' harus bertipe '{expected}'"
+            ));
+        }
+    }
+
+    // 3. Constraint string (`minLength`, `maxLength`)
+    if let Some(s) = val.as_str() {
+        let len = s.chars().count();
+        if let Some(min_l) = schema.get("minLength").and_then(|v| v.as_u64()) {
+            if (len as u64) < min_l {
+                return Err(anyhow!(
+                    "validasi schema MCP gagal: field '{path}' panjang minimum {min_l} karakter"
+                ));
+            }
+        }
+        if let Some(max_l) = schema.get("maxLength").and_then(|v| v.as_u64()) {
+            if (len as u64) > max_l {
+                return Err(anyhow!(
+                    "validasi schema MCP gagal: field '{path}' panjang maksimum {max_l} karakter"
+                ));
             }
         }
     }
 
-    if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
-        for (k, val) in obj {
-            let Some(prop_schema) = props.get(k) else {
-                continue;
-            };
-            let Some(expected) = prop_schema.get("type").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let ok = match expected {
-                "string" => val.is_string(),
-                "integer" => val.as_i64().is_some() || val.as_u64().is_some(),
-                "number" => val.is_number(),
-                "boolean" => val.is_boolean(),
-                "array" => val.is_array(),
-                "object" => val.is_object(),
-                "null" => val.is_null(),
-                _ => true,
-            };
-            if !ok {
+    // 4. Constraint numerik (`minimum`, `maximum`)
+    if let Some(num) = val.as_f64() {
+        if let Some(min_v) = schema.get("minimum").and_then(|v| v.as_f64()) {
+            if num < min_v {
                 return Err(anyhow!(
-                    "validasi schema MCP gagal: field '{k}' harus bertipe '{expected}'"
+                    "validasi schema MCP gagal: field '{path}' harus >= {min_v}"
+                ));
+            }
+        }
+        if let Some(max_v) = schema.get("maximum").and_then(|v| v.as_f64()) {
+            if num > max_v {
+                return Err(anyhow!(
+                    "validasi schema MCP gagal: field '{path}' harus <= {max_v}"
+                ));
+            }
+        }
+    }
+
+    // 5. Rekursif `array` (`items`, `minItems`, `maxItems`)
+    if let Some(arr) = val.as_array() {
+        if let Some(min_i) = schema.get("minItems").and_then(|v| v.as_u64()) {
+            if (arr.len() as u64) < min_i {
+                return Err(anyhow!(
+                    "validasi schema MCP gagal: array '{path}' minimal {min_i} item"
+                ));
+            }
+        }
+        if let Some(max_i) = schema.get("maxItems").and_then(|v| v.as_u64()) {
+            if (arr.len() as u64) > max_i {
+                return Err(anyhow!(
+                    "validasi schema MCP gagal: array '{path}' maksimal {max_i} item"
+                ));
+            }
+        }
+        if let Some(item_schema) = schema.get("items") {
+            for (idx, item) in arr.iter().enumerate() {
+                validate_schema_node(item_schema, item, &format!("{path}[{idx}]"))?;
+            }
+        }
+    }
+
+    // 6. Rekursif `object` (`required`, `properties`, `additionalProperties: false`)
+    if let Some(obj) = val.as_object() {
+        if let Some(reqs) = schema.get("required").and_then(|v| v.as_array()) {
+            for r in reqs {
+                if let Some(key) = r.as_str() {
+                    match obj.get(key) {
+                        None | Some(Value::Null) => {
+                            return Err(anyhow!(
+                                "validasi schema MCP gagal: field wajib '{path}.{key}' tidak ada atau null"
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let props = schema.get("properties").and_then(|v| v.as_object());
+        let disallow_extra = schema
+            .get("additionalProperties")
+            .and_then(|v| v.as_bool())
+            == Some(false);
+        for (k, child_val) in obj {
+            let child_path = format!("{path}.{k}");
+            if let Some(prop_schema) = props.and_then(|p| p.get(k)) {
+                validate_schema_node(prop_schema, child_val, &child_path)?;
+            } else if disallow_extra {
+                return Err(anyhow!(
+                    "validasi schema MCP gagal: field tambahan '{child_path}' tidak diizinkan (additionalProperties=false)"
                 ));
             }
         }

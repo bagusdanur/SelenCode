@@ -235,7 +235,9 @@ pub async fn run() -> Result<()> {
         .build()
         .context("gagal membuat HTTP client")?;
 
-    let (tag_name, download_url) = resolve_latest_release(&client, &repo, asset_name).await?;
+    let (tag_name, download_url) = resolve_latest_release(&client, &repo, asset_name)
+        .await
+        .map_err(format_update_error)?;
 
     let remote = parse_version(&tag_name)
         .ok_or_else(|| anyhow::anyhow!("tag rilis tidak dikenal: {tag_name}"))?;
@@ -249,15 +251,39 @@ pub async fn run() -> Result<()> {
         .get(&download_url)
         .send()
         .await
-        .context("unduhan gagal — periksa koneksi internet")?
+        .context("unduhan gagal — periksa koneksi internet")
+        .map_err(format_update_error)?
         .error_for_status()
-        .context("GitHub menolak unduhan aset")?
+        .context("GitHub menolak unduhan aset")
+        .map_err(format_update_error)?
         .bytes()
         .await
-        .context("unduhan terputus di tengah jalan")?;
+        .context("unduhan terputus di tengah jalan")
+        .map_err(format_update_error)?;
 
     let exe = std::env::current_exe().context("tidak bisa menemukan lokasi binary selen")?;
     replace_binary(&exe, &bytes)?;
     println!("Diperbarui ke {tag_name} — jalankan `selen` lagi.");
     Ok(())
+}
+
+/// Live-test P4: sederhanakan rantai error `Caused by:` teknis menjadi 1 baris ramah user;
+/// tampilkan rantai lengkap hanya bila `SELENCODE_DEBUG=1`.
+pub fn format_update_error(err: anyhow::Error) -> anyhow::Error {
+    let verbose = std::env::var("SELENCODE_DEBUG")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if verbose {
+        return err;
+    }
+    let summary = err.to_string();
+    let full = format!("{err:?}");
+    let hint = if full.contains("UnknownIssuer") || full.contains("certificate") {
+        " (sertifikat TLS/proxy jaringan ditolak — jalankan dari jaringan normal atau set SELENCODE_DEBUG=1)"
+    } else if full.contains("dns") || full.contains("Connect") || full.contains("timed out") {
+        " (set SELENCODE_DEBUG=1 untuk detail teknis)"
+    } else {
+        ""
+    };
+    anyhow::anyhow!("{summary}{hint}")
 }

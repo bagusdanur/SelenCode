@@ -327,6 +327,31 @@ impl SandboxController {
         self.inner.lock().map(|s| s.scrub_env).unwrap_or(true)
     }
 
+    /// Apakah eksekusi subprocess saat ini benar-benar akan dibungkus `bwrap` (OS-isolated)?
+    pub fn will_use_os_isolation(&self) -> bool {
+        let Ok(st) = self.inner.lock() else {
+            return false;
+        };
+        matches!(
+            (&st.backend, st.os_isolation, st.mode),
+            (
+                SandboxBackend::BubblewrapOsIsolated(_),
+                OsIsolationPolicy::Strict,
+                SandboxMode::WorkspaceWrite | SandboxMode::Unrestricted
+            ) | (
+                SandboxBackend::BubblewrapOsIsolated(_),
+                OsIsolationPolicy::Auto,
+                SandboxMode::WorkspaceWrite
+            )
+        )
+    }
+
+    /// Apakah isolasi jaringan (`--unshare-net`) benar-benar ditegakkan oleh backend saat ini?
+    pub fn network_isolation_enforced(&self) -> bool {
+        let allow_network = self.inner.lock().map(|s| s.allow_network).unwrap_or(true);
+        !allow_network && self.will_use_os_isolation()
+    }
+
     /// Periksa apakah aksi tulis (`write_file`, `edit_file`, `lsp_rename`, `git_commit`)
     /// diizinkan oleh `SandboxMode` saat ini, sambil mencatat audit log.
     pub fn check_write_allowed(&self, action: &str, target: &str) -> Result<()> {
@@ -387,12 +412,30 @@ impl SandboxController {
             ));
         }
 
+        // P0.1: `strict` WAJIB menegakkan isolasi OS (`bwrap`) untuk semua mode tulis
+        // (termasuk `unrestricted`) — TIDAK BOLEH diam-diam jatuh ke host shell!
         let use_bwrap = match (&st.backend, st.os_isolation, st.mode) {
-            (SandboxBackend::BubblewrapOsIsolated(bwrap_path), OsIsolationPolicy::Auto | OsIsolationPolicy::Strict, SandboxMode::WorkspaceWrite) => {
+            (SandboxBackend::BubblewrapOsIsolated(bwrap_path), OsIsolationPolicy::Strict, _) => {
                 Some(bwrap_path.clone())
             }
+            (
+                SandboxBackend::BubblewrapOsIsolated(bwrap_path),
+                OsIsolationPolicy::Auto,
+                SandboxMode::WorkspaceWrite,
+            ) => Some(bwrap_path.clone()),
             _ => None,
         };
+        if st.os_isolation == OsIsolationPolicy::Strict && use_bwrap.is_none() {
+            self.record_audit(
+                action,
+                cmd_clean,
+                false,
+                "fail-closed: strict mode tidak boleh mengeksekusi tanpa bwrap",
+            );
+            return Err(anyhow!(
+                "sandbox fail-closed: kebijakan `os_isolate = strict` melarang eksekusi tanpa isolasi OS."
+            ));
+        }
 
         let mut cmd = if let Some(bwrap_path) = use_bwrap {
             let cwd_can = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
@@ -513,10 +556,19 @@ impl SandboxController {
         } else {
             "nonaktif".to_string()
         };
+        let net_label = if st.allow_network {
+            "diizinkan (allow_network=true)".to_string()
+        } else if self.network_isolation_enforced() {
+            "diblokir (enforced via bwrap --unshare-net)".to_string()
+        } else {
+            "not enforced (backend Process-Hardened / isolate=off tidak menegakkan blokir jaringan)"
+                .to_string()
+        };
         format!(
             "# Security Sandbox v2\n\
              * mode | {} | os_isolate: {}\n\
              > backend | {} |\n\
+             > network | {} |\n\
              > env guard | {} |\n\
              > audit log | {} |\n\
              ---\n\
@@ -526,6 +578,7 @@ impl SandboxController {
             st.mode.as_str(),
             st.os_isolation.as_str(),
             st.backend.label(),
+            net_label,
             scrub_label,
             audit_label
         )

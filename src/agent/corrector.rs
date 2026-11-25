@@ -189,6 +189,13 @@ impl SelfCorrectState {
             }
             "verify_project" => {
                 self.verified_after_last_edit = true;
+                if !is_error
+                    && (output.contains("verifikasi proyek otomatis dilewati")
+                        || output.starts_with("Ditolak user"))
+                {
+                    self.last_verify_passed = Some(true);
+                    return;
+                }
                 let no_tests = output.contains("TIDAK ADA TEST") || output.contains("NO_TESTS");
                 let timed_out = output.contains("TIMEOUT");
                 let ok = !is_error && !no_tests && !timed_out && output.contains("LULUS");

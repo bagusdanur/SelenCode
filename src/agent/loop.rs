@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use super::context::{
     auto_outline, build_system_prompt, compact_messages, estimate_tokens, expand_at_mentions,
-    format_memories_section, needs_compaction,
+    format_memories_section, needs_compaction, prune_old_tool_results,
 };
 use super::corrector::{LoopGuard, SelfCorrectState};
 use super::plan::{is_read_only, TurnMode, PLAN_NOTE};
@@ -248,8 +248,9 @@ async fn run_turn_inner(
     let mut corrector = SelfCorrectState::new(turn_checkpoint_id);
 
     for step in 0..max_steps {
-        // Compaction konteks (Fase 2): ringkas riwayat lama bila estimasi
-        // token melewati 80% batas, sebelum dikirim ke provider.
+        // Diet konteks (Live-Test P1): padatkan hasil tool lama sebelum mengirim ulang ke provider.
+        prune_old_tool_results(messages, 2);
+        // Compaction konteks: ringkas riwayat lama bila estimasi token melewati ambang batas.
         if needs_compaction(messages, ctx.context_limit_tokens) {
             match &ui {
                 Some(tx) => {
@@ -621,9 +622,9 @@ fn summarize(s: &str, max: usize) -> String {
     out
 }
 
-/// Potong hasil tool agar konteks tidak meledak (30KB, aman UTF-8).
+/// Potong hasil tool agar konteks tidak meledak (16KB, aman UTF-8).
 fn truncate(s: String) -> String {
-    const MAX: usize = 30 * 1024;
+    const MAX: usize = 16 * 1024;
     if s.len() <= MAX {
         s
     } else {
@@ -633,7 +634,7 @@ fn truncate(s: String) -> String {
         }
         let mut cut = s;
         cut.truncate(end);
-        cut.push_str("\n... (hasil dipotong 30KB)");
+        cut.push_str("\n... (hasil dipotong 16KB)");
         cut
     }
 }

@@ -121,12 +121,23 @@ pub fn create_isolated_worktree(cwd: &Path, label: &str) -> Result<WorktreeInfo>
     if !ok {
         return Err(anyhow!("gagal membuat Git Worktree '{id}': {}", out.trim()));
     }
+    // P1.1: simpan base_commit asli di metadata git branch agar commit baru di worktree tetap masuk diff & apply!
+    let cfg_key = format!("branch.{branch}.selen-base");
+    let _ = run_git(cwd, &["config", &cfg_key, &base_commit]);
     Ok(WorktreeInfo {
         id,
         branch,
         path: wt_dir,
         base_commit,
     })
+}
+
+fn read_recorded_base_commit(cwd: &Path, branch: &str, fallback_head: &str) -> String {
+    let cfg_key = format!("branch.{branch}.selen-base");
+    match run_git(cwd, &["config", "--get", &cfg_key]) {
+        Ok((true, out)) if !out.trim().is_empty() => out.trim().to_string(),
+        _ => fallback_head.to_string(),
+    }
 }
 
 /// Daftar seluruh Git Worktree aktif milik SelenCode (`selen/wt-*`).
@@ -153,11 +164,12 @@ pub fn list_worktrees(cwd: &Path) -> Result<Vec<WorktreeInfo>> {
                 .unwrap_or(branch.as_str())
                 .to_string();
             if let Some(id) = short_branch.strip_prefix(WORKTREE_BRANCH_PREFIX) {
+                let recorded_base = read_recorded_base_commit(cwd, &short_branch, head);
                 out_vec.push(WorktreeInfo {
                     id: id.to_string(),
                     branch: short_branch,
                     path,
-                    base_commit: head.clone(),
+                    base_commit: recorded_base,
                 });
             }
         }
@@ -226,26 +238,36 @@ fn parse_porcelain_paths(status_out: &str) -> (Vec<String>, Vec<String>) {
 pub fn preview_diff(cwd: &Path, id: &str) -> Result<WorktreeDiffPreview> {
     let wt = find_worktree(cwd, id)?;
 
-    // Perubahan di dalam worktree (belum commit maupun sudah commit di branch worktree).
+    // P1.1: hitung diff terhadap `base_commit` ASLI saat worktree dibuat agar
+    // perubahan yang SUDAH DI-COMMIT di branch worktree maupun yang belum di-commit
+    // semuanya terdeteksi konsisten pada preview & apply!
+    let base_ref = if wt.base_commit.trim().is_empty() {
+        "HEAD"
+    } else {
+        wt.base_commit.as_str()
+    };
     let (_, wt_status) = run_git(&wt.path, &["status", "--porcelain"])?;
     let (mut changed_files, mut deleted_files) = parse_porcelain_paths(&wt_status);
 
-    // Juga cek commit yang mungkin dibuat di branch worktree terhadap HEAD utama.
-    let (ok_nm, nm_out) = run_git(&wt.path, &["diff", "--name-status", "HEAD"])?;
+    let (ok_nm, nm_out) = run_git(&wt.path, &["diff", "--name-status", base_ref])?;
     if ok_nm {
         for line in nm_out.lines() {
             let mut parts = line.splitn(2, '\t');
             let st = parts.next().unwrap_or("").trim();
             let rel = parts.next().unwrap_or("").trim().replace('\\', "/");
-            if rel.is_empty() {
+            if rel.is_empty() || rel.starts_with(".selencode/") {
                 continue;
             }
             if st.starts_with('D') {
+                changed_files.retain(|x| x != &rel);
                 if !deleted_files.contains(&rel) {
                     deleted_files.push(rel);
                 }
-            } else if !changed_files.contains(&rel) {
-                changed_files.push(rel);
+            } else {
+                deleted_files.retain(|x| x != &rel);
+                if !changed_files.contains(&rel) {
+                    changed_files.push(rel);
+                }
             }
         }
     }
@@ -262,7 +284,7 @@ pub fn preview_diff(cwd: &Path, id: &str) -> Result<WorktreeDiffPreview> {
         }
     }
 
-    let (_, raw_diff) = run_git(&wt.path, &["diff"])?;
+    let (_, raw_diff) = run_git(&wt.path, &["diff", base_ref])?;
     let mut diff_text = redact_secrets(&raw_diff);
     if diff_text.len() > MAX_DIFF_PREVIEW_BYTES {
         let mut cut = MAX_DIFF_PREVIEW_BYTES;
@@ -307,53 +329,81 @@ pub fn apply_worktree_to_main(
         ));
     }
 
-    let cp_id = undo_stack
-        .lock()
-        .expect("undo_stack poisoned")
-        .begin_checkpoint(format!("apply worktree {}", wt.id));
-
-    let mut applied_files = Vec::new();
+    // P1.3: pra-validasi & baca seluruh sumber ke memori sebelum mengubah 1 file pun di workspace utama.
+    let mut staged_writes: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
     for rel in &preview.changed_files {
         let src = resolve_in_sandbox(&wt.path, Path::new(rel))?;
         let dst = resolve_in_sandbox(cwd, Path::new(rel))?;
         if is_secret_file(&src) || is_secret_file(&dst) || !src.is_file() {
             continue;
         }
-        let after = std::fs::read(&src)?;
-        let before = std::fs::read(&dst).ok();
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&dst, &after)?;
-        if let Ok(mut st) = undo_stack.lock() {
-            st.record(FileSnapshot {
-                path: dst,
-                rel: rel.clone(),
-                before,
-                after,
-            });
-        }
-        applied_files.push(rel.clone());
+        let after = std::fs::read(&src)
+            .with_context(|| format!("gagal membaca file worktree '{rel}'"))?;
+        staged_writes.push((rel.clone(), dst, after));
     }
-
-    let mut deleted_files = Vec::new();
+    let mut staged_deletes: Vec<(String, PathBuf)> = Vec::new();
     for rel in &preview.deleted_files {
         let dst = resolve_in_sandbox(cwd, Path::new(rel))?;
         if is_secret_file(&dst) || !dst.is_file() {
             continue;
         }
-        let before = std::fs::read(&dst).ok();
-        std::fs::remove_file(&dst)?;
-        if let Ok(mut st) = undo_stack.lock() {
-            st.record(FileSnapshot {
-                path: dst,
-                rel: rel.clone(),
-                before,
-                after: Vec::new(),
-            });
-        }
-        deleted_files.push(rel.clone());
+        staged_deletes.push((rel.clone(), dst));
     }
+
+    let cp_id = undo_stack
+        .lock()
+        .expect("undo_stack poisoned")
+        .begin_checkpoint(format!("apply worktree {}", wt.id));
+
+    let apply_res: Result<(Vec<String>, Vec<String>)> = (|| {
+        let mut applied_files = Vec::new();
+        for (rel, dst, after) in staged_writes {
+            let before = std::fs::read(&dst).ok();
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&dst, &after)?;
+            if let Ok(mut st) = undo_stack.lock() {
+                st.record(FileSnapshot {
+                    path: dst,
+                    rel: rel.clone(),
+                    before,
+                    after,
+                });
+            }
+            applied_files.push(rel);
+        }
+
+        let mut deleted_files = Vec::new();
+        for (rel, dst) in staged_deletes {
+            let before = std::fs::read(&dst).ok();
+            std::fs::remove_file(&dst)?;
+            if let Ok(mut st) = undo_stack.lock() {
+                st.record(FileSnapshot {
+                    path: dst,
+                    rel: rel.clone(),
+                    before,
+                    after: Vec::new(),
+                });
+            }
+            deleted_files.push(rel);
+        }
+        Ok((applied_files, deleted_files))
+    })();
+
+    let (applied_files, deleted_files) = match apply_res {
+        Ok(pair) => pair,
+        Err(e) => {
+            // P1.3: rollback atomik semua file yang sempat tertulis bila apply gagal di tengah!
+            if let Ok(mut st) = undo_stack.lock() {
+                let _ = st.rollback_to(Some(cp_id));
+            }
+            return Err(anyhow!(
+                "apply worktree '{}' gagal di tengah jalan (perubahan parsial otomatis di-rollback): {e}",
+                wt.id
+            ));
+        }
+    };
 
     Ok(ApplyWorktreeReport {
         id: wt.id,
