@@ -62,9 +62,9 @@ pub struct Ctx {
     pub guard: crate::config::GuardCfg,
     /// Pengaturan anggaran hasil tool (`[tool_budget]`: cap shell 40/60, spillover, turn budget).
     pub tool_budget: crate::config::ToolBudgetCfg,
-    /// Pengaturan Skills System ala Hermes (`[skills]`: `index_max_tokens`, `auto_load`).
+    /// Pengaturan Skills System SelenCode (`[skills]`: `index_max_tokens`, `auto_load`).
     pub skills: crate::config::SkillsCfg,
-    /// Aktifkan review self-improvement otomatis pasca-giliran kompleks (ala Hermes).
+    /// Aktifkan review self-improvement otomatis pasca-giliran kompleks.
     /// Default false di Ctx::new agar tes mock tidak memicu panggilan ekstra;
     /// Session::build mengisinya dari `cfg.agent.auto_skills` (default true).
     pub auto_skills: bool,

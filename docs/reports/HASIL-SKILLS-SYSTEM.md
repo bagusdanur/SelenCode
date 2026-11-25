@@ -1,8 +1,8 @@
-# Hasil Implementasi Skills System ala Hermes — SelenCode v0.4.0
+# Hasil Implementasi SelenCode Skills System — v0.4.0
 
 - **Versi:** `v0.4.0` (dari `v0.3.4`)
 - **Tanggal:** 25 November 2026
-- **Prinsip:** Playbook `SKILL.md` lintas-sesi berbasis Progressive Disclosure 3 tingkat ala Hermes Agent (`NousResearch/hermes-agent`), tetap menjaga penuh sistem hemat token Tahap 0–6, Bagian A performa, spillover `run_shell`, plan mode, dan UX persetujuan yang sudah terverifikasi.
+- **Prinsip:** Playbook `SKILL.md` lintas-sesi berbasis Progressive Disclosure 3 tingkat milik SelenCode, tetap menjaga penuh sistem hemat token Tahap 0–6, Bagian A performa, spillover `run_shell`, plan mode, dan UX persetujuan yang sudah terverifikasi.
 
 ---
 
@@ -46,7 +46,7 @@
 
 ## 2. Hasil Pengujian & Bukti DB
 
-### A. Tes Otomatis (`tests/skills_hermes.rs` + Seluruh Suite Lama pada CI Linux & Windows x64)
+### A. Tes Otomatis (`tests/skills_system.rs` + Seluruh Suite Lama pada CI Linux & Windows x64)
 - `tahap1_frontmatter_parsing_valid_invalid_and_priority_project_over_user`: memverifikasi parsing YAML valid/rusak, validasi kebab-case, prioritas proyek > pengguna, warning tanpa crash untuk skill rusak/duplikat, serta validitas 2 skill bawaan (`rilis-github`, `tinjau-rust`).
 - `tahap2_index_truncated_60_chars_and_grouped_by_category`: memverifikasi pemotongan deskripsi indeks ≤60 char dan pengelompokan kategori.
 - `tahap3_and_tahap4_skill_view_security_and_approval_gated_create_edit`: memverifikasi Tingkat 2 & Tingkat 3, penolakan path traversal (`../`, path absolut) dan `.env`, serta verifikasi bahwa penolakan approval membatalkan penulisan `skill_create` sedangkan persetujuan menulis `SKILL.md` teredaksi + menampilkan unified diff.

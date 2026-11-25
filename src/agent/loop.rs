@@ -155,7 +155,7 @@ async fn run_turn_inner(
     ui: Option<mpsc::Sender<UiEvent>>,
     mode: TurnMode,
 ) -> Result<(String, Option<Usage>)> {
-    // Progressive Disclosure (Hermes-style toolsets + Tahap 6 MCP >15 on-demand index + Skills v0.4.0):
+    // Progressive Disclosure (tiered toolsets + MCP >15 on-demand index + Skills System v0.4.0):
     // Hanya kirim Core Toolset + toolset yang cocok dengan intent/workspace, bukan seluruh 29+ schema!
     let has_mcp = registry.names().iter().any(|n| n.starts_with("mcp__"));
     let installed_skills = crate::skills::list_skills(&ctx.cwd);
@@ -332,15 +332,15 @@ async fn run_turn_inner(
     for step in 0..max_steps {
         // Tahap 1 — Prune hasil tool lama (>200 char di luar 20 pesan terakhir) + arsip ke file (TANPA LLM).
         let pruned_now = prune_old_tool_results_with_archive(messages, &prune_dir, 20);
-        // Tahap 5 — Kompresi dua tahap ala Hermes: hanya ringkas jika MASIH > 50% sesudah Tahap 1 prune!
+        // Kompresi dua tahap: hanya ringkas jika MASIH > 50% sesudah Tahap 1 prune!
         if needs_compaction(messages, ctx.context_limit_tokens) {
             match &ui {
                 Some(tx) => {
                     let _ = tx
-                        .send(UiEvent::Info("compaction dua tahap (Hermes) dijalankan".into()))
+                        .send(UiEvent::Info("compaction dua tahap dijalankan".into()))
                         .await;
                 }
-                None => eprintln!("[selen] compaction dua tahap (Hermes) dijalankan"),
+                None => eprintln!("[selen] compaction dua tahap dijalankan"),
             }
             *messages = compact_messages_hermes(messages);
         }

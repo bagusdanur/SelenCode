@@ -1,4 +1,4 @@
-//! Tools Skills System ala Hermes Agent (Progressive Disclosure 3 Tingkat):
+//! Tools Skills System SelenCode (Progressive Disclosure 3 Tingkat):
 //! - `skills_list`: daftar indeks ringkas skill (nama + deskripsi maks 60 char per kategori).
 //! - `skill_view(name, path?)`: Tingkat 2 (isi penuh `SKILL.md` + daftar file referensi) &
 //!   Tingkat 3 (muat 1 file referensi di dalam folder skill dengan validasi anti-traversal & anti-secret).

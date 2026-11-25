@@ -35,12 +35,12 @@ pub struct Config {
     /// Anggaran hasil tool: cap per tool, spillover ke file, & budget per turn (`[tool_budget]`).
     #[serde(default, skip_serializing_if = "ToolBudgetCfg::is_default")]
     pub tool_budget: ToolBudgetCfg,
-    /// Pengaturan Skills System ala Hermes (`[skills]` di selencode.toml).
+    /// Pengaturan Skills System SelenCode (`[skills]` di selencode.toml).
     #[serde(default, skip_serializing_if = "SkillsCfg::is_default")]
     pub skills: SkillsCfg,
 }
 
-/// Konfigurasi Skills System ala Hermes (`[skills]`).
+/// Konfigurasi Skills System SelenCode (`[skills]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillsCfg {
     /// Override batas token indeks dinamis awal sesi khusus saat banyak skill terpasang

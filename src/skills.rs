@@ -1,4 +1,4 @@
-//! Skills System ala Hermes Agent (Progressive Disclosure 3 Tingkat),
+//! Skills System SelenCode (Progressive Disclosure 3 Tingkat),
 //! `/init` (generator AGENTS.md), dan `/export` (ekspor percakapan ke Markdown).
 //!
 //! Arsitektur Skills v0.4.0:
@@ -684,7 +684,7 @@ pub fn skill_file_path_for(cwd: &Path, name: &str, category: Option<&str>) -> Re
 }
 
 /// Simpan atau perbarui (patch) skill ke `<proyek>/.selencode/skills/<nama>/SKILL.md`
-/// dengan frontmatter YAML standar Hermes. Konten diredaksi dari pola rahasia sebelum ditulis.
+/// dengan frontmatter YAML standar SelenCode. Konten diredaksi dari pola rahasia sebelum ditulis.
 pub fn upsert_skill(
     cwd: &Path,
     name: &str,
@@ -807,9 +807,9 @@ pub fn seed_default_user_skills() {
     }
 }
 
-/// Template skill bawaan ala Hermes Agent untuk efisiensi token & langkah minimal.
+/// Template skill bawaan SelenCode untuk efisiensi token & langkah minimal.
 pub const TOKEN_EFFICIENCY_SKILL_BODY: &str = "\
-Gunakan disiplin hemat token ala Hermes Agent (Progressive Disclosure):
+Gunakan disiplin hemat token SelenCode (Progressive Disclosure):
 1. Jangan baca file penuh jika cukup memakai `search_text` atau rentang baris (`start_line`/`end_line`).
 2. Jangan aktifkan toolset tambahan lewat `activate_toolset` kecuali benar-benar diperlukan giliran ini.
 3. Lakukan perubahan kode seminimal mungkin dalam 1–2 panggilan `edit_file`, bukan berulang kali.
@@ -821,7 +821,7 @@ pub fn install_token_efficiency_skill(cwd: &Path) -> Result<PathBuf> {
     let (path, _, _) = upsert_skill(
         cwd,
         "save-token",
-        Some("Disiplin hemat token & langkah minimal ala Hermes Agent"),
+        Some("Disiplin hemat token & langkah minimal SelenCode"),
         TOKEN_EFFICIENCY_SKILL_BODY,
     )?;
     Ok(path)

@@ -1,4 +1,4 @@
-//! Tes komprehensif Skills System ala Hermes (Tahap 1–6, v0.4.0):
+//! Tes komprehensif SelenCode Skills System (Tahap 1–6, v0.4.0):
 //! 1. Parsing frontmatter YAML (valid/rusak), kebab-case, prioritas proyek > pengguna, folder rusak tidak crash.
 //! 2. Indeks dikelompokkan per kategori & deskripsi dipotong <= 60 karakter.
 //! 3. Tool `skills_list` & `skill_view` (Tingkat 2 & 3) + penolakan path traversal & file rahasia.

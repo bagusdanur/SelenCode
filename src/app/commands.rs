@@ -1298,7 +1298,7 @@ impl Session {
             return Ok(format!(
                 "# Skill `save-token` Terpasang\n\
                  * lokasi | {} | siap dipakai via `/skill save-token`\n\
-                 ! Mengikuti pola Progressive Disclosure Hermes Agent (langkah & pembacaan minimal).",
+                 ! Mengikuti pola Progressive Disclosure SelenCode (langkah & pembacaan minimal).",
                 p.display()
             ));
         }
