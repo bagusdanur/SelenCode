@@ -368,7 +368,7 @@ async fn tui_worker(
                 }
                 ModelPickerCmd::ClearAll => {
                     let msg = match s.apply_model_arg("clear") {
-                        Ok(_) => "Daftar dibersihkan â€” tersisa 1 model aktif.".to_string(),
+                        Ok(_) => "Daftar dibersihkan — tersisa 1 model aktif.".to_string(),
                         Err(e) => format!("Gagal: {e}"),
                     };
                     let _ = ui_tx
@@ -588,7 +588,7 @@ pub(crate) async fn interactive_tui(cli: Cli, resume: bool) -> Result<()> {
     }
     if s.needs_setup {
         app.setup_wizard = Some(SetupWizardState::new(Some(
-            "Belum ada provider/API key yang siap â€” ayo isi provider pertamamu di sini!"
+            "Belum ada provider/API key yang siap — ayo isi provider pertamamu di sini!"
                 .to_string(),
         )));
     }

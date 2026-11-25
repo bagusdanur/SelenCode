@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "selen", version, about = "SelenCode â€” terminal AI coding agent (full Rust), persona Selena")]
-struct Cli {
+#[command(name = "selen", version, about = "SelenCode — terminal AI coding agent (full Rust), persona Selena")]
+pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
     /// Auto-approve semua tool yang butuh persetujuan (mode interaktif)

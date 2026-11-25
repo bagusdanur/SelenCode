@@ -1,4 +1,4 @@
-use super::{make_routed_provider};
+use super::make_routed_provider;
 use anyhow::Result;
 use selencode::agent::context::{
     compact_messages, estimate_tokens, format_context_compact, infer_model_context_limit,
@@ -124,7 +124,7 @@ impl Session {
         };
         let resumed_note = resumed_title.map(|(title, created)| {
             format!(
-                "Melanjutkan sesi: \"{title}\" ({created}) â€” {} pesan dimuat.",
+                "Melanjutkan sesi: \"{title}\" ({created}) — {} pesan dimuat.",
                 messages.len()
             )
         });
@@ -165,7 +165,7 @@ impl Session {
                 cfg.shell.clone(),
                 cfg.agent.max_parallel_subagents,
             )));
-        // Tool MCP (Fase 7): HANYA registry induk mode Execute â€” tidak ikut
+        // Tool MCP (Fase 7): HANYA registry induk mode Execute — tidak ikut
         // registry baca-saja plan/subagent. Server yang gagal start dilewati
         // dengan peringatan stderr; build_mcp_tools tidak mengembalikan Err,
         // jadi start selen tidak pernah digagalkan oleh server MCP.
@@ -218,7 +218,7 @@ impl Session {
         let ctx_s = format_context_compact(self.ctx.context_limit_tokens);
         Ok(format!(
             "# Provider Siap Dipakai!\n\
-             * {} | {} | aktif Â· ctx {ctx_s}\n\
+             * {} | {} | aktif · ctx {ctx_s}\n\
              > config | {} | tersimpan & jadi default\n\
              ---\n\
              ! Sekarang langsung ketik pertanyaanmu, atau `/model` untuk tambah model 1-per-1.",
@@ -622,7 +622,7 @@ impl Session {
                 ids.len()
             ),
             None => format!(
-                "# Katalog API {} ({} tersedia Â· tidak otomatis disimpan)\n",
+                "# Katalog API {} ({} tersedia · tidak otomatis disimpan)\n",
                 self.provider_name,
                 ids.len()
             ),
@@ -636,9 +636,9 @@ impl Session {
                 let is_saved = saved.iter().any(|s| s == *id);
                 let mark = if is_active { "*" } else { ">" };
                 let note = if is_active {
-                    "aktif Â· tersimpan"
+                    "aktif · tersimpan"
                 } else if is_saved {
-                    "âœ“ sudah di daftar"
+                    "✓ sudah di daftar"
                 } else {
                     ""
                 };
@@ -711,7 +711,7 @@ impl Session {
                 }
                 Ok(format!(
                     "# Provider Ditambahkan\n\
-                     > {name} | {model} | kind {kind} Â· {key_info}\n\
+                     > {name} | {model} | kind {kind} · {key_info}\n\
                      ---\n\
                      ! Config disimpan ke: {}\n\
                      ! Pakai sekarang: /model {name}   |   Jadikan default: /provider default {name}",
@@ -800,12 +800,12 @@ impl Session {
         if after_msgs == before_msgs {
             format!(
                 "# Compaction Konteks\n\
-                 ! Riwayat masih pendek ({before_msgs} pesan, ~{before_tok} token) â€” belum perlu diringkas."
+                 ! Riwayat masih pendek ({before_msgs} pesan, ~{before_tok} token) — belum perlu diringkas."
             )
         } else {
             format!(
                 "# Compaction Konteks Selesai\n\
-                 * pesan | {before_msgs} â†’ {after_msgs} | estimasi ~{before_tok} â†’ ~{after_tok} token"
+                 * pesan | {before_msgs} → {after_msgs} | estimasi ~{before_tok} → ~{after_tok} token"
             )
         }
     }
@@ -817,7 +817,7 @@ impl Session {
                 let mut s = format!("token sesi ini: {i} in / {o} out");
                 if let (Some(pin), Some(pout)) = (self.pcfg.price_in, self.pcfg.price_out) {
                     let cost = (i as f64 / 1_000_000.0) * pin + (o as f64 / 1_000_000.0) * pout;
-                    s.push_str(&format!(" Â· estimasi biaya ${cost:.4}"));
+                    s.push_str(&format!(" · estimasi biaya ${cost:.4}"));
                 }
                 s
             }
@@ -830,7 +830,7 @@ impl Session {
         let list = self.pcfg.effective_models();
         let active_ctx = format_context_compact(self.ctx.context_limit_tokens);
         let mut out = format!(
-            "# Model di Provider {} ({} tersimpan Â· ctx {active_ctx})\n",
+            "# Model di Provider {} ({} tersimpan · ctx {active_ctx})\n",
             self.provider_name,
             list.len()
         );
@@ -839,7 +839,7 @@ impl Session {
             let mark = if active { "*" } else { ">" };
             let m_ctx = format_context_compact(self.model_context_for(m));
             let note = if active {
-                format!("aktif Â· ctx {m_ctx}")
+                format!("aktif · ctx {m_ctx}")
             } else {
                 format!("ctx {m_ctx}")
             };
@@ -865,9 +865,9 @@ impl Session {
             };
             let count = p.effective_models().len();
             let tag = if active {
-                format!("provider aktif Â· {} Â· {count} model Â· {key_ok}", p.kind)
+                format!("provider aktif · {} · {count} model · {key_ok}", p.kind)
             } else {
-                format!("provider Â· {} Â· {count} model Â· {key_ok}", p.kind)
+                format!("provider · {} · {count} model · {key_ok}", p.kind)
             };
             out.push_str(&format!("{mark} {n} | {} | {tag}\n", p.model));
         }

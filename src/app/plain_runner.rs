@@ -28,9 +28,9 @@ fn run_plain_setup_wizard(s: &mut Session) -> Result<()> {
         })
     };
 
-    println!("\n=== â˜¾ Setup Provider SelenCode ===");
+    println!("\n=== ☾ Setup Provider SelenCode ===");
     for (i, p) in SETUP_PRESETS.iter().enumerate() {
-        println!("  {}. {} â€” {}", i + 1, p.label, p.desc);
+        println!("  {}. {} — {}", i + 1, p.label, p.desc);
     }
     let pick_str = prompt_line("Pilih jenis API (1-8)", "1")?;
     let idx = pick_str
@@ -75,11 +75,11 @@ pub(crate) async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
     let mut s = Session::build(cli.provider.as_deref(), cli.yes, resume, None, None, true).await?;
     if s.needs_setup {
         println!(
-            "â˜¾ Provider belum siap ({}). Mulai setup interaktifâ€¦",
+            "☾ Provider belum siap ({}). Mulai setup interaktif…",
             s.setup_reason.as_deref().unwrap_or("belum dikonfigurasi")
         );
         if let Err(e) = run_plain_setup_wizard(&mut s) {
-            eprintln!("[setup] {e} â€” kamu bisa ulangi kapan saja lewat `/setup`.");
+            eprintln!("[setup] {e} — kamu bisa ulangi kapan saja lewat `/setup`.");
         }
     }
     if let Some(note) = &s.resumed_note {

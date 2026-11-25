@@ -51,7 +51,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
         cfg.agent.approval.clone()
     };
 
-    println!("â˜¾ SelenCode Telegram Gateway aktif!");
+    println!("☾ SelenCode Telegram Gateway aktif!");
     println!("  Bot      : {bot_handle} (id: {})", me.id);
     println!("  Provider : {prov_name} / {}", pcfg.model);
     println!("  Folder   : {}", cwd.display());
@@ -91,7 +91,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
     loop {
         let updates = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                println!("\nâ˜¾ Telegram Gateway dihentikan.");
+                println!("\n☾ Telegram Gateway dihentikan.");
                 break;
             }
             res = tg.get_updates(offset, 25) => match res {
@@ -143,15 +143,15 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
             // `/id` selalu dijawab agar pemilik bisa langsung tahu ID untuk whitelist.
             if text.eq_ignore_ascii_case("/id") {
                 let allowed_note = if latest_cfg.telegram.is_allowed(user_id, chat_id) {
-                    "âœ… Sudah ada di whitelist."
+                    "✅ Sudah ada di whitelist."
                 } else {
-                    "ðŸ”’ Belum di whitelist. Jalankan di SelenCode:\n/telegram allow <USER_ID>"
+                    "🔒 Belum di whitelist. Jalankan di SelenCode:\n/telegram allow <USER_ID>"
                 };
                 let _ = tg
                     .send_message(
                         chat_id,
                         &format!(
-                            "â˜¾ Info ID Telegram kamu:\nUser ID: {user_id}\nChat ID: {chat_id}\n{allowed_note}"
+                            "☾ Info ID Telegram kamu:\nUser ID: {user_id}\nChat ID: {chat_id}\n{allowed_note}"
                         ),
                     )
                     .await;
@@ -164,7 +164,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     .send_message(
                         chat_id,
                         &format!(
-                            "ðŸ”’ Akses ditolak â€” User ID {user_id} belum ada di whitelist SelenCode.\n\
+                            "🔒 Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode.\n\
                              Tambahkan dari terminal SelenCode:\n\
                              /telegram allow {user_id}"
                         ),
@@ -173,7 +173,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 continue;
             }
 
-            // `/cancel` selalu diproses walau chat sedang sibuk â€” batalkan giliran & approval tertunda!
+            // `/cancel` selalu diproses walau chat sedang sibuk — batalkan giliran & approval tertunda!
             if text.eq_ignore_ascii_case("/cancel") || text.eq_ignore_ascii_case("/stop") {
                 let cancelled_approvals = hub.cancel_chat_approvals(chat_id);
                 let notify_opt = cancel_tokens
@@ -184,9 +184,9 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     n.notify_waiters();
                 }
                 let msg = if cancelled_approvals > 0 {
-                    format!("ðŸ›‘ Dibatalkan ({cancelled_approvals} persetujuan tertunda ditolak).")
+                    format!("🛑 Dibatalkan ({cancelled_approvals} persetujuan tertunda ditolak).")
                 } else {
-                    "ðŸ›‘ Sinyal pembatalan dikirim ke giliran aktif.".to_string()
+                    "🛑 Sinyal pembatalan dikirim ke giliran aktif.".to_string()
                 };
                 let _ = tg.send_message(chat_id, &msg).await;
                 continue;
@@ -216,9 +216,9 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 let dropped = hub.cancel_chat_approvals(chat_id);
                 cancel_notify.notify_waiters();
                 let notice = if dropped > 0 {
-                    format!("âš¡ Menginterupsi giliran sebelumnya ({dropped} approval dibatalkan) â€” memproses pesan barumuâ€¦")
+                    format!("⚡ Menginterupsi giliran sebelumnya ({dropped} approval dibatalkan) — memproses pesan barumu…")
                 } else {
-                    "âš¡ Menginterupsi giliran sebelumnya â€” memproses pesan barumuâ€¦".to_string()
+                    "⚡ Menginterupsi giliran sebelumnya — memproses pesan barumu…".to_string()
                 };
                 let _ = tg.send_message(chat_id, &notice).await;
             }
@@ -254,7 +254,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 }
                 if let Err(e) = res {
                     let _ = tg_clone
-                        .send_long_message(chat_id, &format!("âŒ Error: {e}"))
+                        .send_long_message(chat_id, &format!("❌ Error: {e}"))
                         .await;
                 }
             });
@@ -330,17 +330,17 @@ async fn handle_telegram_chat_message(
     // Perintah khusus Telegram (/start, /status).
     if text.eq_ignore_ascii_case("/start") {
         let msg = format!(
-            "â˜¾ Halo! Aku Selena dari SelenCode.\n\
+            "☾ Halo! Aku Selena dari SelenCode.\n\
              Provider: {} / {}\n\
              Folder: {}\n\n\
              Kirim pesan coding apa saja langsung di chat ini!\n\
              Perintah cepat:\n\
-             â€¢ /model â€” lihat daftar model bernomor\n\
-             â€¢ /model 2 Â· /model add <id> Â· /model clear\n\
-             â€¢ /models [cari] â€” intip katalog API\n\
-             â€¢ /approve [ask|edits|auto] â€” atur mode izin\n\
-             â€¢ /new â€” mulai sesi baru Â· /status â€” info sesi\n\
-             â€¢ /help â€” semua perintah",
+             • /model — lihat daftar model bernomor\n\
+             • /model 2 · /model add <id> · /model clear\n\
+             • /models [cari] — intip katalog API\n\
+             • /approve [ask|edits|auto] — atur mode izin\n\
+             • /new — mulai sesi baru · /status — info sesi\n\
+             • /help — semua perintah",
             s.provider_name,
             s.pcfg.model,
             s.ctx.cwd.display()
@@ -395,7 +395,7 @@ async fn handle_telegram_chat_message(
         }
         SlashCommand::New => {
             let sid = s.reset_session()?;
-            tg.send_message(chat_id, &format!("âœ¨ Sesi baru dimulai ({sid})."))
+            tg.send_message(chat_id, &format!("✨ Sesi baru dimulai ({sid})."))
                 .await?;
             return Ok(());
         }
@@ -550,7 +550,7 @@ async fn handle_telegram_chat_message(
             return Ok(());
         }
         SlashCommand::Stop => {
-            tg.send_message(chat_id, "ðŸ›‘ Tidak ada giliran aktif yang berjalan.")
+            tg.send_message(chat_id, "🛑 Tidak ada giliran aktif yang berjalan.")
                 .await?;
             return Ok(());
         }
@@ -590,7 +590,7 @@ async fn handle_telegram_chat_message(
                     summary,
                     is_error,
                 } => {
-                    let icon = if is_error { "âœ—" } else { "âœ“" };
+                    let icon = if is_error { "✗" } else { "✓" };
                     let short: String = summary.chars().take(70).collect();
                     tools.push(format!("{icon} {name}: {short}"));
                 }
@@ -626,7 +626,7 @@ async fn handle_telegram_chat_message(
         }
         // Jangan kirim pesan "dibatalkan" bila pembatalan dipicu oleh pesan interupsi baru.
         if gen_counter.load(Ordering::SeqCst) == my_gen {
-            tg.send_message(chat_id, "ðŸ›‘ Giliran dibatalkan.").await?;
+            tg.send_message(chat_id, "🛑 Giliran dibatalkan.").await?;
         }
         return Ok(());
     };
@@ -634,7 +634,7 @@ async fn handle_telegram_chat_message(
     let mut final_msg = String::new();
     if !tools.is_empty() {
         let shown: Vec<String> = tools.into_iter().take(8).collect();
-        final_msg.push_str("ðŸ”§ Aksi:\n");
+        final_msg.push_str("🔧 Aksi:\n");
         final_msg.push_str(&shown.join("\n"));
         final_msg.push_str("\n\n");
     }
@@ -645,3 +645,4 @@ async fn handle_telegram_chat_message(
     tg.send_long_message(chat_id, &final_msg).await?;
     Ok(())
 }
+

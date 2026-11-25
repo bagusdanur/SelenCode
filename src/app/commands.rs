@@ -32,7 +32,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                     "belum diatur".to_string()
                 };
                 let users_str = if self.cfg.telegram.allowed_users.is_empty() {
-                    "(kosong â€” wajib isi whitelist agar aman)".to_string()
+                    "(kosong — wajib isi whitelist agar aman)".to_string()
                 } else {
                     self.cfg
                         .telegram
@@ -79,7 +79,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                 }
                 let saved = config::save(&self.cfg)?;
                 let uid_note = if self.cfg.telegram.allowed_users.is_empty() {
-                    "Belum ada User ID di whitelist â€” jalankan `selen telegram`, kirim `/id` ke bot, lalu `/telegram allow <ID>`."
+                    "Belum ada User ID di whitelist — jalankan `selen telegram`, kirim `/id` ke bot, lalu `/telegram allow <ID>`."
                         .to_string()
                 } else {
                     format!(
@@ -195,7 +195,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
         let mut out = format!("# Daftar Checkpoint ({} tersimpan)\n", cps.len());
         for (cp, count) in cps.iter().rev().take(15) {
             out.push_str(&format!(
-                "> #{} | {} | {} Â· {} perubahan sejak titik ini\n",
+                "> #{} | {} | {} · {} perubahan sejak titik ini\n",
                 cp.id, cp.label, cp.created_at, count
             ));
         }
@@ -271,12 +271,12 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                 "key KOSONG".to_string()
             };
             let def_tag = if *n == self.cfg.default_provider {
-                " Â· default"
+                " · default"
             } else {
                 ""
             };
             out.push_str(&format!(
-                "{mark} {n} | {} | {} Â· {url} Â· {key_status}{def_tag}\n",
+                "{mark} {n} | {} | {} · {url} · {key_status}{def_tag}\n",
                 p.model, p.kind
             ));
         }
@@ -290,12 +290,12 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
         for p in PROVIDER_PRESETS {
             let url = p.base_url.unwrap_or("(endpoint resmi)");
             let env = if p.default_env.is_empty() {
-                "(tanpa API key â€” lokal)"
+                "(tanpa API key — lokal)"
             } else {
                 p.default_env
             };
             out.push_str(&format!(
-                "> {} | {} | {} Â· {url} Â· {env}\n",
+                "> {} | {} | {} · {url} · {env}\n",
                 p.id, p.default_model, p.kind
             ));
         }
@@ -306,7 +306,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
         out
     }
 
-    /// `!perintah` â€” jalankan shell lokal cepat tanpa memanggil LLM (ala OpenCode).
+    /// `!perintah` — jalankan shell lokal cepat tanpa memanggil LLM (ala OpenCode).
     pub(crate) async fn handle_inline_shell(&self, command: &str) -> Result<String> {
         if is_forbidden_command(command) {
             anyhow::bail!("perintah ditolak demi keamanan (pola destruktif): {command}");
@@ -470,13 +470,13 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                     out.push_str("---\n");
                     for m in metrics.iter().take(6) {
                         let cost = if m.has_cost_data {
-                            format!(" Â· ${:.4}", m.estimated_cost_usd)
+                            format!(" · ${:.4}", m.estimated_cost_usd)
                         } else {
                             String::new()
                         };
                         let cd = if m.in_cooldown() { " [cooldown]" } else { "" };
                         out.push_str(&format!(
-                            "> {} | {} ok / {} err | avg {}ms Â· {}in/{}out{cost}{cd}\n",
+                            "> {} | {} ok / {} err | avg {}ms · {}in/{}out{cost}{cd}\n",
                             m.route_id,
                             m.successes,
                             m.errors,
@@ -685,7 +685,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                 .references(None, None, None, Some(sym))
                 .await?;
             let mut out = format!(
-                "# Referensi: {} ({} lokasi Â· {})\n",
+                "# Referensi: {} ({} lokasi · {})\n",
                 rep.symbol,
                 rep.locations.len(),
                 rep.backend
@@ -718,7 +718,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
     }
 
     /// Kelola Long-Horizon Tasks persisten lintas sesi (`/task`).
-    /// Mengembalikan `(kartu_menu, optional_resume_prompt)` â€” bila user menjalankan
+    /// Mengembalikan `(kartu_menu, optional_resume_prompt)` — bila user menjalankan
     /// `/task resume <id>`, `optional_resume_prompt` berisi prompt pemulihan lengkap.
     pub(crate) fn handle_task(&self, arg: Option<&str>) -> Result<(String, Option<String>)> {
         let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
@@ -732,7 +732,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                     let mark = if t.status == "in_progress" { "*" } else { ">" };
                     let goal_short: String = t.goal.chars().take(52).collect();
                     out.push_str(&format!(
-                        "{mark} {} | {} Â· {}/{} | {goal_short}\n",
+                        "{mark} {} | {} · {}/{} | {goal_short}\n",
                         t.id,
                         t.status,
                         t.completed_steps(),
@@ -744,7 +744,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
             out.push_str("! Buat tugas:   /task new <tujuan>\n");
             out.push_str("! Lihat detail: /task show <id>\n");
             out.push_str("! Jeda:         /task pause <id> [catatan]\n");
-            out.push_str("! Lanjutkan:    /task resume <id>   Â·   Hapus: /task rm <id>");
+            out.push_str("! Lanjutkan:    /task resume <id>   ·   Hapus: /task rm <id>");
             return Ok((out, None));
         };
 
@@ -842,7 +842,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
             let card = format!(
                 "# Melanjutkan Long-Horizon Task {}\n\
                  * status | in_progress ({}/{}) | {}\n\
-                 ! Mengirim konteks pemulihan ke Selenaâ€¦",
+                 ! Mengirim konteks pemulihan ke Selena…",
                 rec.id,
                 rec.completed_steps(),
                 rec.steps.len(),
@@ -873,7 +873,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                 for m in list {
                     let scope = if m.scope == "global" { "global" } else { "project" };
                     out.push_str(&format!(
-                        "> #{} | {} Â· {scope} | {}\n",
+                        "> #{} | {} · {scope} | {}\n",
                         m.id, m.category, m.content
                     ));
                 }
@@ -895,7 +895,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
             }
             let id = self.store.add_memory_categorized(&cwd_str, cat, text)?;
             return Ok(format!(
-                "# Memori Proyek Disimpan\n* #{id} | {cat} Â· project | {text}"
+                "# Memori Proyek Disimpan\n* #{id} | {cat} · project | {text}"
             ));
         }
         if let Some(rest) = arg.strip_prefix("global ") {
@@ -905,7 +905,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
             }
             let id = self.store.add_memory_categorized("global", cat, text)?;
             return Ok(format!(
-                "# Memori Global Disimpan\n* #{id} | {cat} Â· global | {text}"
+                "# Memori Global Disimpan\n* #{id} | {cat} · global | {text}"
             ));
         }
         if let Some(rest) = arg.strip_prefix("update ").or_else(|| arg.strip_prefix("edit ")) {
@@ -942,11 +942,11 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
             anyhow::bail!("memori #{id} tidak ditemukan");
         }
         Ok("# Cara Pakai /memory\n\
-            ! /memory                              â€” lihat semua memori aktif\n\
-            ! /memory add [kategori] <catatan>     â€” simpan memori proyek (arch/commands/conventions/decisions/issues/tasks)\n\
-            ! /memory update <id> [kat] <catatan>  â€” perbarui memori berdasarkan ID\n\
-            ! /memory global [kategori] <catatan>  â€” simpan memori global lintas proyek\n\
-            ! /memory rm <id>                      â€” hapus memori berdasarkan ID"
+            ! /memory                              — lihat semua memori aktif\n\
+            ! /memory add [kategori] <catatan>     — simpan memori proyek (arch/commands/conventions/decisions/issues/tasks)\n\
+            ! /memory update <id> [kat] <catatan>  — perbarui memori berdasarkan ID\n\
+            ! /memory global [kategori] <catatan>  — simpan memori global lintas proyek\n\
+            ! /memory rm <id>                      — hapus memori berdasarkan ID"
             .to_string())
     }
 
@@ -959,7 +959,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                 "NONAKTIF"
             };
             let mut out = format!(
-                "# Daftar Skills (.selencode/skills Â· auto self-improvement: {auto_state})\n"
+                "# Daftar Skills (.selencode/skills · auto self-improvement: {auto_state})\n"
             );
             if skills.is_empty() {
                 out.push_str("! Belum ada skill tersimpan.\n");
@@ -1107,9 +1107,9 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                  * mode | {} | aktif sesi ini\n\
                  > izin sesi | {allowed_str} | diizinkan via tombol [a]\n\
                  ---\n\
-                 ! /approve edits â€” otomatis izinkan edit/tulis file (tetap tanya shell/git/web)\n\
-                 ! /approve auto  â€” otomatis izinkan semua aksi aman sesi ini (.env & perintah destruktif tetap diblokir)\n\
-                 ! /approve ask   â€” kembali tanya per aksi & reset izin sesi",
+                 ! /approve edits — otomatis izinkan edit/tulis file (tetap tanya shell/git/web)\n\
+                 ! /approve auto  — otomatis izinkan semua aksi aman sesi ini (.env & perintah destruktif tetap diblokir)\n\
+                 ! /approve ask   — kembali tanya per aksi & reset izin sesi",
                 mode.label()
             ));
         };
