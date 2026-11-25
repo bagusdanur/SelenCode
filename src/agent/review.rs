@@ -8,7 +8,7 @@
 //! - Tetap mempertahankan `run_self_improvement_review` dan `AUTO_REVIEW_MIN_TOOLS`
 //!   untuk kompatibilitas mundur perintah manual `/skills review` & tes existing.
 
-use crate::agent::context::{analyze_token_breakdown, prune_old_tool_outputs};
+use crate::agent::context::{analyze_token_breakdown, prune_old_tool_results};
 use crate::config::Config;
 use crate::providers::{Block, Message, Provider, Role, StreamEvent};
 use crate::security::{is_secret_file, redact_secrets};
@@ -386,7 +386,7 @@ pub fn build_pruned_review_prompt(
     max_tokens: u64,
 ) -> (String, String) {
     let mut pruned = messages.to_vec();
-    let _ = prune_old_tool_outputs(&mut pruned, 2);
+    let _ = prune_old_tool_results(&mut pruned, 2);
 
     // Alokasi karakter konservatif agar total prompt + respons muat dalam `max_tokens`.
     // 1 token ~ 3 karakter; sisakan ~45% untuk system prompt + JSON output.
