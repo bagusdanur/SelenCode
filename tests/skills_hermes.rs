@@ -12,7 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use selencode::agent::run_turn;
 use selencode::providers::{
-    AssistantReply, Message, Provider, StreamEvent, ToolCall, ToolSpec, Usage,
+    AssistantReply, Block, Message, Provider, StreamEvent, ToolCall, ToolSpec, Usage,
 };
 use selencode::security::{ApprovalRequest, Approver};
 use selencode::skills::{
@@ -34,6 +34,22 @@ fn temp_dir(tag: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// Gabungkan seluruh isi blok (`Text`, `ToolUse`, `ToolResult`) dari seluruh pesan yang dikirim ke provider.
+fn flatten_all_blocks(messages: &[Message]) -> String {
+    let mut parts = Vec::new();
+    for m in messages {
+        for b in &m.content {
+            match b {
+                Block::Text(t) => parts.push(t.clone()),
+                Block::ToolUse { name, args, .. } => parts.push(format!("{name}({args})")),
+                Block::ToolResult { content, .. } => parts.push(content.clone()),
+                Block::Image { media_type, .. } => parts.push(format!("[image:{media_type}]")),
+            }
+        }
+    }
+    parts.join("\n---BLK---\n")
 }
 
 #[test]
@@ -351,11 +367,7 @@ async fn tahap6_db_token_proof_10_skills_lazy_load_and_single_skill_view() {
             tx: mpsc::Sender<StreamEvent>,
         ) -> Result<AssistantReply> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
-            let joined: String = messages
-                .iter()
-                .map(|m| m.plain_text())
-                .collect::<Vec<_>>()
-                .join("\n---MSG---\n");
+            let joined = flatten_all_blocks(messages);
             self.snapshots.lock().unwrap().push(joined.clone());
 
             match n {
@@ -534,7 +546,7 @@ async fn tahap6_end_to_end_create_skill_with_approval_then_new_session_follows_i
             tools: &[ToolSpec],
             tx: mpsc::Sender<StreamEvent>,
         ) -> Result<AssistantReply> {
-            let joined: String = messages.iter().map(|m| m.plain_text()).collect::<Vec<_>>().join("\n");
+            let joined = flatten_all_blocks(messages);
             match self.calls.fetch_add(1, Ordering::SeqCst) {
                 0 => {
                     // Indeks sesi BARU memuat `format-laporan-kpi`, tetapi isi penuh belum masuk!
