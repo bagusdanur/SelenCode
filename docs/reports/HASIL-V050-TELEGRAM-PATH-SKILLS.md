@@ -1,6 +1,7 @@
 # Hasil Update SelenCode v0.5.0 — Pengiriman Telegram, PATH Sesi, & Perilaku Menulis Skill
 
 - **Versi:** `v0.5.0` (dari `v0.4.0`)
+- **Rilis Publik:** `https://github.com/bagusdanur/SelenCode/releases/tag/v0.5.0` (`draft=false`, 3 aset biner: `selen-linux-x64` 14.82 MB, `selen-termux-arm64` 13.38 MB, `selen-windows-x64.exe` 13.6 MB)
 - **Tanggal:** 26 November 2026
 - **Fokus:** Empat perbaikan terarah untuk gateway Telegram, lingkungan `PATH` pada `run_shell`, disiplin penulisan nyata pada perintah pembuatan skill, dan keterbacaan pesan Telegram yang hemat emoji — tanpa mengubah mekanisme hemat token Tahap 0–6, Skills System Tahap 1–6, maupun desain TUI Moonlit.
 
@@ -49,5 +50,42 @@
 - `perbaikan2_enriched_shell_path_adds_user_bins_without_duplicates` & `perbaikan2_run_shell_finds_executable_in_custom_path_and_scrubs_secrets`: memverifikasi penambahan `~/.local/bin`, `~/bin`, `$PREFIX/bin` tanpa duplikat serta eksekusi biner dummy dengan nama pendek.
 - `perbaikan3_skill_edit_ref_path_writes_audit_reference_with_approval_and_diff`: memverifikasi penolakan path traversal & `.env`, persetujuan wajib + diff unified saat menulis `references/audit-rawdl.md`, serta pembacaan balik lewat `skill_view` Tingkat 3.
 
-### B. Uji Live `v0.5.0` (Akan diisi sesudah rilis `v0.5.0` terbit)
-- *(Diisi setelah binary rilis `v0.5.0` terbit: uji live Perbaikan 3 buat skill pada folder dengan skill existing + skenario kontrol, serta regresi A/B/E tabel `usage` pada 9Router. Catatan jujur untuk uji live Telegram: karena mesin pengembang ini tidak menyimpan token bot Telegram pemilik, uji urutan pesan live di Telegram & `rawdl sources` di box pemilik siap langsung diverifikasi pemilik begitu `selen update` ke `v0.5.0` dijalankan.)*
+### B. Uji Live Biner Rilis `v0.5.0` (`selen-windows-x64.exe` pada 9Router `ag/gemini-4-neon-medium`)
+
+Seluruh angka token di bawah diambil langsung dari tabel SQLite **`usage`** (dan diverifikasi 1:1 terhadap `call_token_metrics`), bukan dari estimator. Sesi uji sementara dibersihkan dari database sesudah pengukuran.
+
+| Skenario | Calls (`usage` / `metrics`) | Avg Tools | Input Token per Panggilan (`usage`) | Rata-rata In/Call | Total In / Out | Status |
+| :--- | :---: | :---: | :--- | :---: | :---: | :--- |
+| **Perbaikan 3 — Buat skill (existing `raw-downloader`)** | `3 / 3` | `20` | `5.729 → 6.123 → 7.692` | `6.515` | `19.544 / 1.688` | **LULUS** — `has_full_skill_in_initial_system_prompt=false`, panggil `skill_view` + `skill_edit`, ubah `SKILL.md` (`253 B → 968 B`, hash berubah) + tampilkan hasil audit & diff ringkas |
+| **Perbaikan 3 — Kontrol (tugas biasa)** | `2 / 2` | `8` | `3.804 → 4.140` | `3.972` | `7.944 / 524` | **LULUS** — 0 pemanggilan `skill_view`/`skill_edit`/`skill_create`, 0 perubahan file skill (`HASH_UNCHANGED=True`) |
+| **Regresi Proyek A (`rekap.js`)** | `6 / 6` | `8` | `3.611 → 3.770 → 4.294 → 4.378 → 4.514 → 4.654` | `4.204` | `25.221 / 861` | **LULUS** (≤ 5.000) |
+| **Regresi Proyek B (`hitung.js`)** | `7 / 7` | `8` | `3.624 → 3.732 → 4.294 → 4.496 → 4.604 → 4.892 → 5.070` | `4.387` | `30.712 / 1.447` | **LULUS** (≤ 5.000) |
+| **Gabungan Regresi A + B** | `13 / 13` | `8` | 13 panggilan (`55.933` total in) | **`4.303`** | `55.933 / 2.308` | **LULUS** (target ≤ 5.000 in/call) |
+| **Regresi Proyek E + Resume (`kata.txt`)** | `5 / 5` | `8` | Turn 1: `3.593 → 3.779` · **Resume Turn 2:** `3.852 → 3.972 → 4.091` | **`3.857`** | `19.287 / 466` | **LULUS** (panggilan resume `3.852–4.091` in, jauh di bawah batas ≤ 7.500; `kata.txt` berisi 5 buah + `TOTAL: 5`) |
+
+---
+
+## 4. Contoh Format Pesan Telegram Baru (`v0.5.0`)
+
+1. **Gelembung progres sementara (0 emoji):**
+   - Sedang berjalan: `Sedang bekerja — langkah 2/25 · run_shell`
+   - Saat menunggu approval: `Menunggu persetujuan — lihat pesan di bawah.`
+   - Fallback bila hapus gagal sesudah jawaban baru terkirim: `Selesai — 3 aksi tool · 14 dtk`
+2. **Kartu approval (maks 1 emoji `⚠️`, perintah utuh tanpa potong, tombol polos):**
+   - Judul: `⚠️ Perlu persetujuan`
+   - Isi: perintah lengkap dalam `<pre><code>...</code></pre>` (bila >3.800 char HTML, seluruh perintah utuh dikirim lebih dulu sebagai pesan lanjutan bernomor) + `Alasan: Menjalankan perintah shell di dalam ruang kerja.` + `Batas waktu: 5 menit.`
+   - Tombol: `[Setuju]` `[Tolak]` / `[Selalu untuk run_shell — sesi ini]`
+3. **Pesan jawaban akhir (selalu `sendMessage` baru di posisi paling bawah chat, 0 emoji dekoratif):**
+   - Blok lipat opsional:
+     `<blockquote expandable><b>Aksi Tool (2)</b>`
+     `run_shell — rawdl sources`
+     `skill_edit — .selencode/skills/ops/raw-downloader/SKILL.md`
+     `</blockquote>`
+   - Diikuti isi jawaban utama yang rapi.
+
+---
+
+## 5. Catatan Jujur Ruang Lingkup Uji
+- **Terverifikasi penuh secara otomatis di CI Linux & Windows x64 (`4d3f56c`) + workflow rilis `v0.5.0`:** seluruh tes baru (`tests/v050_telegram_path_skills.rs`), tes Telegram & sesi (`tests/telegram_doctor_sessions.rs`), tes Skills System (`tests/skills_system.rs`), serta seluruh suite existing lulus 100%.
+- **Terverifikasi live pada biner rilis `v0.5.0` + 9Router:** Perbaikan 3 (existing skill write + diff ringkas, kontrol tanpa tulisan), lazy loading skill, serta regresi token A/B/E + resume pada tabel `usage`.
+- **Menunggu verifikasi pemilik di lingkungan produksi:** uji chat Telegram live (notifikasi pesan baru, jeda progres saat approval, urutan kronologis) dan `rawdl sources` di box pemilik belum dijalankan dari mesin pengembang karena token bot Telegram & instalasi `rawdl` hanya ada di perangkat pemilik. Pemilik dapat langsung menjalankan `selen update` ke `v0.5.0` untuk menguji kedua poin tersebut secara langsung.
