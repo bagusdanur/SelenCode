@@ -55,6 +55,20 @@
   - Sesudah `skill_view("skill-03")`: panggilan 2 memuat **hanya `skill-03`** (9 skill lainnya tetap tidak masuk konteks); total tercatat di `usage`/`call_token_metrics` tepat 2 panggilan (`3.550 in`).
 - `tahap6_end_to_end_create_skill_with_approval_then_new_session_follows_it`: Sesi 1 membuat skill `format-laporan-kpi` lewat `skill_create` + persetujuan `true` → keluar → Sesi 2 (riwayat kosong baru) melihat indeks `format-laporan-kpi` → memanggil `skill_view` → menghasilkan `laporan_kpi.txt` yang mengikuti aturan playbook (`=== LAPORAN KPI RESMI ===` & `VERIFIED-BY-SKILL`).
 
-### B. Catatan Kejujuran Uji Live Provider (9Router `ag/gemini-3-flash`)
-- Lingkungan build/pengembang ini tidak mengekspor API key live `SELENCODE_ROUTER_KEY` untuk panggilan provider nyata, sehingga **angka tabel `usage` dari panggilan live 9Router (skenario A/B/E dan skenario live buat-skill → sesi-baru)** belum dijalankan dari shell ini dan **tidak diklaim** di laporan ini.
-- Seluruh mekanisme Tahap 1–5, bukti isolasi 10 skill di SQLite `usage`/`call_token_metrics`, skenario end-to-end 2 sesi dengan approval nyata, serta regresi seluruh test suite lama (`tests/fase*`, `tests/stage*`, `tests/hermes_full_and_perf.rs`, `tests/token_efficiency_hermes.rs`) diverifikasi hijau pada CI Linux x64 & Windows x64.
+### B. Bukti Uji Live Provider Nyata (`selen 0.4.0` ke 9Router `ag/gemini-4-neon-medium`, Tabel `usage`)
+Pengujian live dilakukan langsung memakai **binary rilis resmi `selen-windows-x64.exe` `v0.4.0`** terhadap endpoint 9Router (`https://router.ryukomik.com/v1`, model `ag/gemini-4-neon-medium`; `ag/gemini-3-flash` tidak tersedia di katalog router ini), dengan API key hanya lewat env proses dan sesi sementara dibersihkan sesudah dibaca:
+
+1. **Uji 10 Skill Terpasang (`proyek-10skills`, masing-masing body ~3,5 KB / total ~35 KB):**
+   - `has_full_skill_in_initial_system_prompt`: **`false`** (0 dari 10 isi penuh skill masuk pada panggilan pertama).
+   - Lintasan aktual tabel `usage` (3 panggilan · `metric_rows = 3/3`): **`4.610 → 5.049 (+439) → 5.188`** (total `14.847 in / 321 out`).
+   - Model langsung memanggil `skill_view("skill-03")` pada panggilan pertama dan menghasilkan `hasil03.txt` berisi persis **`KODE-UNIK-03-OK`**.
+2. **Uji End-to-End 2 Sesi Nyata (`proyek-e2e-skill`):**
+   - **Sesi 1 (Buat Skill):** memanggil `skill_create` (lewat persetujuan) → menghasilkan `.selencode/skills/ops/format-laporan-kpi/SKILL.md` (`usage`: 2 panggilan `4.477 → 4.721`, total `9.198 in / 262 out`, `metric_rows = 2/2`).
+   - **Sesi 2 (Sesi Baru, riwayat kosong, prompt tidak menyebut kata "skill"):** hanya **8 tool aktif** (`7 core + skill_view`), `has_full_skill_in_initial_system_prompt = false`, model melihat indeks `format-laporan-kpi` → memanggil `skill_view("format-laporan-kpi")` → menulis `laporan_kpi.txt` yang dimulai persis `=== LAPORAN KPI RESMI ===` dan `Status: TERVERIFIKASI-SKILL-V040`.
+   - Lintasan aktual tabel `usage` Sesi 2 (3 panggilan · `metric_rows = 3/3`): **`3.517 → 3.874 → 4.310`** (rata-rata **3.900 token masuk/panggilan**, total `11.701 in / 711 out`).
+3. **Regresi A/B/E Live (Baseline `v0.3.4` pada provider & model yang sama, tabel `usage`):**
+   - Gabungan A + B: **11 panggilan · 43.157 in (rata-rata 3.923 token/panggilan)** — jauh di bawah target pemilik ≤5.000/panggilan; Resume E: **3.397 in** (1 panggilan, jawaban benar); `usage` vs `call_token_metrics` **1:1** (`5/5`, `6/6`, `3/3`).
+
+### C. Rilis Resmi `v0.4.0`
+- **GitHub Release (publik, non-draft):** https://github.com/bagusdanur/SelenCode/releases/tag/v0.4.0
+- **Aset terbit:** `selen-linux-x64` (14,80 MB), `selen-termux-arm64` (13,36 MB), `selen-windows-x64.exe` (13,58 MB).
