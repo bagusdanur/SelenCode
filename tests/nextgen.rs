@@ -498,4 +498,11 @@ fn model_clear_help_panduan_dan_telegram_gateway_helpers() {
     assert_eq!(msgs.len(), 3);
     // Pemanggilan kedua saat ekor bukan dangling ToolUse tidak menambah apa pun.
     assert!(sanitize_interrupted_messages(&mut msgs).is_none());
+
+    // 10. Perintah /setup & Config::empty() untuk onboarding pertama kali tanpa crash
+    assert_eq!(parse_slash_command("/setup"), SlashCommand::Setup);
+    let empty_cfg = selencode::config::Config::empty();
+    assert!(empty_cfg.providers.is_empty());
+    let err = empty_cfg.resolve_provider(None).unwrap_err().to_string();
+    assert!(err.contains("/setup"), "pesan error harus arahkan ke /setup: {err}");
 }

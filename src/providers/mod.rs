@@ -109,3 +109,28 @@ pub trait Provider: Send + Sync {
         ""
     }
 }
+
+/// Provider placeholder saat user pertama kali menjalankan `selen` tanpa config /
+/// tanpa API key agar TUI tetap terbuka bersih dan langsung membuka Wizard `/setup`.
+pub struct UnconfiguredProvider {
+    pub reason: String,
+}
+
+#[async_trait]
+impl Provider for UnconfiguredProvider {
+    async fn stream_chat(
+        &self,
+        _msgs: &[Message],
+        _tools: &[ToolSpec],
+        _tx: mpsc::Sender<StreamEvent>,
+    ) -> Result<AssistantReply> {
+        anyhow::bail!(
+            "Provider AI belum dikonfigurasi ({}). Jalankan `/setup` untuk mengisi API provider & key.",
+            self.reason
+        )
+    }
+
+    fn model_name(&self) -> &str {
+        "(belum diatur)"
+    }
+}

@@ -15,6 +15,8 @@ pub enum SlashCommand {
     Models(Option<String>),
     /// /provider | /provider add ... | /provider preset ... | /provider model ... | /provider default ... | /provider rm ...
     Provider(Option<String>),
+    /// /setup — buka wizard interaktif untuk pasang provider, base URL, API key, & model.
+    Setup,
     /// /telegram [setup <token> [user_id] | allow <id> | rm <id> | approve <mode> | off]
     Telegram(Option<String>),
     /// /undo — batalkan edit/tulis file terakhir oleh agent.
@@ -72,6 +74,12 @@ pub struct CommandDef {
 }
 
 pub const COMMANDS: &[CommandDef] = &[
+    CommandDef {
+        cmd: "/setup",
+        args: "",
+        desc: "wizard mudah pasang provider, base URL, API key, & model",
+        takes_args: false,
+    },
     CommandDef {
         cmd: "/model",
         args: "[no / add / rm / clear]",
@@ -260,6 +268,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/model" => SlashCommand::Model(rest),
         "/models" => SlashCommand::Models(rest),
         "/provider" | "/connect" => SlashCommand::Provider(rest),
+        "/setup" | "/onboard" => SlashCommand::Setup,
         "/telegram" | "/tg" => SlashCommand::Telegram(rest),
         "/undo" => SlashCommand::Undo,
         "/redo" => SlashCommand::Redo,

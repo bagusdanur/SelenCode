@@ -487,6 +487,74 @@ async fn stop_cancel_all_approvals_tolak_aktif_dan_antrean() {
 }
 
 #[test]
+fn setup_wizard_alur_lengkap_openai_compatible_dan_render_tui() {
+    use selencode::tui::app::{SetupStep, SetupWizardState};
+
+    // 1. Alur OpenAI-Compatible Custom (5 langkah)
+    let mut w = SetupWizardState::new(Some("Belum ada provider".into()));
+    assert_eq!(w.step, SetupStep::ChooseApi);
+    assert_eq!(w.selected, 0); // OpenAI-Compatible Custom
+    assert!(w.advance().is_none());
+    assert_eq!(w.step, SetupStep::ProviderName);
+
+    w.name = "router".into();
+    assert!(w.advance().is_none());
+    assert_eq!(w.step, SetupStep::BaseUrl);
+
+    // Validasi URL tidak valid ditolak
+    w.base_url = "bukan-url".into();
+    assert!(w.advance().is_none());
+    assert!(w.error.is_some());
+
+    w.base_url = "https://router.ryukomik.com/v1".into();
+    assert!(w.advance().is_none());
+    assert_eq!(w.step, SetupStep::ApiKey);
+
+    // Masking API key
+    w.api_key = "sk-1234567890abcd".into();
+    assert!(w.masked_key().contains("••••••"));
+    assert!(w.advance().is_none());
+    assert_eq!(w.step, SetupStep::ModelId);
+
+    w.model = "ag/gemini-4-neon-low".into();
+    let res = w.advance().expect("langkah terakhir harus hasilkan SetupResult");
+    assert_eq!(res.name, "router");
+    assert_eq!(res.kind, "openai");
+    assert_eq!(
+        res.base_url.as_deref(),
+        Some("https://router.ryukomik.com/v1")
+    );
+    assert_eq!(res.api_key_or_env, "sk-1234567890abcd");
+    assert_eq!(res.model, "ag/gemini-4-neon-low");
+
+    // 2. Alur Anthropic/Gemini melewati langkah BaseUrl otomatis
+    let mut w2 = SetupWizardState::new(None);
+    w2.selected = 3; // Anthropic Claude
+    w2.advance();
+    assert_eq!(w2.step, SetupStep::ProviderName);
+    w2.advance();
+    assert_eq!(w2.step, SetupStep::ApiKey, "Anthropic tidak perlu BaseUrl");
+
+    // 3. Render modal wizard di desktop (80x24) & mobile HP (50x28) tidak panik
+    let mut a = app();
+    a.setup_wizard = Some(SetupWizardState::new(Some("Selamat datang!".into())));
+    for (cols, rows) in [(80, 24), (50, 28)] {
+        let backend = TestBackend::new(cols, rows);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| selencode::tui::draw(f, &mut a)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Setup Provider SelenCode"));
+        assert!(text.contains("OpenAI-Compatible Custom"));
+    }
+}
+
+#[test]
 fn diff_view_warna_dan_hitung() {
     let diff = "diff src/a.rs\n konteks\n-lama\n+baru\n+kedua\n";
     assert!(looks_like_diff(diff));

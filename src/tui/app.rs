@@ -60,6 +60,337 @@ pub struct PendingApproval {
     pub reply: Option<tokio::sync::oneshot::Sender<bool>>,
 }
 
+/// Preset pilihan API saat onboarding / `/setup` (awal kosong -> pilih API compatible -> isi URL & key).
+#[derive(Debug, Clone, Copy)]
+pub struct SetupPreset {
+    pub label: &'static str,
+    pub desc: &'static str,
+    pub default_name: &'static str,
+    pub kind: &'static str,
+    pub default_url: &'static str,
+    pub default_model: &'static str,
+    pub needs_key: bool,
+}
+
+pub const SETUP_PRESETS: &[SetupPreset] = &[
+    SetupPreset {
+        label: "OpenAI-Compatible Custom",
+        desc: "isi Base URL sendiri (9Router, vLLM, LiteLLM, proxy custom)",
+        default_name: "custom",
+        kind: "openai",
+        default_url: "",
+        default_model: "",
+        needs_key: true,
+    },
+    SetupPreset {
+        label: "OpenRouter",
+        desc: "akses banyak model (Claude, GPT, Gemini, DeepSeek)",
+        default_name: "openrouter",
+        kind: "openai",
+        default_url: "https://openrouter.ai/api/v1",
+        default_model: "anthropic/claude-sonnet-4",
+        needs_key: true,
+    },
+    SetupPreset {
+        label: "OpenAI Resmi",
+        desc: "GPT-4.1, GPT-5, o3, GPT-4o",
+        default_name: "openai",
+        kind: "openai",
+        default_url: "https://api.openai.com/v1",
+        default_model: "gpt-4.1",
+        needs_key: true,
+    },
+    SetupPreset {
+        label: "Anthropic Claude",
+        desc: "Claude Sonnet 4, Opus 4, Haiku (API resmi)",
+        default_name: "anthropic",
+        kind: "anthropic",
+        default_url: "",
+        default_model: "claude-sonnet-4-20250514",
+        needs_key: true,
+    },
+    SetupPreset {
+        label: "Google Gemini",
+        desc: "Gemini 2.5 Pro / Flash (context window 1M)",
+        default_name: "gemini",
+        kind: "gemini",
+        default_url: "",
+        default_model: "gemini-2.5-flash",
+        needs_key: true,
+    },
+    SetupPreset {
+        label: "Groq",
+        desc: "inferensi ultra cepat (Llama 3.3, Qwen)",
+        default_name: "groq",
+        kind: "openai",
+        default_url: "https://api.groq.com/openai/v1",
+        default_model: "llama-3.3-70b-versatile",
+        needs_key: true,
+    },
+    SetupPreset {
+        label: "DeepSeek",
+        desc: "DeepSeek Chat & R1",
+        default_name: "deepseek",
+        kind: "openai",
+        default_url: "https://api.deepseek.com/v1",
+        default_model: "deepseek-chat",
+        needs_key: true,
+    },
+    SetupPreset {
+        label: "Ollama Lokal",
+        desc: "jalan lokal di PC/HP tanpa API key",
+        default_name: "ollama",
+        kind: "openai",
+        default_url: "http://localhost:11434/v1",
+        default_model: "qwen2.5-coder:7b",
+        needs_key: false,
+    },
+];
+
+/// Langkah-langkah pada Wizard Setup Provider interaktif.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupStep {
+    ChooseApi,
+    ProviderName,
+    BaseUrl,
+    ApiKey,
+    ModelId,
+}
+
+/// Hasil akhir Wizard Setup Provider yang siap disimpan ke config & langsung diaktifkan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupResult {
+    pub name: String,
+    pub kind: String,
+    pub base_url: Option<String>,
+    pub api_key_or_env: String,
+    pub model: String,
+}
+
+/// State modal Wizard Setup Provider interaktif (`/setup` atau otomatis saat pertama buka).
+#[derive(Debug, Clone)]
+pub struct SetupWizardState {
+    pub step: SetupStep,
+    pub selected: usize,
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub needs_key: bool,
+    pub show_key: bool,
+    pub notice: Option<String>,
+    pub error: Option<String>,
+}
+
+impl SetupWizardState {
+    pub fn new(notice: Option<String>) -> Self {
+        Self {
+            step: SetupStep::ChooseApi,
+            selected: 0,
+            name: String::new(),
+            kind: "openai".to_string(),
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            needs_key: true,
+            show_key: false,
+            notice,
+            error: None,
+        }
+    }
+
+    pub fn step_number(&self) -> (usize, usize) {
+        let total = if self.kind == "openai" || self.step == SetupStep::ChooseApi {
+            5
+        } else {
+            4
+        };
+        let cur = match self.step {
+            SetupStep::ChooseApi => 1,
+            SetupStep::ProviderName => 2,
+            SetupStep::BaseUrl => 3,
+            SetupStep::ApiKey => {
+                if self.kind == "openai" {
+                    4
+                } else {
+                    3
+                }
+            }
+            SetupStep::ModelId => total,
+        };
+        (cur, total)
+    }
+
+    pub fn move_up(&mut self) {
+        if self.step == SetupStep::ChooseApi {
+            let len = SETUP_PRESETS.len();
+            self.selected = if self.selected == 0 { len - 1 } else { self.selected - 1 };
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.step == SetupStep::ChooseApi {
+            self.selected = (self.selected + 1) % SETUP_PRESETS.len();
+        }
+    }
+
+    pub fn push_char(&mut self, c: char) {
+        self.error = None;
+        match self.step {
+            SetupStep::ProviderName => self.name.push(c),
+            SetupStep::BaseUrl => self.base_url.push(c),
+            SetupStep::ApiKey => self.api_key.push(c),
+            SetupStep::ModelId => self.model.push(c),
+            SetupStep::ChooseApi => {}
+        }
+    }
+
+    pub fn push_str(&mut self, s: &str) {
+        let clean = s.trim();
+        for c in clean.chars() {
+            if !c.is_control() {
+                self.push_char(c);
+            }
+        }
+    }
+
+    pub fn pop_char(&mut self) {
+        self.error = None;
+        match self.step {
+            SetupStep::ProviderName => {
+                self.name.pop();
+            }
+            SetupStep::BaseUrl => {
+                self.base_url.pop();
+            }
+            SetupStep::ApiKey => {
+                self.api_key.pop();
+            }
+            SetupStep::ModelId => {
+                self.model.pop();
+            }
+            SetupStep::ChooseApi => {}
+        }
+    }
+
+    /// Mundur 1 langkah. Mengembalikan `true` jika user menekan Esc pada langkah 1 (tutup modal).
+    pub fn back(&mut self) -> bool {
+        self.error = None;
+        match self.step {
+            SetupStep::ChooseApi => true,
+            SetupStep::ProviderName => {
+                self.step = SetupStep::ChooseApi;
+                false
+            }
+            SetupStep::BaseUrl => {
+                self.step = SetupStep::ProviderName;
+                false
+            }
+            SetupStep::ApiKey => {
+                self.step = if self.kind == "openai" {
+                    SetupStep::BaseUrl
+                } else {
+                    SetupStep::ProviderName
+                };
+                false
+            }
+            SetupStep::ModelId => {
+                self.step = SetupStep::ApiKey;
+                false
+            }
+        }
+    }
+
+    /// Maju 1 langkah; mengembalikan `Some(SetupResult)` saat langkah terakhir valid.
+    pub fn advance(&mut self) -> Option<SetupResult> {
+        self.error = None;
+        match self.step {
+            SetupStep::ChooseApi => {
+                let p = SETUP_PRESETS[self.selected.min(SETUP_PRESETS.len() - 1)];
+                self.name = p.default_name.to_string();
+                self.kind = p.kind.to_string();
+                self.base_url = p.default_url.to_string();
+                self.model = p.default_model.to_string();
+                self.needs_key = p.needs_key;
+                self.api_key.clear();
+                self.step = SetupStep::ProviderName;
+                None
+            }
+            SetupStep::ProviderName => {
+                let n = self.name.trim();
+                if n.is_empty() || n.chars().any(|c| c.is_whitespace()) {
+                    self.error = Some("Nama provider wajib diisi tanpa spasi (mis. router, openrouter).".into());
+                    return None;
+                }
+                self.name = n.to_string();
+                self.step = if self.kind == "openai" {
+                    SetupStep::BaseUrl
+                } else {
+                    SetupStep::ApiKey
+                };
+                None
+            }
+            SetupStep::BaseUrl => {
+                let u = self.base_url.trim();
+                if !u.starts_with("http://") && !u.starts_with("https://") {
+                    self.error = Some("Base URL wajib diawali http:// atau https:// (mis. https://api.openai.com/v1).".into());
+                    return None;
+                }
+                self.base_url = u.to_string();
+                self.step = SetupStep::ApiKey;
+                None
+            }
+            SetupStep::ApiKey => {
+                let k = self.api_key.trim();
+                if self.needs_key && k.is_empty() {
+                    self.error = Some("API key wajib diisi (paste sk-... atau nama ENV var).".into());
+                    return None;
+                }
+                self.api_key = if k.is_empty() {
+                    "ollama".to_string()
+                } else {
+                    k.to_string()
+                };
+                self.step = SetupStep::ModelId;
+                None
+            }
+            SetupStep::ModelId => {
+                let m = self.model.trim();
+                if m.is_empty() {
+                    self.error = Some("ID model wajib diisi (mis. gpt-4.1, claude-sonnet-4, ag/gemini-4).".into());
+                    return None;
+                }
+                self.model = m.to_string();
+                Some(SetupResult {
+                    name: self.name.clone(),
+                    kind: self.kind.clone(),
+                    base_url: if self.kind == "openai" {
+                        Some(self.base_url.clone())
+                    } else {
+                        None
+                    },
+                    api_key_or_env: self.api_key.clone(),
+                    model: self.model.clone(),
+                })
+            }
+        }
+    }
+
+    pub fn masked_key(&self) -> String {
+        if self.show_key {
+            return self.api_key.clone();
+        }
+        let chars: Vec<char> = self.api_key.chars().collect();
+        if chars.len() <= 8 {
+            return "•".repeat(chars.len());
+        }
+        let head: String = chars[..4].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{head}••••••{tail}")
+    }
+}
+
 /// Mode tampilan di dalam modal pemilih model interaktif (ala Hermes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelPickerMode {
@@ -234,6 +565,8 @@ pub struct App {
     pub approval_policy: Option<Arc<Mutex<ApprovalPolicy>>>,
     /// Modal pemilih model interaktif (`/model` di TUI).
     pub model_picker: Option<ModelPickerState>,
+    /// Modal Wizard Setup Provider interaktif (otomatis saat belum ada provider/key, atau via `/setup`).
+    pub setup_wizard: Option<SetupWizardState>,
     pub should_quit: bool,
     /// Rencana dari giliran plan yang menunggu konfirmasi y/n (Fase 6).
     pub pending_plan: Option<String>,
@@ -304,6 +637,7 @@ impl App {
             approval_scroll: 0,
             approval_policy: None,
             model_picker: None,
+            setup_wizard: None,
             should_quit: false,
             pending_plan: None,
             plan_next: false,

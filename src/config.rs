@@ -234,9 +234,25 @@ pub fn load() -> Result<Config> {
             return load_from(&p);
         }
     }
+    #[cfg(windows)]
+    let env_hint = r#"$env:SELENCODE_ROUTER_KEY="isi-api-key-kamu""#;
+    #[cfg(not(windows))]
+    let env_hint = r#"export SELENCODE_ROUTER_KEY="isi-api-key-kamu""#;
     Err(anyhow!(
-        "Config SelenCode tidak ditemukan. Buat salah satu file ini:\n  ./selencode.toml\n  ~/.config/selencode/config.toml\n\nContoh isi (lihat juga config.example.toml di repo):\n\ndefault_provider = \"router\"\n\n[providers.router]\nkind = \"openai\"\nbase_url = \"https://router.ryukomik.com/v1\"\nmodel = \"isi-model-kamu\"\napi_key_env = \"SELENCODE_ROUTER_KEY\"\n\nLalu set API key-nya: export SELENCODE_ROUTER_KEY=... (nama env mengikuti api_key_env)"
+        "Config SelenCode tidak ditemukan. Jalankan `selen` untuk setup interaktif otomatis, atau buat file:\n  ./selencode.toml\n  ~/.config/selencode/config.toml\n\nContoh set API key di terminal:\n  {env_hint}"
     ))
+}
+
+/// Muat config bila sudah ada; bila file config belum ada, kembalikan `Config::empty()`
+/// (provider kosong) agar TUI bisa langsung membuka Wizard Setup Provider tanpa crash!
+/// Bila file config ADA tetapi rusak/tidak valid, tetap kembalikan `Err`.
+pub fn load_or_empty() -> Result<(Config, bool)> {
+    for p in candidate_paths() {
+        if p.exists() {
+            return Ok((load_from(&p)?, true));
+        }
+    }
+    Ok((Config::empty(), false))
 }
 
 pub fn load_from(path: &std::path::Path) -> Result<Config> {
@@ -308,10 +324,40 @@ impl ProviderCfg {
 }
 
 impl Config {
+    /// Config awal kosong (belum ada provider) untuk onboarding interaktif pertama kali.
+    pub fn empty() -> Self {
+        Self {
+            default_provider: String::new(),
+            providers: HashMap::new(),
+            agent: AgentCfg::default(),
+            shell: ShellCfg::default(),
+            mcp_servers: Vec::new(),
+            telegram: TelegramCfg::default(),
+        }
+    }
+
     /// Ambil (nama, cfg, api_key) untuk provider terpilih.
     /// Prioritas key: env var `api_key_env` -> field `api_key` di config.
     pub fn resolve_provider(&self, name: Option<&str>) -> Result<(String, ProviderCfg, String)> {
-        let name = name.unwrap_or(&self.default_provider).to_string();
+        if self.providers.is_empty() {
+            return Err(anyhow!(
+                "belum ada provider terpasang. Jalankan `/setup` untuk mengisi API provider & key."
+            ));
+        }
+        let name = name
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                if !self.default_provider.trim().is_empty()
+                    && self.providers.contains_key(&self.default_provider)
+                {
+                    self.default_provider.clone()
+                } else {
+                    let mut keys: Vec<&String> = self.providers.keys().collect();
+                    keys.sort();
+                    keys.first().map(|s| (*s).clone()).unwrap_or_default()
+                }
+            });
         let cfg = self
             .providers
             .get(&name)
@@ -326,12 +372,15 @@ impl Config {
         .ok_or_else(|| {
             if cfg.api_key_env.trim().is_empty() {
                 anyhow!(
-                    "provider '{name}' belum punya API key. Atur lewat `/provider add` atau isi api_key_env di config."
+                    "provider '{name}' belum punya API key. Jalankan `/setup` atau `/provider add` untuk mengisinya."
                 )
             } else {
+                #[cfg(windows)]
+                let cmd_hint = format!(r#"$env:{}="isi-api-key""#, cfg.api_key_env);
+                #[cfg(not(windows))]
+                let cmd_hint = format!(r#"export {}="isi-api-key""#, cfg.api_key_env);
                 anyhow!(
-                    "env var {} (api_key_env provider '{name}') belum di-set. Contoh: export {}=...",
-                    cfg.api_key_env,
+                    "env var {} (api_key_env provider '{name}') belum di-set. Contoh: {cmd_hint} — atau jalankan `/setup` untuk menyimpan API key langsung di config.",
                     cfg.api_key_env
                 )
             }

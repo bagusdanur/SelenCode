@@ -13,10 +13,11 @@ use selencode::config::{self, Config, ProviderCfg};
 use selencode::providers::anthropic::AnthropicProvider;
 use selencode::providers::gemini::GeminiProvider;
 use selencode::providers::openai::{fetch_models_with_context, OpenAiProvider};
-use selencode::providers::{Message, Provider, Role};
+use selencode::providers::{Message, Provider, Role, UnconfiguredProvider};
 use selencode::repl::{
-    help_menu_markup, parse_model_action, parse_provider_action, parse_slash_command,
-    strip_menu_markup, KeySpec, ModelAction, ProviderAction, SlashCommand, PROVIDER_PRESETS,
+    classify_key_spec, help_menu_markup, parse_model_action, parse_provider_action,
+    parse_slash_command, strip_menu_markup, KeySpec, ModelAction, ProviderAction, SlashCommand,
+    PROVIDER_PRESETS,
 };
 use selencode::security::{
     is_forbidden_command, redact_secrets, ApprovalMode, ApprovalPolicy, ApprovalRequest, Approver,
@@ -30,7 +31,7 @@ use selencode::telegram::{
 };
 use selencode::tools::delegate::Delegate;
 use selencode::tools::{default_registry_with_shell, read_only_registry, Ctx, Registry};
-use selencode::tui::app::App;
+use selencode::tui::app::{App, SetupResult, SetupWizardState, SETUP_PRESETS};
 use selencode::tui::{ModelPickerCmd, TuiChannels, TuiCommand};
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
@@ -161,6 +162,9 @@ struct Session {
     last_remote_models: Vec<String>,
     /// Cache kapasitas context window model yang dilaporkan endpoint API `/models`.
     model_context_cache: HashMap<String, usize>,
+    /// True bila belum ada provider/API key yang siap -> langsung buka Wizard `/setup`.
+    needs_setup: bool,
+    setup_reason: Option<String>,
 }
 
 impl Session {
@@ -180,10 +184,45 @@ impl Session {
         resume: bool,
         first_prompt: Option<&str>,
         approval_tx: Option<tokio::sync::mpsc::Sender<ApprovalRequest>>,
+        allow_unconfigured: bool,
     ) -> Result<Session> {
-        let cfg = config::load()?;
-        let (name, pcfg, api_key) = cfg.resolve_provider(provider_name)?;
-        let provider = make_provider(&cfg, &name, &pcfg, &api_key)?;
+        let cfg = if allow_unconfigured {
+            config::load_or_empty()?.0
+        } else {
+            config::load()?
+        };
+        let (name, pcfg, provider, needs_setup, setup_reason) =
+            match cfg.resolve_provider(provider_name) {
+                Ok((n, p, key)) => {
+                    let prov = make_provider(&cfg, &n, &p, &key)?;
+                    (n, p, prov, false, None)
+                }
+                Err(e) if allow_unconfigured => {
+                    let reason = e.to_string();
+                    let empty_pcfg = ProviderCfg {
+                        kind: "openai".to_string(),
+                        base_url: None,
+                        model: "(belum diatur)".to_string(),
+                        models: Vec::new(),
+                        api_key_env: String::new(),
+                        api_key: None,
+                        price_in: None,
+                        price_out: None,
+                        context_limit: None,
+                    };
+                    let stub: Arc<dyn Provider> = Arc::new(UnconfiguredProvider {
+                        reason: reason.clone(),
+                    });
+                    (
+                        "(belum diatur)".to_string(),
+                        empty_pcfg,
+                        stub,
+                        true,
+                        Some(reason),
+                    )
+                }
+                Err(e) => return Err(e),
+            };
         let cwd = std::env::current_dir()?;
         let cwd_str = cwd.to_string_lossy().to_string();
         let store = Arc::new(Store::open()?);
@@ -264,7 +303,46 @@ impl Session {
             resumed_note,
             last_remote_models: Vec::new(),
             model_context_cache: HashMap::new(),
+            needs_setup,
+            setup_reason,
         })
+    }
+
+    /// Terapkan hasil Wizard `/setup`: simpan provider baru ke config, jadikan default,
+    /// dan langsung aktifkan di sesi berjalan tanpa perlu restart `selen`.
+    fn apply_setup_result(&mut self, res: SetupResult) -> Result<String> {
+        let (api_key_env, api_key) = match classify_key_spec(&res.api_key_or_env) {
+            KeySpec::EnvVar(env_name) => (env_name, None),
+            KeySpec::DirectKey(raw) => (String::new(), Some(raw)),
+        };
+        let pcfg = ProviderCfg {
+            kind: res.kind.clone(),
+            base_url: res.base_url.clone(),
+            model: res.model.clone(),
+            models: vec![res.model.clone()],
+            api_key_env,
+            api_key,
+            price_in: None,
+            price_out: None,
+            context_limit: None,
+        };
+        self.cfg.providers.insert(res.name.clone(), pcfg);
+        self.cfg.default_provider = res.name.clone();
+        let saved_path = config::save(&self.cfg)?;
+        self.switch_provider(&res.name)?;
+        self.needs_setup = false;
+        self.setup_reason = None;
+        let ctx_s = format_context_compact(self.ctx.context_limit_tokens);
+        Ok(format!(
+            "# Provider Siap Dipakai!\n\
+             * {} | {} | aktif · ctx {ctx_s}\n\
+             > config | {} | tersimpan & jadi default\n\
+             ---\n\
+             ! Sekarang langsung ketik pertanyaanmu, atau `/model` untuk tambah model 1-per-1.",
+            self.provider_name,
+            self.pcfg.model,
+            saved_path.display()
+        ))
     }
 
     /// Hitung kapasitas context window aktif untuk model saat ini:
@@ -1708,8 +1786,15 @@ async fn main() -> Result<()> {
             if prompt.trim().is_empty() {
                 anyhow::bail!("prompt kosong. Contoh: selen run \"jelaskan project ini\"");
             }
-            let mut s =
-                Session::build(cli.provider.as_deref(), cli.yes, false, Some(&prompt), None).await?;
+            let mut s = Session::build(
+                cli.provider.as_deref(),
+                cli.yes,
+                false,
+                Some(&prompt),
+                None,
+                false,
+            )
+            .await?;
             if cli.plan {
                 // run --plan: 1 giliran plan, lalu berhenti (tanpa eksekusi).
                 run_turn_mode(
@@ -2152,6 +2237,26 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
+            TuiCommand::SaveSetupProvider(res) => match s.apply_setup_result(res) {
+                Ok(card) => {
+                    let _ = ui_tx
+                        .send(UiEvent::ModelChanged {
+                            provider: s.provider_name.clone(),
+                            model: s.pcfg.model.clone(),
+                        })
+                        .await;
+                    let _ = ui_tx
+                        .send(UiEvent::ContextInfo {
+                            used_tokens: estimate_tokens(&s.messages),
+                            limit_tokens: s.ctx.context_limit_tokens,
+                        })
+                        .await;
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
             TuiCommand::Telegram(arg) => match s.handle_telegram(arg.as_deref()) {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
@@ -2201,8 +2306,15 @@ async fn interactive_tui(cli: Cli, resume: bool) -> Result<()> {
     // config ikut berlaku di mode TUI.
     let (approval_tx, approval_rx) =
         tokio::sync::mpsc::channel::<ApprovalRequest>(8);
-    let s =
-        Session::build(cli.provider.as_deref(), cli.yes, resume, None, Some(approval_tx)).await?;
+    let s = Session::build(
+        cli.provider.as_deref(),
+        cli.yes,
+        resume,
+        None,
+        Some(approval_tx),
+        true,
+    )
+    .await?;
     let (init_in, init_out) = s.store.total_usage(&s.session_id).unwrap_or((0, 0));
     let mut app = App::new(
         s.ctx.cwd.to_string_lossy().to_string(),
@@ -2229,6 +2341,12 @@ async fn interactive_tui(cli: Cli, resume: bool) -> Result<()> {
     }
     if cli.plan {
         app.info("Mode plan aktif untuk giliran pertama (--plan).");
+    }
+    if s.needs_setup {
+        app.setup_wizard = Some(SetupWizardState::new(Some(
+            "Belum ada provider/API key yang siap — ayo isi provider pertamamu di sini!"
+                .to_string(),
+        )));
     }
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TuiCommand>(32);
@@ -2260,8 +2378,79 @@ async fn interactive_tui(cli: Cli, resume: bool) -> Result<()> {
     }
 }
 
+fn run_plain_setup_wizard(s: &mut Session) -> Result<()> {
+    let stdin = std::io::stdin();
+    let prompt_line = |label: &str, default_val: &str| -> Result<String> {
+        if default_val.is_empty() {
+            print!("{label}: ");
+        } else {
+            print!("{label} [{default_val}]: ");
+        }
+        std::io::stdout().flush()?;
+        let mut buf = String::new();
+        stdin.read_line(&mut buf)?;
+        let v = buf.trim();
+        Ok(if v.is_empty() {
+            default_val.to_string()
+        } else {
+            v.to_string()
+        })
+    };
+
+    println!("\n=== ☾ Setup Provider SelenCode ===");
+    for (i, p) in SETUP_PRESETS.iter().enumerate() {
+        println!("  {}. {} — {}", i + 1, p.label, p.desc);
+    }
+    let pick_str = prompt_line("Pilih jenis API (1-8)", "1")?;
+    let idx = pick_str
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n >= 1 && n <= SETUP_PRESETS.len())
+        .map(|n| n - 1)
+        .unwrap_or(0);
+    let preset = SETUP_PRESETS[idx];
+
+    let name = prompt_line("Nama provider", preset.default_name)?;
+    let base_url = if preset.kind == "openai" {
+        let u = prompt_line("Base URL (https://.../v1)", preset.default_url)?;
+        if u.trim().is_empty() {
+            anyhow::bail!("Base URL wajib diisi untuk OpenAI-compatible");
+        }
+        Some(u)
+    } else {
+        None
+    };
+    let key_default = if preset.needs_key { "" } else { "ollama" };
+    let api_key_or_env = prompt_line("API Key (atau nama ENV var)", key_default)?;
+    if preset.needs_key && api_key_or_env.trim().is_empty() {
+        anyhow::bail!("API key wajib diisi");
+    }
+    let model = prompt_line("ID Model utama", preset.default_model)?;
+    if model.trim().is_empty() {
+        anyhow::bail!("ID Model wajib diisi");
+    }
+    let card = s.apply_setup_result(SetupResult {
+        name,
+        kind: preset.kind.to_string(),
+        base_url,
+        api_key_or_env,
+        model,
+    })?;
+    println!("{}", strip_menu_markup(&card));
+    Ok(())
+}
+
 async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
-    let mut s = Session::build(cli.provider.as_deref(), cli.yes, resume, None, None).await?;
+    let mut s = Session::build(cli.provider.as_deref(), cli.yes, resume, None, None, true).await?;
+    if s.needs_setup {
+        println!(
+            "☾ Provider belum siap ({}). Mulai setup interaktif…",
+            s.setup_reason.as_deref().unwrap_or("belum dikonfigurasi")
+        );
+        if let Err(e) = run_plain_setup_wizard(&mut s) {
+            eprintln!("[setup] {e} — kamu bisa ulangi kapan saja lewat `/setup`.");
+        }
+    }
     if let Some(note) = &s.resumed_note {
         println!("{note}");
     }
@@ -2311,6 +2500,11 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
+            SlashCommand::Setup => {
+                if let Err(e) = run_plain_setup_wizard(&mut s) {
+                    eprintln!("[error] {e}");
+                }
+            }
             SlashCommand::Telegram(arg) => match s.handle_telegram(arg.as_deref()) {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
@@ -2745,6 +2939,7 @@ async fn handle_telegram_chat_message(
                 false,
                 Some(&text),
                 Some(approval_tx),
+                false,
             )
             .await?;
             let policy = s.ctx.approver.policy();
@@ -2947,7 +3142,7 @@ async fn handle_telegram_chat_message(
                 .await?;
             return Ok(());
         }
-        SlashCommand::Exit | SlashCommand::Details | SlashCommand::Plan => {
+        SlashCommand::Exit | SlashCommand::Details | SlashCommand::Plan | SlashCommand::Setup => {
             tg.send_message(
                 chat_id,
                 "Perintah tersebut khusus mode terminal. Ketik /help untuk perintah Telegram.",

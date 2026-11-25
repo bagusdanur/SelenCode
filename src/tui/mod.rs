@@ -17,7 +17,10 @@ use crate::agent::UiEvent;
 use crate::repl::{filter_commands, help_menu_markup, parse_slash_command, SlashCommand};
 use crate::security::{tool_category_from_title, ApprovalRequest};
 use anyhow::Result;
-use app::{App, LineKind, ModelPickerMode, ToolState};
+use app::{
+    App, LineKind, ModelPickerMode, SetupResult, SetupStep, SetupWizardState, ToolState,
+    SETUP_PRESETS,
+};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
@@ -78,6 +81,8 @@ pub enum TuiCommand {
     FetchRemoteModels(Option<String>),
     /// /provider [preset|add|model|default|rm ...]: kelola & pasang provider lain.
     ManageProvider(Option<String>),
+    /// Simpan provider baru hasil Wizard `/setup`, jadikan default, & aktifkan langsung.
+    SaveSetupProvider(SetupResult),
     /// /telegram [setup|allow|rm|approve|off]: kelola koneksi Telegram Gateway.
     Telegram(Option<String>),
     Undo,
@@ -752,7 +757,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.input.set_block(Block::default());
     frame.render_widget(&app.input, cols[1]);
     // Kursor hanya relevan tanpa popup/modal.
-    if app.approval.is_none() && app.model_picker.is_none() {
+    if app.approval.is_none() && app.model_picker.is_none() && app.setup_wizard.is_none() {
         frame.set_cursor_position((
             cols[1].x + app.input.cursor().1 as u16,
             cols[1].y + app.input.cursor().0 as u16,
@@ -761,7 +766,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Live `/` command palette: muncul otomatis tepat di atas status bar saat
     // user mulai mengetik `/...` (tanpa popup approval/modal aktif).
-    if app.approval.is_none() && app.model_picker.is_none() {
+    if app.approval.is_none() && app.model_picker.is_none() && app.setup_wizard.is_none() {
         let cur_input = app.input.lines().join("\n");
         let palette = filter_commands(&cur_input);
         if !palette.is_empty() && chunks[0].height >= 5 {
@@ -842,6 +847,270 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             );
             frame.render_widget(widget, popup);
         }
+    }
+
+    // Modal Wizard Setup Provider Moonlit Ungu (onboarding pertama kali & `/setup`)
+    if let Some(wiz) = &app.setup_wizard {
+        let pct_x = if area.width < 90 { 94 } else { 78 };
+        let pct_y = if area.height < 26 { 88 } else { 72 };
+        let popup = centered_rect(pct_x, pct_y, area);
+        frame.render_widget(Clear, popup);
+
+        let modal_bg = Color::Rgb(20, 15, 38);
+        let row_hl = Color::Rgb(46, 28, 86);
+        let (step_cur, step_total) = wiz.step_number();
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(moonlit::VIOLET))
+            .style(Style::default().bg(modal_bg))
+            .title_style(
+                Style::default()
+                    .fg(moonlit::LILAC)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .title(format!(
+                " ☾ Setup Provider SelenCode ({step_cur}/{step_total}) "
+            ));
+        let inner = outer.inner(popup);
+        frame.render_widget(outer, popup);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // judul langkah & info
+                Constraint::Min(5),    // isi langkah (daftar preset / kotak ketik)
+                Constraint::Length(2), // footer tombol navigasi
+            ])
+            .split(inner);
+
+        let (step_title, step_hint) = match wiz.step {
+            SetupStep::ChooseApi => (
+                "Pilih Jenis API / Provider",
+                "Pilih API compatible atau preset — ↑↓ pilih lalu Enter",
+            ),
+            SetupStep::ProviderName => (
+                "Beri Nama Provider",
+                "Nama singkat tanpa spasi (mis. router, openrouter, claude)",
+            ),
+            SetupStep::BaseUrl => (
+                "Masukkan Base URL Endpoint (OpenAI-Compatible)",
+                "Contoh: https://router.ryukomik.com/v1 atau https://openrouter.ai/api/v1",
+            ),
+            SetupStep::ApiKey => (
+                "Masukkan API Key",
+                if wiz.needs_key {
+                    "Paste API key (sk-...) langsung atau nama ENV var · Tab: lihat/sembunyi"
+                } else {
+                    "Opsional untuk Ollama lokal — cukup tekan Enter untuk lanjut"
+                },
+            ),
+            SetupStep::ModelId => (
+                "Masukkan ID Model Utama",
+                "Contoh: ag/gemini-4-neon-low · claude-sonnet-4 · gpt-4.1",
+            ),
+        };
+
+        let header_lines = vec![
+            Line::from(vec![
+                Span::styled(" ✦ ", Style::default().fg(moonlit::GOLD)),
+                Span::styled(
+                    step_title.to_string(),
+                    Style::default()
+                        .fg(moonlit::LILAC)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                format!("   {step_hint}"),
+                Style::default().fg(moonlit::DIM),
+            )),
+            Line::from(Span::styled(
+                "─".repeat(sections[0].width as usize),
+                Style::default().fg(moonlit::FAINT),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(header_lines).style(Style::default().bg(modal_bg)),
+            sections[0],
+        );
+
+        let mut body_lines: Vec<Line<'static>> = Vec::new();
+        if let Some(notice) = &wiz.notice {
+            if wiz.step == SetupStep::ChooseApi {
+                body_lines.push(Line::from(vec![
+                    Span::styled(" ℹ ", Style::default().fg(moonlit::CYAN_MOON)),
+                    Span::styled(notice.clone(), Style::default().fg(moonlit::LAV)),
+                ]));
+                body_lines.push(Line::from(""));
+            }
+        }
+        match wiz.step {
+            SetupStep::ChooseApi => {
+                let body_h = sections[1].height as usize;
+                let max_items = body_h.saturating_sub(if wiz.notice.is_some() { 2 } else { 0 }).max(1);
+                let start = if SETUP_PRESETS.len() > max_items && wiz.selected >= max_items {
+                    wiz.selected + 1 - max_items
+                } else {
+                    0
+                };
+                let wide = sections[1].width >= 60;
+                for (idx, p) in SETUP_PRESETS
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(max_items)
+                {
+                    let is_sel = idx == wiz.selected;
+                    let bg = if is_sel {
+                        Style::default().bg(row_hl)
+                    } else {
+                        Style::default().bg(modal_bg)
+                    };
+                    let mut spans = vec![
+                        Span::styled(
+                            if is_sel { " ▸ " } else { "   " },
+                            bg.fg(moonlit::LILAC),
+                        ),
+                        Span::styled(
+                            format!("{}. ", idx + 1),
+                            bg.fg(moonlit::VIOLET).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            p.label.to_string(),
+                            bg.fg(if is_sel {
+                                moonlit::LILAC
+                            } else {
+                                moonlit::SILVER
+                            })
+                            .add_modifier(if is_sel {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                        ),
+                    ];
+                    if wide {
+                        spans.push(Span::styled("  ·  ", bg.fg(moonlit::FAINT)));
+                        spans.push(Span::styled(p.desc.to_string(), bg.fg(moonlit::DIM)));
+                    }
+                    body_lines.push(Line::from(spans));
+                }
+            }
+            SetupStep::ProviderName
+            | SetupStep::BaseUrl
+            | SetupStep::ApiKey
+            | SetupStep::ModelId => {
+                let (label, value) = match wiz.step {
+                    SetupStep::ProviderName => ("Nama provider", wiz.name.clone()),
+                    SetupStep::BaseUrl => ("Base URL", wiz.base_url.clone()),
+                    SetupStep::ApiKey => ("API Key", wiz.masked_key()),
+                    SetupStep::ModelId => ("Model utama", wiz.model.clone()),
+                    SetupStep::ChooseApi => unreachable!(),
+                };
+                body_lines.push(Line::from(""));
+                body_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("   {label}: "),
+                        Style::default().fg(moonlit::LAV).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                body_lines.push(Line::from(vec![
+                    Span::styled("   ❯ ", Style::default().fg(moonlit::VIOLET).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{value}█"),
+                        Style::default()
+                            .bg(row_hl)
+                            .fg(moonlit::MINT)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                body_lines.push(Line::from(""));
+                // Ringkasan field yang sudah diisi sejauh ini
+                body_lines.push(Line::from(vec![
+                    Span::styled("   Ringkasan: ", Style::default().fg(moonlit::FAINT)),
+                    Span::styled(
+                        format!("kind={}", wiz.kind),
+                        Style::default().fg(moonlit::DIM),
+                    ),
+                    Span::styled(
+                        if !wiz.name.is_empty() && wiz.step != SetupStep::ProviderName {
+                            format!(" · nama={}", wiz.name)
+                        } else {
+                            String::new()
+                        },
+                        Style::default().fg(moonlit::DIM),
+                    ),
+                    Span::styled(
+                        if !wiz.base_url.is_empty()
+                            && matches!(wiz.step, SetupStep::ApiKey | SetupStep::ModelId)
+                        {
+                            format!(" · url={}", wiz.base_url)
+                        } else {
+                            String::new()
+                        },
+                        Style::default().fg(moonlit::DIM),
+                    ),
+                ]));
+            }
+        }
+        if let Some(err) = &wiz.error {
+            body_lines.push(Line::from(""));
+            body_lines.push(Line::from(vec![
+                Span::styled("   ✖ ", Style::default().fg(moonlit::ROSE)),
+                Span::styled(err.clone(), Style::default().fg(moonlit::ROSE)),
+            ]));
+        }
+        frame.render_widget(
+            Paragraph::new(body_lines)
+                .style(Style::default().bg(modal_bg))
+                .wrap(Wrap { trim: false }),
+            sections[1],
+        );
+
+        let pill_ok = Style::default()
+            .bg(moonlit::DEEP)
+            .fg(moonlit::MINT)
+            .add_modifier(Modifier::BOLD);
+        let pill_alt = Style::default()
+            .bg(row_hl)
+            .fg(moonlit::LILAC)
+            .add_modifier(Modifier::BOLD);
+        let pill_no = Style::default()
+            .bg(Color::Rgb(68, 22, 34))
+            .fg(moonlit::ROSE)
+            .add_modifier(Modifier::BOLD);
+        let next_label = if wiz.step == SetupStep::ModelId {
+            " [Enter] simpan & pakai "
+        } else {
+            " [Enter] lanjut "
+        };
+        let back_label = if wiz.step == SetupStep::ChooseApi {
+            " [Esc] tutup "
+        } else {
+            " [Esc] kembali "
+        };
+        let mut fspans = vec![
+            Span::raw(" "),
+            Span::styled(next_label, pill_ok),
+            Span::raw("  "),
+            Span::styled(back_label, pill_no),
+        ];
+        if wiz.step == SetupStep::ApiKey {
+            fspans.push(Span::raw("  "));
+            fspans.push(Span::styled(" [Tab] tampilkan key ", pill_alt));
+        }
+        let footer_lines = vec![
+            Line::from(Span::styled(
+                "─".repeat(sections[2].width as usize),
+                Style::default().fg(moonlit::FAINT),
+            )),
+            Line::from(fspans),
+        ];
+        frame.render_widget(
+            Paragraph::new(footer_lines).style(Style::default().bg(modal_bg)),
+            sections[2],
+        );
     }
 
     // Modal Pemilih Model Interaktif Moonlit Ungu (ala Hermes: pilih 1-per-1, tambah manual, hapus)
@@ -1407,6 +1676,9 @@ fn submit(
         SlashCommand::Provider(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::ManageProvider(arg));
         }
+        SlashCommand::Setup => {
+            app.setup_wizard = Some(SetupWizardState::new(None));
+        }
         SlashCommand::Telegram(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Telegram(arg));
         }
@@ -1556,10 +1828,80 @@ fn handle_key(
     if key.kind == KeyEventKind::Release {
         return;
     }
-    // Ctrl+C selalu keluar dengan bersih, termasuk saat modal approval atau pemilih model terbuka.
+    // Ctrl+C selalu keluar dengan bersih, termasuk saat modal approval, wizard setup, atau pemilih model terbuka.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         cancel.notify_waiters();
         app.should_quit = true;
+        return;
+    }
+    // Modal Wizard Setup Provider (`/setup` atau otomatis saat pertama buka).
+    if app.setup_wizard.is_some() {
+        let step = app
+            .setup_wizard
+            .as_ref()
+            .map(|w| w.step)
+            .unwrap_or(SetupStep::ChooseApi);
+        match key.code {
+            KeyCode::Esc => {
+                let close = app
+                    .setup_wizard
+                    .as_mut()
+                    .map(|w| w.back())
+                    .unwrap_or(true);
+                if close {
+                    app.setup_wizard = None;
+                }
+            }
+            KeyCode::Up if step == SetupStep::ChooseApi => {
+                if let Some(w) = &mut app.setup_wizard {
+                    w.move_up();
+                }
+            }
+            KeyCode::Down if step == SetupStep::ChooseApi => {
+                if let Some(w) = &mut app.setup_wizard {
+                    w.move_down();
+                }
+            }
+            KeyCode::Enter => {
+                let done = app.setup_wizard.as_mut().and_then(|w| w.advance());
+                if let Some(res) = done {
+                    app.setup_wizard = None;
+                    send_cmd(app, cmd_tx, TuiCommand::SaveSetupProvider(res));
+                }
+            }
+            KeyCode::Tab if step == SetupStep::ApiKey => {
+                if let Some(w) = &mut app.setup_wizard {
+                    w.show_key = !w.show_key;
+                }
+            }
+            KeyCode::Backspace if step != SetupStep::ChooseApi => {
+                if let Some(w) = &mut app.setup_wizard {
+                    w.pop_char();
+                }
+            }
+            KeyCode::Char(c)
+                if step == SetupStep::ChooseApi
+                    && ('1'..='8').contains(&c)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < SETUP_PRESETS.len() {
+                    if let Some(w) = &mut app.setup_wizard {
+                        w.selected = idx;
+                        let _ = w.advance();
+                    }
+                }
+            }
+            KeyCode::Char(c)
+                if step != SetupStep::ChooseApi
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if let Some(w) = &mut app.setup_wizard {
+                    w.push_char(c);
+                }
+            }
+            _ => {}
+        }
         return;
     }
     // Popup approval mengunci semua input lain (dukung y / a / n / ↑↓ gulir).
@@ -1900,6 +2242,20 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
                 match event::read()? {
                     Event::Key(key) => {
                         handle_key(&mut app, &ch.cmd_tx, &ch.cancel, &ch.interrupt_pending, key)
+                    }
+                    Event::Paste(text) => {
+                        if let Some(w) = &mut app.setup_wizard {
+                            w.push_str(&text);
+                        } else if let Some(mp) = &mut app.model_picker {
+                            if mp.mode == ModelPickerMode::AddManual {
+                                mp.manual_input.push_str(text.trim());
+                            } else if mp.mode == ModelPickerMode::Catalog {
+                                mp.filter_input.push_str(text.trim());
+                                mp.selected = 0;
+                            }
+                        } else if app.approval.is_none() {
+                            app.input.insert_str(&text);
+                        }
                     }
                     Event::Mouse(m) => match m.kind {
                         MouseEventKind::ScrollUp => {
