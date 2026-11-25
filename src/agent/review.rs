@@ -18,7 +18,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Jumlah minimum panggilan tool dalam 1 giliran sebelum review otomatis dipicu.
-pub const AUTO_REVIEW_MIN_TOOLS: usize = 3;
+/// Dinaikkan ke 6 agar tugas rutin 3–5 tool tidak membakar 1 panggilan LLM ekstra (~2.900 token)
+/// hanya untuk menjawab `NONE`.
+pub const AUTO_REVIEW_MIN_TOOLS: usize = 6;
 
 const MAX_DIGEST_BYTES: usize = 6 * 1024;
 
@@ -108,11 +110,32 @@ Aturan KETAT:\n\
     ];
     let skill_tool = ManageSkill;
     let specs = vec![skill_tool.spec()];
+    let breakdown = crate::agent::context::analyze_token_breakdown(&review_msgs, &specs, 1);
     let (tx, _rx) = mpsc::channel::<StreamEvent>(64);
     let reply = provider.stream_chat(&review_msgs, &specs, tx).await?;
 
-    if let (Some(store), Some(sid), Some(u)) = (&ctx.store, &ctx.session_id, reply.usage) {
-        let _ = store.record_usage(sid, provider.model_name(), u.input_tokens, u.output_tokens);
+    if let (Some(store), Some(sid)) = (&ctx.store, &ctx.session_id) {
+        let (act_in, act_out) = reply
+            .usage
+            .map(|u| (u.input_tokens, u.output_tokens))
+            .unwrap_or((0, 0));
+        if let Some(u) = reply.usage {
+            let _ = store.record_usage(sid, provider.model_name(), u.input_tokens, u.output_tokens);
+        }
+        // Catat juga ke `call_token_metrics` agar jumlah baris selalu 100% sinkron dengan tabel `usage`!
+        let _ = store.record_call_token_metric(&crate::store::CallTokenMetric {
+            session_id: sid.clone(),
+            model: provider.model_name().to_string(),
+            est_system_tokens: breakdown.system_tokens,
+            est_tools_tokens: breakdown.tools_tokens,
+            est_history_tokens: breakdown.conversation_tokens,
+            est_tool_results_tokens: breakdown.tool_results_tokens,
+            actual_input_tokens: act_in,
+            actual_output_tokens: act_out,
+            active_tools_count: breakdown.active_tools,
+            pruned_count: 0,
+            deduped_count: 0,
+        });
     }
 
     let mut events: Vec<String> = Vec::new();

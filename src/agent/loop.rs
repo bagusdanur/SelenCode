@@ -10,7 +10,7 @@ use super::context::{
     analyze_token_breakdown, auto_outline, build_system_prompt, cap_dynamic_injection,
     compact_messages_hermes, estimate_tokens, expand_at_mentions, format_memories_section,
     head_tail_truncate, needs_compaction, prune_old_tool_results_with_archive,
-    session_archive_dir, spillover_if_needed,
+    session_archive_dir, spillover_if_needed, spillover_with_preview,
 };
 use super::corrector::{LoopGuard, SelfCorrectState, ToolDedupCache};
 use super::plan::{is_read_only, TurnMode, PLAN_NOTE};
@@ -862,10 +862,12 @@ fn summarize(s: &str, max: usize) -> String {
 }
 
 /// Tahap 4 — Terapkan anggaran hasil tool:
-/// 1. Spillover ke file bila hasil tunggal > `spillover_chars` (default 50.000 char).
-/// 2. Budget agregat per turn: bila `turn_tool_chars_used` akan melampaui `turn_budget`, spill hasil besar duluan.
-/// 3. Khusus `run_shell`: potong 40% kepala + 60% ekor hingga `shell_cap_chars`.
-/// 4. Tool lain: potong aman di batas 16KB.
+/// 1. Khusus `run_shell`: bila melebihi `shell_cap_chars` (default 12.000) atau `spillover_chars` (50.000),
+///    SELALU arsipkan output utuh ke file spillover lebih dulu agar tidak ada baris yang hilang, lalu
+///    kembalikan pratinjau 40% kepala / 60% ekor + path arsipnya.
+/// 2. Tool lain: spillover ke file bila hasil tunggal > `spillover_chars` (default 50.000 char).
+/// 3. Budget agregat per turn: bila `turn_tool_chars_used` akan melampaui `turn_budget`, spill hasil besar duluan.
+/// 4. Tool lain <= batas: potong aman di batas 16KB.
 fn shape_tool_output(
     session_id: &str,
     call_id: &str,
@@ -876,6 +878,33 @@ fn shape_tool_output(
     turn_budget: usize,
 ) -> String {
     let char_len = redacted.chars().count();
+    if tool_name == "run_shell" {
+        let cap = budget.shell_cap_chars.max(1_000);
+        if char_len > budget.spillover_chars && budget.spillover_chars > 0 {
+            if let Some(spilled) = spillover_with_preview(
+                session_id,
+                call_id,
+                tool_name,
+                &redacted,
+                budget.spillover_chars,
+                2_400,
+            ) {
+                *turn_tool_chars_used += spilled.chars().count();
+                return spilled;
+            }
+        }
+        if char_len > cap {
+            if let Some(spilled) =
+                spillover_with_preview(session_id, call_id, tool_name, &redacted, cap, cap)
+            {
+                *turn_tool_chars_used += spilled.chars().count();
+                return spilled;
+            }
+            let cut = head_tail_truncate(&redacted, cap);
+            *turn_tool_chars_used += cut.chars().count();
+            return cut;
+        }
+    }
     if let Some(spilled) = spillover_if_needed(
         session_id,
         call_id,

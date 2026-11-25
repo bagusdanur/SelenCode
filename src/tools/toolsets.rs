@@ -19,7 +19,9 @@ pub const LOAD_MCP_TOOLS_NAME: &str = "load_mcp_tools";
 /// Tahap 6: bila jumlah tool MCP terdaftar > 15, kirim indeks ringkas + pemuat skema on-demand!
 pub const MCP_ON_DEMAND_THRESHOLD: usize = 15;
 
-/// 8 tool paling esensial yang selalu aktif di setiap giliran Execute (~650 token total).
+/// 6 tool paling esensial yang selalu aktif di setiap giliran Execute (+ `activate_toolset` = 7 tool).
+/// `git_status`/`git_diff` otomatis aktif hanya bila folder adalah repo Git (`.git` ada) atau diminta,
+/// sehingga tugas di folder polos hemat 2 skema tool (~400–600 token aktual) di setiap panggilan API!
 pub const CORE_TOOLS: &[&str] = &[
     "list_files",
     "read_file",
@@ -27,12 +29,11 @@ pub const CORE_TOOLS: &[&str] = &[
     "edit_file",
     "search_text",
     "run_shell",
-    "git_status",
-    "git_diff",
 ];
 
 /// Daftar paket toolset tambahan yang dapat diaktifkan secara dinamis.
 pub const EXTENDED_TOOLSETS: &[(&str, &str, &[&str])] = &[
+    ("git_read", "status & diff repositori git", &["git_status", "git_diff"]),
     ("verify", "verifikasi build/test/lint proyek", &["verify_project"]),
     ("git_write", "commit perubahan git", &["git_commit"]),
     ("code_nav", "outline AST & Smart Context Index", &["outline", "retrieve_context"]),
@@ -74,7 +75,7 @@ pub const EXTENDED_TOOLSETS: &[(&str, &str, &[&str])] = &[
 pub fn activate_toolset_spec() -> ToolSpec {
     ToolSpec {
         name: ACTIVATE_TOOLSET_NAME.to_string(),
-        description: "Aktifkan toolset tambahan secara on-demand: verify, git_write, code_nav, lsp, bg, web, plan, skills_mem, multi_agent, mcp.".to_string(),
+        description: "Aktifkan toolset tambahan secara on-demand: git_read, verify, git_write, code_nav, lsp, bg, web, plan, skills_mem, multi_agent, mcp.".to_string(),
         parameters: schema(
             json!({
                 "toolsets": {
@@ -116,6 +117,15 @@ pub fn select_initial_toolsets(
         set.insert("verify".to_string());
     }
 
+    // `git_read` otomatis aktif bila folder benar-benar repo Git ATAU prompt menyebut git/diff/commit.
+    if cwd.join(".git").exists()
+        || ["git ", "git_", "commit", "diff", "branch", "staged"]
+            .iter()
+            .any(|kw| lower.contains(kw))
+    {
+        set.insert("git_read".to_string());
+    }
+
     if ["commit", "git ", "git_commit", "staged", "branch"]
         .iter()
         .any(|kw| lower.contains(kw))
@@ -123,21 +133,23 @@ pub fn select_initial_toolsets(
         set.insert("git_write".to_string());
     }
 
-    if prompt.chars().count() >= 80
-        || [
-            "arsitektur",
-            "struktur",
-            "refactor",
-            "outline",
-            "retrieve",
-            "seluruh repo",
-            "codebase",
-            "cari fungsi",
-            "jelaskan project",
-            "jelaskan proyek",
-        ]
-        .iter()
-        .any(|kw| lower.contains(kw))
+    // JANGAN mengaktifkan `code_nav` atau `plan` hanya karena panjang prompt (prompt 180+ char
+    // untuk tugas 1 file atau `/resume` tidak butuh 4 schema tambahan di setiap panggilan API!).
+    if [
+        "arsitektur",
+        "struktur repo",
+        "struktur proyek",
+        "refactor besar",
+        "outline",
+        "retrieve_context",
+        "seluruh repo",
+        "codebase",
+        "cari fungsi",
+        "jelaskan project",
+        "jelaskan proyek",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
     {
         set.insert("code_nav".to_string());
     }
@@ -181,15 +193,22 @@ pub fn select_initial_toolsets(
         set.insert("web".to_string());
     }
 
-    if prompt.chars().count() >= 180
-        || ["rencana", "plan", "tahap", "langkah", "task", "long-horizon", "pemulihan"]
-            .iter()
-            .any(|kw| lower.contains(kw))
+    if [
+        "rencana",
+        "update_plan",
+        "manage_task",
+        "long-horizon",
+        "roadmap",
+        "checklist",
+        "pemulihan task",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
     {
         set.insert("plan".to_string());
     }
 
-    if ["skill", "memori", "memory", "ingat", "catat", "pelajari", "/learn"]
+    if ["skill", "memori", "memory", "manage_skill", "manage_memory", "/learn"]
         .iter()
         .any(|kw| lower.contains(kw))
     {
@@ -215,8 +234,7 @@ pub fn select_initial_toolsets(
     if has_mcp
         && (lower.contains("mcp")
             || lower.contains("resource")
-            || lower.contains("prompt")
-            || prompt.chars().count() >= 120)
+            || lower.contains("prompt"))
     {
         set.insert("mcp".to_string());
     }

@@ -1,9 +1,13 @@
-use super::{run_timed, schema, str_arg, truncate_output, Ctx, Tool, MAX_TOOL_OUTPUT};
+use super::{run_timed, schema, str_arg, truncate_output, Ctx, Tool};
 use crate::providers::ToolSpec;
 use crate::security::is_forbidden_command;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+
+/// Batas aman tangkapan output mentah shell di memori (512 KB) agar output besar seperti
+/// 60KB+ tetap utuh saat masuk ke tahap spillover arsip di `agent/loop.rs` tanpa pernah hilang.
+const MAX_SHELL_CAPTURE: usize = 512 * 1024;
 
 /// run_shell — jalankan perintah shell di cwd project.
 /// Approval wajib KECUALI perintah cocok allowlist config [shell].
@@ -74,7 +78,7 @@ impl Tool for RunShell {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_shell".into(),
-            description: "Jalankan perintah shell di folder project (timeout sesuai config, output maks 30KB). Perintah di luar allowlist butuh persetujuan user; exit code non-nol dilaporkan apa adanya.".into(),
+            description: "Jalankan perintah shell di folder project. Perintah di luar allowlist butuh persetujuan; output besar diarsipkan otomatis.".into(),
             parameters: schema(
                 json!({"command": {"type": "string", "description": "perintah shell lengkap"}}),
                 &["command"],
@@ -119,7 +123,7 @@ impl Tool for RunShell {
         let (code, output) = run_timed(&mut cmd, self.timeout_secs)
             .await
             .map_err(|e| anyhow!("perintah '{command}': {e}"))?;
-        let output = truncate_output(output, MAX_TOOL_OUTPUT);
+        let output = truncate_output(output, MAX_SHELL_CAPTURE);
         // Exit non-nol BUKAN error fatal: model perlu tahu (mis. test gagal).
         Ok(format!(
             "exit code: {}\n{output}",

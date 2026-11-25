@@ -67,6 +67,8 @@ impl TokenBreakdown {
 }
 
 /// Hitung estimasi token terpisah per komponen (system prompt, schema tool aktif, chat, hasil tool).
+/// Memakai rasio terkalibrasi (~3 char/token untuk teks Indonesia, kode, & JSON schema + wrapper API ~70 char/tool)
+/// agar jauh lebih mendekati tagihan aktual provider dibanding pembagi naif `chars / 4`.
 pub fn analyze_token_breakdown(
     messages: &[Message],
     active_specs: &[ToolSpec],
@@ -76,6 +78,15 @@ pub fn analyze_token_breakdown(
     let mut conv_chars = 0usize;
     let mut tool_res_chars = 0usize;
     for m in messages {
+        // Overhead peran & bungkus JSON per pesan (~24 char).
+        let msg_overhead = 24usize;
+        if m.role == Role::System {
+            system_chars += msg_overhead;
+        } else if m.role == Role::Tool {
+            tool_res_chars += msg_overhead;
+        } else {
+            conv_chars += msg_overhead;
+        }
         for b in &m.content {
             match b {
                 Block::Text(t) => {
@@ -85,12 +96,12 @@ pub fn analyze_token_breakdown(
                         conv_chars += t.chars().count();
                     }
                 }
-                Block::Image { .. } => conv_chars += 1200,
+                Block::Image { .. } => conv_chars += 900,
                 Block::ToolUse { name, args, .. } => {
-                    conv_chars += name.chars().count() + args.to_string().chars().count();
+                    conv_chars += name.chars().count() + args.to_string().chars().count() + 36;
                 }
                 Block::ToolResult { content, .. } => {
-                    tool_res_chars += content.chars().count();
+                    tool_res_chars += content.chars().count() + 24;
                 }
             }
         }
@@ -101,14 +112,14 @@ pub fn analyze_token_breakdown(
             t.name.chars().count()
                 + t.description.chars().count()
                 + t.parameters.to_string().chars().count()
-                + 40
+                + 70
         })
         .sum();
     TokenBreakdown {
-        system_tokens: system_chars / 4,
-        tools_tokens: tools_chars / 4,
-        conversation_tokens: conv_chars / 4,
-        tool_results_tokens: tool_res_chars / 4,
+        system_tokens: system_chars.div_ceil(3),
+        tools_tokens: tools_chars.div_ceil(3),
+        conversation_tokens: conv_chars.div_ceil(3),
+        tool_results_tokens: tool_res_chars.div_ceil(3),
         active_tools: active_specs.len(),
         total_tools,
     }
@@ -505,13 +516,14 @@ pub fn head_tail_truncate(text: &str, max_chars: usize) -> String {
 }
 
 /// Spillover (Tahap 4): tulis hasil tool yang melampaui ambang `threshold_chars` utuh ke file
-/// arsip kerja sesi, lalu kembalikan pratinjau kepala/ekor + path file arsipnya.
-pub fn spillover_if_needed(
+/// arsip kerja sesi, lalu kembalikan pratinjau kepala/ekor (`preview_chars`) + path file arsipnya.
+pub fn spillover_with_preview(
     session_id: &str,
     call_id: &str,
     tool_name: &str,
     redacted_content: &str,
     threshold_chars: usize,
+    preview_chars: usize,
 ) -> Option<String> {
     let total = redacted_content.chars().count();
     if total <= threshold_chars || threshold_chars == 0 {
@@ -531,11 +543,31 @@ pub fn spillover_if_needed(
     );
     let path = dir.join(file_name);
     let _ = std::fs::write(&path, redacted_content);
-    let preview = head_tail_truncate(redacted_content, 1200);
+    let preview = head_tail_truncate(redacted_content, preview_chars.max(400));
     Some(format!(
-        "[Spillover `{tool_name}` ({total} char) — arsip penuh: {}]\n{preview}",
+        "[Spillover `{tool_name}` ({total} char) — arsip penuh: {}]\n\
+         (Catatan: bagian tengah tidak ditampilkan; gunakan `search_text` atau `read_file` dengan `start_line`/`end_line` pada file asli/arsip bila mencari detail tertentu.)\n\
+         {preview}",
         path.display()
     ))
+}
+
+/// Spillover (Tahap 4) dengan panjang pratinjau default 1.200 karakter.
+pub fn spillover_if_needed(
+    session_id: &str,
+    call_id: &str,
+    tool_name: &str,
+    redacted_content: &str,
+    threshold_chars: usize,
+) -> Option<String> {
+    spillover_with_preview(
+        session_id,
+        call_id,
+        tool_name,
+        redacted_content,
+        threshold_chars,
+        1200,
+    )
 }
 
 /// Batasi blok injeksi dinamis (memori + skill + konteks snapshot) agar tidak melampaui

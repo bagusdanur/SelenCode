@@ -5,17 +5,21 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use selencode::agent::context::{
     cap_dynamic_injection, compact_messages_hermes, compression_summary_budget, head_tail_truncate,
-    prune_old_tool_results_with_archive, spillover_if_needed, AuxCooldownState,
-    HERMES_SUMMARY_MARKER,
+    prune_old_tool_results_with_archive, spillover_if_needed, spillover_with_preview,
+    AuxCooldownState, HERMES_SUMMARY_MARKER,
 };
 use selencode::agent::corrector::{
     canonical_tool_fingerprint, LoopGuard, SelfCorrectState, ToolDedupCache,
 };
 use selencode::agent::plan::TurnMode;
-use selencode::providers::{anthropic, Block, Message, Role, ToolSpec};
+use selencode::agent::review::{run_self_improvement_review, AUTO_REVIEW_MIN_TOOLS};
+use selencode::providers::{
+    anthropic, AssistantReply, Block, Message, Provider, Role, StreamEvent, ToolSpec, Usage,
+};
 use selencode::store::{CallTokenMetric, Store};
 use selencode::tools::toolsets::{
-    active_tool_specs_with_mcp, build_mcp_compact_index, LOAD_MCP_TOOLS_NAME,
+    active_tool_specs, active_tool_specs_with_mcp, build_mcp_compact_index,
+    select_initial_toolsets, LOAD_MCP_TOOLS_NAME,
 };
 use selencode::tools::{default_registry, Ctx, Tool};
 use selencode::tui::app::{App, LineKind, TranscriptLine};
@@ -307,4 +311,103 @@ fn bagian_a_tui_per_message_render_cache_handles_150_messages_fast() {
         avg_ms < 50.0,
         "redraw cache 150 pesan harus sangat ringan (<50ms di CI, aktual {avg_ms:.2}ms)"
     );
+}
+
+#[tokio::test]
+async fn regression_fixes_shell_spillover_lean_toolsets_and_review_metrics() {
+    // 1. Spillover run_shell 66.000 char menyimpan arsip UTUH (termasuk baris tengah & baris 2000)
+    //    dan pratinjau menyertakan kepala + ekor sejati + petunjuk search_text/read_file!
+    let mut big_shell = String::new();
+    for i in 1..=2000 {
+        if i == 750 {
+            big_shell.push_str("BARIS-0750: FAKTA-TENGAH-RAHASIA\n");
+        } else {
+            big_shell.push_str(&format!("BARIS-{i:04}: isi log panjang untuk uji spillover shell\n"));
+        }
+    }
+    assert!(big_shell.chars().count() > 60_000);
+    let spilled = spillover_with_preview("sess-reg-sh", "sh1", "run_shell", &big_shell, 50_000, 2_400)
+        .expect("run_shell >50k harus spillover");
+    assert!(spilled.contains("[Spillover `run_shell`"));
+    assert!(spilled.contains("BARIS-0001"));
+    assert!(spilled.contains("BARIS-2000"), "ekor sejati baris 2000 harus ada: {spilled}");
+    assert!(spilled.contains("search_text"));
+
+    // 2. Prompt panjang 220 char & prompt resume di folder polos TIDAK boleh membengkak jadi 11-13 tool!
+    let plain_dir = std::env::temp_dir().join(format!(
+        "selen-plain-ts-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&plain_dir).unwrap();
+    let reg = default_registry();
+    let long_task = "Buat program Python rekap.py yang membaca file contoh.csv berisi kolom nama dan nilai untuk 5 siswa, hitung rata-rata nilai dengan 2 desimal, tampilkan siswa dengan nilai tertinggi, lalu jalankan skripnya untuk memastikan hasilnya tepat.";
+    assert!(long_task.chars().count() > 200);
+    let ts_long = select_initial_toolsets(long_task, &plain_dir, false, TurnMode::Execute);
+    let specs_long = active_tool_specs(&reg, &ts_long, TurnMode::Execute);
+    assert!(
+        specs_long.len() <= 7,
+        "tugas panjang di folder polos harus tetap <=7 tool (bukan 13!), dapat {}: {:?}",
+        specs_long.len(),
+        specs_long.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+    );
+    let resume_prompt = "apa kata sandi yang kita simpan di kata.txt dan apa pekerjaan terakhir yang baru kita selesaikan?";
+    let ts_res = select_initial_toolsets(resume_prompt, &plain_dir, false, TurnMode::Execute);
+    let specs_res = active_tool_specs(&reg, &ts_res, TurnMode::Execute);
+    assert!(
+        specs_res.len() <= 7,
+        "resume di folder polos harus <=7 tool (bukan 11!), dapat {}",
+        specs_res.len()
+    );
+    // Sementara folder dengan .git tetap otomatis mengaktifkan git_status & git_diff!
+    std::fs::create_dir_all(plain_dir.join(".git")).unwrap();
+    let ts_git = select_initial_toolsets("periksa perubahan", &plain_dir, false, TurnMode::Execute);
+    let specs_git = active_tool_specs(&reg, &ts_git, TurnMode::Execute);
+    assert!(specs_git.iter().any(|s| s.name == "git_status"));
+    assert!(specs_git.iter().any(|s| s.name == "git_diff"));
+    let _ = std::fs::remove_dir_all(&plain_dir);
+
+    // 3. Auto-review threshold >= 6 & run_self_improvement_review wajib mengisi call_token_metrics 1:1 dengan usage!
+    assert!(AUTO_REVIEW_MIN_TOOLS >= 6);
+    struct NoopReviewProv;
+    #[async_trait]
+    impl Provider for NoopReviewProv {
+        fn model_name(&self) -> &str {
+            "mock-review"
+        }
+        async fn stream_chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _tx: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> anyhow::Result<AssistantReply> {
+            Ok(AssistantReply {
+                text: "NONE".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: Some(Usage {
+                    input_tokens: 1500,
+                    output_tokens: 1,
+                }),
+            })
+        }
+    }
+    let db = std::env::temp_dir().join(format!(
+        "selen-rev-m-{}.db",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let store = Arc::new(Store::open_at(&db).unwrap());
+    let sid = store.create_session("/tmp", "mock", "mock-review", "rev").unwrap();
+    let ctx = Ctx::new(std::env::temp_dir(), true).with_store(store.clone(), sid.clone());
+    let hist = vec![
+        Message::text(Role::User, "tolong buat file"),
+        Message::text(Role::Assistant, "selesai"),
+    ];
+    let res = run_self_improvement_review(Arc::new(NoopReviewProv), &ctx, &hist)
+        .await
+        .unwrap();
+    assert!(res.is_none());
+    let rep = store.session_token_metrics(&sid).unwrap();
+    assert_eq!(rep.calls, 1, "review call wajib tercatat di call_token_metrics");
+    assert_eq!(rep.total_actual_input, 1500);
+    let _ = std::fs::remove_file(&db);
 }
