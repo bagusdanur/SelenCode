@@ -90,6 +90,7 @@ pub enum TuiCommand {
     Checkpoint(Option<String>),
     Rollback(Option<String>),
     Verify(Option<String>),
+    Index(Option<String>),
     Memory(Option<String>),
     Skills(Option<String>),
     UseSkill(Option<String>),
@@ -1700,6 +1701,9 @@ fn submit(
             } else {
                 send_cmd(app, cmd_tx, TuiCommand::Verify(arg));
             }
+        }
+        SlashCommand::Index(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Index(arg));
         }
         SlashCommand::Memory(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Memory(arg));

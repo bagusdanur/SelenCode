@@ -23,6 +23,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
     "search_text",
     "outline",
+    "retrieve_context",
     "git_status",
     "git_diff",
     "fetch_url",

@@ -379,3 +379,28 @@ pub fn redact_secrets(text: &str) -> String {
     }
     out
 }
+
+/// Deteksi apakah teks mengandung rahasia/token/password/private key (dipakai
+/// guard Project Memory agar kredensial TIDAK PERNAH tersimpan di memori proyek).
+pub fn contains_secret(text: &str) -> bool {
+    if redact_secrets(text) != text {
+        return true;
+    }
+    use std::sync::OnceLock;
+    static EXTRA: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    let extra = EXTRA.get_or_init(|| {
+        [
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----",
+            r"xox[baprs]-[A-Za-z0-9\-]{10,}",
+            r"AIzaSy[A-Za-z0-9_\-]{20,}",
+            r"\b\d{8,10}:[A-Za-z0-9_\-]{30,}\b", // Telegram bot token
+            r"glpat-[A-Za-z0-9_\-]{16,}",
+            r"sq0csp-[A-Za-z0-9_\-]{16,}",
+            r"(?i)\b(?:password|passwd|secret|api_key|apikey|access_token|private_key)\b\s*(?:is|adalah|=|:)\s*\S{6,}",
+        ]
+        .iter()
+        .map(|p| regex::Regex::new(p).expect("pola deteksi secret valid"))
+        .collect()
+    });
+    extra.iter().any(|re| re.is_match(text))
+}

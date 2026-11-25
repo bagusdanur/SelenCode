@@ -29,7 +29,9 @@ pub enum SlashCommand {
     Rollback(Option<String>),
     /// /verify [check | test | lint | all] — jalankan validasi proyek otomatis & tampilkan diagnostik.
     Verify(Option<String>),
-    /// /memory | /memory add <teks> | /memory global <teks> | /memory rm <id>
+    /// /index [query] atau /context [query] — lihat indeks repositori inkremental & uji pencarian konteks relevan.
+    Index(Option<String>),
+    /// /memory | /memory add [kat] <teks> | /memory update <id> [kat] <teks> | /memory global [kat] <teks> | /memory rm <id>
     Memory(Option<String>),
     /// /skills | /skills auto | /skills review | /skills show <nama> | /skills rm <nama>
     Skills(Option<String>),
@@ -147,9 +149,15 @@ pub const COMMANDS: &[CommandDef] = &[
         takes_args: true,
     },
     CommandDef {
+        cmd: "/index",
+        args: "[query]",
+        desc: "indeks repositori inkremental & uji smart context retrieval",
+        takes_args: true,
+    },
+    CommandDef {
         cmd: "/memory",
-        args: "[add / global / rm <id>]",
-        desc: "memori persisten lintas sesi (global & project)",
+        args: "[add / update / global / rm <id>]",
+        desc: "memori proyek terstruktur lintas sesi (anti-rahasia)",
         takes_args: true,
     },
     CommandDef {
@@ -275,6 +283,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/checkpoint" | "/cp" => SlashCommand::Checkpoint(rest),
         "/rollback" => SlashCommand::Rollback(rest),
         "/verify" => SlashCommand::Verify(rest),
+        "/index" | "/context" => SlashCommand::Index(rest),
         "/memory" => SlashCommand::Memory(rest),
         "/skills" => SlashCommand::Skills(rest),
         "/skill" => SlashCommand::Skill(rest),

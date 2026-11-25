@@ -1439,44 +1439,82 @@ impl Session {
         }
     }
 
+    fn handle_index(&self, arg: Option<&str>) -> Result<String> {
+        let mut idx = self
+            .ctx
+            .repo_index
+            .lock()
+            .expect("repo_index poisoned");
+        Ok(idx.format_status_card(arg))
+    }
+
     fn handle_memory(&self, arg: Option<&str>) -> Result<String> {
         let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
         let Some(arg) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
-            let list = self.store.list_memories(&cwd_str, 30)?;
-            let mut out = String::from("# Memori Persisten Selena\n");
+            let list = self.store.list_memories(&cwd_str, 40)?;
+            let mut out = String::from("# Memori Proyek & Global Selena\n");
             if list.is_empty() {
                 out.push_str("! Belum ada memori tersimpan.\n");
             } else {
                 for m in list {
                     let scope = if m.scope == "global" { "global" } else { "project" };
-                    out.push_str(&format!("> #{} | {scope} | {}\n", m.id, m.content));
+                    out.push_str(&format!(
+                        "> #{} | {} · {scope} | {}\n",
+                        m.id, m.category, m.content
+                    ));
                 }
             }
             out.push_str("---\n");
-            out.push_str("! Simpan memori project: /memory add <catatan>\n");
-            out.push_str("! Simpan memori global:  /memory global <catatan>\n");
-            out.push_str("! Hapus memori:          /memory rm <id>");
+            out.push_str("! Kategori: arch, commands, conventions, decisions, issues, tasks, general\n");
+            out.push_str("! Simpan project: /memory add [kategori] <catatan>\n");
+            out.push_str("! Perbarui:       /memory update <id> [kategori] <catatan>\n");
+            out.push_str("! Simpan global:  /memory global [kategori] <catatan>\n");
+            out.push_str("! Hapus memori:   /memory rm <id>  (rahasia/token/password selalu ditolak)");
             return Ok(out);
         };
         if let Some(rest) = arg.strip_prefix("add ") {
-            let text = rest.trim();
+            let (cat, text) = split_optional_category(rest.trim());
             if text.is_empty() {
-                anyhow::bail!("isi memori kosong. Contoh: /memory add Selalu pakai bahasa Indonesia");
+                anyhow::bail!(
+                    "isi memori kosong. Contoh: /memory add commands Jalankan cargo test sebelum rilis"
+                );
             }
-            let id = self.store.add_memory(&cwd_str, text)?;
+            let id = self.store.add_memory_categorized(&cwd_str, cat, text)?;
             return Ok(format!(
-                "# Memori Project Disimpan\n* #{id} | project | {text}"
+                "# Memori Proyek Disimpan\n* #{id} | {cat} · project | {text}"
             ));
         }
         if let Some(rest) = arg.strip_prefix("global ") {
-            let text = rest.trim();
+            let (cat, text) = split_optional_category(rest.trim());
             if text.is_empty() {
                 anyhow::bail!("isi memori global kosong.");
             }
-            let id = self.store.add_memory("global", text)?;
+            let id = self.store.add_memory_categorized("global", cat, text)?;
             return Ok(format!(
-                "# Memori Global Disimpan\n* #{id} | global | {text}"
+                "# Memori Global Disimpan\n* #{id} | {cat} · global | {text}"
             ));
+        }
+        if let Some(rest) = arg.strip_prefix("update ").or_else(|| arg.strip_prefix("edit ")) {
+            let mut parts = rest.trim().splitn(2, char::is_whitespace);
+            let id_raw = parts.next().unwrap_or("").trim_start_matches('#');
+            let id: i64 = id_raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("id memori harus angka (mis. /memory update 1 arch ...)"))?;
+            let tail = parts.next().unwrap_or("").trim();
+            if tail.is_empty() {
+                anyhow::bail!("isi memori baru kosong. Contoh: /memory update {id} [kategori] <catatan baru>");
+            }
+            let (explicit_cat, text) = split_explicit_category_opt(tail);
+            if text.is_empty() {
+                anyhow::bail!("isi memori baru kosong.");
+            }
+            if self.store.update_memory(id, explicit_cat, text)? {
+                let cat_disp = explicit_cat.unwrap_or("(tetap)");
+                return Ok(format!(
+                    "# Memori Diperbarui\n* #{id} | {cat_disp} | {text}"
+                ));
+            }
+            anyhow::bail!("memori #{id} tidak ditemukan");
         }
         if let Some(rest) = arg.strip_prefix("rm ").or_else(|| arg.strip_prefix("del ")) {
             let id: i64 = rest
@@ -1490,10 +1528,11 @@ impl Session {
             anyhow::bail!("memori #{id} tidak ditemukan");
         }
         Ok("# Cara Pakai /memory\n\
-            ! /memory                  — lihat semua memori aktif\n\
-            ! /memory add <catatan>    — simpan memori khusus project ini\n\
-            ! /memory global <catatan> — simpan memori global lintas project\n\
-            ! /memory rm <id>          — hapus memori berdasarkan ID"
+            ! /memory                              — lihat semua memori aktif\n\
+            ! /memory add [kategori] <catatan>     — simpan memori proyek (arch/commands/conventions/decisions/issues/tasks)\n\
+            ! /memory update <id> [kat] <catatan>  — perbarui memori berdasarkan ID\n\
+            ! /memory global [kategori] <catatan>  — simpan memori global lintas proyek\n\
+            ! /memory rm <id>                      — hapus memori berdasarkan ID"
             .to_string())
     }
 
@@ -1994,6 +2033,14 @@ async fn tui_worker(
                 }
             },
             TuiCommand::Verify(arg) => match s.handle_verify(arg.as_deref()).await {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::Index(arg) => match s.handle_index(arg.as_deref()) {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
                 }
@@ -2533,6 +2580,10 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
+            SlashCommand::Index(arg) => match s.handle_index(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
             SlashCommand::Memory(arg) => match s.handle_memory(arg.as_deref()) {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
@@ -2660,6 +2711,34 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Pisahkan kategori eksplisit di awal argumen `/memory add [kat] <teks>`.
+/// Bila kata pertama bukan kategori resmi, kategori default `"general"` dan seluruh teks dipertahankan.
+fn split_optional_category(s: &str) -> (&'static str, &str) {
+    let mut parts = s.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or("");
+    if let (Some(cat), Some(rest)) = (selencode::store::parse_explicit_category(first), parts.next()) {
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return (cat, trimmed);
+        }
+    }
+    ("general", s.trim())
+}
+
+/// Sama seperti `split_optional_category`, tapi mengembalikan `None` untuk kategori bila tidak disebut
+/// secara eksplisit (dipakai `/memory update <id> [kat] <teks>` agar kategori lama tetap terjaga).
+fn split_explicit_category_opt(s: &str) -> (Option<&'static str>, &str) {
+    let mut parts = s.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or("");
+    if let (Some(cat), Some(rest)) = (selencode::store::parse_explicit_category(first), parts.next()) {
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return (Some(cat), trimmed);
+        }
+    }
+    (None, s.trim())
 }
 
 // ---------- Telegram Bot Gateway (`selen telegram`) ----------
@@ -3103,6 +3182,12 @@ async fn handle_telegram_chat_message(
         }
         SlashCommand::Verify(arg) => {
             let reply = s.handle_verify(arg.as_deref()).await?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Index(arg) => {
+            let reply = s.handle_index(arg.as_deref())?;
             tg.send_long_message(chat_id, &strip_menu_markup(&reply))
                 .await?;
             return Ok(());

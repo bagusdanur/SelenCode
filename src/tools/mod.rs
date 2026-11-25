@@ -1,8 +1,10 @@
 pub mod delegate;
 pub mod file;
 pub mod git;
+pub mod memory;
 pub mod outline;
 pub mod plan;
+pub mod retrieve;
 pub mod search;
 pub mod shell;
 pub mod skill;
@@ -40,6 +42,9 @@ pub struct Ctx {
     pub plan_state: Arc<std::sync::Mutex<Vec<plan::PlanStep>>>,
     /// Riwayat snapshot edit file untuk `/undo` dan `/redo`.
     pub undo_stack: Arc<std::sync::Mutex<undo::UndoStack>>,
+    /// Indeks repositori inkremental bersama untuk Smart Context Retrieval (Tahap 2).
+    /// Kosong saat dibuat (tanpa I/O) dan diperbarui secara inkremental saat diminta.
+    pub repo_index: Arc<std::sync::Mutex<crate::context_index::RepoIndex>>,
     /// Aktifkan review self-improvement otomatis pasca-giliran kompleks (ala Hermes).
     /// Default false di Ctx::new agar tes mock tidak memicu panggilan ekstra;
     /// Session::build mengisinya dari `cfg.agent.auto_skills` (default true).
@@ -52,6 +57,9 @@ pub struct Ctx {
 
 impl Ctx {
     pub fn new(cwd: PathBuf, auto_yes: bool) -> Self {
+        let repo_index = Arc::new(std::sync::Mutex::new(
+            crate::context_index::RepoIndex::new(cwd.clone()),
+        ));
         Self {
             cwd,
             approver: Arc::new(Approver::new(auto_yes)),
@@ -60,6 +68,7 @@ impl Ctx {
             session_id: None,
             plan_state: Arc::new(std::sync::Mutex::new(Vec::new())),
             undo_stack: Arc::new(std::sync::Mutex::new(undo::UndoStack::default())),
+            repo_index,
             auto_skills: false,
             self_correct: false,
         }
@@ -195,6 +204,7 @@ pub fn default_registry_with_shell(shell_cfg: &ShellCfg) -> Registry {
         .register(Arc::new(file::EditFile))
         .register(Arc::new(search::SearchText))
         .register(Arc::new(outline::Outline))
+        .register(Arc::new(retrieve::RetrieveContext))
         .register(Arc::new(shell::RunShell::new(
             shell_cfg.allowlist.clone(),
             shell_cfg.timeout_secs,
@@ -205,6 +215,7 @@ pub fn default_registry_with_shell(shell_cfg: &ShellCfg) -> Registry {
         .register(Arc::new(web::FetchUrl))
         .register(Arc::new(plan::UpdatePlan))
         .register(Arc::new(skill::ManageSkill))
+        .register(Arc::new(memory::ManageMemory))
         .register(Arc::new(verify::VerifyProject::new(shell_cfg.timeout_secs)))
 }
 
@@ -217,6 +228,7 @@ pub fn read_only_registry() -> Registry {
         .register(Arc::new(file::ReadFile))
         .register(Arc::new(search::SearchText))
         .register(Arc::new(outline::Outline))
+        .register(Arc::new(retrieve::RetrieveContext))
         .register(Arc::new(git::GitStatus))
         .register(Arc::new(git::GitDiff))
         .register(Arc::new(web::FetchUrl))

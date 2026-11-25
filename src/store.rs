@@ -23,12 +23,67 @@ pub struct SessionInfo {
     pub title: String,
 }
 
+/// Kategori terstruktur untuk Memori Proyek (Tahap 2).
+pub const MEMORY_CATEGORIES: &[(&str, &str)] = &[
+    ("arch", "Struktur & Arsitektur Proyek"),
+    ("commands", "Perintah Build, Test, & Lint"),
+    ("conventions", "Konvensi Penamaan & Gaya Kode"),
+    ("decisions", "Keputusan Teknis"),
+    ("issues", "Masalah & Solusi"),
+    ("tasks", "Status Tugas Belum Selesai"),
+    ("general", "Catatan Umum"),
+];
+
+/// Normalisasi nama/alias kategori memori proyek ke kode kanonik.
+pub fn normalize_memory_category(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "arch" | "architecture" | "arsitektur" | "struktur" => "arch",
+        "commands" | "command" | "cmd" | "build" | "test" | "lint" | "perintah" => "commands",
+        "conventions" | "convention" | "style" | "gaya" | "konvensi" => "conventions",
+        "decisions" | "decision" | "keputusan" => "decisions",
+        "issues" | "issue" | "bug" | "bugs" | "fix" | "troubleshoot" | "masalah" | "solusi" => {
+            "issues"
+        }
+        "tasks" | "task" | "todo" | "tugas" | "wip" => "tasks",
+        _ => "general",
+    }
+}
+
+/// Cek apakah token pertama adalah nama/alias kategori eksplisit (bukan teks biasa).
+pub fn parse_explicit_category(word: &str) -> Option<&'static str> {
+    let low = word.trim().trim_end_matches(':').to_ascii_lowercase();
+    match low.as_str() {
+        "arch" | "architecture" | "arsitektur" | "struktur" => Some("arch"),
+        "commands" | "command" | "cmd" | "build" | "test" | "lint" | "perintah" => Some("commands"),
+        "conventions" | "convention" | "style" | "gaya" | "konvensi" => Some("conventions"),
+        "decisions" | "decision" | "keputusan" => Some("decisions"),
+        "issues" | "issue" | "bug" | "bugs" | "troubleshoot" | "masalah" | "solusi" => {
+            Some("issues")
+        }
+        "tasks" | "task" | "todo" | "tugas" | "wip" => Some("tasks"),
+        "general" | "umum" => Some("general"),
+        _ => None,
+    }
+}
+
+/// Label tampilan manusiawi untuk kode kategori memori.
+pub fn memory_category_label(cat: &str) -> &'static str {
+    let norm = normalize_memory_category(cat);
+    MEMORY_CATEGORIES
+        .iter()
+        .find(|(k, _)| *k == norm)
+        .map(|(_, label)| *label)
+        .unwrap_or("Catatan Umum")
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryItem {
     pub id: i64,
     pub scope: String,
+    pub category: String,
     pub content: String,
     pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Lokasi DB: env SELENCODE_DB (dipakai tes) atau
@@ -51,7 +106,9 @@ CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session_id TEXT,
 CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, session_id TEXT, model TEXT,
                     input_tokens INT, output_tokens INT, ts TEXT);
 CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, scope TEXT,
-                    content TEXT, ts TEXT);
+                    content TEXT, ts TEXT,
+                    category TEXT NOT NULL DEFAULT 'general',
+                    updated_at TEXT NOT NULL DEFAULT '');
 ";
 
 fn now() -> String {
@@ -140,6 +197,7 @@ impl Store {
         let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
         let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
         conn.execute_batch(SCHEMA).context("gagal membuat skema sesi")?;
+        migrate_memories_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -273,31 +331,105 @@ impl Store {
         ))
     }
 
-    // ---------- Memori Persisten Lintas Sesi (/memory) ----------
+    // ---------- Memori Proyek & Global Terstruktur (/memory, Tahap 2) ----------
 
     pub fn add_memory(&self, scope: &str, content: &str) -> Result<i64> {
+        self.add_memory_categorized(scope, "general", content)
+    }
+
+    pub fn add_memory_categorized(
+        &self,
+        scope: &str,
+        category: &str,
+        content: &str,
+    ) -> Result<i64> {
+        let clean = validate_memory_content(content)?;
+        let cat = normalize_memory_category(category);
+        let ts = now();
         let conn = self.conn.lock().expect("mutex store poisoned");
         conn.execute(
-            "INSERT INTO memories (scope, content, ts) VALUES (?1, ?2, ?3)",
-            rusqlite::params![scope, content.trim(), now()],
+            "INSERT INTO memories (scope, category, content, ts, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![scope, cat, clean, ts, ts],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Perbarui isi (dan opsional kategori) memori yang sudah ada.
+    pub fn update_memory(
+        &self,
+        id: i64,
+        category: Option<&str>,
+        content: &str,
+    ) -> Result<bool> {
+        let clean = validate_memory_content(content)?;
+        let ts = now();
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let affected = if let Some(cat) = category {
+            let norm = normalize_memory_category(cat);
+            conn.execute(
+                "UPDATE memories SET category = ?2, content = ?3, updated_at = ?4 WHERE id = ?1",
+                rusqlite::params![id, norm, clean, ts],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE memories SET content = ?2, updated_at = ?3 WHERE id = ?1",
+                rusqlite::params![id, clean, ts],
+            )?
+        };
+        Ok(affected > 0)
     }
 
     /// Ambil memori untuk `cwd` ini + memori `"global"`, terbaru dulu.
     pub fn list_memories(&self, cwd: &str, limit: usize) -> Result<Vec<MemoryItem>> {
         let conn = self.conn.lock().expect("mutex store poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, scope, content, ts FROM memories \
+            "SELECT id, scope, category, content, ts, updated_at FROM memories \
              WHERE scope = 'global' OR scope = ?1 \
              ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![cwd, limit as i64], |row| {
+            let ts: String = row.get(4)?;
+            let upd: String = row.get::<_, String>(5).unwrap_or_default();
             Ok(MemoryItem {
                 id: row.get(0)?,
                 scope: row.get(1)?,
-                content: row.get(2)?,
-                created_at: row.get(3)?,
+                category: row.get::<_, String>(2).unwrap_or_else(|_| "general".to_string()),
+                content: row.get(3)?,
+                created_at: ts.clone(),
+                updated_at: if upd.is_empty() { ts } else { upd },
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Ambil memori untuk kategori tertentu (`cwd` + `"global"`).
+    pub fn list_memories_by_category(
+        &self,
+        cwd: &str,
+        category: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryItem>> {
+        let cat = normalize_memory_category(category);
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, scope, category, content, ts, updated_at FROM memories \
+             WHERE (scope = 'global' OR scope = ?1) AND category = ?2 \
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![cwd, cat, limit as i64], |row| {
+            let ts: String = row.get(4)?;
+            let upd: String = row.get::<_, String>(5).unwrap_or_default();
+            Ok(MemoryItem {
+                id: row.get(0)?,
+                scope: row.get(1)?,
+                category: row.get(2)?,
+                content: row.get(3)?,
+                created_at: ts.clone(),
+                updated_at: if upd.is_empty() { ts } else { upd },
             })
         })?;
         let mut out = Vec::new();
@@ -312,4 +444,42 @@ impl Store {
         let n = conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
         Ok(n > 0)
     }
+}
+
+/// Migrasi aman tabel `memories` dari database SelenCode versi lama.
+fn migrate_memories_schema(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !cols.iter().any(|c| c == "category") {
+        conn.execute(
+            "ALTER TABLE memories ADD COLUMN category TEXT NOT NULL DEFAULT 'general'",
+            [],
+        )
+        .context("gagal migrasi kolom category pada tabel memories")?;
+    }
+    if !cols.iter().any(|c| c == "updated_at") {
+        conn.execute(
+            "ALTER TABLE memories ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .context("gagal migrasi kolom updated_at pada tabel memories")?;
+    }
+    Ok(())
+}
+
+/// Guard keamanan Project Memory: tolak isi kosong atau yang mengandung rahasia/token/password.
+pub fn validate_memory_content(content: &str) -> Result<String> {
+    let clean = content.trim();
+    if clean.is_empty() {
+        anyhow::bail!("isi memori tidak boleh kosong");
+    }
+    if crate::security::contains_secret(clean) {
+        anyhow::bail!(
+            "ditolak: memori proyek tidak boleh menyimpan rahasia, token, password, private key, atau API key"
+        );
+    }
+    Ok(clean.to_string())
 }

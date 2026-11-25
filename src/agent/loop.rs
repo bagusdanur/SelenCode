@@ -192,6 +192,22 @@ async fn run_turn_inner(
         if !auto.is_empty() {
             user_text.push_str("\n\n");
             user_text.push_str(&auto);
+        } else if ctx.self_correct {
+            // Tahap 2: Smart Context Retrieval otomatis (hanya saat skor simbol/path tinggi >= 30,
+            // budget ketat 3 KB agar hemat token & tidak mengganggu sapaan biasa).
+            let hits = ctx
+                .repo_index
+                .lock()
+                .ok()
+                .map(|mut idx| idx.query(user_prompt, 3, 3072))
+                .unwrap_or_default();
+            if hits.first().map(|h| h.score >= 30).unwrap_or(false) {
+                let smart_block = crate::context_index::format_hits_for_prompt(&hits, 3072);
+                if !smart_block.is_empty() {
+                    user_text.push_str("\n\n[Konteks relevan otomatis (Smart Index)]\n");
+                    user_text.push_str(&smart_block);
+                }
+            }
         }
     }
     let user_msg = Message::text(Role::User, user_text);
