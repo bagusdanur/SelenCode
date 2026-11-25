@@ -103,6 +103,8 @@ pub enum TuiCommand {
     ExportChat(Option<String>),
     /// /approve [ask | edits | auto]: atur mode izin sesi aktif.
     SetApproval(Option<String>),
+    /// /sandbox [read-only | workspace-write | unrestricted | isolate ... | audit]
+    Sandbox(Option<String>),
     /// /new: mulai sesi baru yang bersih.
     NewSession,
     /// /compact: ringkas riwayat konteks secara manual.
@@ -1741,6 +1743,9 @@ fn submit(
         }
         SlashCommand::Approve(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::SetApproval(arg));
+        }
+        SlashCommand::Sandbox(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Sandbox(arg));
         }
         SlashCommand::Details => {
             app.show_tool_details = !app.show_tool_details;

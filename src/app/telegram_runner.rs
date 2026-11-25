@@ -393,6 +393,12 @@ async fn handle_telegram_chat_message(
                 .await?;
             return Ok(());
         }
+        SlashCommand::Sandbox(arg) => {
+            let reply = s.handle_sandbox(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
         SlashCommand::New => {
             let sid = s.reset_session()?;
             tg.send_message(chat_id, &format!("✨ Sesi baru dimulai ({sid})."))

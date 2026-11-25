@@ -53,6 +53,8 @@ pub enum SlashCommand {
     Export(Option<String>),
     /// /approve [ask | edits | auto] — atur mode izin aksi sesi aktif.
     Approve(Option<String>),
+    /// /sandbox [read-only | workspace-write | unrestricted | isolate ... | audit] — Security Sandbox v2.
+    Sandbox(Option<String>),
     /// /details — toggle tampilan ringkas vs detail pada baris tool di TUI.
     Details,
     /// /sessions
@@ -229,6 +231,12 @@ pub const COMMANDS: &[CommandDef] = &[
         takes_args: true,
     },
     CommandDef {
+        cmd: "/sandbox",
+        args: "[read-only / workspace-write / isolate / audit]",
+        desc: "atur mode sandbox, isolasi OS, env guard, & audit log",
+        takes_args: true,
+    },
+    CommandDef {
         cmd: "/details",
         args: "",
         desc: "toggle tampilan ringkas / detail hasil tool",
@@ -327,6 +335,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/init" => SlashCommand::Init,
         "/export" => SlashCommand::Export(rest),
         "/approve" => SlashCommand::Approve(rest),
+        "/sandbox" => SlashCommand::Sandbox(rest),
         "/details" => SlashCommand::Details,
         "/sessions" => SlashCommand::Sessions,
         "/resume" => SlashCommand::Resume,

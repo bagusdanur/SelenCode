@@ -265,6 +265,10 @@ impl Tool for LspRename {
             return Ok(out.trim_end().to_string());
         }
 
+        ctx.sandbox.check_write_allowed(
+            "lsp_rename",
+            &format!("{} -> {}", preview.old_name, preview.new_name),
+        )?;
         let detail = preview
             .files
             .iter()

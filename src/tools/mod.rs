@@ -53,6 +53,8 @@ pub struct Ctx {
     pub bg_manager: Arc<bg::BgManager>,
     /// Manajer LSP hibrida + fallback Tree-sitter (Tahap 4: diagnostics, definition, references, hover, rename).
     pub lsp_manager: Arc<crate::lsp::LspManager>,
+    /// Kebijakan Security Sandbox v2 (mode izin, env scrubbing, isolasi OS, & audit log).
+    pub sandbox: Arc<crate::sandbox::SandboxController>,
     /// Aktifkan review self-improvement otomatis pasca-giliran kompleks (ala Hermes).
     /// Default false di Ctx::new agar tes mock tidak memicu panggilan ekstra;
     /// Session::build mengisinya dari `cfg.agent.auto_skills` (default true).
@@ -80,9 +82,14 @@ impl Ctx {
             repo_index,
             bg_manager: Arc::new(bg::BgManager::new()),
             lsp_manager,
+            sandbox: Arc::new(crate::sandbox::SandboxController::default()),
             auto_skills: false,
             self_correct: false,
         }
+    }
+    pub fn with_sandbox(mut self, sandbox: Arc<crate::sandbox::SandboxController>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
     pub fn with_auto_skills(mut self, enabled: bool) -> Self {
         self.auto_skills = enabled;

@@ -145,11 +145,16 @@ impl Session {
                     infer_model_context_limit(&pcfg.model)
                 }
             });
+        let sandbox = Arc::new(selencode::sandbox::SandboxController::from_config(
+            &cfg.sandbox,
+            selencode::sandbox::default_audit_log_path(),
+        ));
         let ctx = Ctx::new(cwd, mode == ApprovalMode::AutoAll)
             .with_approver(approver)
             .with_context_limit(init_ctx_limit)
             .with_auto_skills(cfg.agent.auto_skills)
             .with_self_correct(cfg.agent.self_correct)
+            .with_sandbox(sandbox)
             .with_store(store.clone(), session_id.clone());
         // Delegate (Fase 6): subagent memakai provider sesi saat build;
         // ganti provider via /model TIDAK mengganti provider subagent

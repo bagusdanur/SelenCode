@@ -128,8 +128,18 @@ impl BgManager {
         }
     }
 
-    /// Mulai proses baru di background dalam `cwd`. Wajib dijalankan di dalam runtime Tokio.
+    /// Mulai proses baru di background dalam `cwd` (memakai sandbox default).
     pub fn start(&self, command: &str, cwd: &Path) -> Result<JobSnapshot> {
+        self.start_with_sandbox(command, cwd, &crate::sandbox::SandboxController::default())
+    }
+
+    /// Mulai proses baru di background dengan `SandboxController` sesi (scrub env, mode, & audit).
+    pub fn start_with_sandbox(
+        &self,
+        command: &str,
+        cwd: &Path,
+        sandbox: &crate::sandbox::SandboxController,
+    ) -> Result<JobSnapshot> {
         let cmd_str = command.trim();
         if cmd_str.is_empty() {
             return Err(anyhow!("perintah kosong"));
@@ -158,23 +168,8 @@ impl BgManager {
             }
         }
 
-        #[cfg(windows)]
-        let mut cmd = {
-            let mut c = tokio::process::Command::new("cmd");
-            c.args(["/C", cmd_str]);
-            c
-        };
-        #[cfg(not(windows))]
-        let mut cmd = {
-            let mut c = tokio::process::Command::new("sh");
-            c.args(["-c", cmd_str]);
-            c
-        };
-        cmd.current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let mut cmd = sandbox.prepare_shell_command("bg_start", cmd_str, cwd)?;
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd
             .spawn()
@@ -463,7 +458,9 @@ impl Tool for BgStart {
                 "Ditolak user — proses background TIDAK dijalankan: {command}"
             ));
         }
-        let snap = ctx.bg_manager.start(&command, &ctx.cwd)?;
+        let snap = ctx
+            .bg_manager
+            .start_with_sandbox(&command, &ctx.cwd, &ctx.sandbox)?;
         Ok(format!(
             "Proses background dimulai:\n- job_id: {}\n- owner: {}\n- pid: {}\n- status: {}\n- command: {}\nGunakan bg_output(job_id=\"{}\") untuk membaca log atau bg_stop(job_id=\"{}\") untuk menghentikan.",
             snap.id,

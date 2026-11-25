@@ -416,6 +416,7 @@ fn config_save_load_and_direct_api_key_fallback() {
         mcp_servers: Vec::new(),
         telegram: Default::default(),
         routing: Default::default(),
+        sandbox: Default::default(),
     };
     save_to(&cfg, &path).unwrap();
     let loaded = load_from(&path).unwrap();

@@ -112,21 +112,9 @@ impl Tool for RunShell {
             ));
         }
 
-        #[cfg(windows)]
-        let mut cmd = {
-            let mut c = tokio::process::Command::new("cmd");
-            c.args(["/C", &command]);
-            c
-        };
-        #[cfg(not(windows))]
-        let mut cmd = {
-            let mut c = tokio::process::Command::new("sh");
-            c.args(["-c", &command]);
-            c
-        };
-        cmd.current_dir(&ctx.cwd)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true);
+        let mut cmd = ctx
+            .sandbox
+            .prepare_shell_command("run_shell", &command, &ctx.cwd)?;
 
         let (code, output) = run_timed(&mut cmd, self.timeout_secs)
             .await

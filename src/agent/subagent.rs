@@ -53,6 +53,7 @@ pub async fn run_subagent(
         repo_index: parent_ctx.repo_index.clone(),
         bg_manager: parent_ctx.bg_manager.clone(),
         lsp_manager: parent_ctx.lsp_manager.clone(),
+        sandbox: parent_ctx.sandbox.clone(),
         auto_skills: false,
         self_correct: false,
     };

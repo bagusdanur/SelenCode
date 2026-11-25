@@ -6,7 +6,7 @@ use selencode::config;
 use selencode::providers::router::TaskKind;
 use selencode::providers::{Message, Role};
 use selencode::repl::{strip_menu_markup, KeySpec, PROVIDER_PRESETS};
-use selencode::security::{is_forbidden_command, redact_secrets, ApprovalMode};
+use selencode::security::{redact_secrets, ApprovalMode};
 use selencode::skills::{
     export_conversation_md, init_agents_md, list_skills, load_skill, remove_skill, save_skill,
 };
@@ -309,24 +309,10 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
 
     /// `!perintah` — jalankan shell lokal cepat tanpa memanggil LLM (ala OpenCode).
     pub(crate) async fn handle_inline_shell(&self, command: &str) -> Result<String> {
-        if is_forbidden_command(command) {
-            anyhow::bail!("perintah ditolak demi keamanan (pola destruktif): {command}");
-        }
-        #[cfg(windows)]
-        let mut cmd = {
-            let mut c = tokio::process::Command::new("cmd");
-            c.args(["/C", command]);
-            c
-        };
-        #[cfg(not(windows))]
-        let mut cmd = {
-            let mut c = tokio::process::Command::new("sh");
-            c.args(["-c", command]);
-            c
-        };
-        cmd.current_dir(&self.ctx.cwd)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true);
+        let mut cmd = self
+            .ctx
+            .sandbox
+            .prepare_shell_command("inline_shell", command, &self.ctx.cwd)?;
         let out = tokio::time::timeout(Duration::from_secs(60), cmd.output())
             .await
             .map_err(|_| anyhow::anyhow!("timeout 60 detik menjalankan `!{command}`"))??;
@@ -1087,6 +1073,71 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                 path.display()
             ))
         }
+    }
+
+    pub(crate) fn handle_sandbox(&mut self, arg: Option<&str>) -> Result<String> {
+        use selencode::sandbox::{OsIsolationPolicy, SandboxMode};
+        let Some(raw) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            return Ok(self.ctx.sandbox.format_status_card());
+        };
+        if raw.eq_ignore_ascii_case("audit") || raw.starts_with("audit ") {
+            let limit = raw
+                .strip_prefix("audit ")
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .map(|n| n.clamp(1, 50))
+                .unwrap_or(15);
+            let entries = self.ctx.sandbox.recent_audit_entries(limit);
+            let mut out = format!("# Audit Log Sandbox ({} entri terbaru)\n", entries.len());
+            if entries.is_empty() {
+                out.push_str("! Belum ada entri audit log tersimpan.\n");
+            } else {
+                for e in entries {
+                    let mark = if e.allowed { "*" } else { ">" };
+                    let verdict = if e.allowed { "OK" } else { "BLOKIR" };
+                    let short_ts: String = e.ts.chars().take(19).collect();
+                    out.push_str(&format!(
+                        "{mark} {short_ts} | {} · {verdict} | {} ({})\n",
+                        e.action, e.target, e.detail
+                    ));
+                }
+            }
+            return Ok(out);
+        }
+        if let Some(rest) = raw.strip_prefix("isolate ") {
+            let pol = OsIsolationPolicy::parse(rest).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "kebijakan isolasi '{}' tidak dikenal. Pilihan: off, auto, strict",
+                    rest.trim()
+                )
+            })?;
+            self.ctx.sandbox.set_os_isolation(pol);
+            self.cfg.sandbox.os_isolate = pol.as_str().to_string();
+            let saved = config::save(&self.cfg)?;
+            return Ok(format!(
+                "# Isolasi OS Sandbox Diperbarui\n\
+                 * os_isolate | {} | backend: {}\n\
+                 ! Config disimpan ke: {}",
+                pol.as_str(),
+                self.ctx.sandbox.backend().label(),
+                saved.display()
+            ));
+        }
+        if let Some(mode) = SandboxMode::parse(raw) {
+            self.ctx.sandbox.set_mode(mode);
+            self.cfg.sandbox.mode = mode.as_str().to_string();
+            let saved = config::save(&self.cfg)?;
+            return Ok(format!(
+                "# Mode Sandbox Diperbarui\n\
+                 * mode | {} | backend: {}\n\
+                 ! Config disimpan ke: {}",
+                mode.as_str(),
+                self.ctx.sandbox.backend().label(),
+                saved.display()
+            ));
+        }
+        anyhow::bail!(
+            "argumen `/sandbox {raw}` tidak dikenal. Pilihan: read-only, workspace-write, unrestricted, isolate <off|auto|strict>, audit"
+        )
     }
 
     pub(crate) fn handle_approve(&mut self, arg: Option<&str>) -> Result<String> {

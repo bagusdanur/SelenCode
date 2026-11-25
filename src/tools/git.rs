@@ -104,6 +104,7 @@ impl Tool for GitCommit {
             .ok_or_else(|| anyhow!("argumen 'message' wajib"))?
             .to_string();
         ensure_repo(ctx).await?;
+        ctx.sandbox.check_write_allowed("git_commit", &message)?;
         if !ctx
             .approver
             .ask(&format!("git_commit: {message}"), "git add -A && git commit").await

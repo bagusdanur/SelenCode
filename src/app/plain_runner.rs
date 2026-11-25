@@ -229,6 +229,10 @@ pub(crate) async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
+            SlashCommand::Sandbox(arg) => match s.handle_sandbox(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
             SlashCommand::Details => {
                 println!("Perintah /details hanya berlaku pada mode TUI.");
             }

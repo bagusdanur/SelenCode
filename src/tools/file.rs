@@ -162,6 +162,7 @@ impl Tool for WriteFile {
         if is_secret_file(&p) {
             return Err(anyhow!("file '{rel}' ditolak: file rahasia tidak boleh ditulis lewat tool"));
         }
+        ctx.sandbox.check_write_allowed("write_file", rel)?;
         let before = std::fs::read(&p).ok();
         let old = before
             .as_deref()
@@ -216,6 +217,7 @@ impl Tool for EditFile {
         if is_secret_file(&p) {
             return Err(anyhow!("file '{rel}' ditolak: file rahasia tidak boleh diedit lewat tool"));
         }
+        ctx.sandbox.check_write_allowed("edit_file", rel)?;
         let text = std::fs::read_to_string(&p).map_err(|e| anyhow!("gagal membaca {rel}: {e}"))?;
         let count = text.matches(old_s).count();
         if count == 0 {

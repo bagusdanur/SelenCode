@@ -301,6 +301,14 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
+            TuiCommand::Sandbox(arg) => match s.handle_sandbox(arg.as_deref()) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
             TuiCommand::ShowModels => {
                 let _ = ui_tx.send(UiEvent::Menu(s.models_menu())).await;
             }

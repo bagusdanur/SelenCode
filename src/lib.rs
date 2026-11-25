@@ -6,6 +6,7 @@ pub mod mcp;
 pub mod outline;
 pub mod providers;
 pub mod repl;
+pub mod sandbox;
 pub mod security;
 pub mod skills;
 pub mod store;

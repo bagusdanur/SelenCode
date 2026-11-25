@@ -20,6 +20,61 @@ pub struct Config {
     /// Pengaturan Dynamic Model Routing, Fallback Provider, & Retry (Tahap 3).
     #[serde(default, skip_serializing_if = "RoutingCfg::is_empty")]
     pub routing: RoutingCfg,
+    /// Pengaturan Security Sandbox v2 (`[sandbox]` di selencode.toml).
+    #[serde(default, skip_serializing_if = "SandboxCfg::is_empty")]
+    pub sandbox: SandboxCfg,
+}
+
+/// Konfigurasi Security Sandbox v2 (`[sandbox]` di selencode.toml).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxCfg {
+    /// Mode sandbox: `"read-only"`, `"workspace-write"` (default), atau `"unrestricted"`.
+    #[serde(default = "default_sandbox_mode")]
+    pub mode: String,
+    /// Kebijakan isolasi OS: `"off"` (default), `"auto"` (`bwrap` di Linux bila tersedia),
+    /// atau `"strict"` (fail-closed bila isolasi OS tidak tersedia).
+    #[serde(default = "default_sandbox_isolate")]
+    pub os_isolate: String,
+    /// Saring environment variable sensitif (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`)
+    /// sebelum spawn subprocess shell/bg/verify (default: true).
+    #[serde(default = "default_true")]
+    pub scrub_env: bool,
+    /// Izinkan akses jaringan di dalam sandbox `bwrap` (default: true).
+    #[serde(default = "default_true")]
+    pub allow_network: bool,
+    /// Catat aksi berisiko ke audit log JSONL teredaksi (default: true).
+    #[serde(default = "default_true")]
+    pub audit_log: bool,
+}
+
+fn default_sandbox_mode() -> String {
+    "workspace-write".to_string()
+}
+
+fn default_sandbox_isolate() -> String {
+    "off".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SandboxCfg {
+    fn default() -> Self {
+        Self {
+            mode: default_sandbox_mode(),
+            os_isolate: default_sandbox_isolate(),
+            scrub_env: true,
+            allow_network: true,
+            audit_log: true,
+        }
+    }
+}
+
+impl SandboxCfg {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Konfigurasi Dynamic Model Routing (`[routing]` di selencode.toml, Tahap 3).
@@ -380,6 +435,7 @@ impl Config {
             mcp_servers: Vec::new(),
             telegram: TelegramCfg::default(),
             routing: RoutingCfg::default(),
+            sandbox: SandboxCfg::default(),
         }
     }
 
