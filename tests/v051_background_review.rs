@@ -12,7 +12,9 @@ use selencode::agent::review::{
     is_session_substantive, run_background_review, ReviewSkipReason,
 };
 use selencode::config::Config;
-use selencode::providers::{Block, Message, Provider, Reply, Role, StreamEvent, ToolSpec, Usage};
+use selencode::providers::{
+    AssistantReply, Block, Message, Provider, Role, StreamEvent, ToolSpec, Usage,
+};
 use selencode::repl::{parse_slash_command, SlashCommand};
 use selencode::store::Store;
 use selencode::telegram::parse_callback_review;
@@ -40,12 +42,13 @@ impl Provider for MockReviewProvider {
         _messages: &[Message],
         _tools: &[ToolSpec],
         _tx: mpsc::Sender<StreamEvent>,
-    ) -> Result<Reply> {
+    ) -> Result<AssistantReply> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match &self.response_text {
-            Ok(text) => Ok(Reply {
+            Ok(text) => Ok(AssistantReply {
                 text: text.clone(),
                 tool_calls: Vec::new(),
+                finish_reason: Some("stop".into()),
                 usage: Some(Usage {
                     input_tokens: self.in_tokens,
                     output_tokens: self.out_tokens,
