@@ -2,6 +2,7 @@ pub mod bg;
 pub mod delegate;
 pub mod file;
 pub mod git;
+pub mod lsp;
 pub mod memory;
 pub mod outline;
 pub mod plan;
@@ -48,6 +49,8 @@ pub struct Ctx {
     pub repo_index: Arc<std::sync::Mutex<crate::context_index::RepoIndex>>,
     /// Manajer proses latar belakang milik SelenCode (Tahap 3: `bg_start`/`bg_output`/`bg_status`/`bg_stop`).
     pub bg_manager: Arc<bg::BgManager>,
+    /// Manajer LSP hibrida + fallback Tree-sitter (Tahap 4: diagnostics, definition, references, hover, rename).
+    pub lsp_manager: Arc<crate::lsp::LspManager>,
     /// Aktifkan review self-improvement otomatis pasca-giliran kompleks (ala Hermes).
     /// Default false di Ctx::new agar tes mock tidak memicu panggilan ekstra;
     /// Session::build mengisinya dari `cfg.agent.auto_skills` (default true).
@@ -63,6 +66,7 @@ impl Ctx {
         let repo_index = Arc::new(std::sync::Mutex::new(
             crate::context_index::RepoIndex::new(cwd.clone()),
         ));
+        let lsp_manager = Arc::new(crate::lsp::LspManager::new(cwd.clone()));
         Self {
             cwd,
             approver: Arc::new(Approver::new(auto_yes)),
@@ -73,6 +77,7 @@ impl Ctx {
             undo_stack: Arc::new(std::sync::Mutex::new(undo::UndoStack::default())),
             repo_index,
             bg_manager: Arc::new(bg::BgManager::new()),
+            lsp_manager,
             auto_skills: false,
             self_correct: false,
         }
@@ -209,6 +214,11 @@ pub fn default_registry_with_shell(shell_cfg: &ShellCfg) -> Registry {
         .register(Arc::new(search::SearchText))
         .register(Arc::new(outline::Outline))
         .register(Arc::new(retrieve::RetrieveContext))
+        .register(Arc::new(lsp::LspDiagnostics))
+        .register(Arc::new(lsp::LspDefinition))
+        .register(Arc::new(lsp::LspReferences))
+        .register(Arc::new(lsp::LspHover))
+        .register(Arc::new(lsp::LspRename))
         .register(Arc::new(shell::RunShell::new(
             shell_cfg.allowlist.clone(),
             shell_cfg.timeout_secs,
@@ -237,6 +247,10 @@ pub fn read_only_registry() -> Registry {
         .register(Arc::new(search::SearchText))
         .register(Arc::new(outline::Outline))
         .register(Arc::new(retrieve::RetrieveContext))
+        .register(Arc::new(lsp::LspDiagnostics))
+        .register(Arc::new(lsp::LspDefinition))
+        .register(Arc::new(lsp::LspReferences))
+        .register(Arc::new(lsp::LspHover))
         .register(Arc::new(git::GitStatus))
         .register(Arc::new(git::GitDiff))
         .register(Arc::new(web::FetchUrl))

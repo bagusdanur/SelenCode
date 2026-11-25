@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod config;
 pub mod context_index;
+pub mod lsp;
 pub mod mcp;
 pub mod outline;
 pub mod providers;

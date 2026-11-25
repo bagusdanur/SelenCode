@@ -171,6 +171,22 @@ impl SelfCorrectState {
                 self.verified_after_last_edit = false;
                 self.last_verify_passed = None;
             }
+            "lsp_rename" => {
+                let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+                if dry_run
+                    || is_error
+                    || output.starts_with("Ditolak user")
+                    || !output.contains("diterapkan")
+                {
+                    return;
+                }
+                self.edited_code_file = true;
+                if !self.edited_files.iter().any(|p| p == "(lsp_rename)") {
+                    self.edited_files.push("(lsp_rename)".to_string());
+                }
+                self.verified_after_last_edit = false;
+                self.last_verify_passed = None;
+            }
             "verify_project" => {
                 self.verified_after_last_edit = true;
                 let ok = !is_error && output.contains("LULUS");

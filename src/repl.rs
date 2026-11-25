@@ -35,6 +35,8 @@ pub enum SlashCommand {
     Jobs(Option<String>),
     /// /route [auto on/off | fallback ... | set <tugas> <target> | retries <n>] — Dynamic Model Routing & telemetri.
     Route(Option<String>),
+    /// /lsp [diag [path] | def <simbol> | refs <simbol> | hover <simbol>] — LSP diagnostics & navigasi simbol.
+    Lsp(Option<String>),
     /// /memory | /memory add [kat] <teks> | /memory update <id> [kat] <teks> | /memory global [kat] <teks> | /memory rm <id>
     Memory(Option<String>),
     /// /skills | /skills auto | /skills review | /skills show <nama> | /skills rm <nama>
@@ -171,6 +173,12 @@ pub const COMMANDS: &[CommandDef] = &[
         takes_args: true,
     },
     CommandDef {
+        cmd: "/lsp",
+        args: "[diag / def / refs <simbol>]",
+        desc: "status LSP adapter, diagnostik bahasa, definisi, & referensi simbol",
+        takes_args: true,
+    },
+    CommandDef {
         cmd: "/memory",
         args: "[add / update / global / rm <id>]",
         desc: "memori proyek terstruktur lintas sesi (anti-rahasia)",
@@ -302,6 +310,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/index" | "/context" => SlashCommand::Index(rest),
         "/jobs" | "/bg" => SlashCommand::Jobs(rest),
         "/route" | "/routing" => SlashCommand::Route(rest),
+        "/lsp" => SlashCommand::Lsp(rest),
         "/memory" => SlashCommand::Memory(rest),
         "/skills" => SlashCommand::Skills(rest),
         "/skill" => SlashCommand::Skill(rest),

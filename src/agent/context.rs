@@ -39,7 +39,8 @@ bukan tool bawaan SelenCode — perlakukan hasil dan kemampuannya sebagai milik 
 10. Gunakan tool delegate untuk menugaskan beberapa penjelajahan/pencarian yang INDEPENDEN secara paralel ke subagent baca-saja (mis. memeriksa beberapa file atau folder sekaligus). Jangan pakai delegate untuk menulis atau mengubah apa pun — subagent tidak bisa menulis.\n\
 11. Kamu memiliki sistem skill prosedural (`.selencode/skills/*.md`) lewat tool `manage_skill`. Bila tugas user cocok dengan skill yang ada di katalog, panggil `manage_skill(action=\"read\")` dulu. Bila kamu menyelesaikan workflow penting/berulang atau memperbaiki bug teknis yang berguna untuk masa depan, kamu bisa menyimpannya (`create`) atau memperbaruinya (`patch`) tanpa menyimpan rahasia.\n\
 12. Kamu memiliki Memori Proyek terstruktur lintas sesi lewat tool `manage_memory` (kategori: `arch`, `commands`, `conventions`, `decisions`, `issues`, `tasks`, `general`). Simpan keputusan teknis, perintah build/test, atau solusi penting agar sesi berikutnya lebih cerdas — JANGAN PERNAH menyimpan rahasia, API key, token, atau password.\n\
-13. Untuk proses berdurasi panjang (dev server, watcher, build/test lama), gunakan `bg_start` untuk menjalankan di background, lalu pantau output dengan `bg_output`, cek status dengan `bg_status`, dan hentikan secara aman dengan `bg_stop` setelah selesai.\n",
+13. Untuk proses berdurasi panjang (dev server, watcher, build/test lama), gunakan `bg_start` untuk menjalankan di background, lalu pantau output dengan `bg_output`, cek status dengan `bg_status`, dan hentikan secara aman dengan `bg_stop` setelah selesai.\n\
+14. Untuk analisis kode lanjutan & refactoring presisi, gunakan `lsp_diagnostics`, `lsp_definition`, `lsp_references`, `lsp_hover`, dan `lsp_rename` (selalu pakai `dry_run=true` bila ragu sebelum menerapkan rename lintas file).\n",
     );
     let skills = crate::skills::list_skills(cwd);
     if !skills.is_empty() {

@@ -1769,6 +1769,111 @@ impl Session {
         )
     }
 
+    async fn handle_lsp(&self, arg: Option<&str>) -> Result<String> {
+        let Some(raw) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            return Ok(self.ctx.lsp_manager.format_status_card());
+        };
+        if raw.eq_ignore_ascii_case("diag") || raw.eq_ignore_ascii_case("diagnostics") {
+            let rep = self.ctx.lsp_manager.diagnostics(None).await?;
+            let mut out = format!("# LSP Diagnostics ({})\n", rep.backend);
+            if rep.diagnostics.is_empty() {
+                out.push_str("* status | bersih | tidak ditemukan error sintaks/bahasa\n");
+            } else {
+                for d in rep.diagnostics.iter().take(20) {
+                    out.push_str(&format!(
+                        "> {}:{} | {} | {}\n",
+                        d.rel_path, d.line, d.severity, d.message
+                    ));
+                }
+            }
+            return Ok(out);
+        }
+        if let Some(rest) = raw
+            .strip_prefix("diag ")
+            .or_else(|| raw.strip_prefix("diagnostics "))
+        {
+            let target = rest.trim();
+            let rep = self.ctx.lsp_manager.diagnostics(Some(target)).await?;
+            let mut out = format!("# LSP Diagnostics: {target} ({})\n", rep.backend);
+            if rep.diagnostics.is_empty() {
+                out.push_str("* status | bersih | tidak ditemukan error pada file ini\n");
+            } else {
+                for d in rep.diagnostics.iter().take(20) {
+                    out.push_str(&format!(
+                        "> L{}:C{} | {} | {}\n",
+                        d.line, d.col, d.severity, d.message
+                    ));
+                }
+            }
+            return Ok(out);
+        }
+        if let Some(rest) = raw
+            .strip_prefix("def ")
+            .or_else(|| raw.strip_prefix("definition "))
+        {
+            let sym = rest.trim();
+            let rep = self
+                .ctx
+                .lsp_manager
+                .definition(None, None, None, Some(sym))
+                .await?;
+            let mut out = format!("# Definisi: {} ({})\n", rep.symbol, rep.backend);
+            if rep.locations.is_empty() {
+                out.push_str("! Definisi simbol tidak ditemukan di workspace.\n");
+            } else {
+                for loc in rep.locations.iter().take(15) {
+                    out.push_str(&format!(
+                        "* {}:{} | L{} | {}\n",
+                        loc.rel_path, loc.col, loc.line, loc.preview
+                    ));
+                }
+            }
+            return Ok(out);
+        }
+        if let Some(rest) = raw
+            .strip_prefix("refs ")
+            .or_else(|| raw.strip_prefix("ref "))
+            .or_else(|| raw.strip_prefix("references "))
+        {
+            let sym = rest.trim();
+            let rep = self
+                .ctx
+                .lsp_manager
+                .references(None, None, None, Some(sym))
+                .await?;
+            let mut out = format!(
+                "# Referensi: {} ({} lokasi · {})\n",
+                rep.symbol,
+                rep.locations.len(),
+                rep.backend
+            );
+            if rep.locations.is_empty() {
+                out.push_str("! Tidak ada referensi simbol ditemukan.\n");
+            } else {
+                for loc in rep.locations.iter().take(20) {
+                    out.push_str(&format!(
+                        "> {}:{} | C{} | {}\n",
+                        loc.rel_path, loc.line, loc.col, loc.preview
+                    ));
+                }
+            }
+            return Ok(out);
+        }
+        if let Some(rest) = raw.strip_prefix("hover ") {
+            let sym = rest.trim();
+            let rep = self
+                .ctx
+                .lsp_manager
+                .hover(None, None, None, Some(sym))
+                .await?;
+            return Ok(format!(
+                "# Hover: {} ({})\n{}",
+                rep.symbol, rep.backend, rep.content
+            ));
+        }
+        Ok(self.ctx.lsp_manager.format_status_card())
+    }
+
     fn handle_memory(&self, arg: Option<&str>) -> Result<String> {
         let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
         let Some(arg) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
@@ -2385,6 +2490,14 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
+            TuiCommand::Lsp(arg) => match s.handle_lsp(arg.as_deref()).await {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
             TuiCommand::Memory(arg) => match s.handle_memory(arg.as_deref()) {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
@@ -2926,6 +3039,10 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                 Err(e) => eprintln!("[error] {e}"),
             },
             SlashCommand::Route(arg) => match s.handle_route(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Lsp(arg) => match s.handle_lsp(arg.as_deref()).await {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
@@ -3545,6 +3662,12 @@ async fn handle_telegram_chat_message(
         }
         SlashCommand::Route(arg) => {
             let reply = s.handle_route(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Lsp(arg) => {
+            let reply = s.handle_lsp(arg.as_deref()).await?;
             tg.send_long_message(chat_id, &strip_menu_markup(&reply))
                 .await?;
             return Ok(());
