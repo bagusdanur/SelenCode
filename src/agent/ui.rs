@@ -67,6 +67,19 @@ pub enum UiEvent {
         provider: String,
         model: String,
     },
+    /// Berpindah/melanjutkan sesi tersimpan (/resume <nomor>): muat ulang transkrip ringkas & metrik sesi.
+    SessionResumed {
+        session_id: String,
+        title: String,
+        provider: String,
+        model: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        context_used: usize,
+        context_limit: usize,
+        preview_lines: Vec<(String, String)>,
+        total_messages: usize,
+    },
     /// Giliran gagal dengan error.
     Error(String),
 }

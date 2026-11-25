@@ -362,6 +362,31 @@ impl Store {
         Ok(())
     }
 
+    /// Perbarui judul sesi secara eksplisit atau otomatis dari konteks percakapan.
+    pub fn update_session_title(&self, session_id: &str, title: &str) -> Result<()> {
+        let clean = title.trim();
+        if clean.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "UPDATE sessions SET title = ?2 WHERE id = ?1",
+            rusqlite::params![session_id, clean],
+        )?;
+        Ok(())
+    }
+
+    /// Hitung jumlah pesan tersimpan pada satu sesi.
+    pub fn count_messages(&self, session_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
     pub fn save_message(&self, session_id: &str, msg: &Message) -> Result<()> {
         let content = blocks_to_json(&msg.content);
         let conn = self.conn.lock().expect("mutex store poisoned");
@@ -369,6 +394,27 @@ impl Store {
             "INSERT INTO messages (session_id, role, content, ts) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![session_id, role_str(msg.role), content, now()],
         )?;
+        // Otomatis beri nama sesi sesuai konteks pesan user pertama yang substantif
+        // bila judul sesi masih placeholder ("(sesi baru)" atau kosong).
+        if msg.role == Role::User {
+            let cur_title: Option<String> = conn
+                .query_row(
+                    "SELECT title FROM sessions WHERE id = ?1",
+                    rusqlite::params![session_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(cur) = cur_title {
+                if is_placeholder_title(&cur) {
+                    if let Some(inferred) = infer_title_from_blocks(&msg.content) {
+                        let _ = conn.execute(
+                            "UPDATE sessions SET title = ?2 WHERE id = ?1",
+                            rusqlite::params![session_id, inferred],
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -425,13 +471,81 @@ impl Store {
     }
 
     /// Daftar sesi untuk satu cwd, terbaru dulu.
+    /// Untuk sesi lama yang judulnya masih placeholder `"(sesi baru)"`, otomatis
+    /// menyimpulkan judul kontekstual dari isi percakapan tersimpan & menyimpannya.
     pub fn list_sessions(&self, cwd: &str, limit: usize) -> Result<Vec<SessionInfo>> {
-        self.query_sessions(cwd, limit)
+        let mut list = self.query_sessions(cwd, limit)?;
+        for s in &mut list {
+            if is_placeholder_title(&s.title) {
+                if let Ok(msgs) = self.load_messages(&s.id) {
+                    if let Some(inferred) = infer_session_title(&msgs) {
+                        let _ = self.update_session_title(&s.id, &inferred);
+                        s.title = inferred;
+                    }
+                }
+            }
+        }
+        Ok(list)
+    }
+
+    /// Cari sesi berdasarkan nomor urut (`1..=limit`, boleh diawali `#`) atau prefix ID sesi.
+    pub fn resolve_session(
+        &self,
+        cwd: &str,
+        target: &str,
+        limit: usize,
+    ) -> Result<SessionInfo> {
+        let clean = target.trim().trim_start_matches('#').trim();
+        if clean.is_empty() {
+            anyhow::bail!("nomor atau ID sesi tidak boleh kosong");
+        }
+        let list = self.list_sessions(cwd, limit)?;
+        if list.is_empty() {
+            anyhow::bail!("belum ada sesi tersimpan untuk folder ini");
+        }
+        if clean.chars().all(|c| c.is_ascii_digit()) {
+            let idx: usize = clean
+                .parse()
+                .with_context(|| format!("nomor sesi '{target}' tidak valid"))?;
+            if idx == 0 || idx > list.len() {
+                anyhow::bail!(
+                    "nomor sesi #{idx} di luar jangkauan (tersedia 1..={}). Ketik /resume untuk melihat daftar.",
+                    list.len()
+                );
+            }
+            return Ok(list[idx - 1].clone());
+        }
+        if let Some(found) = list
+            .into_iter()
+            .find(|s| s.id == clean || s.id.starts_with(clean))
+        {
+            return Ok(found);
+        }
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let pattern = format!("{clean}%");
+        let mut stmt = conn.prepare(
+            "SELECT id, cwd, provider, model, created_at, title FROM sessions \
+             WHERE cwd = ?1 AND id LIKE ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![cwd, pattern], |row| {
+            Ok(SessionInfo {
+                id: row.get(0)?,
+                cwd: row.get(1)?,
+                provider: row.get(2)?,
+                model: row.get(3)?,
+                created_at: row.get(4)?,
+                title: row.get(5)?,
+            })
+        })?;
+        if let Some(r) = rows.next() {
+            return Ok(r?);
+        }
+        anyhow::bail!("sesi '{target}' tidak ditemukan di folder ini. Ketik /resume untuk melihat 10 sesi terakhir.")
     }
 
     /// Sesi terakhir (terbaru) untuk cwd, untuk `selen resume`.
     pub fn latest_session(&self, cwd: &str) -> Result<Option<SessionInfo>> {
-        Ok(self.query_sessions(cwd, 1)?.into_iter().next())
+        Ok(self.list_sessions(cwd, 1)?.into_iter().next())
     }
 
     pub fn record_usage(
@@ -909,4 +1023,248 @@ pub fn validate_memory_content(content: &str) -> Result<String> {
         );
     }
     Ok(clean.to_string())
+}
+
+/// Apakah judul sesi masih placeholder default yang boleh diperbarui otomatis dari konteks?
+pub fn is_placeholder_title(title: &str) -> bool {
+    let t = title.trim();
+    t.is_empty() || t == "(sesi baru)"
+}
+
+fn is_trivial_filler(text: &str) -> bool {
+    let clean: String = text
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect();
+    let norm = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    matches!(
+        norm.as_str(),
+        "" | "halo"
+            | "hai"
+            | "hi"
+            | "hello"
+            | "hey"
+            | "p"
+            | "ping"
+            | "ok"
+            | "oke"
+            | "okay"
+            | "ya"
+            | "iya"
+            | "siap"
+            | "lanjut"
+            | "lanjutkan"
+            | "lanjutt"
+            | "tes"
+            | "test"
+            | "thanks"
+            | "makasih"
+            | "terima kasih"
+            | "selamat pagi"
+            | "selamat siang"
+            | "selamat sore"
+            | "selamat malam"
+    )
+}
+
+/// Ringkas teks prompt menjadi judul sesi yang bersih, ringkas, & sesuai konteks (maks ~56 karakter).
+pub fn summarize_prompt_title(raw: &str) -> String {
+    // Kasus khusus: prompt pemulihan Long-Horizon Task -> ambil baris "Tujuan utama:".
+    for line in raw.lines() {
+        if let Some(rest) = line.trim().strip_prefix("Tujuan utama:") {
+            let goal = rest.trim();
+            if !goal.is_empty() {
+                return truncate_title_words(goal, 56);
+            }
+        }
+    }
+
+    // Ambil baris substantif pertama di luar blok kode ```...``` dan tag sistem `[...]`.
+    let mut in_fence = false;
+    let mut chosen = String::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            continue;
+        }
+        let cleaned = trimmed.trim_start_matches(['#', '>', '-', '*', '•', ' ']);
+        if !cleaned.is_empty() {
+            chosen = cleaned.to_string();
+            break;
+        }
+    }
+    if chosen.is_empty() {
+        chosen = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    } else {
+        chosen = chosen.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+
+    // Pangkas kalimat pembuka basa-basi agar topik inti langsung terbaca di daftar /resume.
+    const FILLER_PREFIXES: &[&str] = &[
+        "halo selena,",
+        "halo selena",
+        "hai selena,",
+        "hai selena",
+        "hey selena,",
+        "hey selena",
+        "hi selena,",
+        "hi selena",
+        "selena,",
+        "selena ",
+        "tolong bantu aku ",
+        "tolong bantu saya ",
+        "tolong bantu ",
+        "tolong ",
+        "bisa tolong bantu ",
+        "bisa tolong ",
+        "bisa bantu ",
+        "bantu aku ",
+        "bantu saya ",
+        "bantu ",
+        "coba tolong ",
+        "coba ",
+        "mohon ",
+        "please help me ",
+        "please ",
+        "can you please ",
+        "can you ",
+        "could you ",
+        "help me ",
+    ];
+    let mut working = chosen.trim().to_string();
+    for _ in 0..3 {
+        let lower = working.to_ascii_lowercase();
+        let mut stripped = false;
+        for pref in FILLER_PREFIXES {
+            if lower.starts_with(pref) {
+                let candidate = working[pref.len()..].trim_start_matches([',', ':', '-', ' ']);
+                if candidate.chars().count() >= 4 {
+                    working = candidate.to_string();
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+
+    // Jika ada lebih dari satu kalimat panjang, ambil kalimat pertama yang utuh.
+    if working.chars().count() > 60 {
+        if let Some(pos) = working.find(". ").or_else(|| working.find("? ")) {
+            if pos >= 12 {
+                working.truncate(pos);
+            }
+        }
+    }
+
+    let trimmed = working
+        .trim()
+        .trim_end_matches(['.', '?', '!', ',', ':', ';'])
+        .trim();
+    if trimmed.is_empty() {
+        return "(sesi baru)".to_string();
+    }
+
+    // Kapitalisasi huruf awal bila kata biasa (bukan path/command seperti `/resume` atau `src/`).
+    let formatted = if trimmed.starts_with('/')
+        || trimmed.starts_with('.')
+        || trimmed.starts_with("src/")
+        || trimmed.starts_with("tests/")
+    {
+        trimmed.to_string()
+    } else {
+        let mut chars = trimmed.chars();
+        match chars.next() {
+            Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+            None => String::new(),
+        }
+    };
+
+    truncate_title_words(&formatted, 56)
+}
+
+fn truncate_title_words(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for word in s.split_whitespace() {
+        let next_len = if out.is_empty() {
+            word.chars().count()
+        } else {
+            out.chars().count() + 1 + word.chars().count()
+        };
+        if next_len + 1 > max_chars {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    if out.is_empty() {
+        let cut: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{cut}…")
+    } else {
+        format!("{out}…")
+    }
+}
+
+fn extract_blocks_text(blocks: &[Block]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Text(t) if !t.trim().is_empty() => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Hasilkan judul sesi kontekstual dari 1 pesan user; kembalikan `None` bila pesan cuma basa-basi singkat.
+pub fn infer_title_from_blocks(blocks: &[Block]) -> Option<String> {
+    let text = extract_blocks_text(blocks);
+    if text.trim().is_empty() || is_trivial_filler(&text) {
+        return None;
+    }
+    let title = summarize_prompt_title(&text);
+    if is_placeholder_title(&title) {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+/// Simpulkan judul sesi kontekstual dari seluruh riwayat pesan sesi (lewati sapaan singkat di awal).
+pub fn infer_session_title(messages: &[Message]) -> Option<String> {
+    let mut fallback: Option<String> = None;
+    for m in messages {
+        if m.role != Role::User {
+            continue;
+        }
+        if let Some(title) = infer_title_from_blocks(&m.content) {
+            return Some(title);
+        }
+        if fallback.is_none() {
+            let text = extract_blocks_text(&m.content);
+            if !text.trim().is_empty() {
+                let s = summarize_prompt_title(&text);
+                if !is_placeholder_title(&s) {
+                    fallback = Some(s);
+                }
+            }
+        }
+    }
+    fallback
 }

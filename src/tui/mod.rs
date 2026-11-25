@@ -112,7 +112,7 @@ pub enum TuiCommand {
     /// /compact: ringkas riwayat konteks secara manual.
     CompactContext,
     ShowSessions,
-    ShowSessionInfo,
+    Resume(Option<String>),
     Shutdown,
 }
 
@@ -1783,8 +1783,19 @@ fn submit(
         SlashCommand::Sessions => {
             send_cmd(app, cmd_tx, TuiCommand::ShowSessions);
         }
-        SlashCommand::Resume => {
-            send_cmd(app, cmd_tx, TuiCommand::ShowSessionInfo);
+        SlashCommand::Resume(arg) => {
+            let is_switch = arg
+                .as_deref()
+                .map(|s| {
+                    let t = s.trim();
+                    !t.is_empty() && !t.eq_ignore_ascii_case("info") && !t.starts_with("rename ")
+                })
+                .unwrap_or(false);
+            if is_switch && app.busy {
+                app.error("Tunggu giliran saat ini selesai atau gunakan /stop sebelum pindah sesi.");
+            } else {
+                send_cmd(app, cmd_tx, TuiCommand::Resume(arg));
+            }
         }
         SlashCommand::Plan => {
             app.plan_next = true;

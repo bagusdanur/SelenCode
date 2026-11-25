@@ -7,7 +7,7 @@ use selencode::agent::ui::ModelPickerData;
 use selencode::config::{self, Config, ProviderCfg};
 use selencode::providers::openai::fetch_models_with_context;
 use selencode::providers::router::RouterTelemetry;
-use selencode::providers::{Message, Provider, UnconfiguredProvider};
+use selencode::providers::{Block, Message, Provider, Role, UnconfiguredProvider};
 use selencode::repl::{
     classify_key_spec, parse_model_action, parse_provider_action, KeySpec, ModelAction,
     ProviderAction,
@@ -44,21 +44,52 @@ pub(crate) struct Session {
     pub(crate) router_telemetry: Arc<std::sync::Mutex<RouterTelemetry>>,
 }
 
+/// Hasil pemulihan sesi saat user menjalankan `/resume <nomor>`.
+#[derive(Debug, Clone)]
+pub(crate) struct ResumedSessionData {
+    pub(crate) session_id: String,
+    pub(crate) title: String,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) context_used: usize,
+    pub(crate) context_limit: usize,
+    pub(crate) preview_lines: Vec<(String, String)>,
+    pub(crate) total_messages: usize,
+}
+
 impl Session {
-    /// Judul sesi: potongan prompt pertama (maks 60 karakter).
+    /// Judul sesi: ringkasan kontekstual dari prompt pertama (maks ~56 karakter).
     pub(crate) fn title_from(prompt: &str) -> String {
-        let t: String = prompt.chars().take(60).collect();
-        if t.is_empty() {
-            "(sesi baru)".to_string()
-        } else {
-            t
-        }
+        selencode::store::summarize_prompt_title(prompt)
     }
 
     pub(crate) async fn build(
         provider_name: Option<&str>,
         yes: bool,
         resume: bool,
+        first_prompt: Option<&str>,
+        approval_tx: Option<tokio::sync::mpsc::Sender<ApprovalRequest>>,
+        allow_unconfigured: bool,
+    ) -> Result<Session> {
+        Self::build_with_target(
+            provider_name,
+            yes,
+            resume,
+            None,
+            first_prompt,
+            approval_tx,
+            allow_unconfigured,
+        )
+        .await
+    }
+
+    pub(crate) async fn build_with_target(
+        provider_name: Option<&str>,
+        yes: bool,
+        resume: bool,
+        resume_target: Option<&str>,
         first_prompt: Option<&str>,
         approval_tx: Option<tokio::sync::mpsc::Sender<ApprovalRequest>>,
         allow_unconfigured: bool,
@@ -105,7 +136,14 @@ impl Session {
         let cwd_str = cwd.to_string_lossy().to_string();
         let store = Arc::new(Store::open()?);
 
-        let (session_id, messages, resumed_title) = if resume {
+        let (session_id, messages, resumed_title) = if let Some(target) = resume_target
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            let info = store.resolve_session(&cwd_str, target, 10)?;
+            let msgs = store.load_messages(&info.id)?;
+            (info.id, msgs, Some((info.title, info.created_at)))
+        } else if resume {
             match store.latest_session(&cwd_str)? {
                 Some(info) => {
                     let msgs = store.load_messages(&info.id)?;
@@ -794,6 +832,38 @@ impl Session {
         Ok(new_id)
     }
 
+    /// Beralih & lanjutkan sesi tersimpan berdasarkan nomor urut (`1..=10`) atau prefix ID.
+    pub(crate) fn resume_by_target(&mut self, target: &str) -> Result<ResumedSessionData> {
+        let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
+        let info = self.store.resolve_session(&cwd_str, target, 10)?;
+        let msgs = self.store.load_messages(&info.id)?;
+        let (input_tokens, output_tokens) = self.store.total_usage(&info.id).unwrap_or((0, 0));
+        let context_used = estimate_tokens(&msgs);
+        let context_limit = self.ctx.context_limit_tokens;
+        let preview_lines = build_session_preview(&msgs, 6);
+        let total_messages = msgs.len();
+
+        self.session_id = info.id.clone();
+        self.ctx.session_id = Some(info.id.clone());
+        self.messages = msgs;
+        if let Ok(mut plan) = self.ctx.plan_state.lock() {
+            plan.clear();
+        }
+
+        Ok(ResumedSessionData {
+            session_id: info.id,
+            title: info.title,
+            provider: self.provider_name.clone(),
+            model: self.pcfg.model.clone(),
+            input_tokens,
+            output_tokens,
+            context_used,
+            context_limit,
+            preview_lines,
+            total_messages,
+        })
+    }
+
     /// Compaction konteks manual (/compact).
     pub(crate) fn compact_now(&mut self) -> String {
         let before_msgs = self.messages.len();
@@ -964,5 +1034,41 @@ impl Session {
         }
         config::save(&self.cfg)?;
         Ok(())
+    }
+}
+
+/// Ambil hingga `max_items` cuplikan pesan User/Assistant terakhir sebagai konteks visual saat `/resume <nomor>`.
+fn build_session_preview(messages: &[Message], max_items: usize) -> Vec<(String, String)> {
+    let mut items: Vec<(String, String)> = Vec::new();
+    for m in messages {
+        let role = match m.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            _ => continue,
+        };
+        let text: String = m
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text(t) if !t.trim().is_empty() => Some(t.trim()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            continue;
+        }
+        let clipped: String = if text.chars().count() > 280 {
+            let s: String = text.chars().take(279).collect();
+            format!("{s}…")
+        } else {
+            text
+        };
+        items.push((role.to_string(), clipped));
+    }
+    if items.len() > max_items {
+        items.split_off(items.len() - max_items)
+    } else {
+        items
     }
 }

@@ -1,4 +1,5 @@
 use super::cli::Cli;
+use super::commands::ResumeOutcome;
 use super::provider_label;
 use super::session::Session;
 use anyhow::Result;
@@ -554,25 +555,51 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
-            TuiCommand::ShowSessionInfo => {
-                let _ = ui_tx.send(UiEvent::Menu(s.session_info_menu())).await;
-            }
+            TuiCommand::Resume(arg) => match s.handle_resume(arg.as_deref()) {
+                Ok(ResumeOutcome::Menu(card)) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Ok(ResumeOutcome::Switched(data)) => {
+                    let _ = ui_tx
+                        .send(UiEvent::SessionResumed {
+                            session_id: data.session_id,
+                            title: data.title,
+                            provider: data.provider,
+                            model: data.model,
+                            input_tokens: data.input_tokens,
+                            output_tokens: data.output_tokens,
+                            context_used: data.context_used,
+                            context_limit: data.context_limit,
+                            preview_lines: data.preview_lines,
+                            total_messages: data.total_messages,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
             TuiCommand::Shutdown => break,
         }
     }
 }
 
-pub(crate) async fn interactive_tui(cli: Cli, resume: bool) -> Result<()> {
+pub(crate) async fn interactive_tui(
+    cli: Cli,
+    resume: bool,
+    resume_target: Option<String>,
+) -> Result<()> {
     // Approver berbasis channel: permintaan approval dari tool mengalir ke
     // popup TUI, jawaban kembali via oneshot (lihat security::Approver).
     // Dibangun di dalam Session::build agar `agent.approval = "auto"` dari
     // config ikut berlaku di mode TUI.
     let (approval_tx, approval_rx) =
         tokio::sync::mpsc::channel::<ApprovalRequest>(8);
-    let s = Session::build(
+    let s = Session::build_with_target(
         cli.provider.as_deref(),
         cli.yes,
         resume,
+        resume_target.as_deref(),
         None,
         Some(approval_tx),
         true,

@@ -63,8 +63,8 @@ pub enum SlashCommand {
     Details,
     /// /sessions
     Sessions,
-    /// /resume (di dalam sesi interaktif: tampilkan info sesi aktif)
-    Resume,
+    /// /resume [nomor | info | rename <judul>] — lihat 10 sesi terakhir bernomor & lanjutkan sesi.
+    Resume(Option<String>),
     /// /plan (giliran berikutnya plan mode baca-saja)
     Plan,
     /// /new atau /clear (mulai sesi percakapan baru yang bersih)
@@ -278,9 +278,9 @@ pub const COMMANDS: &[CommandDef] = &[
     },
     CommandDef {
         cmd: "/resume",
-        args: "",
-        desc: "tampilkan detail sesi & kapasitas konteks model",
-        takes_args: false,
+        args: "[nomor / info]",
+        desc: "tampilkan 10 sesi terakhir bernomor & lanjutkan sesi",
+        takes_args: true,
     },
     CommandDef {
         cmd: "/help",
@@ -356,7 +356,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/sandbox" => SlashCommand::Sandbox(rest),
         "/details" => SlashCommand::Details,
         "/sessions" => SlashCommand::Sessions,
-        "/resume" => SlashCommand::Resume,
+        "/resume" => SlashCommand::Resume(rest),
         "/plan" => SlashCommand::Plan,
         "/new" | "/clear" => SlashCommand::New,
         "/compact" => SlashCommand::Compact,

@@ -535,9 +535,27 @@ async fn handle_telegram_chat_message(
                 .await?;
             return Ok(());
         }
-        SlashCommand::Resume => {
-            tg.send_long_message(chat_id, &strip_menu_markup(&s.session_info_menu()))
-                .await?;
+        SlashCommand::Resume(arg) => {
+            let reply = match s.handle_resume(arg.as_deref())? {
+                super::commands::ResumeOutcome::Menu(card) => strip_menu_markup(&card),
+                super::commands::ResumeOutcome::Switched(data) => {
+                    let mut out = format!(
+                        "Melanjutkan sesi: \"{}\" ({}) — {} pesan dimuat.",
+                        data.title,
+                        data.session_id.chars().take(10).collect::<String>(),
+                        data.total_messages
+                    );
+                    if !data.preview_lines.is_empty() {
+                        out.push_str("\n\nCuplikan terakhir:");
+                        for (role, text) in data.preview_lines {
+                            let tag = if role == "user" { "User" } else { "Selena" };
+                            out.push_str(&format!("\n- {tag}: {text}"));
+                        }
+                    }
+                    out
+                }
+            };
+            tg.send_long_message(chat_id, &reply).await?;
             return Ok(());
         }
         SlashCommand::Init => {

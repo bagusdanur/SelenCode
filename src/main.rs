@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Commands::Resume) => interactive(cli, true).await,
+        Some(Commands::Resume { target }) => interactive(cli, true, target).await,
         Some(Commands::Telegram) => run_telegram_gateway(cli).await,
         Some(Commands::Bench {
             suite,
@@ -83,17 +83,17 @@ async fn main() -> Result<()> {
             .await
         }
         Some(Commands::Update) => selencode::update::run().await,
-        None => interactive(cli, false).await,
+        None => interactive(cli, false, None).await,
     }
 }
 
 /// Mode interaktif: TUI bila stdin & stdout sama-sama TTY dan tidak ada
 /// flag --plain; selain itu REPL polos (aman untuk pipa/script).
-async fn interactive(cli: Cli, resume: bool) -> Result<()> {
+async fn interactive(cli: Cli, resume: bool, resume_target: Option<String>) -> Result<()> {
     let use_tui = !cli.plain && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if use_tui {
-        interactive_tui(cli, resume).await
+        interactive_tui(cli, resume, resume_target).await
     } else {
-        interactive_plain(cli, resume).await
+        interactive_plain(cli, resume, resume_target).await
     }
 }

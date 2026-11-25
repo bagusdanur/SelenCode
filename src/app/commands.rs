@@ -1,4 +1,4 @@
-use super::session::Session;
+use super::session::{ResumedSessionData, Session};
 use anyhow::Result;
 use selencode::agent::context::{calc_context_pct, estimate_tokens, format_context_compact};
 use selencode::agent::run_self_improvement_review;
@@ -12,6 +12,14 @@ use selencode::skills::{
 };
 use selencode::telegram::{parse_telegram_action, TelegramAction};
 use std::time::Duration;
+
+/// Hasil eksekusi perintah `/resume [nomor | info | rename <judul>]`.
+pub(crate) enum ResumeOutcome {
+    /// Tampilkan kartu menu (daftar 10 sesi bernomor, info sesi aktif, atau konfirmasi rename).
+    Menu(String),
+    /// Berhasil berpindah & memuat ulang sesi terpilih.
+    Switched(ResumedSessionData),
+}
 
 impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
     pub(crate) fn handle_telegram(&mut self, arg: Option<&str>) -> Result<String> {
@@ -1452,7 +1460,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
         println!("{}", strip_menu_markup(&self.models_menu()));
     }
 
-    /// Kartu daftar sesi terakhir cwd ini (mode TUI & polos).
+    /// Kartu daftar 10 sesi terakhir cwd ini bernomor (`#1..#10`) dengan judul kontekstual.
     pub(crate) fn sessions_menu(&self) -> Result<String> {
         let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
         let list = self.store.list_sessions(&cwd_str, 10)?;
@@ -1461,18 +1469,59 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                 "# Sesi Tersimpan\n! Belum ada sesi tersimpan untuk folder ini.".to_string(),
             );
         }
-        let mut out = String::from("# 10 Sesi Terakhir di Folder Ini\n");
-        for s in list {
-            let mark = if s.id == self.session_id { "*" } else { ">" };
+        let mut out = format!("# {} Sesi Terakhir di Folder Ini\n", list.len());
+        for (i, s) in list.iter().enumerate() {
+            let num = i + 1;
+            let is_cur = s.id == self.session_id;
+            let mark = if is_cur { "*" } else { ">" };
             let short_ts: String = s.created_at.chars().take(16).collect();
+            let short_ts = short_ts.replace('T', " ");
+            let msg_count = self.store.count_messages(&s.id).unwrap_or(0);
+            let active_tag = if is_cur { " (aktif)" } else { "" };
             out.push_str(&format!(
-                "{mark} {short_ts} | {}/{} | \"{}\"\n",
-                s.provider, s.model, s.title
+                "{mark} #{num} | {}{active_tag} | {short_ts} · {msg_count} msg · {}\n",
+                s.title, s.model
             ));
         }
         out.push_str("---\n");
-        out.push_str("! Lanjutkan sesi terakhir dari terminal: selen resume");
+        out.push_str("! Lanjutkan sesi:  /resume <nomor>   (contoh: /resume 1)\n");
+        out.push_str("! Info sesi aktif: /resume info   ·   Ubah judul: /resume rename <judul baru>\n");
+        out.push_str("! Dari terminal:   selen resume <nomor>");
         Ok(out)
+    }
+
+    /// Tangani `/resume [nomor | info | rename <judul>]`:
+    /// - Tanpa argumen -> daftar 10 sesi terakhir bernomor (`#1..#10`)
+    /// - `info` -> detail sesi aktif
+    /// - `rename <judul>` -> ubah judul sesi aktif di SQLite
+    /// - `<nomor>` atau `<prefix_id>` -> lanjutkan & muat ulang sesi terpilih
+    pub(crate) fn handle_resume(
+        &mut self,
+        arg: Option<&str>,
+    ) -> Result<ResumeOutcome> {
+        let Some(raw) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            return Ok(ResumeOutcome::Menu(self.sessions_menu()?));
+        };
+        if raw.eq_ignore_ascii_case("info") || raw.eq_ignore_ascii_case("status") {
+            return Ok(ResumeOutcome::Menu(self.session_info_menu()));
+        }
+        if raw.eq_ignore_ascii_case("list") || raw.eq_ignore_ascii_case("ls") {
+            return Ok(ResumeOutcome::Menu(self.sessions_menu()?));
+        }
+        if let Some(rest) = raw
+            .strip_prefix("rename ")
+            .or_else(|| raw.strip_prefix("title "))
+        {
+            let new_title = selencode::store::summarize_prompt_title(rest);
+            self.store
+                .update_session_title(&self.session_id, &new_title)?;
+            return Ok(ResumeOutcome::Menu(format!(
+                "# Judul Sesi Diperbarui\n* sesi | {} | \"{new_title}\"",
+                self.session_id.chars().take(10).collect::<String>()
+            )));
+        }
+        let resumed = self.resume_by_target(raw)?;
+        Ok(ResumeOutcome::Switched(resumed))
     }
 
     pub(crate) fn session_info_menu(&self) -> String {

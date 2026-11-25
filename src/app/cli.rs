@@ -27,8 +27,11 @@ pub enum Commands {
         /// Perintah / prompt untuk agent
         prompt: Vec<String>,
     },
-    /// Lanjutkan sesi terakhir untuk folder ini (mode interaktif)
-    Resume,
+    /// Lanjutkan sesi terakhir atau nomor sesi tertentu (mis. `selen resume` atau `selen resume 2`)
+    Resume {
+        /// Nomor urut sesi (1-10) atau prefix ID sesi (opsional; default sesi terbaru)
+        target: Option<String>,
+    },
     /// Jalankan Telegram Bot Gateway untuk chat & coding jarak jauh dari Telegram
     Telegram,
     /// Jalankan Agent Benchmark Engine untuk mengukur & membandingkan kualitas model

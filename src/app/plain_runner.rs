@@ -71,8 +71,21 @@ fn run_plain_setup_wizard(s: &mut Session) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
-    let mut s = Session::build(cli.provider.as_deref(), cli.yes, resume, None, None, true).await?;
+pub(crate) async fn interactive_plain(
+    cli: Cli,
+    resume: bool,
+    resume_target: Option<String>,
+) -> Result<()> {
+    let mut s = Session::build_with_target(
+        cli.provider.as_deref(),
+        cli.yes,
+        resume,
+        resume_target.as_deref(),
+        None,
+        None,
+        true,
+    )
+    .await?;
     if s.needs_setup {
         println!(
             "☾ Provider belum siap ({}). Mulai setup interaktif…",
@@ -259,9 +272,24 @@ pub(crate) async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                     eprintln!("[error] {e}");
                 }
             }
-            SlashCommand::Resume => {
-                println!("{}", strip_menu_markup(&s.session_info_menu()));
-            }
+            SlashCommand::Resume(arg) => match s.handle_resume(arg.as_deref()) {
+                Ok(super::commands::ResumeOutcome::Menu(card)) => {
+                    println!("{}", strip_menu_markup(&card));
+                }
+                Ok(super::commands::ResumeOutcome::Switched(data)) => {
+                    println!(
+                        "Melanjutkan sesi: \"{}\" ({}) — {} pesan dimuat.",
+                        data.title,
+                        data.session_id.chars().take(10).collect::<String>(),
+                        data.total_messages
+                    );
+                    for (role, text) in data.preview_lines {
+                        let prefix = if role == "user" { ">" } else { "☾" };
+                        println!("  {prefix} {text}");
+                    }
+                }
+                Err(e) => eprintln!("[error] {e}"),
+            },
             SlashCommand::Plan => {
                 plan_next = true;
                 println!("Mode plan aktif untuk giliran berikutnya (baca-saja, diakhiri rencana).");

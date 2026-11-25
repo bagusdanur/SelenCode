@@ -843,6 +843,47 @@ impl App {
                 self.pending_plan = None;
                 self.plan_next = false;
             }
+            UiEvent::SessionResumed {
+                session_id,
+                title,
+                provider,
+                model,
+                input_tokens,
+                output_tokens,
+                context_used,
+                context_limit,
+                preview_lines,
+                total_messages,
+            } => {
+                self.lines.clear();
+                self.welcome = None;
+                self.resumed = true;
+                self.session_id = session_id;
+                self.provider = provider;
+                self.model = model;
+                self.session_in = input_tokens;
+                self.session_out = output_tokens;
+                self.context_used = context_used;
+                self.context_limit = context_limit.max(1);
+                self.context_pct = calc_context_pct(context_used, self.context_limit);
+                self.step_current = 0;
+                self.scroll = 0;
+                self.busy = false;
+                self.streaming = false;
+                self.pending_plan = None;
+                self.plan_next = false;
+                self.info(format!(
+                    "Melanjutkan sesi: \"{title}\" — {total_messages} pesan dimuat."
+                ));
+                for (role, text) in preview_lines {
+                    let kind = if role == "user" {
+                        LineKind::User
+                    } else {
+                        LineKind::Assistant
+                    };
+                    self.lines.push(TranscriptLine::simple(kind, text));
+                }
+            }
             UiEvent::Error(text) => {
                 self.busy = false;
                 self.error(text);
