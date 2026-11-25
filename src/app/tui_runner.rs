@@ -667,7 +667,7 @@ pub(crate) async fn interactive_tui(
     app.resumed = s.resumed_note.is_some();
     let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
     app.prompt_history = s.store.load_prompt_history(&cwd_str, 100).unwrap_or_default();
-    app.workspace_files = collect_workspace_files(&s.ctx.cwd, 1500);
+    let scan_cwd = s.ctx.cwd.clone();
     app.plan_next = cli.plan;
     if let Some(note) = &s.resumed_note {
         app.info(note.clone());
@@ -684,6 +684,15 @@ pub(crate) async fn interactive_tui(
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TuiCommand>(32);
     let (ui_tx, ui_rx) = tokio::sync::mpsc::channel::<UiEvent>(256);
+    // Bagian A: pindai daftar `@file` secara non-blocking di thread latar agar cold start TUI < 300ms!
+    let ui_tx_scan = ui_tx.clone();
+    tokio::spawn(async move {
+        if let Ok(files) =
+            tokio::task::spawn_blocking(move || collect_workspace_files(&scan_cwd, 1500)).await
+        {
+            let _ = ui_tx_scan.send(UiEvent::WorkspaceFilesLoaded(files)).await;
+        }
+    });
     let cancel = Arc::new(tokio::sync::Notify::new());
     let interrupt_pending = Arc::new(AtomicBool::new(false));
     let worker = tokio::spawn(tui_worker(

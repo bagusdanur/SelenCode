@@ -26,6 +26,109 @@ pub struct Config {
     /// Custom Hooks (`[[hooks]]` di selencode.toml) — `pre_tool` & `post_tool`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hooks: Vec<HookCfg>,
+    /// Konfigurasi Guard (dedup, loop guard, & rem Self-correction, `[guard]`).
+    #[serde(default, skip_serializing_if = "GuardCfg::is_default")]
+    pub guard: GuardCfg,
+    /// Konfigurasi model aux murah untuk kompresi riwayat (`[aux]`).
+    #[serde(default, skip_serializing_if = "AuxCfg::is_empty")]
+    pub aux: AuxCfg,
+    /// Anggaran hasil tool: cap per tool, spillover ke file, & budget per turn (`[tool_budget]`).
+    #[serde(default, skip_serializing_if = "ToolBudgetCfg::is_default")]
+    pub tool_budget: ToolBudgetCfg,
+}
+
+/// Konfigurasi dedup panggilan tool, loop guard, & batas putaran Self-correction (`[guard]`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuardCfg {
+    /// Aktifkan dedup + loop guard + rem Self-correction (set `false` untuk debug).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Batas maksimum putaran Self-correction otomatis per giliran (default: 1).
+    #[serde(default = "default_max_self_correct_rounds")]
+    pub max_self_correct_rounds: usize,
+}
+
+fn default_max_self_correct_rounds() -> usize {
+    1
+}
+
+impl Default for GuardCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_self_correct_rounds: default_max_self_correct_rounds(),
+        }
+    }
+}
+
+impl GuardCfg {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Konfigurasi model tambahan murah untuk meringkas konteks (`[aux]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuxCfg {
+    /// Nama model termurah untuk meringkas riwayat (kosong = pakai model utama).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_model: Option<String>,
+}
+
+impl AuxCfg {
+    pub fn is_empty(&self) -> bool {
+        self.compression_model
+            .as_deref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+    }
+}
+
+/// Anggaran hasil tool per panggilan & agregat per turn (`[tool_budget]`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolBudgetCfg {
+    /// Batas karakter output `run_shell` (40% kepala + 60% ekor, default 12.000).
+    #[serde(default = "default_shell_cap_chars")]
+    pub shell_cap_chars: usize,
+    /// Ambang spillover hasil tunggal ke file arsip kerja sesi (default 50.000).
+    #[serde(default = "default_spillover_chars")]
+    pub spillover_chars: usize,
+    /// Budget agregat hasil tool per turn sebelum hasil terbesar di-spill duluan (default 60.000).
+    #[serde(default = "default_turn_budget_chars")]
+    pub turn_budget_chars: usize,
+    /// Batas maksimum estimasi token injeksi dinamis awal sesi (default 1.500).
+    #[serde(default = "default_dynamic_inject_max_tokens")]
+    pub dynamic_inject_max_tokens: usize,
+}
+
+fn default_shell_cap_chars() -> usize {
+    12_000
+}
+fn default_spillover_chars() -> usize {
+    50_000
+}
+fn default_turn_budget_chars() -> usize {
+    60_000
+}
+fn default_dynamic_inject_max_tokens() -> usize {
+    1_500
+}
+
+impl Default for ToolBudgetCfg {
+    fn default() -> Self {
+        Self {
+            shell_cap_chars: default_shell_cap_chars(),
+            spillover_chars: default_spillover_chars(),
+            turn_budget_chars: default_turn_budget_chars(),
+            dynamic_inject_max_tokens: default_dynamic_inject_max_tokens(),
+        }
+    }
+}
+
+impl ToolBudgetCfg {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Konfigurasi 1 Custom Hook (`[[hooks]]` di selencode.toml).
@@ -496,6 +599,9 @@ impl Config {
             routing: RoutingCfg::default(),
             sandbox: SandboxCfg::default(),
             hooks: Vec::new(),
+            guard: GuardCfg::default(),
+            aux: AuxCfg::default(),
+            tool_budget: ToolBudgetCfg::default(),
         }
     }
 

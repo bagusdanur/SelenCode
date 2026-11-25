@@ -214,6 +214,36 @@ impl ModelPerfRecord {
     }
 }
 
+/// Catatan rincian token per panggilan API provider (Tahap 0 — Instrumentasi).
+#[derive(Debug, Clone, Default)]
+pub struct CallTokenMetric {
+    pub session_id: String,
+    pub model: String,
+    pub est_system_tokens: usize,
+    pub est_tools_tokens: usize,
+    pub est_history_tokens: usize,
+    pub est_tool_results_tokens: usize,
+    pub actual_input_tokens: u64,
+    pub actual_output_tokens: u64,
+    pub active_tools_count: usize,
+    pub pruned_count: usize,
+    pub deduped_count: usize,
+}
+
+/// Ringkasan metrik token agregat untuk satu sesi (dipakai `/resume info` & uji regresi).
+#[derive(Debug, Clone, Default)]
+pub struct SessionTokenMetricsSummary {
+    pub calls: usize,
+    pub avg_system_tokens: usize,
+    pub avg_tools_tokens: usize,
+    pub avg_history_tokens: usize,
+    pub avg_tool_results_tokens: usize,
+    pub total_actual_input: u64,
+    pub total_actual_output: u64,
+    pub total_pruned: usize,
+    pub total_deduped: usize,
+}
+
 /// Lokasi DB: env SELENCODE_DB (dipakai tes) atau
 /// ~/.local/share/selencode/selen.db (dirs::data_dir).
 pub fn db_path() -> PathBuf {
@@ -255,6 +285,13 @@ CREATE TABLE IF NOT EXISTS model_perf (route_id TEXT NOT NULL, task_kind TEXT NO
                     PRIMARY KEY (route_id, task_kind));
 CREATE TABLE IF NOT EXISTS prompt_history (id INTEGER PRIMARY KEY, cwd TEXT NOT NULL,
                     prompt TEXT NOT NULL, ts TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS call_token_metrics (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                    ts TEXT NOT NULL, model TEXT NOT NULL,
+                    est_system_tokens INT NOT NULL, est_tools_tokens INT NOT NULL,
+                    est_history_tokens INT NOT NULL, est_tool_results_tokens INT NOT NULL,
+                    actual_input_tokens INT NOT NULL DEFAULT 0, actual_output_tokens INT NOT NULL DEFAULT 0,
+                    active_tools_count INT NOT NULL DEFAULT 0,
+                    pruned_count INT NOT NULL DEFAULT 0, deduped_count INT NOT NULL DEFAULT 0);
 ";
 
 fn now() -> String {
@@ -479,6 +516,66 @@ impl Store {
             .collect();
         rows.reverse();
         Ok(rows)
+    }
+
+    /// Catat rincian estimasi & aktual token 1 panggilan provider (Tahap 0).
+    pub fn record_call_token_metric(&self, m: &CallTokenMetric) -> Result<()> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        self.materialize_if_pending(&conn, &m.session_id)?;
+        conn.execute(
+            "INSERT INTO call_token_metrics \
+             (session_id, ts, model, est_system_tokens, est_tools_tokens, est_history_tokens, \
+              est_tool_results_tokens, actual_input_tokens, actual_output_tokens, \
+              active_tools_count, pruned_count, deduped_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                m.session_id,
+                now(),
+                m.model,
+                m.est_system_tokens as i64,
+                m.est_tools_tokens as i64,
+                m.est_history_tokens as i64,
+                m.est_tool_results_tokens as i64,
+                m.actual_input_tokens as i64,
+                m.actual_output_tokens as i64,
+                m.active_tools_count as i64,
+                m.pruned_count as i64,
+                m.deduped_count as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Ringkas metrik rincian token seluruh panggilan pada satu sesi (Tahap 0).
+    pub fn session_token_metrics(&self, session_id: &str) -> Result<SessionTokenMetricsSummary> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let row = conn.query_row(
+            "SELECT COUNT(*), \
+                    COALESCE(AVG(est_system_tokens), 0), \
+                    COALESCE(AVG(est_tools_tokens), 0), \
+                    COALESCE(AVG(est_history_tokens), 0), \
+                    COALESCE(AVG(est_tool_results_tokens), 0), \
+                    COALESCE(SUM(actual_input_tokens), 0), \
+                    COALESCE(SUM(actual_output_tokens), 0), \
+                    COALESCE(SUM(pruned_count), 0), \
+                    COALESCE(SUM(deduped_count), 0) \
+             FROM call_token_metrics WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |r| {
+                Ok(SessionTokenMetricsSummary {
+                    calls: r.get::<_, i64>(0)?.max(0) as usize,
+                    avg_system_tokens: r.get::<_, f64>(1)?.max(0.0).round() as usize,
+                    avg_tools_tokens: r.get::<_, f64>(2)?.max(0.0).round() as usize,
+                    avg_history_tokens: r.get::<_, f64>(3)?.max(0.0).round() as usize,
+                    avg_tool_results_tokens: r.get::<_, f64>(4)?.max(0.0).round() as usize,
+                    total_actual_input: r.get::<_, i64>(5)?.max(0) as u64,
+                    total_actual_output: r.get::<_, i64>(6)?.max(0) as u64,
+                    total_pruned: r.get::<_, i64>(7)?.max(0) as usize,
+                    total_deduped: r.get::<_, i64>(8)?.max(0) as usize,
+                })
+            },
+        )?;
+        Ok(row)
     }
 
     /// Buat sesi baru; mengembalikan id sesi (uuid).

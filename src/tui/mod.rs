@@ -431,226 +431,313 @@ pub fn render_menu_card(markup: &str) -> Vec<Line<'static>> {
     render_menu_card_width(markup, 96)
 }
 
-fn display_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    // Sambutan Moonlit menempel di awal transkrip & ikut bergulir.
-    let mut out: Vec<Line<'static>> = app.welcome.clone().unwrap_or_default();
-    let mut prev_kind: Option<LineKind> = None;
+/// Render 1 `TranscriptLine` dan simpan hasilnya di cache per-pesan agar ketikan/scroll
+/// tidak mem-parse ulang Markdown seluruh riwayat pada setiap frame (Bagian A).
+fn ensure_line_cached(
+    l: &mut app::TranscriptLine,
+    width: u16,
+    show_tool_details: bool,
+    has_leading_blank: bool,
+    prev_assistant: bool,
+) {
+    if l.cached_width == width
+        && l.cached_details == show_tool_details
+        && l.cached_text_len == l.text.len()
+        && l.cached_tool_state == l.tool_state
+        && l.cached_has_leading_blank == has_leading_blank
+        && l.cached_prev_assistant == prev_assistant
+    {
+        return;
+    }
+
+    let mut out: Vec<Line<'static>> = Vec::new();
     let narrow = width < 72;
     let indent = if narrow { " " } else { "  " };
     let max_w = (width as usize).saturating_sub(1).clamp(24, 110);
     let inner_w = max_w.saturating_sub(indent.len()).max(20);
 
-    for l in &app.lines {
-        match l.kind {
-            LineKind::User => {
-                if !out.is_empty() {
+    match l.kind {
+        LineKind::User => {
+            if has_leading_blank {
+                out.push(Line::from(""));
+            }
+            let mut first = true;
+            for part in l.text.lines() {
+                let first_pfx = vec![
+                    Span::styled(
+                        format!("{indent}┃ "),
+                        Style::default().fg(moonlit::DEEP),
+                    ),
+                    Span::styled(
+                        if first { "❯ " } else { "  " }.to_string(),
+                        Style::default()
+                            .fg(moonlit::VIOLET)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                let cont_pfx = vec![
+                    Span::styled(
+                        format!("{indent}┃ "),
+                        Style::default().fg(moonlit::DEEP),
+                    ),
+                    Span::raw("  "),
+                ];
+                let body = vec![Span::styled(
+                    part.to_string(),
+                    Style::default()
+                        .fg(moonlit::SILVER)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
+                first = false;
+            }
+        }
+        LineKind::Assistant => {
+            if !prev_assistant {
+                if has_leading_blank {
                     out.push(Line::from(""));
                 }
+                let dashes = inner_w.saturating_sub(12).clamp(4, 56);
+                out.push(Line::from(vec![
+                    Span::styled(
+                        format!("{indent}╭─ "),
+                        Style::default().fg(moonlit::BORDER),
+                    ),
+                    Span::styled(
+                        "☾ ".to_string(),
+                        Style::default()
+                            .fg(moonlit::VIOLET)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "Selena".to_string(),
+                        Style::default()
+                            .fg(moonlit::LILAC)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" {}", "─".repeat(dashes)),
+                        Style::default().fg(moonlit::BORDER),
+                    ),
+                ]));
+            }
+            out.extend(markdown::render_markdown_width(&l.text, width));
+        }
+        LineKind::Tool => {
+            let (icon, color) = match l.tool_state {
+                Some(ToolState::Pending) => ("◐", moonlit::GOLD),
+                Some(ToolState::Ok) => ("●", moonlit::MINT),
+                Some(ToolState::Err) => ("✖", moonlit::ROSE),
+                None => ("●", moonlit::DIM),
+            };
+            if !show_tool_details {
+                let label = l.tool_name.as_deref().unwrap_or("tool");
+                out.push(Line::from(vec![
+                    Span::styled(format!("{indent}{icon} "), Style::default().fg(color)),
+                    Span::styled(label.to_string(), Style::default().fg(moonlit::LAV)),
+                    Span::styled(" (ringkas · /details)", Style::default().fg(moonlit::FAINT)),
+                ]));
+            } else {
                 let mut first = true;
                 for part in l.text.lines() {
-                    let first_pfx = vec![
-                        Span::styled(
-                            format!("{indent}┃ "),
-                            Style::default().fg(moonlit::DEEP),
-                        ),
-                        Span::styled(
-                            if first { "❯ " } else { "  " }.to_string(),
-                            Style::default()
-                                .fg(moonlit::VIOLET)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ];
-                    let cont_pfx = vec![
-                        Span::styled(
-                            format!("{indent}┃ "),
-                            Style::default().fg(moonlit::DEEP),
-                        ),
-                        Span::raw("  "),
-                    ];
-                    let body = vec![Span::styled(
-                        part.to_string(),
-                        Style::default()
-                            .fg(moonlit::SILVER)
-                            .add_modifier(Modifier::BOLD),
+                    let first_pfx = vec![Span::styled(
+                        if first {
+                            format!("{indent}{icon} ")
+                        } else {
+                            format!("{indent}  ")
+                        },
+                        Style::default().fg(color),
                     )];
+                    let cont_pfx = vec![Span::raw(format!("{indent}  "))];
+                    let part_style = if !first
+                        && (part.starts_with("+++ ")
+                            || part.starts_with("--- ")
+                            || part.starts_with("diff --git "))
+                    {
+                        Style::default()
+                            .fg(moonlit::CYAN_MOON)
+                            .add_modifier(Modifier::BOLD)
+                    } else if !first && part.starts_with("@@") {
+                        Style::default()
+                            .fg(moonlit::VIOLET)
+                            .add_modifier(Modifier::BOLD)
+                    } else if !first && part.starts_with('+') {
+                        Style::default().fg(moonlit::MINT)
+                    } else if !first && part.starts_with('-') {
+                        Style::default().fg(moonlit::ROSE)
+                    } else {
+                        Style::default().fg(moonlit::DIM)
+                    };
+                    let body = vec![Span::styled(part.to_string(), part_style)];
                     out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
                     first = false;
                 }
             }
-            LineKind::Assistant => {
-                if prev_kind != Some(LineKind::Assistant) {
-                    if !out.is_empty() {
-                        out.push(Line::from(""));
-                    }
-                    let dashes = inner_w.saturating_sub(12).clamp(4, 56);
-                    out.push(Line::from(vec![
-                        Span::styled(
-                            format!("{indent}╭─ "),
-                            Style::default().fg(moonlit::BORDER),
-                        ),
-                        Span::styled(
-                            "☾ ".to_string(),
-                            Style::default()
-                                .fg(moonlit::VIOLET)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            "Selena".to_string(),
-                            Style::default()
-                                .fg(moonlit::LILAC)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!(" {}", "─".repeat(dashes)),
-                            Style::default().fg(moonlit::BORDER),
-                        ),
-                    ]));
-                }
-                out.extend(markdown::render_markdown_width(&l.text, width));
+        }
+        LineKind::Plan => {
+            if has_leading_blank {
+                out.push(Line::from(""));
             }
-            LineKind::Tool => {
-                let (icon, color) = match l.tool_state {
-                    Some(ToolState::Pending) => ("◐", moonlit::GOLD),
-                    Some(ToolState::Ok) => ("●", moonlit::MINT),
-                    Some(ToolState::Err) => ("✖", moonlit::ROSE),
-                    None => ("●", moonlit::DIM),
-                };
-                if !app.show_tool_details {
-                    let label = l.tool_name.as_deref().unwrap_or("tool");
-                    out.push(Line::from(vec![
-                        Span::styled(format!("{indent}{icon} "), Style::default().fg(color)),
-                        Span::styled(label.to_string(), Style::default().fg(moonlit::LAV)),
-                        Span::styled(" (ringkas · /details)", Style::default().fg(moonlit::FAINT)),
-                    ]));
-                } else {
-                    let mut first = true;
-                    for part in l.text.lines() {
-                        let first_pfx = vec![Span::styled(
-                            if first {
-                                format!("{indent}{icon} ")
-                            } else {
-                                format!("{indent}  ")
-                            },
-                            Style::default().fg(color),
-                        )];
-                        let cont_pfx = vec![Span::raw(format!("{indent}  "))];
-                        // Warnai baris diff unified (`+`, `-`, `@@`, `diff --git`) agar perubahan kode langsung terbaca!
-                        let part_style = if !first
-                            && (part.starts_with("+++ ")
-                                || part.starts_with("--- ")
-                                || part.starts_with("diff --git "))
-                        {
-                            Style::default()
-                                .fg(moonlit::CYAN_MOON)
-                                .add_modifier(Modifier::BOLD)
-                        } else if !first && part.starts_with("@@") {
-                            Style::default()
-                                .fg(moonlit::VIOLET)
-                                .add_modifier(Modifier::BOLD)
-                        } else if !first && part.starts_with('+') {
-                            Style::default().fg(moonlit::MINT)
-                        } else if !first && part.starts_with('-') {
-                            Style::default().fg(moonlit::ROSE)
-                        } else {
-                            Style::default().fg(moonlit::DIM)
-                        };
-                        let body = vec![Span::styled(part.to_string(), part_style)];
-                        out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
-                        first = false;
-                    }
-                }
+            for part in l.text.lines() {
+                let pfx = vec![Span::styled(
+                    format!("{indent}┃ "),
+                    Style::default().fg(moonlit::VIOLET),
+                )];
+                let body = vec![Span::styled(
+                    part.to_string(),
+                    Style::default().fg(moonlit::LAV),
+                )];
+                out.extend(markdown::wrap_styled_spans(pfx.clone(), pfx, body, max_w));
             }
-            LineKind::Plan => {
-                if !out.is_empty() {
-                    out.push(Line::from(""));
-                }
-                for part in l.text.lines() {
-                    let pfx = vec![Span::styled(
-                        format!("{indent}┃ "),
-                        Style::default().fg(moonlit::VIOLET),
+        }
+        LineKind::Info => {
+            let is_usage = l.text.starts_with("token sesi ini:");
+            for (idx, part) in l.text.lines().enumerate() {
+                if is_usage {
+                    let first_pfx = vec![Span::styled(
+                        format!("{indent}╰─ "),
+                        Style::default().fg(moonlit::BORDER),
                     )];
+                    let cont_pfx = vec![Span::raw(format!("{indent}   "))];
                     let body = vec![Span::styled(
                         part.to_string(),
-                        Style::default().fg(moonlit::LAV),
+                        Style::default().fg(moonlit::DIM),
                     )];
-                    out.extend(markdown::wrap_styled_spans(pfx.clone(), pfx, body, max_w));
-                }
-            }
-            LineKind::Info => {
-                let is_usage = l.text.starts_with("token sesi ini:");
-                for (idx, part) in l.text.lines().enumerate() {
-                    if is_usage {
-                        let first_pfx = vec![Span::styled(
-                            format!("{indent}╰─ "),
-                            Style::default().fg(moonlit::BORDER),
-                        )];
-                        let cont_pfx = vec![Span::raw(format!("{indent}   "))];
-                        let body = vec![Span::styled(
-                            part.to_string(),
-                            Style::default().fg(moonlit::DIM),
-                        )];
-                        out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
-                    } else {
-                        let is_interrupt = part.starts_with('⚡');
-                        let first_pfx = vec![Span::styled(
-                            if idx == 0 {
-                                format!("{indent}· ")
-                            } else {
-                                format!("{indent}  ")
-                            },
-                            Style::default().fg(if is_interrupt {
-                                moonlit::GOLD
-                            } else {
-                                moonlit::VIOLET
-                            }),
-                        )];
-                        let cont_pfx = vec![Span::raw(format!("{indent}  "))];
-                        let body = vec![Span::styled(
-                            part.to_string(),
-                            Style::default().fg(if is_interrupt {
-                                moonlit::LAV
-                            } else {
-                                moonlit::DIM
-                            }),
-                        )];
-                        out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
-                    }
-                }
-            }
-            LineKind::Menu => {
-                if !out.is_empty() {
-                    out.push(Line::from(""));
-                }
-                out.extend(render_menu_card_width(&l.text, width));
-            }
-            LineKind::Error => {
-                for (idx, part) in l.text.lines().enumerate() {
+                    out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
+                } else {
+                    let is_interrupt = part.starts_with('⚡');
                     let first_pfx = vec![Span::styled(
                         if idx == 0 {
-                            format!("{indent}✖ [error] ")
+                            format!("{indent}· ")
                         } else {
-                            format!("{indent}          ")
+                            format!("{indent}  ")
                         },
-                        Style::default().fg(moonlit::ROSE),
+                        Style::default().fg(if is_interrupt {
+                            moonlit::GOLD
+                        } else {
+                            moonlit::VIOLET
+                        }),
                     )];
                     let cont_pfx = vec![Span::raw(format!("{indent}  "))];
                     let body = vec![Span::styled(
                         part.to_string(),
-                        Style::default().fg(moonlit::ROSE),
+                        Style::default().fg(if is_interrupt {
+                            moonlit::LAV
+                        } else {
+                            moonlit::DIM
+                        }),
                     )];
                     out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
                 }
             }
         }
-        prev_kind = Some(l.kind);
+        LineKind::Menu => {
+            if has_leading_blank {
+                out.push(Line::from(""));
+            }
+            out.extend(render_menu_card_width(&l.text, width));
+        }
+        LineKind::Error => {
+            for (idx, part) in l.text.lines().enumerate() {
+                let first_pfx = vec![Span::styled(
+                    if idx == 0 {
+                        format!("{indent}✖ [error] ")
+                    } else {
+                        format!("{indent}          ")
+                    },
+                    Style::default().fg(moonlit::ROSE),
+                )];
+                let cont_pfx = vec![Span::raw(format!("{indent}  "))];
+                let body = vec![Span::styled(
+                    part.to_string(),
+                    Style::default().fg(moonlit::ROSE),
+                )];
+                out.extend(markdown::wrap_styled_spans(first_pfx, cont_pfx, body, max_w));
+            }
+        }
     }
-    if out.is_empty() {
-        out.push(Line::from(Span::styled(
-            "  ☾ Ketik perintah untuk Selena…",
-            Style::default().fg(moonlit::DIM),
-        )));
+
+    l.cached_wrapped_rows = wrapped_line_count(&out, width);
+    l.cached_lines = out;
+    l.cached_width = width;
+    l.cached_details = show_tool_details;
+    l.cached_text_len = l.text.len();
+    l.cached_tool_state = l.tool_state;
+    l.cached_has_leading_blank = has_leading_blank;
+    l.cached_prev_assistant = prev_assistant;
+}
+
+/// Kumpulkan HANYA potongan baris transkrip yang terlihat di viewport (`viewport_start..viewport_end`)
+/// dengan memanfaatkan cache per-pesan (O(1) per pesan off-screen — super ringan untuk 100+ pesan!).
+fn visible_transcript_slice(
+    app: &mut App,
+    width: u16,
+    viewport: usize,
+) -> (Vec<Line<'static>>, usize, u16) {
+    let welcome = app.welcome.clone().unwrap_or_default();
+    let welcome_rows = wrapped_line_count(&welcome, width);
+    let mut has_prev_content = !welcome.is_empty();
+    let mut prev_assistant = false;
+    let show_details = app.show_tool_details;
+
+    let mut total_rows = welcome_rows;
+    for l in &mut app.lines {
+        ensure_line_cached(l, width, show_details, has_prev_content, prev_assistant);
+        total_rows += l.cached_wrapped_rows;
+        if !l.cached_lines.is_empty() {
+            has_prev_content = true;
+        }
+        prev_assistant = l.kind == LineKind::Assistant;
     }
-    out
+
+    if total_rows == 0 {
+        return (
+            vec![Line::from(Span::styled(
+                "  ☾ Ketik perintah untuk Selena…",
+                Style::default().fg(moonlit::DIM),
+            ))],
+            1,
+            0,
+        );
+    }
+
+    let max_scroll = total_rows.saturating_sub(viewport);
+    let from_bottom = (app.scroll as usize).min(max_scroll);
+    let view_start = max_scroll - from_bottom;
+    let view_end = view_start + viewport.max(1);
+
+    let mut slice: Vec<Line<'static>> = Vec::new();
+    let mut local_scroll = 0usize;
+    let mut cursor = 0usize;
+    let mut started = false;
+
+    if welcome_rows > 0 {
+        let end = cursor + welcome_rows;
+        if end > view_start && cursor < view_end {
+            local_scroll = view_start.saturating_sub(cursor);
+            slice.extend(welcome);
+            started = true;
+        }
+        cursor = end;
+    }
+
+    for l in &app.lines {
+        let rows = l.cached_wrapped_rows;
+        let end = cursor + rows;
+        if end > view_start && cursor < view_end {
+            if !started {
+                local_scroll = view_start.saturating_sub(cursor);
+                started = true;
+            }
+            slice.extend(l.cached_lines.iter().cloned());
+        }
+        cursor = end;
+        if cursor >= view_end {
+            break;
+        }
+    }
+
+    (slice, total_rows, local_scroll.min(u16::MAX as usize) as u16)
 }
 
 /// Hitung jumlah baris visual sesudah wrap selebar `width`, agar auto-scroll
@@ -718,18 +805,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    // Transkrip (gulir: app.scroll = jarak dari bawah)
-    let lines = display_lines(app, chunks[0].width);
+    // Transkrip (gulir: app.scroll = jarak dari bawah) — hanya render potongan viewport!
     let viewport = chunks[0].height as usize;
-    let total = wrapped_line_count(&lines, chunks[0].width);
+    let (visible_lines, total, local_y) = visible_transcript_slice(app, chunks[0].width, viewport);
     app.last_total_lines = total;
     app.last_viewport = viewport;
-    let max_scroll = total.saturating_sub(viewport);
-    let from_bottom = (app.scroll as usize).min(max_scroll);
-    let y = (max_scroll - from_bottom).min(u16::MAX as usize) as u16;
-    let transcript = Paragraph::new(lines)
+    let transcript = Paragraph::new(visible_lines)
         .wrap(Wrap { trim: false })
-        .scroll((y, 0));
+        .scroll((local_y, 0));
     frame.render_widget(transcript, chunks[0]);
 
     // Status bar Moonlit responsif: model + kapasitas context window AI + token + langkah.
@@ -2406,19 +2489,69 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let result = (|| -> Result<()> {
+        // Event-driven dirty-flag loop (Bagian A — ringan di laptop kentang):
+        // - Saat idle (`!app.busy`): 0 redraw/detik (~0% CPU), poll 200ms.
+        // - Saat streaming/sibuk (`app.busy`): gabungkan seluruh token antre dalam 1 frame,
+        //   batasi redraw streaming maksimal ~12 fps (80ms) dan spinner ~6 fps (160ms).
+        // - Input keyboard / paste / resize / mouse langsung redraw instan (<1ms lag).
+        let mut dirty = true;
+        let mut last_draw = std::time::Instant::now();
+        let mut last_anim_tick = std::time::Instant::now();
+
         loop {
-            terminal.draw(|f| draw(f, &mut app))?;
-            // Event UI & approval yang menunggu.
+            let mut got_ui_event = false;
             while let Ok(ev) = ch.event_rx.try_recv() {
                 app.apply_event(ev);
+                got_ui_event = true;
             }
             while let Ok(req) = ch.approval_rx.try_recv() {
                 app.receive_approval(req);
+                got_ui_event = true;
             }
-            if event::poll(Duration::from_millis(50))? {
+            if got_ui_event {
+                dirty = true;
+            }
+
+            // Saat sedang sibuk tanpa event baru, animasi spinner dibatasi ~6 fps (160ms).
+            if app.busy && !dirty && last_anim_tick.elapsed() >= Duration::from_millis(160) {
+                dirty = true;
+                last_anim_tick = std::time::Instant::now();
+            }
+
+            // Saat streaming cepat, coalesce burst token hingga maks ~12 fps (80ms) bila
+            // tidak ada input user, agar CPU lemah tidak pernah freeze.
+            let should_draw = if dirty {
+                if !got_ui_event || !app.busy || last_draw.elapsed() >= Duration::from_millis(65) {
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if should_draw {
+                terminal.draw(|f| draw(f, &mut app))?;
+                dirty = false;
+                last_draw = std::time::Instant::now();
+                if app.busy {
+                    last_anim_tick = last_draw;
+                }
+            }
+
+            let poll_ms = if dirty {
+                16
+            } else if app.busy {
+                60
+            } else {
+                200
+            };
+
+            if event::poll(Duration::from_millis(poll_ms))? {
                 match event::read()? {
                     Event::Key(key) => {
-                        handle_key(&mut app, &ch.cmd_tx, &ch.cancel, &ch.interrupt_pending, key)
+                        handle_key(&mut app, &ch.cmd_tx, &ch.cancel, &ch.interrupt_pending, key);
+                        dirty = true;
                     }
                     Event::Paste(text) => {
                         if let Some(w) = &mut app.setup_wizard {
@@ -2433,28 +2566,36 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
                         } else if app.approval.is_none() {
                             app.input.insert_str(&text);
                         }
+                        dirty = true;
                     }
-                    Event::Mouse(m) => match m.kind {
-                        MouseEventKind::ScrollUp => {
-                            if app.approval.is_some() {
-                                app.approval_scroll = app.approval_scroll.saturating_sub(3);
-                            } else if let Some(mp) = &mut app.model_picker {
-                                mp.move_up();
-                            } else {
-                                app.scroll_up(3);
+                    Event::Mouse(m) => {
+                        match m.kind {
+                            MouseEventKind::ScrollUp => {
+                                if app.approval.is_some() {
+                                    app.approval_scroll = app.approval_scroll.saturating_sub(3);
+                                } else if let Some(mp) = &mut app.model_picker {
+                                    mp.move_up();
+                                } else {
+                                    app.scroll_up(3);
+                                }
+                                dirty = true;
                             }
-                        }
-                        MouseEventKind::ScrollDown => {
-                            if app.approval.is_some() {
-                                app.approval_scroll = app.approval_scroll.saturating_add(3);
-                            } else if let Some(mp) = &mut app.model_picker {
-                                mp.move_down();
-                            } else {
-                                app.scroll_down(3);
+                            MouseEventKind::ScrollDown => {
+                                if app.approval.is_some() {
+                                    app.approval_scroll = app.approval_scroll.saturating_add(3);
+                                } else if let Some(mp) = &mut app.model_picker {
+                                    mp.move_down();
+                                } else {
+                                    app.scroll_down(3);
+                                }
+                                dirty = true;
                             }
+                            _ => {}
                         }
-                        _ => {}
-                    },
+                    }
+                    Event::Resize(_, _) => {
+                        dirty = true;
+                    }
                     _ => {}
                 }
             }

@@ -268,6 +268,39 @@ impl AnthropicStreamParser {
     }
 }
 
+/// Terapkan Prompt Caching ala Hermes (`system_and_3`, Tahap 3) pada body request Anthropic:
+/// - Tandai blok `system` sebagai ephemeral cache breakpoint.
+/// - Tandai skema tool terakhir (bila ada) sebagai cache breakpoint.
+/// - Tandai hingga 3 pesan non-system terakhir dengan `cache_control: {"type": "ephemeral"}`.
+pub fn apply_prompt_caching(body: &mut Value) {
+    let ephem = json!({"type": "ephemeral"});
+    if let Some(sys_str) = body.get("system").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+        if !sys_str.is_empty() {
+            body["system"] = json!([{
+                "type": "text",
+                "text": sys_str,
+                "cache_control": ephem
+            }]);
+        }
+    }
+    if let Some(tools) = body.get_mut("tools").and_then(|v| v.as_array_mut()) {
+        if let Some(last_tool) = tools.last_mut().and_then(|v| v.as_object_mut()) {
+            last_tool.insert("cache_control".into(), json!({"type": "ephemeral"}));
+        }
+    }
+    if let Some(msgs) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        let len = msgs.len();
+        let start = len.saturating_sub(3);
+        for m in &mut msgs[start..] {
+            if let Some(blocks) = m.get_mut("content").and_then(|v| v.as_array_mut()) {
+                if let Some(last_blk) = blocks.last_mut().and_then(|v| v.as_object_mut()) {
+                    last_blk.insert("cache_control".into(), json!({"type": "ephemeral"}));
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Provider for AnthropicProvider {
     fn model_name(&self) -> &str {
@@ -280,7 +313,8 @@ impl Provider for AnthropicProvider {
         tools: &[ToolSpec],
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<AssistantReply> {
-        let body = build_request(msgs, tools, &self.model, self.max_output_tokens);
+        let mut body = build_request(msgs, tools, &self.model, self.max_output_tokens);
+        apply_prompt_caching(&mut body);
         let url = format!("{}/v1/messages", self.base_url);
         let resp = tokio::time::timeout(
             RESPONSE_TIMEOUT,

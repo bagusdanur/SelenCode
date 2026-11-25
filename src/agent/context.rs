@@ -469,9 +469,178 @@ pub fn sanitize_interrupted_messages(messages: &mut Vec<Message>) -> Option<Mess
     Some(synthetic)
 }
 
-/// Diet konteks (Live-Test P1): padatkan `Block::ToolResult` lama di luar `keep_recent_tool_msgs`
-/// pesan tool terakhir agar output file/shell besar tidak terus-terusan dikirim ulang di tiap langkah
-/// maupun saat `/resume`. Mengembalikan jumlah blok yang dipadatkan.
+/// Direktori arsip hasil tool yang di-prune / spillover (`~/.local/share/selencode/<kind>/<session_id>`).
+pub fn session_archive_dir(kind: &str, session_id: &str) -> std::path::PathBuf {
+    let base = std::env::var("SELENCODE_DATA_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let safe_sid: String = session_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(48)
+        .collect();
+    let safe_sid = if safe_sid.is_empty() { "default".to_string() } else { safe_sid };
+    base.join("selencode").join(kind).join(safe_sid)
+}
+
+/// Pemotongan 40% kepala + 60% ekor untuk output shell/command panjang (Tahap 4),
+/// menjaga error/ringkasan di bagian akhir tetap utuh.
+pub fn head_tail_truncate(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars || max_chars < 80 {
+        return text.to_string();
+    }
+    let head_n = max_chars * 40 / 100;
+    let tail_n = max_chars.saturating_sub(head_n + 60);
+    let head: String = text.chars().take(head_n).collect();
+    let tail: String = text
+        .chars()
+        .skip(total.saturating_sub(tail_n))
+        .collect();
+    let omitted = total.saturating_sub(head_n + tail_n);
+    format!("{head}\n\n... [{omitted} karakter tengah dipotong (40% kepala / 60% ekor)] ...\n\n{tail}")
+}
+
+/// Spillover (Tahap 4): tulis hasil tool yang melampaui ambang `threshold_chars` utuh ke file
+/// arsip kerja sesi, lalu kembalikan pratinjau kepala/ekor + path file arsipnya.
+pub fn spillover_if_needed(
+    session_id: &str,
+    call_id: &str,
+    tool_name: &str,
+    redacted_content: &str,
+    threshold_chars: usize,
+) -> Option<String> {
+    let total = redacted_content.chars().count();
+    if total <= threshold_chars || threshold_chars == 0 {
+        return None;
+    }
+    let dir = session_archive_dir("spillover", session_id);
+    let _ = std::fs::create_dir_all(&dir);
+    let safe_id: String = call_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(36)
+        .collect();
+    let file_name = format!(
+        "{}_{}.txt",
+        tool_name.replace('/', "_"),
+        if safe_id.is_empty() { "out".to_string() } else { safe_id }
+    );
+    let path = dir.join(file_name);
+    let _ = std::fs::write(&path, redacted_content);
+    let preview = head_tail_truncate(redacted_content, 1200);
+    Some(format!(
+        "[Spillover `{tool_name}` ({total} char) — arsip penuh: {}]\n{preview}",
+        path.display()
+    ))
+}
+
+/// Batasi blok injeksi dinamis (memori + skill + konteks snapshot) agar tidak melampaui
+/// anggaran `max_tokens` (Tahap 6, default 1.500 token = 6.000 char).
+pub fn cap_dynamic_injection(text: &str, max_tokens: usize) -> String {
+    let max_chars = max_tokens.saturating_mul(4);
+    if max_chars == 0 || text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max_chars.saturating_sub(40)).collect();
+    format!("{head}\n... [injeksi dinamis dibatasi {max_tokens} token]")
+}
+
+/// Cari nama tool berdasarkan `tool_use_id` dari pesan Assistant sebelumnya.
+fn resolve_tool_name_for_id(messages: &[Message], up_to: usize, tool_id: &str) -> String {
+    for m in messages[..up_to].iter().rev() {
+        if m.role == Role::Assistant {
+            for b in &m.content {
+                if let Block::ToolUse { id, name, .. } = b {
+                    if id == tool_id {
+                        return name.clone();
+                    }
+                }
+            }
+        }
+    }
+    "tool".to_string()
+}
+
+/// Tahap 1 — Prune hasil tool lama TANPA LLM + arsipkan hasil utuh (teredaksi) ke file:
+/// - Hanya memproses `Block::ToolResult` di luar `keep_tail_msgs` pesan terakhir (default 20)
+///   yang panjangnya `> 200` karakter.
+/// - Menulis isi asli teredaksi ke `archive_dir/<idx>_<id>.txt`.
+/// - Mengganti isi di konteks menjadi stub 1 baris + cuplikan awal maks 120 char (100% idempoten!).
+/// - TIDAK menyentuh pesan User, teks Assistant, maupun 20 pesan terakhir.
+pub fn prune_old_tool_results_with_archive(
+    messages: &mut [Message],
+    archive_dir: &Path,
+    keep_tail_msgs: usize,
+) -> usize {
+    const MIN_PRUNE_CHARS: usize = 200;
+    const PREVIEW_CHARS: usize = 120;
+
+    if messages.len() <= keep_tail_msgs {
+        return 0;
+    }
+    let cutoff = messages.len() - keep_tail_msgs;
+    // Kumpulkan (msg_idx, block_idx, tool_name) sebelum memutasi agar borrow checker bersih.
+    let mut targets: Vec<(usize, usize, String, String)> = Vec::new();
+    for i in 0..cutoff {
+        if messages[i].role != Role::Tool {
+            continue;
+        }
+        for (bi, b) in messages[i].content.iter().enumerate() {
+            if let Block::ToolResult { id, content, .. } = b {
+                if content.chars().count() > MIN_PRUNE_CHARS
+                    && !content.starts_with("[Hasil ")
+                    && !content.contains("diringkas — arsip:")
+                {
+                    let tname = resolve_tool_name_for_id(messages, i, id);
+                    targets.push((i, bi, id.clone(), tname));
+                }
+            }
+        }
+    }
+    if targets.is_empty() {
+        return 0;
+    }
+    let _ = std::fs::create_dir_all(archive_dir);
+    let mut pruned = 0usize;
+    for (msg_idx, block_idx, call_id, tool_name) in targets {
+        if let Some(Block::ToolResult { content, .. }) = messages[msg_idx].content.get_mut(block_idx) {
+            let safe_id: String = call_id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .take(32)
+                .collect();
+            let fname = format!(
+                "{:04}_{}_{}.txt",
+                msg_idx,
+                tool_name.replace('/', "_"),
+                if safe_id.is_empty() { "res".to_string() } else { safe_id }
+            );
+            let archive_path = archive_dir.join(fname);
+            let _ = std::fs::write(&archive_path, content.as_str());
+            let first_line: String = content
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(PREVIEW_CHARS)
+                .collect();
+            *content = format!(
+                "[Hasil {tool_name} diringkas — arsip: {}] {first_line}",
+                archive_path.display()
+            );
+            pruned += 1;
+        }
+    }
+    pruned
+}
+
+/// Diet konteks ringan (kompatibilitas tes lama): padatkan `Block::ToolResult` lama di luar
+/// `keep_recent_tool_msgs` pesan tool terakhir.
 pub fn prune_old_tool_results(messages: &mut [Message], keep_recent_tool_msgs: usize) -> usize {
     const MAX_OLD_TOOL_CHARS: usize = 360;
     const KEEP_HEAD_CHARS: usize = 220;
@@ -490,7 +659,10 @@ pub fn prune_old_tool_results(messages: &mut [Message], keep_recent_tool_msgs: u
         for b in &mut messages[idx].content {
             if let Block::ToolResult { content, .. } = b {
                 let char_len = content.chars().count();
-                if char_len > MAX_OLD_TOOL_CHARS && !content.ends_with("[hasil tool lama dipadatkan]") {
+                if char_len > MAX_OLD_TOOL_CHARS
+                    && !content.ends_with("[hasil tool lama dipadatkan]")
+                    && !content.contains("diringkas — arsip:")
+                {
                     let head: String = content.chars().take(KEEP_HEAD_CHARS).collect();
                     *content = format!("{head}\n… ({char_len} char) [hasil tool lama dipadatkan]");
                     pruned += 1;
@@ -501,13 +673,230 @@ pub fn prune_old_tool_results(messages: &mut [Message], keep_recent_tool_msgs: u
     pruned
 }
 
-/// Compaction memicu lebih dini di 60% batas konteks (atau maks 48.000 token untuk model
-/// berkapasitas jumbo agar sesi panjang & `/resume` tetap hemat token).
+/// Header penanda pesan ringkasan kompresi dua tahap ala Hermes (Tahap 5).
+pub const HERMES_SUMMARY_MARKER: &str = "[RINGKASAN KONTEKS HERMES]";
+
+/// Hitung anggaran token ringkasan kompresi (20% dari isi yang dikompresi, min 2.000, maks 12.000).
+pub fn compression_summary_budget(compressed_tokens: usize) -> usize {
+    (compressed_tokens * 20 / 100).clamp(2_000, 12_000)
+}
+
+/// Template tetap ringkasan kompresi ala Hermes Agent (Tahap 5).
+pub fn format_hermes_summary_deterministic(
+    prev_summary: Option<&str>,
+    evicted: &[Message],
+) -> String {
+    let mut goals = Vec::new();
+    let mut tools_used = Vec::new();
+    let mut files_mentioned = Vec::new();
+    let mut decisions = Vec::new();
+    let mut blocked = Vec::new();
+
+    for m in evicted {
+        match m.role {
+            Role::User => {
+                let first: String = m
+                    .plain_text()
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim()
+                    .chars()
+                    .take(140)
+                    .collect();
+                if !first.is_empty() && goals.len() < 4 {
+                    goals.push(first);
+                }
+            }
+            Role::Assistant => {
+                let first: String = m
+                    .plain_text()
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim()
+                    .chars()
+                    .take(140)
+                    .collect();
+                if !first.is_empty() && decisions.len() < 4 {
+                    decisions.push(first);
+                }
+                for b in &m.content {
+                    if let Block::ToolUse { name, args, .. } = b {
+                        if !tools_used.contains(name) {
+                            tools_used.push(name.clone());
+                        }
+                        if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                            if !files_mentioned.iter().any(|x| x == p) && files_mentioned.len() < 12
+                            {
+                                files_mentioned.push(p.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Role::Tool => {
+                for b in &m.content {
+                    if let Block::ToolResult {
+                        content,
+                        is_error: true,
+                        ..
+                    } = b
+                    {
+                        let cut: String = content.chars().take(120).collect();
+                        if blocked.len() < 4 {
+                            blocked.push(cut);
+                        }
+                    }
+                }
+            }
+            Role::System => {}
+        }
+    }
+
+    let prev_note = prev_summary
+        .map(|s| {
+            let trimmed: String = s.chars().take(1200).collect();
+            format!("\nRingkasan sebelumnya (diperbarui):\n{trimmed}\n")
+        })
+        .unwrap_or_default();
+
+    format!(
+        "{HERMES_SUMMARY_MARKER}\n\
+         ## Goal\n{}\n\
+         ## Constraints & Preferences\n- Ikuti aturan kerja SelenCode, redaksi rahasia, & verifikasi hemat.\n\
+         ## Progress\n- Done: {} pesan lama dikompresi (tool dipakai: {})\n- In Progress: lanjutkan konteks dari 20 pesan terbaru\n- Blocked: {}\n\
+         ## Key Decisions\n{}\n\
+         ## Relevant Files\n{}\n\
+         ## Next Steps\n- Lanjutkan tugas terakhir user tanpa mengulang langkah yang sudah selesai.\n\
+         ## Critical Context\n{}{}",
+        if goals.is_empty() {
+            "- (lihat pesan awal sesi)".to_string()
+        } else {
+            goals.iter().map(|g| format!("- {g}")).collect::<Vec<_>>().join("\n")
+        },
+        evicted.len(),
+        if tools_used.is_empty() {
+            "tidak ada".to_string()
+        } else {
+            tools_used.join(", ")
+        },
+        if blocked.is_empty() {
+            "tidak ada".to_string()
+        } else {
+            blocked.join(" | ")
+        },
+        if decisions.is_empty() {
+            "- (belum ada keputusan tambahan)".to_string()
+        } else {
+            decisions
+                .iter()
+                .map(|d| format!("- {d}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        if files_mentioned.is_empty() {
+            "- (belum ada file tercatat)".to_string()
+        } else {
+            files_mentioned
+                .iter()
+                .map(|f| format!("- {f}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        "Pasangan tool call/result di luar jendela 20 pesan terakhir diringkas aman.",
+        prev_note
+    )
+}
+
+/// Kompresi dua tahap ala Hermes (Tahap 5):
+/// Lindungi 3 pesan pertama + 20 pesan terakhir; perbarui ringkasan sebelumnya bila ada;
+/// pastikan ekor tidak memutus pasangan ToolUse/ToolResult.
+pub fn compact_messages_hermes(messages: &[Message]) -> Vec<Message> {
+    const KEEP_HEAD: usize = 3;
+    const KEEP_TAIL: usize = 20;
+    if messages.len() <= KEEP_HEAD + KEEP_TAIL {
+        return messages.to_vec();
+    }
+    let mut head_end = KEEP_HEAD.min(messages.len());
+    // Jangan memutus pasangan Assistant(ToolUse) -> Tool(ToolResult) di batas kepala.
+    while head_end < messages.len() && messages[head_end].role == Role::Tool {
+        head_end += 1;
+    }
+    let mut tail_start = messages.len().saturating_sub(KEEP_TAIL);
+    while tail_start > head_end && messages[tail_start].role == Role::Tool {
+        tail_start -= 1;
+    }
+    if tail_start <= head_end {
+        return messages.to_vec();
+    }
+    let head = &messages[..head_end];
+    let middle = &messages[head_end..tail_start];
+    let tail = &messages[tail_start..];
+
+    // Cari apakah sudah ada ringkasan Hermes sebelumnya untuk diperbarui secara inkremental.
+    let prev_summary = middle.iter().find_map(|m| {
+        let txt = m.plain_text();
+        txt.starts_with(HERMES_SUMMARY_MARKER).then_some(txt)
+    });
+    let new_evicted: Vec<Message> = middle
+        .iter()
+        .filter(|m| !m.plain_text().starts_with(HERMES_SUMMARY_MARKER))
+        .cloned()
+        .collect();
+    let summary = format_hermes_summary_deterministic(prev_summary.as_deref(), &new_evicted);
+
+    let mut out = Vec::with_capacity(head.len() + 1 + tail.len());
+    out.extend_from_slice(head);
+    // Sisipkan sebagai pesan User (BUKAN System) agar prefix System Prompt TETAP BEKU 100% untuk cache hit!
+    out.push(Message::text(Role::User, summary));
+    out.extend_from_slice(tail);
+    out
+}
+
+/// Cooldown bertingkat model aux kompresi (60 -> 300 -> 900 detik) setelah kegagalan (Tahap 5).
+#[derive(Debug, Default)]
+pub struct AuxCooldownState {
+    consecutive_failures: u32,
+    next_retry_at: Option<std::time::Instant>,
+}
+
+impl AuxCooldownState {
+    pub fn cooldown_secs_for(failures: u32) -> u64 {
+        match failures {
+            0 => 0,
+            1 => 60,
+            2 => 300,
+            _ => 900,
+        }
+    }
+
+    pub fn is_in_cooldown(&self) -> bool {
+        self.next_retry_at
+            .map(|t| std::time::Instant::now() < t)
+            .unwrap_or(false)
+    }
+
+    pub fn record_failure(&mut self) -> u64 {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let secs = Self::cooldown_secs_for(self.consecutive_failures);
+        self.next_retry_at =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+        secs
+    }
+
+    pub fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.next_retry_at = None;
+    }
+}
+
+/// Compaction memicu pada 50% batas konteks (Tahap 5 Hermes-style, maks 48.000 token untuk model jumbo).
 pub fn needs_compaction(messages: &[Message], limit_tokens: usize) -> bool {
     if limit_tokens == 0 {
         return false;
     }
-    let threshold = (limit_tokens * 60 / 100).min(48_000).max(limit_tokens.min(10));
+    let threshold = (limit_tokens * 50 / 100).min(48_000).max(limit_tokens.min(10));
     estimate_tokens(messages) > threshold
 }
 

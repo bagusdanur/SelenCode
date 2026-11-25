@@ -15,6 +15,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 pub const ACTIVATE_TOOLSET_NAME: &str = "activate_toolset";
+pub const LOAD_MCP_TOOLS_NAME: &str = "load_mcp_tools";
+/// Tahap 6: bila jumlah tool MCP terdaftar > 15, kirim indeks ringkas + pemuat skema on-demand!
+pub const MCP_ON_DEMAND_THRESHOLD: usize = 15;
 
 /// 8 tool paling esensial yang selalu aktif di setiap giliran Execute (~650 token total).
 pub const CORE_TOOLS: &[&str] = &[
@@ -238,25 +241,99 @@ pub fn is_tool_active(tool_name: &str, active_toolsets: &HashSet<String>) -> boo
     true
 }
 
+/// Meta-tool pemuat skema MCP on-demand bila server MCP mendaftarkan >15 tool (Tahap 6).
+pub fn load_mcp_tools_spec() -> ToolSpec {
+    ToolSpec {
+        name: LOAD_MCP_TOOLS_NAME.to_string(),
+        description: "Muat skema JSON penuh untuk tool MCP tertentu dari indeks MCP saat dibutuhkan.".to_string(),
+        parameters: schema(
+            json!({
+                "names": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Daftar nama tool MCP (contoh: [\"mcp__github__create_issue\"])."
+                }
+            }),
+            &["names"],
+        ),
+    }
+}
+
+/// Susun indeks 1 baris (nama + deskripsi maks 60 char) untuk tool MCP ketika jumlahnya > 15 (Tahap 6).
+pub fn build_mcp_compact_index(registry: &Registry) -> Option<String> {
+    let mcp_specs: Vec<ToolSpec> = registry.specs_where(|n| n.starts_with("mcp__"));
+    if mcp_specs.len() <= MCP_ON_DEMAND_THRESHOLD {
+        return None;
+    }
+    let mut out = format!(
+        "Indeks MCP ({} tool — muat skema penuh lewat `{LOAD_MCP_TOOLS_NAME}` bila perlu):\n",
+        mcp_specs.len()
+    );
+    for s in mcp_specs {
+        let short_desc: String = s
+            .description
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(60)
+            .collect();
+        out.push_str(&format!("- {}: {short_desc}\n", s.name));
+    }
+    Some(out.trim_end().to_string())
+}
+
+/// Susun daftar `ToolSpec` ramping yang benar-benar dikirim ke provider berdasarkan `active_toolsets`
+/// dan daftar `loaded_mcp_tools` (untuk mode indeks MCP >15 tool).
+pub fn active_tool_specs_with_mcp(
+    registry: &Registry,
+    active_toolsets: &HashSet<String>,
+    loaded_mcp_tools: &HashSet<String>,
+    mode: TurnMode,
+) -> Vec<ToolSpec> {
+    let mcp_count = registry
+        .names()
+        .iter()
+        .filter(|n| n.starts_with("mcp__"))
+        .count();
+    let mcp_indexed_mode = mcp_count > MCP_ON_DEMAND_THRESHOLD;
+
+    let mut specs = match mode {
+        TurnMode::Plan => registry.specs_where(|n| is_read_only(n) && is_tool_active(n, active_toolsets)),
+        TurnMode::Execute => registry.specs_where(|n| {
+            if n.starts_with("mcp__") && mcp_indexed_mode {
+                loaded_mcp_tools.contains(n)
+            } else {
+                is_tool_active(n, active_toolsets)
+            }
+        }),
+    };
+    if mode == TurnMode::Execute && mcp_indexed_mode {
+        specs.push(load_mcp_tools_spec());
+    }
+    // Tambahkan meta-tool `activate_toolset` bila masih ada toolset non-MCP tersembunyi di registry.
+    let total_eligible = match mode {
+        TurnMode::Plan => registry.specs_where(is_read_only).len(),
+        TurnMode::Execute => registry
+            .names()
+            .iter()
+            .filter(|n| !mcp_indexed_mode || !n.starts_with("mcp__"))
+            .count(),
+    };
+    if specs.len() < total_eligible {
+        specs.push(activate_toolset_spec());
+    }
+    specs
+}
+
 /// Susun daftar `ToolSpec` ramping yang benar-benar dikirim ke provider berdasarkan `active_toolsets`.
 pub fn active_tool_specs(
     registry: &Registry,
     active_toolsets: &HashSet<String>,
     mode: TurnMode,
 ) -> Vec<ToolSpec> {
-    let mut specs = match mode {
-        TurnMode::Plan => registry.specs_where(|n| is_read_only(n) && is_tool_active(n, active_toolsets)),
-        TurnMode::Execute => registry.specs_where(|n| is_tool_active(n, active_toolsets)),
-    };
-    // Tambahkan meta-tool `activate_toolset` bila masih ada toolset tersembunyi di registry.
-    let total_eligible = match mode {
-        TurnMode::Plan => registry.specs_where(is_read_only).len(),
-        TurnMode::Execute => registry.names().len(),
-    };
-    if specs.len() < total_eligible {
-        specs.push(activate_toolset_spec());
-    }
-    specs
+    active_tool_specs_with_mcp(registry, active_toolsets, &HashSet::new(), mode)
 }
 
 /// Ringkasan 1 baris toolset yang tersedia untuk disisipkan murah ke system prompt (~50 token).

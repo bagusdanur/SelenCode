@@ -418,6 +418,9 @@ fn config_save_load_and_direct_api_key_fallback() {
         routing: Default::default(),
         sandbox: Default::default(),
         hooks: Vec::new(),
+        guard: Default::default(),
+        aux: Default::default(),
+        tool_budget: Default::default(),
     };
     save_to(&cfg, &path).unwrap();
     let loaded = load_from(&path).unwrap();

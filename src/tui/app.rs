@@ -40,16 +40,41 @@ pub struct TranscriptLine {
     /// Khusus baris Tool: nama tool untuk mencocokkan ToolStart/ToolDone.
     pub tool_name: Option<String>,
     pub tool_state: Option<ToolState>,
+    /// Cache layout per-pesan (Bagian A — ringan di laptop kentang):
+    /// mencegah re-parsing Markdown & wrapping ulang seluruh transkrip tiap frame/ketikan!
+    pub cached_width: u16,
+    pub cached_details: bool,
+    pub cached_text_len: usize,
+    pub cached_tool_state: Option<ToolState>,
+    pub cached_has_leading_blank: bool,
+    pub cached_prev_assistant: bool,
+    pub cached_lines: Vec<Line<'static>>,
+    pub cached_wrapped_rows: usize,
 }
 
 impl TranscriptLine {
-    fn simple(kind: LineKind, text: String) -> Self {
+    pub fn simple(kind: LineKind, text: String) -> Self {
         Self {
             kind,
             text,
             tool_name: None,
             tool_state: None,
+            cached_width: 0,
+            cached_details: false,
+            cached_text_len: usize::MAX,
+            cached_tool_state: None,
+            cached_has_leading_blank: false,
+            cached_prev_assistant: false,
+            cached_lines: Vec::new(),
+            cached_wrapped_rows: 0,
         }
+    }
+
+    pub fn with_tool(text: String, tool_name: Option<String>, tool_state: Option<ToolState>) -> Self {
+        let mut s = Self::simple(LineKind::Tool, text);
+        s.tool_name = tool_name;
+        s.tool_state = tool_state;
+        s
     }
 }
 
@@ -856,12 +881,11 @@ impl App {
                 } else {
                     format!("{name} {args}")
                 };
-                self.lines.push(TranscriptLine {
-                    kind: LineKind::Tool,
+                self.lines.push(TranscriptLine::with_tool(
                     text,
-                    tool_name: Some(name),
-                    tool_state: Some(ToolState::Pending),
-                });
+                    Some(name),
+                    Some(ToolState::Pending),
+                ));
             }
             UiEvent::ToolDone {
                 name,
@@ -894,12 +918,11 @@ impl App {
                     None => {
                         // ToolDone tanpa ToolStart (tidak terjadi di loop
                         // sekarang) — tetap tampilkan sebagai baris tool.
-                        self.lines.push(TranscriptLine {
-                            kind: LineKind::Tool,
-                            text: format!("{name} — {summary}"),
-                            tool_name: Some(name),
-                            tool_state: Some(state),
-                        });
+                        self.lines.push(TranscriptLine::with_tool(
+                            format!("{name} — {summary}"),
+                            Some(name),
+                            Some(state),
+                        ));
                     }
                 }
             }
@@ -1019,6 +1042,9 @@ impl App {
                     };
                     self.lines.push(TranscriptLine::simple(kind, text));
                 }
+            }
+            UiEvent::WorkspaceFilesLoaded(files) => {
+                self.workspace_files = files;
             }
             UiEvent::Error(text) => {
                 self.busy = false;

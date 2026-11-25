@@ -58,6 +58,10 @@ pub struct Ctx {
     pub sandbox: Arc<crate::sandbox::SandboxController>,
     /// Custom Hooks (`pre_tool` & `post_tool`) dari `selencode.toml`.
     pub hooks: Arc<crate::hooks::HookEngine>,
+    /// Pengaturan dedup, loop guard, & rem Self-correction (`[guard]`).
+    pub guard: crate::config::GuardCfg,
+    /// Pengaturan anggaran hasil tool (`[tool_budget]`: cap shell 40/60, spillover, turn budget).
+    pub tool_budget: crate::config::ToolBudgetCfg,
     /// Aktifkan review self-improvement otomatis pasca-giliran kompleks (ala Hermes).
     /// Default false di Ctx::new agar tes mock tidak memicu panggilan ekstra;
     /// Session::build mengisinya dari `cfg.agent.auto_skills` (default true).
@@ -87,6 +91,8 @@ impl Ctx {
             lsp_manager,
             sandbox: Arc::new(crate::sandbox::SandboxController::default()),
             hooks: Arc::new(crate::hooks::HookEngine::default()),
+            guard: crate::config::GuardCfg::default(),
+            tool_budget: crate::config::ToolBudgetCfg::default(),
             auto_skills: false,
             self_correct: false,
         }
@@ -97,6 +103,14 @@ impl Ctx {
     }
     pub fn with_hooks(mut self, hooks: Arc<crate::hooks::HookEngine>) -> Self {
         self.hooks = hooks;
+        self
+    }
+    pub fn with_guard(mut self, guard: crate::config::GuardCfg) -> Self {
+        self.guard = guard;
+        self
+    }
+    pub fn with_tool_budget(mut self, tool_budget: crate::config::ToolBudgetCfg) -> Self {
+        self.tool_budget = tool_budget;
         self
     }
     pub fn with_auto_skills(mut self, enabled: bool) -> Self {

@@ -7,10 +7,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::context::{
-    auto_outline, build_system_prompt, compact_messages, estimate_tokens, expand_at_mentions,
-    format_memories_section, needs_compaction, prune_old_tool_results,
+    analyze_token_breakdown, auto_outline, build_system_prompt, cap_dynamic_injection,
+    compact_messages_hermes, estimate_tokens, expand_at_mentions, format_memories_section,
+    head_tail_truncate, needs_compaction, prune_old_tool_results_with_archive,
+    session_archive_dir, spillover_if_needed,
 };
-use super::corrector::{LoopGuard, SelfCorrectState};
+use super::corrector::{LoopGuard, SelfCorrectState, ToolDedupCache};
 use super::plan::{is_read_only, TurnMode, PLAN_NOTE};
 use super::ui::UiEvent;
 
@@ -153,29 +155,49 @@ async fn run_turn_inner(
     ui: Option<mpsc::Sender<UiEvent>>,
     mode: TurnMode,
 ) -> Result<(String, Option<Usage>)> {
-    // Progressive Disclosure (Hermes-style toolsets):
-    // Hanya kirim Core Toolset + toolset yang cocok dengan intent/workspace, bukan seluruh 29 schema!
-    // Model dapat membuka toolset lain kapan saja lewat `activate_toolset`.
+    // Progressive Disclosure (Hermes-style toolsets + Tahap 6 MCP >15 on-demand index):
+    // Hanya kirim Core Toolset + toolset yang cocok dengan intent/workspace, bukan seluruh 29+ schema!
     let has_mcp = registry.names().iter().any(|n| n.starts_with("mcp__"));
     let mut active_toolsets =
         crate::tools::toolsets::select_initial_toolsets(user_prompt, &ctx.cwd, has_mcp, mode);
-    let mut tools = crate::tools::toolsets::active_tool_specs(registry, &active_toolsets, mode);
+    let mut loaded_mcp_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut tools = crate::tools::toolsets::active_tool_specs_with_mcp(
+        registry,
+        &active_toolsets,
+        &loaded_mcp_tools,
+        mode,
+    );
+    // Tahap 3 & Tahap 6: Bekukan System Prompt di awal sesi (prefix statis byte-identik sepanjang sesi,
+    // diikuti snapshot blok dinamis dibatasi <= dynamic_inject_max_tokens di bagian paling akhir).
     if messages.is_empty() {
         let mut sys = build_system_prompt(&ctx.cwd, &tools);
+        let mut dynamic_snapshot = String::new();
         let hint = crate::tools::toolsets::inactive_toolsets_hint(registry, &active_toolsets);
         if !hint.is_empty() {
-            sys.push('\n');
-            sys.push_str(&hint);
-            sys.push('\n');
+            dynamic_snapshot.push_str(&hint);
+            dynamic_snapshot.push('\n');
+        }
+        if let Some(mcp_idx) = crate::tools::toolsets::build_mcp_compact_index(registry) {
+            dynamic_snapshot.push_str(&mcp_idx);
+            dynamic_snapshot.push('\n');
         }
         if let Some(store) = &ctx.store {
             let cwd_str = ctx.cwd.to_string_lossy().to_string();
             if let Ok(mems) = store.list_memories(&cwd_str, 15) {
                 let mem_sec = format_memories_section(&mems);
                 if !mem_sec.is_empty() {
-                    sys.push_str(&mem_sec);
+                    dynamic_snapshot.push_str(&mem_sec);
                 }
             }
+        }
+        if !dynamic_snapshot.trim().is_empty() {
+            let capped = cap_dynamic_injection(
+                dynamic_snapshot.trim(),
+                ctx.tool_budget.dynamic_inject_max_tokens,
+            );
+            sys.push_str("\n--- Konteks Sesi (Snapshot Awal) ---\n");
+            sys.push_str(&capped);
+            sys.push('\n');
         }
         let sys_msg = Message::text(Role::System, sys);
         persist_message(ctx, &sys_msg);
@@ -253,25 +275,44 @@ async fn run_turn_inner(
         None
     };
     let mut loop_guard = LoopGuard::new();
-    let mut corrector = SelfCorrectState::new(turn_checkpoint_id);
+    let mut dedup = ToolDedupCache::new();
+    let sc_max = if ctx.guard.enabled {
+        ctx.guard.max_self_correct_rounds
+    } else {
+        super::corrector::MAX_REPAIR_ATTEMPTS
+    };
+    let mut corrector = SelfCorrectState::new(turn_checkpoint_id).with_max_attempts(sc_max);
+    let sid_for_archive = ctx
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "ephemeral".to_string());
+    let prune_dir = session_archive_dir("pruned", &sid_for_archive);
+    let mut turn_tool_chars_used = 0usize;
+    let scaled_turn_budget = (ctx.tool_budget.turn_budget_chars as u128
+        * (ctx.context_limit_tokens.max(20_000) as u128)
+        / 100_000)
+        .clamp(24_000, 180_000) as usize;
+    let mut last_step_deduped = 0usize;
 
     for step in 0..max_steps {
-        // Diet konteks (Live-Test P1): padatkan hasil tool lama sebelum mengirim ulang ke provider.
-        prune_old_tool_results(messages, 2);
-        // Compaction konteks: ringkas riwayat lama bila estimasi token melewati ambang batas.
+        // Tahap 1 — Prune hasil tool lama (>200 char di luar 20 pesan terakhir) + arsip ke file (TANPA LLM).
+        let pruned_now = prune_old_tool_results_with_archive(messages, &prune_dir, 20);
+        // Tahap 5 — Kompresi dua tahap ala Hermes: hanya ringkas jika MASIH > 50% sesudah Tahap 1 prune!
         if needs_compaction(messages, ctx.context_limit_tokens) {
             match &ui {
                 Some(tx) => {
                     let _ = tx
-                        .send(UiEvent::Info("compaction konteks dijalankan".into()))
+                        .send(UiEvent::Info("compaction dua tahap (Hermes) dijalankan".into()))
                         .await;
                 }
-                None => eprintln!("[selen] compaction konteks dijalankan"),
+                None => eprintln!("[selen] compaction dua tahap (Hermes) dijalankan"),
             }
-            *messages = compact_messages(messages);
+            *messages = compact_messages_hermes(messages);
         }
+        // Tahap 0 — Instrumentasi rincian estimasi token per komponen sebelum panggilan API.
+        let breakdown = analyze_token_breakdown(messages, &tools, registry.names().len());
         if let Some(tx) = &ui {
-            let est = estimate_tokens(messages);
+            let est = breakdown.total_tokens();
             let pct = calc_context_pct(est, ctx.context_limit_tokens);
             let _ = tx
                 .send(UiEvent::ContextInfo {
@@ -326,6 +367,27 @@ async fn run_turn_inner(
             println!();
         }
         persist_usage(ctx, provider.model_name(), reply.usage);
+        // Tahap 0 — Catat rincian token per panggilan API ke SQLite `call_token_metrics`.
+        if let (Some(store), Some(sid)) = (&ctx.store, &ctx.session_id) {
+            let (act_in, act_out) = reply
+                .usage
+                .map(|u| (u.input_tokens, u.output_tokens))
+                .unwrap_or((0, 0));
+            let _ = store.record_call_token_metric(&crate::store::CallTokenMetric {
+                session_id: sid.clone(),
+                model: provider.model_name().to_string(),
+                est_system_tokens: breakdown.system_tokens,
+                est_tools_tokens: breakdown.tools_tokens,
+                est_history_tokens: breakdown.conversation_tokens,
+                est_tool_results_tokens: breakdown.tool_results_tokens,
+                actual_input_tokens: act_in,
+                actual_output_tokens: act_out,
+                active_tools_count: breakdown.active_tools,
+                pruned_count: pruned_now,
+                deduped_count: last_step_deduped,
+            });
+        }
+        last_step_deduped = 0;
         if let Some(u) = reply.usage {
             turn_usage.input_tokens += u.input_tokens;
             turn_usage.output_tokens += u.output_tokens;
@@ -482,9 +544,10 @@ async fn run_turn_inner(
                             activated.push(ts);
                         }
                     }
-                    tools = crate::tools::toolsets::active_tool_specs(
+                    tools = crate::tools::toolsets::active_tool_specs_with_mcp(
                         registry,
                         &active_toolsets,
+                        &loaded_mcp_tools,
                         mode,
                     );
                     let active_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
@@ -494,6 +557,38 @@ async fn run_turn_inner(
                             activated,
                             active_names.len(),
                             active_names.join(", ")
+                        ),
+                        false,
+                    )
+                } else if call.name == crate::tools::toolsets::LOAD_MCP_TOOLS_NAME {
+                    let req_names: Vec<String> = call
+                        .args
+                        .get("names")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                                .filter(|s| !s.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut loaded = Vec::new();
+                    for nm in req_names {
+                        if registry.get(&nm).is_some() && loaded_mcp_tools.insert(nm.clone()) {
+                            loaded.push(nm);
+                        }
+                    }
+                    tools = crate::tools::toolsets::active_tool_specs_with_mcp(
+                        registry,
+                        &active_toolsets,
+                        &loaded_mcp_tools,
+                        mode,
+                    );
+                    (
+                        format!(
+                            "Skema penuh MCP dimuat ({}): {}",
+                            loaded.len(),
+                            loaded.join(", ")
                         ),
                         false,
                     )
@@ -508,6 +603,78 @@ async fn run_turn_inner(
                         ),
                         true,
                     )
+                } else if ctx.guard.enabled {
+                    if let Some(dedup_stub) = dedup.check_hit(&call.name, &call.args, &ctx.cwd) {
+                        last_step_deduped += 1;
+                        (dedup_stub, false)
+                    } else {
+                        let args_str = call.args.to_string();
+                        let pre_res = if !ctx.hooks.is_empty() {
+                            ctx.hooks
+                                .run_pre_tool(&call.name, &args_str, &ctx.cwd, &ctx.sandbox)
+                                .await
+                        } else {
+                            Ok(Vec::new())
+                        };
+                        match pre_res {
+                            Err(block_err) => (redact_secrets(&format!("ERROR: {block_err}")), true),
+                            Ok(_pre_notes) => {
+                                let (mut out_txt, err_flag) = match registry.get(&call.name) {
+                                    Some(tool) => match tool.run(call.args.clone(), ctx).await {
+                                        Ok(out) => {
+                                            let redacted = redact_secrets(&out);
+                                            let shaped = shape_tool_output(
+                                                &sid_for_archive,
+                                                &call.id,
+                                                &call.name,
+                                                redacted,
+                                                &ctx.tool_budget,
+                                                &mut turn_tool_chars_used,
+                                                scaled_turn_budget,
+                                            );
+                                            (shaped, false)
+                                        }
+                                        Err(e) => (redact_secrets(&format!("ERROR: {e}")), true),
+                                    },
+                                    None => (format!("ERROR: tool '{}' tidak dikenal", call.name), true),
+                                };
+                                if !err_flag {
+                                    if matches!(
+                                        call.name.as_str(),
+                                        "write_file" | "edit_file" | "lsp_rename"
+                                    ) && !out_txt.starts_with("Ditolak user")
+                                    {
+                                        let p = call.args.get("path").and_then(|v| v.as_str());
+                                        dedup.invalidate_on_edit(p);
+                                    } else {
+                                        dedup.record_success(
+                                            &call.name,
+                                            &call.args,
+                                            &out_txt,
+                                            &ctx.cwd,
+                                        );
+                                    }
+                                }
+                                if !ctx.hooks.is_empty() {
+                                    let post_notes = ctx
+                                        .hooks
+                                        .run_post_tool(
+                                            &call.name,
+                                            &args_str,
+                                            err_flag,
+                                            &ctx.cwd,
+                                            &ctx.sandbox,
+                                        )
+                                        .await;
+                                    if !post_notes.is_empty() {
+                                        out_txt.push_str("\n\n");
+                                        out_txt.push_str(&post_notes.join("\n"));
+                                    }
+                                }
+                                (out_txt, err_flag)
+                            }
+                        }
+                    }
                 } else {
                     let args_str = call.args.to_string();
                     let pre_res = if !ctx.hooks.is_empty() {
@@ -522,7 +689,19 @@ async fn run_turn_inner(
                         Ok(_pre_notes) => {
                             let (mut out_txt, err_flag) = match registry.get(&call.name) {
                                 Some(tool) => match tool.run(call.args.clone(), ctx).await {
-                                    Ok(out) => (redact_secrets(&truncate(out)), false),
+                                    Ok(out) => {
+                                        let redacted = redact_secrets(&out);
+                                        let shaped = shape_tool_output(
+                                            &sid_for_archive,
+                                            &call.id,
+                                            &call.name,
+                                            redacted,
+                                            &ctx.tool_budget,
+                                            &mut turn_tool_chars_used,
+                                            scaled_turn_budget,
+                                        );
+                                        (shaped, false)
+                                    }
                                     Err(e) => (redact_secrets(&format!("ERROR: {e}")), true),
                                 },
                                 None => (format!("ERROR: tool '{}' tidak dikenal", call.name), true),
@@ -614,6 +793,21 @@ async fn run_turn_inner(
         persist_message(ctx, &tool_msg);
         messages.push(tool_msg);
 
+        // Tahap 2: deteksi stagnasi sebagai pemicu berhenti (bukan sekadar log) bila guard aktif.
+        if ctx.guard.enabled && loop_guard.is_stagnated() {
+            let stop_note = "Stagnasi beruntun terdeteksi — giliran dihentikan agar tidak memboroskan token.";
+            match &ui {
+                Some(tx) => {
+                    let _ = tx.send(UiEvent::Info(stop_note.into())).await;
+                }
+                None => eprintln!("[selen] {stop_note}"),
+            }
+            if last_text.trim().is_empty() {
+                last_text = stop_note.to_string();
+            }
+            break;
+        }
+
         if step + 1 == max_steps {
             match &ui {
                 Some(tx) => {
@@ -661,6 +855,46 @@ fn summarize(s: &str, max: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// Tahap 4 — Terapkan anggaran hasil tool:
+/// 1. Spillover ke file bila hasil tunggal > `spillover_chars` (default 50.000 char).
+/// 2. Budget agregat per turn: bila `turn_tool_chars_used` akan melampaui `turn_budget`, spill hasil besar duluan.
+/// 3. Khusus `run_shell`: potong 40% kepala + 60% ekor hingga `shell_cap_chars`.
+/// 4. Tool lain: potong aman di batas 16KB.
+fn shape_tool_output(
+    session_id: &str,
+    call_id: &str,
+    tool_name: &str,
+    redacted: String,
+    budget: &crate::config::ToolBudgetCfg,
+    turn_tool_chars_used: &mut usize,
+    turn_budget: usize,
+) -> String {
+    let char_len = redacted.chars().count();
+    if let Some(spilled) = spillover_if_needed(
+        session_id,
+        call_id,
+        tool_name,
+        &redacted,
+        budget.spillover_chars,
+    ) {
+        *turn_tool_chars_used += spilled.chars().count();
+        return spilled;
+    }
+    if *turn_tool_chars_used + char_len > turn_budget && char_len > 2_000 {
+        if let Some(spilled) = spillover_if_needed(session_id, call_id, tool_name, &redacted, 1) {
+            *turn_tool_chars_used += spilled.chars().count();
+            return spilled;
+        }
+    }
+    let shaped = if tool_name == "run_shell" {
+        head_tail_truncate(&redacted, budget.shell_cap_chars.max(1_000))
+    } else {
+        truncate(redacted)
+    };
+    *turn_tool_chars_used += shaped.chars().count();
+    shaped
 }
 
 /// Potong hasil tool agar konteks tidak meledak (16KB, aman UTF-8).

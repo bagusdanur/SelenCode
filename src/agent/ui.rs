@@ -80,6 +80,8 @@ pub enum UiEvent {
         preview_lines: Vec<(String, String)>,
         total_messages: usize,
     },
+    /// Daftar file workspace selesai dipindai di latar belakang untuk `@file` autocomplete (non-blocking startup).
+    WorkspaceFilesLoaded(Vec<String>),
     /// Giliran gagal dengan error.
     Error(String),
 }

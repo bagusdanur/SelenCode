@@ -1619,11 +1619,24 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
         let est = bd.total_tokens();
         let lim = self.ctx.context_limit_tokens;
         let pct = calc_context_pct(est, lim);
+        let metrics_line = match self.store.session_token_metrics(&self.session_id) {
+            Ok(m) if m.calls > 0 => format!(
+                "\n> metrik | {} call · avg sys ~{} / tools ~{} / chat ~{} / res ~{} | pruned {} · dedup {}",
+                m.calls,
+                m.avg_system_tokens,
+                m.avg_tools_tokens,
+                m.avg_history_tokens,
+                m.avg_tool_results_tokens,
+                m.total_pruned,
+                m.total_deduped
+            ),
+            _ => String::new(),
+        };
         format!(
             "# Info Sesi Aktif\n\
              * sesi | {} | {}\n\
              > provider | {} | model {} (kind {})\n\
-             > konteks | {} / {} ({pct}%) | sys ~{} · tools ~{} ({}/{}) · chat ~{} · tool_res ~{}\n\
+             > konteks | {} / {} ({pct}%) | sys ~{} · tools ~{} ({}/{}) · chat ~{} · tool_res ~{}{metrics_line}\n\
              > folder | {} | {} pesan di memori",
             self.session_id.chars().take(12).collect::<String>(),
             self.usage_line(),

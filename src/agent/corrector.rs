@@ -9,15 +9,171 @@
 //!    verifikasi & perbaikan terbatas (`MAX_REPAIR_ATTEMPTS = 3`) sebelum
 //!    agent mengklaim selesai.
 
-use serde_json::Value;
-use std::collections::HashMap;
+use serde_json::{Map, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 /// Batas pengulangan panggilan tool dengan argumen persis sama sebelum peringatan loop.
 pub const MAX_IDENTICAL_CALLS: usize = 3;
 /// Batas error tool beruntun tanpa kemajuan sebelum peringatan stagnasi.
 pub const MAX_CONSECUTIVE_ERRORS: usize = 4;
-/// Batas siklus perbaikan/verifikasi otomatis per giliran agar tidak infinite loop.
+/// Batas siklus perbaikan/verifikasi otomatis default di struct (di runtime diatur `[guard]`, default 1).
 pub const MAX_REPAIR_ATTEMPTS: usize = 3;
+
+/// Kanonisasi nilai JSON (urutkan kunci objek secara alfabetis secara rekursif) agar
+/// `{"a":1,"b":2}` dan `{"b":2,"a":1}` menghasilkan fingerprint identik (Tahap 2).
+pub fn canonicalize_json(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut sorted: BTreeMap<&String, Value> = BTreeMap::new();
+            for (k, val) in map {
+                sorted.insert(k, canonicalize_json(val));
+            }
+            let mut out = Map::new();
+            for (k, val) in sorted {
+                out.insert(k.clone(), val);
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(canonicalize_json).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Fingerprint deterministik FNV-1a 64-bit atas nama tool + argumen JSON kanonis.
+pub fn canonical_tool_fingerprint(name: &str, args: &Value) -> u64 {
+    let canon = canonicalize_json(args).to_string();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in name.as_bytes().iter().chain(b"::".iter()).chain(canon.as_bytes()) {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn file_signature(cwd: &Path, rel: &str) -> Option<(u128, u64)> {
+    let p = crate::security::resolve_in_sandbox(cwd, Path::new(rel)).ok()?;
+    let meta = std::fs::metadata(&p).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some((mtime, meta.len()))
+}
+
+#[derive(Debug, Clone)]
+struct DedupRecord {
+    tool_name: String,
+    file_rel: Option<String>,
+    file_sig: Option<(u128, u64)>,
+    preview: String,
+}
+
+/// Cache deduplikasi panggilan tool identik yang SUDAH SUKSES dalam sesi/turn aktif (Tahap 2):
+/// - `read_file`: cek mtime/ukuran file — kalau belum berubah, kembalikan stub hemat token; kalau berubah, baca ulang!
+/// - `run_shell` & `verify_project`: dedup perintah identik yang baru saja sukses sejak edit file terakhir!
+#[derive(Debug, Default)]
+pub struct ToolDedupCache {
+    records: HashMap<u64, DedupRecord>,
+    pub dedup_hits: usize,
+}
+
+impl ToolDedupCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cek apakah panggilan ini bisa di-dedup. Mengembalikan `Some(stub)` bila identik & masih valid.
+    pub fn check_hit(&mut self, name: &str, args: &Value, cwd: &Path) -> Option<String> {
+        let fp = canonical_tool_fingerprint(name, args);
+        let rec = self.records.get(&fp)?.clone();
+        match name {
+            "read_file" => {
+                let rel = rec.file_rel.as_deref()?;
+                let cur_sig = file_signature(cwd, rel)?;
+                if rec.file_sig == Some(cur_sig) {
+                    self.dedup_hits += 1;
+                    return Some(format!(
+                        "[Dedup: `read_file` '{rel}' tidak berubah sejak pembacaan sebelumnya — gunakan isi sebelumnya tanpa membaca ulang. Cuplikan: {}]",
+                        rec.preview
+                    ));
+                }
+                // File berubah di disk -> hapus cache lama dan izinkan baca ulang beneran!
+                self.records.remove(&fp);
+                None
+            }
+            "run_shell" | "verify_project" => {
+                self.dedup_hits += 1;
+                Some(format!(
+                    "[Dedup: perintah `{name}` identik baru saja LULUS pada giliran ini tanpa perubahan file baru — tidak dijalankan ulang. Hasil sebelumnya: {}]",
+                    rec.preview
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Catat panggilan tool yang SUKSES agar panggilan identik berikutnya dapat di-dedup.
+    pub fn record_success(&mut self, name: &str, args: &Value, output: &str, cwd: &Path) {
+        if !matches!(name, "read_file" | "run_shell" | "verify_project") {
+            return;
+        }
+        if name == "run_shell" && !output.starts_with("exit code: 0") {
+            return;
+        }
+        if name == "verify_project"
+            && !output.contains("LULUS")
+            && !output.contains("verifikasi proyek otomatis dilewati")
+        {
+            return;
+        }
+        let fp = canonical_tool_fingerprint(name, args);
+        let (file_rel, file_sig) = if name == "read_file" {
+            let rel = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let sig = rel.as_deref().and_then(|r| file_signature(cwd, r));
+            (rel, sig)
+        } else {
+            (None, None)
+        };
+        let preview: String = output
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(100)
+            .collect();
+        self.records.insert(
+            fp,
+            DedupRecord {
+                tool_name: name.to_string(),
+                file_rel,
+                file_sig,
+                preview,
+            },
+        );
+    }
+
+    /// Invalidasi cache verifikasi/shell & file yang baru diedit agar perubahan baru tetap terverifikasi!
+    pub fn invalidate_on_edit(&mut self, edited_path: Option<&str>) {
+        self.records.retain(|_, rec| {
+            if matches!(rec.tool_name.as_str(), "run_shell" | "verify_project") {
+                return false;
+            }
+            if let (Some(ed), Some(ref f)) = (edited_path, &rec.file_rel) {
+                if ed == f {
+                    return false;
+                }
+            }
+            true
+        });
+    }
+}
 
 /// Hasil evaluasi `LoopGuard` setelah satu pemanggilan tool selesai.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,11 +201,14 @@ impl LoopWarning {
     }
 }
 
-/// Pendeteksi pengulangan panggilan tool & stagnasi error dalam satu giliran agent.
+/// Pendeteksi pengulangan panggilan tool, kegagalan berulang, & stagnasi error dalam satu giliran agent.
 #[derive(Debug, Default)]
 pub struct LoopGuard {
-    call_counts: HashMap<String, usize>,
+    call_counts: HashMap<u64, usize>,
+    identical_fail_counts: HashMap<u64, usize>,
+    tool_fail_counts: HashMap<String, usize>,
     consecutive_errors: usize,
+    stagnated: bool,
 }
 
 impl LoopGuard {
@@ -57,18 +216,40 @@ impl LoopGuard {
         Self::default()
     }
 
-    /// Catat satu eksekusi tool dan periksa apakah terjadi loop / stagnasi.
+    pub fn is_stagnated(&self) -> bool {
+        self.stagnated
+    }
+
+    /// Catat satu eksekusi tool dan periksa apakah terjadi loop / kegagalan berulang / stagnasi.
     pub fn record(&mut self, tool_name: &str, args: &Value, is_error: bool) -> LoopWarning {
-        let sig = format!("{tool_name}::{}", args);
-        let count = self.call_counts.entry(sig).or_insert(0);
+        let fp = canonical_tool_fingerprint(tool_name, args);
+        let count = self.call_counts.entry(fp).or_insert(0);
         *count += 1;
         let current_count = *count;
 
         if is_error {
             self.consecutive_errors += 1;
-        } else if matches!(tool_name, "edit_file" | "write_file" | "verify_project") {
-            // Perubahan file atau verifikasi sukses mereset hitungan stagnasi.
-            self.consecutive_errors = 0;
+            let id_fails = self.identical_fail_counts.entry(fp).or_insert(0);
+            *id_fails += 1;
+            let id_fail_now = *id_fails;
+
+            let t_fails = self.tool_fail_counts.entry(tool_name.to_string()).or_insert(0);
+            *t_fails += 1;
+            let t_fail_now = *t_fails;
+
+            if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                self.stagnated = true;
+                return LoopWarning::Stagnation {
+                    consecutive_errors: self.consecutive_errors,
+                };
+            }
+            // Tahap 2: peringatan pada 2x kegagalan identik ATAU 3x kegagalan tool yang sama.
+            if id_fail_now >= 2 || t_fail_now >= 3 {
+                return LoopWarning::RepeatedCall {
+                    name: tool_name.to_string(),
+                    count: id_fail_now.max(t_fail_now),
+                };
+            }
         } else {
             self.consecutive_errors = 0;
         }
@@ -77,11 +258,6 @@ impl LoopGuard {
             return LoopWarning::RepeatedCall {
                 name: tool_name.to_string(),
                 count: current_count,
-            };
-        }
-        if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-            return LoopWarning::Stagnation {
-                consecutive_errors: self.consecutive_errors,
             };
         }
         LoopWarning::None
@@ -133,14 +309,29 @@ fn is_code_file(rel: &str) -> bool {
 }
 
 /// State pelacakan self-correction dalam satu giliran eksekusi agent.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SelfCorrectState {
     pub edited_files: Vec<String>,
     pub edited_code_file: bool,
     pub verified_after_last_edit: bool,
     pub last_verify_passed: Option<bool>,
     pub repair_attempts: usize,
+    pub max_attempts: usize,
     pub checkpoint_id: Option<usize>,
+}
+
+impl Default for SelfCorrectState {
+    fn default() -> Self {
+        Self {
+            edited_files: Vec::new(),
+            edited_code_file: false,
+            verified_after_last_edit: false,
+            last_verify_passed: None,
+            repair_attempts: 0,
+            max_attempts: MAX_REPAIR_ATTEMPTS,
+            checkpoint_id: None,
+        }
+    }
 }
 
 impl SelfCorrectState {
@@ -149,6 +340,11 @@ impl SelfCorrectState {
             checkpoint_id,
             ..Self::default()
         }
+    }
+
+    pub fn with_max_attempts(mut self, max_attempts: usize) -> Self {
+        self.max_attempts = max_attempts;
+        self
     }
 
     /// Perbarui state berdasarkan hasil eksekusi 1 tool.
@@ -220,7 +416,12 @@ impl SelfCorrectState {
     ///   atau batas percobaan perbaikan sudah tercapai (agar agent melaporkan kondisi
     ///   secara jujur, bukan looping selamanya).
     pub fn completion_gate(&mut self, remaining_steps: usize) -> Option<String> {
-        if !self.edited_code_file || remaining_steps < 2 || self.repair_attempts >= MAX_REPAIR_ATTEMPTS {
+        let cap = self.max_attempts;
+        if !self.edited_code_file || remaining_steps < 2 || self.repair_attempts >= cap {
+            return None;
+        }
+        // Tahap 2: jika verifikasi sudah LULUS setelah edit terakhir, JANGAN ulangi!
+        if self.verified_after_last_edit && self.last_verify_passed == Some(true) {
             return None;
         }
         let files = self.edited_files.join(", ");
@@ -228,19 +429,17 @@ impl SelfCorrectState {
             self.repair_attempts += 1;
             let attempt = self.repair_attempts;
             return Some(format!(
-                "[Self-Correction Gate {attempt}/{MAX_REPAIR_ATTEMPTS}] Kamu baru saja mengubah file kode ({files}), \
+                "[Self-Correction Gate {attempt}/{cap}] Kamu baru saja mengubah file kode ({files}), \
                  tetapi belum menjalankan verifikasi sesudah edit terakhir. \
-                 Jalankan `verify_project` (atau `run_shell` test/check yang relevan) sekarang untuk memastikan perubahan tidak menimbulkan error, \
-                 lalu perbaiki jika ada kegagalan sebelum melaporkan hasil akhir."
+                 Jalankan 1 perintah verifikasi paling langsung (`verify_project` atau test yang sudah ada) SEKALI saja, lalu berhenti jika lulus."
             ));
         }
         if self.last_verify_passed == Some(false) {
             self.repair_attempts += 1;
             let attempt = self.repair_attempts;
             return Some(format!(
-                "[Self-Correction Gate {attempt}/{MAX_REPAIR_ATTEMPTS}] Verifikasi terakhir pada perubahan ({files}) masih GAGAL. \
-                 Analisis error secara teliti, perbaiki dengan perubahan seminimal mungkin, lalu jalankan ulang verifikasi. \
-                 Jika masalah memang tidak dapat diselesaikan di lingkungan ini, jelaskan penyebab sebenarnya secara jujur tanpa mengklaim berhasil."
+                "[Self-Correction Gate {attempt}/{cap}] Verifikasi terakhir pada perubahan ({files}) masih GAGAL. \
+                 Analisis error secara teliti, perbaiki dengan perubahan seminimal mungkin, lalu verifikasi ulang sekali."
             ));
         }
         None

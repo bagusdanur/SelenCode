@@ -205,6 +205,8 @@ impl Session {
             .with_self_correct(cfg.agent.self_correct)
             .with_sandbox(sandbox)
             .with_hooks(hooks)
+            .with_guard(cfg.guard.clone())
+            .with_tool_budget(cfg.tool_budget.clone())
             .with_store(store.clone(), session_id.clone());
         // P2.2: subagent `delegate` & `orchestrate` berbagi handle `shared_provider`
         // sehingga ganti provider/model lewat `/model` otomatis memperbarui subagent juga!
