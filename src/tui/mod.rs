@@ -91,6 +91,8 @@ pub enum TuiCommand {
     Rollback(Option<String>),
     Verify(Option<String>),
     Index(Option<String>),
+    Jobs(Option<String>),
+    Route(Option<String>),
     Memory(Option<String>),
     Skills(Option<String>),
     UseSkill(Option<String>),
@@ -1704,6 +1706,12 @@ fn submit(
         }
         SlashCommand::Index(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Index(arg));
+        }
+        SlashCommand::Jobs(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Jobs(arg));
+        }
+        SlashCommand::Route(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Route(arg));
         }
         SlashCommand::Memory(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Memory(arg));

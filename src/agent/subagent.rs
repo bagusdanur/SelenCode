@@ -51,6 +51,7 @@ pub async fn run_subagent(
         plan_state: Arc::new(Mutex::new(Vec::<PlanStep>::new())),
         undo_stack: parent_ctx.undo_stack.clone(),
         repo_index: parent_ctx.repo_index.clone(),
+        bg_manager: parent_ctx.bg_manager.clone(),
         auto_skills: false,
         self_correct: false,
     };

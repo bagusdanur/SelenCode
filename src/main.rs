@@ -13,6 +13,7 @@ use selencode::config::{self, Config, ProviderCfg};
 use selencode::providers::anthropic::AnthropicProvider;
 use selencode::providers::gemini::GeminiProvider;
 use selencode::providers::openai::{fetch_models_with_context, OpenAiProvider};
+use selencode::providers::router::{DynamicRouterProvider, ModelRoute, RouterTelemetry, TaskKind};
 use selencode::providers::{Message, Provider, Role, UnconfiguredProvider};
 use selencode::repl::{
     classify_key_spec, help_menu_markup, parse_model_action, parse_provider_action,
@@ -145,6 +146,92 @@ fn make_provider(
     }
 }
 
+/// Rakit `DynamicRouterProvider` vendor-independen (primary + fallback + task routes + telemetri).
+fn make_routed_provider(
+    cfg: &Config,
+    primary_name: &str,
+    primary_cfg: &ProviderCfg,
+    primary_key: &str,
+    telemetry: Arc<std::sync::Mutex<RouterTelemetry>>,
+) -> Result<Arc<dyn Provider>> {
+    let mut routes: Vec<ModelRoute> = Vec::new();
+    let primary_prov = make_provider(cfg, primary_name, primary_cfg, primary_key)?;
+    routes.push(ModelRoute::new(
+        primary_name.to_string(),
+        primary_cfg.model.clone(),
+        primary_prov,
+        primary_cfg.context_limit,
+        primary_cfg.price_in,
+        primary_cfg.price_out,
+        true,
+    ));
+
+    let push_spec = |routes: &mut Vec<ModelRoute>, spec: &str| {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return;
+        }
+        let (pname, model_override) = match spec.split_once(':') {
+            Some((p, m)) if !p.trim().is_empty() && !m.trim().is_empty() => {
+                (p.trim(), Some(m.trim()))
+            }
+            _ => (spec, None),
+        };
+        let Ok((resolved_name, mut pcfg, key)) = cfg.resolve_provider(Some(pname)) else {
+            return;
+        };
+        if let Some(m) = model_override {
+            pcfg.model = m.to_string();
+        }
+        let id = format!("{resolved_name}:{}", pcfg.model);
+        if routes.iter().any(|r| r.id == id) {
+            return;
+        }
+        if let Ok(prov) = make_provider(cfg, &resolved_name, &pcfg, &key) {
+            routes.push(ModelRoute::new(
+                resolved_name,
+                pcfg.model,
+                prov,
+                pcfg.context_limit,
+                pcfg.price_in,
+                pcfg.price_out,
+                false,
+            ));
+        }
+    };
+
+    for fb in &cfg.routing.fallbacks {
+        push_spec(&mut routes, fb);
+    }
+    for target in cfg.routing.task_routes.values() {
+        push_spec(&mut routes, target);
+    }
+    if cfg.routing.auto {
+        // Tambahkan model tersimpan lain di provider aktif agar auto-routing bisa membedakan
+        // model cepat/hemat untuk ringkasan vs model kuat untuk coding/debugging.
+        for m in primary_cfg.effective_models() {
+            if m != primary_cfg.model {
+                push_spec(&mut routes, &format!("{primary_name}:{m}"));
+            }
+        }
+        let mut other_provs: Vec<&String> = cfg.providers.keys().collect();
+        other_provs.sort();
+        for pname in other_provs {
+            if pname != primary_name {
+                push_spec(&mut routes, pname);
+            }
+        }
+    }
+
+    Ok(Arc::new(DynamicRouterProvider::new(
+        routes,
+        cfg.routing.auto,
+        cfg.routing.task_routes.clone(),
+        cfg.routing.max_retries,
+        telemetry,
+    )))
+}
+
 struct Session {
     cfg: Config,
     provider_name: String,
@@ -165,6 +252,8 @@ struct Session {
     /// True bila belum ada provider/API key yang siap -> langsung buka Wizard `/setup`.
     needs_setup: bool,
     setup_reason: Option<String>,
+    /// Telemetri latensi, biaya, retry, fallback, & error Dynamic Model Routing (Tahap 3).
+    router_telemetry: Arc<std::sync::Mutex<RouterTelemetry>>,
 }
 
 impl Session {
@@ -191,10 +280,11 @@ impl Session {
         } else {
             config::load()?
         };
+        let router_telemetry = Arc::new(std::sync::Mutex::new(RouterTelemetry::default()));
         let (name, pcfg, provider, needs_setup, setup_reason) =
             match cfg.resolve_provider(provider_name) {
                 Ok((n, p, key)) => {
-                    let prov = make_provider(&cfg, &n, &p, &key)?;
+                    let prov = make_routed_provider(&cfg, &n, &p, &key, router_telemetry.clone())?;
                     (n, p, prov, false, None)
                 }
                 Err(e) if allow_unconfigured => {
@@ -305,6 +395,7 @@ impl Session {
             model_context_cache: HashMap::new(),
             needs_setup,
             setup_reason,
+            router_telemetry,
         })
     }
 
@@ -375,7 +466,13 @@ impl Session {
     /// Ganti provider aktif (perintah /model <nama>).
     fn switch_provider(&mut self, name: &str) -> Result<()> {
         let (_n, pcfg, api_key) = self.cfg.resolve_provider(Some(name))?;
-        let provider = make_provider(&self.cfg, name, &pcfg, &api_key)?;
+        let provider = make_routed_provider(
+            &self.cfg,
+            name,
+            &pcfg,
+            &api_key,
+            self.router_telemetry.clone(),
+        )?;
         self.provider = provider;
         self.provider_name = name.to_string();
         self.pcfg = pcfg;
@@ -1448,6 +1545,230 @@ impl Session {
         Ok(idx.format_status_card(arg))
     }
 
+    fn handle_jobs(&self, arg: Option<&str>) -> Result<String> {
+        let Some(raw) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            return Ok(self.ctx.bg_manager.format_jobs_card());
+        };
+        if let Some(rest) = raw
+            .strip_prefix("stop ")
+            .or_else(|| raw.strip_prefix("kill "))
+        {
+            let target = rest.trim();
+            if target.eq_ignore_ascii_case("all") {
+                let n = self.ctx.bg_manager.stop_all();
+                return Ok(format!(
+                    "# Proses Background Dihentikan\n* dihentikan | {n} proses | semua job aktif milik SelenCode dihentikan"
+                ));
+            }
+            let snap = self.ctx.bg_manager.stop(target)?;
+            return Ok(format!(
+                "# Proses Background Dihentikan\n* {} | {} | {}",
+                snap.id,
+                snap.state.label(),
+                snap.command
+            ));
+        }
+        if let Some(rest) = raw
+            .strip_prefix("output ")
+            .or_else(|| raw.strip_prefix("log "))
+            .or_else(|| raw.strip_prefix("logs "))
+        {
+            let target = rest.trim();
+            let (snap, out) = self.ctx.bg_manager.output(target, 40, 8192)?;
+            let mut card = format!(
+                "# Log {} ({})\n> perintah | {} | durasi {}s\n---\n",
+                snap.id,
+                snap.state.label(),
+                snap.command,
+                snap.elapsed_secs
+            );
+            if out.trim().is_empty() {
+                card.push_str("! (belum ada output)\n");
+            } else {
+                for line in out.lines().take(40) {
+                    card.push_str(line);
+                    card.push('\n');
+                }
+            }
+            return Ok(card);
+        }
+        Ok(self.ctx.bg_manager.format_jobs_card())
+    }
+
+    fn handle_route(&mut self, arg: Option<&str>) -> Result<String> {
+        let Some(raw) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let mode = if self.cfg.routing.auto {
+                "auto (dinamis sesuai jenis tugas)"
+            } else {
+                "manual (hormati model pilihan user + fallback & retry)"
+            };
+            let fb = if self.cfg.routing.fallbacks.is_empty() {
+                "(belum diatur)".to_string()
+            } else {
+                self.cfg.routing.fallbacks.join(" -> ")
+            };
+            let mut out = format!(
+                "# Dynamic Model Routing & Telemetri\n\
+                 * mode | {mode} | retry maks {}\n\
+                 > primary | {}:{} | fallback: {fb}\n",
+                self.cfg.routing.max_retries, self.provider_name, self.pcfg.model
+            );
+            if !self.cfg.routing.task_routes.is_empty() {
+                out.push_str("---\n");
+                let mut pairs: Vec<(&String, &String)> = self.cfg.routing.task_routes.iter().collect();
+                pairs.sort_by(|a, b| a.0.cmp(b.0));
+                for (task, target) in pairs {
+                    out.push_str(&format!("> tugas {task} | {target} | aturan eksplisit\n"));
+                }
+            }
+            if let Ok(tel) = self.router_telemetry.lock() {
+                let metrics = tel.snapshot_routes();
+                if !metrics.is_empty() {
+                    out.push_str("---\n");
+                    for m in metrics.iter().take(6) {
+                        let cost = if m.has_cost_data {
+                            format!(" · ${:.4}", m.estimated_cost_usd)
+                        } else {
+                            String::new()
+                        };
+                        let cd = if m.in_cooldown() { " [cooldown]" } else { "" };
+                        out.push_str(&format!(
+                            "> {} | {} ok / {} err | avg {}ms · {}in/{}out{cost}{cd}\n",
+                            m.route_id,
+                            m.successes,
+                            m.errors,
+                            m.avg_latency_ms(),
+                            m.input_tokens,
+                            m.output_tokens
+                        ));
+                    }
+                }
+            }
+            out.push_str("---\n");
+            out.push_str("! Aktifkan auto:   /route auto on  (atau /route auto off)\n");
+            out.push_str("! Atur fallback:   /route fallback <prov1,prov2>  (atau /route fallback clear)\n");
+            out.push_str("! Atur per tugas:  /route set <coding/debugging/reasoning/review/summary> <prov[:model]>\n");
+            out.push_str("! Batas retry:     /route retries <0-3>");
+            return Ok(out);
+        };
+
+        if let Some(rest) = raw.strip_prefix("auto ") {
+            let val = rest.trim().to_ascii_lowercase();
+            let enabled = match val.as_str() {
+                "on" | "true" | "1" | "aktif" => true,
+                "off" | "false" | "0" | "manual" => false,
+                _ => anyhow::bail!("pakai `/route auto on` atau `/route auto off`"),
+            };
+            self.cfg.routing.auto = enabled;
+            let saved = config::save(&self.cfg)?;
+            if !self.needs_setup {
+                let pname = self.provider_name.clone();
+                let _ = self.switch_provider(&pname);
+            }
+            let st = if enabled { "AUTO AKTIF" } else { "MANUAL" };
+            return Ok(format!(
+                "# Mode Routing Diperbarui\n* routing | {st} | disimpan ke {}",
+                saved.display()
+            ));
+        }
+
+        if let Some(rest) = raw.strip_prefix("fallback ") {
+            let val = rest.trim();
+            if val.eq_ignore_ascii_case("clear") || val.eq_ignore_ascii_case("none") {
+                self.cfg.routing.fallbacks.clear();
+            } else {
+                self.cfg.routing.fallbacks = val
+                    .split([',', ' '])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+            }
+            let saved = config::save(&self.cfg)?;
+            if !self.needs_setup {
+                let pname = self.provider_name.clone();
+                let _ = self.switch_provider(&pname);
+            }
+            let disp = if self.cfg.routing.fallbacks.is_empty() {
+                "(kosong)".to_string()
+            } else {
+                self.cfg.routing.fallbacks.join(" -> ")
+            };
+            return Ok(format!(
+                "# Fallback Provider Diperbarui\n* fallbacks | {disp} | disimpan ke {}",
+                saved.display()
+            ));
+        }
+
+        if let Some(rest) = raw.strip_prefix("set ") {
+            let mut parts = rest.trim().splitn(2, char::is_whitespace);
+            let task_raw = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("").trim();
+            let task = TaskKind::parse(task_raw).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "jenis tugas '{task_raw}' tidak dikenal. Pilihan: coding, debugging, reasoning, review, summary"
+                )
+            })?;
+            if target.is_empty() {
+                anyhow::bail!("target kosong. Contoh: /route set debugging anthropic:claude-sonnet-4");
+            }
+            self.cfg
+                .routing
+                .task_routes
+                .insert(task.as_str().to_string(), target.to_string());
+            let saved = config::save(&self.cfg)?;
+            if !self.needs_setup {
+                let pname = self.provider_name.clone();
+                let _ = self.switch_provider(&pname);
+            }
+            return Ok(format!(
+                "# Aturan Tugas Diperbarui\n* {} | {target} | disimpan ke {}",
+                task.as_str(),
+                saved.display()
+            ));
+        }
+
+        if let Some(rest) = raw.strip_prefix("unset ").or_else(|| raw.strip_prefix("rm ")) {
+            let key = TaskKind::parse(rest.trim())
+                .map(|t| t.as_str().to_string())
+                .unwrap_or_else(|| rest.trim().to_ascii_lowercase());
+            if self.cfg.routing.task_routes.remove(&key).is_none() {
+                anyhow::bail!("aturan tugas '{key}' tidak ditemukan");
+            }
+            let saved = config::save(&self.cfg)?;
+            if !self.needs_setup {
+                let pname = self.provider_name.clone();
+                let _ = self.switch_provider(&pname);
+            }
+            return Ok(format!(
+                "# Aturan Tugas Dihapus\n> {key} | dihapus | disimpan ke {}",
+                saved.display()
+            ));
+        }
+
+        if let Some(rest) = raw.strip_prefix("retries ") {
+            let n: u8 = rest
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("jumlah retry harus angka 0..=3"))?;
+            self.cfg.routing.max_retries = n.min(3);
+            let saved = config::save(&self.cfg)?;
+            if !self.needs_setup {
+                let pname = self.provider_name.clone();
+                let _ = self.switch_provider(&pname);
+            }
+            return Ok(format!(
+                "# Batas Retry Diperbarui\n* max_retries | {} | disimpan ke {}",
+                self.cfg.routing.max_retries,
+                saved.display()
+            ));
+        }
+
+        anyhow::bail!(
+            "subperintah `/route {raw}` tidak dikenal. Ketik `/route` untuk melihat status & cara pakai."
+        )
+    }
+
     fn handle_memory(&self, arg: Option<&str>) -> Result<String> {
         let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
         let Some(arg) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
@@ -2048,6 +2369,22 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
+            TuiCommand::Jobs(arg) => match s.handle_jobs(arg.as_deref()) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::Route(arg) => match s.handle_route(arg.as_deref()) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
             TuiCommand::Memory(arg) => match s.handle_memory(arg.as_deref()) {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
@@ -2581,6 +2918,14 @@ async fn interactive_plain(cli: Cli, resume: bool) -> Result<()> {
                 Err(e) => eprintln!("[error] {e}"),
             },
             SlashCommand::Index(arg) => match s.handle_index(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Jobs(arg) => match s.handle_jobs(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Route(arg) => match s.handle_route(arg.as_deref()) {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
@@ -3188,6 +3533,18 @@ async fn handle_telegram_chat_message(
         }
         SlashCommand::Index(arg) => {
             let reply = s.handle_index(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Jobs(arg) => {
+            let reply = s.handle_jobs(arg.as_deref())?;
+            tg.send_long_message(chat_id, &strip_menu_markup(&reply))
+                .await?;
+            return Ok(());
+        }
+        SlashCommand::Route(arg) => {
+            let reply = s.handle_route(arg.as_deref())?;
             tg.send_long_message(chat_id, &strip_menu_markup(&reply))
                 .await?;
             return Ok(());

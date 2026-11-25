@@ -17,6 +17,52 @@ pub struct Config {
     /// Pengaturan Telegram Bot Gateway (`selen telegram` & `/telegram`).
     #[serde(default, skip_serializing_if = "TelegramCfg::is_empty")]
     pub telegram: TelegramCfg,
+    /// Pengaturan Dynamic Model Routing, Fallback Provider, & Retry (Tahap 3).
+    #[serde(default, skip_serializing_if = "RoutingCfg::is_empty")]
+    pub routing: RoutingCfg,
+}
+
+/// Konfigurasi Dynamic Model Routing (`[routing]` di selencode.toml, Tahap 3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingCfg {
+    /// true = aktifkan pemilihan model dinamis berbasis jenis tugas (coding/debugging/reasoning/review/summary).
+    /// false (default) = hormati pilihan model manual user, namun fallback + retry + metrik tetap aktif.
+    #[serde(default)]
+    pub auto: bool,
+    /// Daftar nama provider cadangan (atau `"provider:model"`) berurutan saat provider utama gagal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<String>,
+    /// Batas retry untuk error sementara (429/timeout/5xx), maks 3. Default: 1.
+    #[serde(default = "default_routing_retries")]
+    pub max_retries: u8,
+    /// Aturan rute eksplisit per jenis tugas (`coding`, `debugging`, `reasoning`, `review`, `summary`)
+    /// ke `"provider"` atau `"provider:model"`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub task_routes: HashMap<String, String>,
+}
+
+fn default_routing_retries() -> u8 {
+    1
+}
+
+impl Default for RoutingCfg {
+    fn default() -> Self {
+        Self {
+            auto: false,
+            fallbacks: Vec::new(),
+            max_retries: default_routing_retries(),
+            task_routes: HashMap::new(),
+        }
+    }
+}
+
+impl RoutingCfg {
+    pub fn is_empty(&self) -> bool {
+        !self.auto
+            && self.fallbacks.is_empty()
+            && self.max_retries == default_routing_retries()
+            && self.task_routes.is_empty()
+    }
 }
 
 /// Konfigurasi Telegram Bot Gateway (`[telegram]` di selencode.toml).
@@ -333,6 +379,7 @@ impl Config {
             shell: ShellCfg::default(),
             mcp_servers: Vec::new(),
             telegram: TelegramCfg::default(),
+            routing: RoutingCfg::default(),
         }
     }
 

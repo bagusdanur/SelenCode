@@ -1,3 +1,4 @@
+pub mod bg;
 pub mod delegate;
 pub mod file;
 pub mod git;
@@ -45,6 +46,8 @@ pub struct Ctx {
     /// Indeks repositori inkremental bersama untuk Smart Context Retrieval (Tahap 2).
     /// Kosong saat dibuat (tanpa I/O) dan diperbarui secara inkremental saat diminta.
     pub repo_index: Arc<std::sync::Mutex<crate::context_index::RepoIndex>>,
+    /// Manajer proses latar belakang milik SelenCode (Tahap 3: `bg_start`/`bg_output`/`bg_status`/`bg_stop`).
+    pub bg_manager: Arc<bg::BgManager>,
     /// Aktifkan review self-improvement otomatis pasca-giliran kompleks (ala Hermes).
     /// Default false di Ctx::new agar tes mock tidak memicu panggilan ekstra;
     /// Session::build mengisinya dari `cfg.agent.auto_skills` (default true).
@@ -69,6 +72,7 @@ impl Ctx {
             plan_state: Arc::new(std::sync::Mutex::new(Vec::new())),
             undo_stack: Arc::new(std::sync::Mutex::new(undo::UndoStack::default())),
             repo_index,
+            bg_manager: Arc::new(bg::BgManager::new()),
             auto_skills: false,
             self_correct: false,
         }
@@ -209,6 +213,10 @@ pub fn default_registry_with_shell(shell_cfg: &ShellCfg) -> Registry {
             shell_cfg.allowlist.clone(),
             shell_cfg.timeout_secs,
         )))
+        .register(Arc::new(bg::BgStart))
+        .register(Arc::new(bg::BgOutput))
+        .register(Arc::new(bg::BgStatus))
+        .register(Arc::new(bg::BgStop))
         .register(Arc::new(git::GitStatus))
         .register(Arc::new(git::GitDiff))
         .register(Arc::new(git::GitCommit))

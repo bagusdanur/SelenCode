@@ -31,6 +31,10 @@ pub enum SlashCommand {
     Verify(Option<String>),
     /// /index [query] atau /context [query] — lihat indeks repositori inkremental & uji pencarian konteks relevan.
     Index(Option<String>),
+    /// /jobs [output <id> | stop <id|all>] — kelola proses latar belakang milik SelenCode.
+    Jobs(Option<String>),
+    /// /route [auto on/off | fallback ... | set <tugas> <target> | retries <n>] — Dynamic Model Routing & telemetri.
+    Route(Option<String>),
     /// /memory | /memory add [kat] <teks> | /memory update <id> [kat] <teks> | /memory global [kat] <teks> | /memory rm <id>
     Memory(Option<String>),
     /// /skills | /skills auto | /skills review | /skills show <nama> | /skills rm <nama>
@@ -152,6 +156,18 @@ pub const COMMANDS: &[CommandDef] = &[
         cmd: "/index",
         args: "[query]",
         desc: "indeks repositori inkremental & uji smart context retrieval",
+        takes_args: true,
+    },
+    CommandDef {
+        cmd: "/jobs",
+        args: "[output <id> / stop <id>]",
+        desc: "kelola proses background SelenCode (server, watcher, build)",
+        takes_args: true,
+    },
+    CommandDef {
+        cmd: "/route",
+        args: "[auto / fallback / set / retries]",
+        desc: "routing model dinamis, fallback provider, & metrik latensi/biaya",
         takes_args: true,
     },
     CommandDef {
@@ -284,6 +300,8 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/rollback" => SlashCommand::Rollback(rest),
         "/verify" => SlashCommand::Verify(rest),
         "/index" | "/context" => SlashCommand::Index(rest),
+        "/jobs" | "/bg" => SlashCommand::Jobs(rest),
+        "/route" | "/routing" => SlashCommand::Route(rest),
         "/memory" => SlashCommand::Memory(rest),
         "/skills" => SlashCommand::Skills(rest),
         "/skill" => SlashCommand::Skill(rest),
