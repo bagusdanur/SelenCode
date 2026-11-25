@@ -70,11 +70,20 @@
 
 | Metrik | Baseline `v0.3.1` | Sesudah `v0.3.2` | Catatan |
 |---|---:|---:|---|
-| Ukuran binary Windows (`selen.exe`) | 13,12 MB (13.758.976 B) | *(diukur setelah rilis v0.3.2)* | Tambah `strip = true`, `codegen-units = 1`, `panic = "abort"` |
-| Startup `--plain` (warm) | 70,1 ms | *(diukur setelah rilis v0.3.2)* | Target < 300 ms |
+| Ukuran binary Windows (`selen.exe`) | 13,12 MB (13.758.976 B) | **13,23 MB (13.872.128 B)** | Naik +0,11 MB meski pindah ke `opt-level = 3` (kecepatan penuh) + Tahap 0–6 berkat `strip = true`, `lto = true`, `codegen-units = 1`, `panic = "abort"` |
+| Ukuran binary Linux / Termux arm64 | — | **14,46 MB / 13,10 MB** | Terbit di GitHub Release `v0.3.2` |
+| Startup `--version` (warm) | — | **52,2 ms** | Cold pertama setelah unduh: 2117,8 ms (scan Defender) |
+| Startup `--plain` (warm) | 70,1 ms | **75,7 ms** | Jauh di bawah target `< 300 ms`; scan `@file` workspace tidak lagi memblokir startup TUI |
+| `selen doctor` | 813,2 ms | **1192,6 ms** (7 OK · 1 Warn · 0 Fail) | Verifikasi lokal binary `v0.3.2` Windows x64 |
 | Idle TUI redraws / detik | 20 redraw/dtk (50ms loop) | **0 redraw/dtk** (dirty-flag) | CPU idle mendekati 0% |
-| Redraw 150 pesan (cache hit, CI) | Re-parse 150 pesan tiap frame | **100% cache hit + viewport slice** | Diverifikasi di `tests/hermes_full_and_perf.rs` |
+| Redraw 150 pesan (cache hit, CI) | Re-parse 150 pesan tiap frame | **100% cache hit + viewport slice** | Diverifikasi di `tests/hermes_full_and_perf.rs` (`< 50 ms`/frame di CI) |
 | Overhead awal tugas ringan (sistem + tool) | ~5.500+ token (v0.3.0) | **< 2.000 token** (~9 tool aktif) | Diverifikasi di `tests/token_efficiency_hermes.rs` |
+
+### Rilis & Verifikasi CI
+- **GitHub Release:** https://github.com/bagusdanur/SelenCode/releases/tag/v0.3.2
+- **CI Linux x64 (`Cargo Test & Visual Render`):** `success` (seluruh unit & integration tests, Clippy correctness, smoke test CLI, uji render TUI wide 116 & mobile 52).
+- **CI Windows x64 (`Cargo Test & Check`):** `success` (seluruh test Windows + build & smoke test `selen.exe`).
+- **Release Workflow (`v0.3.2`):** `success` — ketiga binary (`selen-linux-x64`, `selen-termux-arm64`, `selen-windows-x64.exe`) terbit & `selen update` lokal sukses naik ke `selen 0.3.2`.
 
 ### Catatan Kejujuran Uji Regresi Live LLM (Skenario A / B / E)
 - Lingkungan build/pengembang ini tidak memiliki API key live `SELENCODE_ROUTER_KEY` (key milik pemilik tidak diekspor ke shell ini), sehingga **angka regresi live terhadap 9Router (`ag/gemini-3-flash`) belum dijalankan dari mesin ini** dan TIDAK diklaim sebelum diuji langsung oleh pemilik/Muse dengan binary rilis `v0.3.2`.
