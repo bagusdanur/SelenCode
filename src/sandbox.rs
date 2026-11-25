@@ -228,6 +228,61 @@ pub struct AuditEntry {
     pub detail: String,
 }
 
+/// Susun `PATH` untuk proses anak `run_shell` agar selalu menyertakan direktori biner lazim milik
+/// pengguna (`~/.local/bin`, `~/bin`, `$PREFIX/bin` di Termux, dan `/usr/local/bin` di Unix)
+/// tanpa menimpa urutan `PATH` yang sudah ada dan tanpa duplikat (v0.5.0).
+pub fn enriched_shell_path(
+    current_path: Option<&std::ffi::OsStr>,
+    home_dir: Option<&Path>,
+    termux_prefix: Option<&Path>,
+) -> std::ffi::OsString {
+    let mut dirs_vec: Vec<PathBuf> = current_path
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+
+    let mut extras: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home_dir {
+        extras.push(home.join(".local").join("bin"));
+        extras.push(home.join("bin"));
+    }
+    if let Some(prefix) = termux_prefix {
+        if !prefix.as_os_str().is_empty() {
+            extras.push(prefix.join("bin"));
+        }
+    }
+    #[cfg(unix)]
+    {
+        extras.push(PathBuf::from("/usr/local/bin"));
+    }
+
+    for extra in extras {
+        if extra.as_os_str().is_empty() {
+            continue;
+        }
+        let already = dirs_vec.iter().any(|existing| {
+            #[cfg(windows)]
+            {
+                existing
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&extra.to_string_lossy())
+            }
+            #[cfg(not(windows))]
+            {
+                existing == &extra
+            }
+        });
+        if !already {
+            dirs_vec.push(extra);
+        }
+    }
+
+    std::env::join_paths(&dirs_vec).unwrap_or_else(|_| {
+        current_path
+            .map(|p| p.to_os_string())
+            .unwrap_or_default()
+    })
+}
+
 /// Path default audit log: env `SELENCODE_AUDIT_LOG` (dipakai tes) atau
 /// `~/.local/share/selencode/audit.jsonl`.
 pub fn default_audit_log_path() -> PathBuf {
@@ -479,6 +534,17 @@ impl SandboxController {
             for sensitive_key in sensitive_env_keys_present() {
                 cmd.env_remove(sensitive_key);
             }
+        }
+
+        // Perbaikan 2 (v0.5.0): pastikan PATH proses anak mencakup ~/.local/bin, ~/bin, & $PREFIX/bin
+        // agar utilitas user (mis. di service systemd/gateway) langsung ditemukan tanpa path penuh.
+        let merged_path = enriched_shell_path(
+            std::env::var_os("PATH").as_deref(),
+            dirs::home_dir().as_deref(),
+            std::env::var_os("PREFIX").as_deref().map(Path::new),
+        );
+        if !merged_path.is_empty() {
+            cmd.env("PATH", merged_path);
         }
 
         self.record_audit(

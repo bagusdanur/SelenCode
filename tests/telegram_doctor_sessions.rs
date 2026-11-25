@@ -50,7 +50,9 @@ fn hi(a: i32) -> bool { a < 10 && a > 0 }
 
     let menu = "# 10 Sesi Terakhir\n* #1 | Fix auth | 2026-11-25 · 4 msg\n---\n! Lanjutkan: `/resume 1`";
     let card = menu_markup_to_telegram_html(menu);
-    assert!(card.contains("🌙 <b>10 Sesi Terakhir</b>"));
+    assert!(card.contains("<b>10 Sesi Terakhir</b>"));
+    assert!(!card.contains('🌙'));
+    assert!(!card.contains('💡'));
     assert!(card.contains("✦ <b>#1</b> — Fix auth"));
     assert!(card.contains("<code>/resume 1</code>"));
 }
@@ -200,6 +202,6 @@ fn telegram_test_action_and_live_progress_html_work() {
     assert!(tool_html.contains("1 tool selesai"));
 
     let stream_html = format_telegram_progress_html(3, 15, None, 2, "Halo <world> & teman");
-    assert!(stream_html.contains("Selena mengetik"));
+    assert!(stream_html.contains("Mengetik..."));
     assert!(stream_html.contains("Halo &lt;world&gt; &amp; teman"));
 }

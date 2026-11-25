@@ -223,6 +223,7 @@ pub fn select_initial_toolsets(
     if [
         "skill",
         "playbook",
+        "referensi permanen",
         "memori",
         "memory",
         "manage_skill",

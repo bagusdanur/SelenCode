@@ -414,14 +414,17 @@ pub fn markdown_to_telegram_html(md: &str) -> String {
             continue;
         }
 
-        // Heading Markdown (`#`, `##`, `###`, `####`) -> judul tebal rapi tanpa `###` mentah.
+        // Heading Markdown (`#`, `##`, `###`, `####`) -> judul tebal rapi tanpa emoji dekoratif.
         if trimmed.starts_with('#') {
             let hashes = trimmed.chars().take_while(|&c| c == '#').count();
             if hashes <= 6 {
                 let rest = trimmed[hashes..].trim();
                 if !rest.is_empty() {
-                    let icon = if hashes == 1 { "📌 " } else { "▸ " };
-                    out.push(format!("{icon}<b>{}</b>", format_inline_md_to_html(rest)));
+                    if hashes == 1 {
+                        out.push(format!("<b>{}</b>", format_inline_md_to_html(rest)));
+                    } else {
+                        out.push(format!("▸ <b>{}</b>", format_inline_md_to_html(rest)));
+                    }
                     continue;
                 }
             }
@@ -472,7 +475,7 @@ pub fn menu_markup_to_telegram_html(markup: &str) -> String {
             continue;
         }
         if let Some(title) = t.strip_prefix("# ") {
-            out.push(format!("🌙 <b>{}</b>", escape_telegram_html(title.trim())));
+            out.push(format!("<b>{}</b>", escape_telegram_html(title.trim())));
             continue;
         }
         if t == "---" {
@@ -480,7 +483,7 @@ pub fn menu_markup_to_telegram_html(markup: &str) -> String {
             continue;
         }
         if let Some(note) = t.strip_prefix("! ") {
-            out.push(format!("💡 <i>{}</i>", format_inline_md_to_html(note.trim())));
+            out.push(format!("<i>{}</i>", format_inline_md_to_html(note.trim())));
             continue;
         }
         if let Some(rest) = t.strip_prefix("* ").or_else(|| t.strip_prefix("> ")) {
@@ -656,8 +659,8 @@ pub struct TgUpdate {
     pub callback_query: Option<TgCallbackQuery>,
 }
 
-/// Format status progres live (diedit in-place di Telegram) agar pengguna langsung melihat
-/// aktivitas Selena tanpa menunggu 30-60 detik dalam diam.
+/// Format status progres live (diedit in-place pada gelembung sementara di Telegram).
+/// Rapi, teks polos terstruktur tanpa emoji dekoratif (v0.5.0).
 pub fn format_telegram_progress_html(
     step: usize,
     max_steps: usize,
@@ -666,34 +669,115 @@ pub fn format_telegram_progress_html(
     preview_text: &str,
 ) -> String {
     let step_tag = if step > 0 && max_steps > 0 {
-        format!(" <i>(langkah {step}/{max_steps})</i>")
+        format!("langkah {step}/{max_steps}")
     } else {
         String::new()
     };
     let trimmed = preview_text.trim();
     if !trimmed.is_empty() && active_tool.is_none() {
-        // Ambil maks 700 karakter terakhir agar pratinjau streaming ringan & cepat dirender.
         let chars: Vec<char> = trimmed.chars().collect();
         let snippet: String = if chars.len() > 700 {
             format!("…{}", chars[chars.len() - 700..].iter().collect::<String>())
         } else {
             trimmed.to_string()
         };
+        let header = if step_tag.is_empty() {
+            "<b>Mengetik...</b>".to_string()
+        } else {
+            format!("<b>Mengetik...</b> <i>({step_tag})</i>")
+        };
         return format!(
-            "🌙 <b>Selena mengetik…</b>{step_tag}\n\n{}",
+            "{header}\n\n<blockquote>{}</blockquote>",
             escape_telegram_html(&snippet)
         );
     }
-    let mut out = format!("🌙 <b>Selena sedang bekerja…</b>{step_tag}");
-    if let Some(tool) = active_tool {
-        out.push_str(&format!("\n⚙️ Menjalankan <code>{}</code>…", escape_telegram_html(tool)));
-    } else {
-        out.push_str("\n💭 Menyusun langkah & jawaban…");
+    let mut parts: Vec<String> = Vec::new();
+    if !step_tag.is_empty() {
+        parts.push(step_tag);
     }
+    if let Some(tool) = active_tool {
+        parts.push(format!("<code>{}</code>", escape_telegram_html(tool)));
+    }
+    let mut out = if parts.is_empty() {
+        "<b>Sedang bekerja...</b>".to_string()
+    } else {
+        format!("<b>Sedang bekerja</b> — {}", parts.join(" · "))
+    };
     if tools_done > 0 {
-        out.push_str(&format!("\n✓ {tools_done} tool selesai"));
+        out.push_str(&format!("\n<i>{tools_done} aksi tool selesai</i>"));
     }
     out
+}
+
+/// Bangun kartu persetujuan Telegram bergaya rapi & hemat emoji (maks 1 emoji ⚠️ di judul)
+/// dengan perintah/aksi UTUH tanpa pernah dipotong diam-diam (v0.5.0).
+///
+/// Mengembalikan `(preamble_html_chunks, card_html, card_plain)`:
+/// - Bila seluruh perintah & alasan muat di 1 pesan (`<= 3800` char HTML), `preamble_html_chunks` kosong
+///   dan perintah utuh berada langsung di dalam `card_html`.
+/// - Bila terlalu panjang (>3800 char), seluruh perintah/detail utuh dipecah ke `preamble_html_chunks`
+///   untuk dikirim tepat sebelum kartu tombol — tidak ada satu karakter pun yang dipangkas diam-diam.
+pub fn format_approval_card_html(
+    category: &str,
+    action_title: &str,
+    detail: &str,
+    timeout_secs: u64,
+) -> (Vec<String>, String, String) {
+    let mins = (timeout_secs / 60).max(1);
+    let action_clean = action_title.trim();
+    let detail_clean = detail.trim();
+
+    let mut full_html = format!(
+        "<b>⚠️ Perlu persetujuan</b>\n\
+         <b>Kategori:</b> <code>{}</code>\n\
+         <b>Perintah:</b>\n<pre><code>{}</code></pre>",
+        escape_telegram_html(category),
+        escape_telegram_html(action_clean)
+    );
+    let mut full_plain = format!(
+        "⚠️ Perlu persetujuan\nKategori: {category}\nPerintah:\n{action_clean}"
+    );
+    if !detail_clean.is_empty() {
+        full_html.push_str(&format!(
+            "\n<b>Alasan:</b>\n<pre><code>{}</code></pre>",
+            escape_telegram_html(detail_clean)
+        ));
+        full_plain.push_str(&format!("\n\nAlasan:\n{detail_clean}"));
+    }
+    full_html.push_str(&format!("\n<i>Batas waktu: {mins} menit.</i>"));
+    full_plain.push_str(&format!("\n\nBatas waktu: {mins} menit."));
+
+    if full_html.chars().count() <= 3800 {
+        return (Vec::new(), full_html, full_plain);
+    }
+
+    // Perintah/detail melebihi batas 1 pesan Telegram -> kirim UTUH sebagai pesan lanjutan sebelumnya!
+    let mut preamble = Vec::new();
+    let mut combined_raw = format!("Perintah:\n{action_clean}");
+    if !detail_clean.is_empty() {
+        combined_raw.push_str(&format!("\n\nAlasan:\n{detail_clean}"));
+    }
+    let chunks = split_telegram_chunks(&combined_raw, 3200);
+    let total_parts = chunks.len();
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        let header = format!(
+            "<b>Detail persetujuan ({}/{total_parts})</b>\n<pre><code>{}</code></pre>",
+            idx + 1,
+            escape_telegram_html(&chunk)
+        );
+        preamble.push(header);
+    }
+    let short_card_html = format!(
+        "<b>⚠️ Perlu persetujuan</b>\n\
+         <b>Kategori:</b> <code>{}</code>\n\
+         Perintah dan detail lengkap ditampilkan utuh pada {total_parts} pesan tepat di atas.\n\
+         <i>Batas waktu: {mins} menit.</i>",
+        escape_telegram_html(category)
+    );
+    let short_card_plain = format!(
+        "⚠️ Perlu persetujuan\nKategori: {category}\nPerintah & detail utuh ada pada {total_parts} pesan di atas.\nBatas waktu: {mins} menit."
+    );
+    (preamble, short_card_html, short_card_plain)
 }
 
 /// Klien ringan Telegram Bot API berbasis `reqwest`.
@@ -965,6 +1049,42 @@ impl TelegramClient {
         Ok(msg.message_id)
     }
 
+    pub async fn send_html_message_with_keyboard(
+        &self,
+        chat_id: i64,
+        html: &str,
+        plain_fallback: &str,
+        rows: Vec<Vec<(String, String)>>,
+    ) -> Result<i64> {
+        let inline_keyboard: Vec<Vec<Value>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|(label, cb)| json!({ "text": label, "callback_data": cb }))
+                    .collect()
+            })
+            .collect();
+        let res: Result<TgMessage> = self
+            .post_json(
+                "sendMessage",
+                json!({
+                    "chat_id": chat_id,
+                    "text": html,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": true,
+                    "reply_markup": { "inline_keyboard": inline_keyboard },
+                }),
+            )
+            .await;
+        match res {
+            Ok(msg) => Ok(msg.message_id),
+            Err(_) => {
+                self.send_message_with_keyboard(chat_id, plain_fallback, rows)
+                    .await
+            }
+        }
+    }
+
     pub async fn edit_message_text(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
         let _: Value = self
             .post_json(
@@ -1011,17 +1131,22 @@ impl TelegramClient {
         }
     }
 
+    /// Hapus pesan sementara dan kembalikan `true` bila Telegram mengonfirmasi penghapusan berhasil.
+    pub async fn delete_message_checked(&self, chat_id: i64, message_id: i64) -> bool {
+        self.post_json::<Value>(
+            "deleteMessage",
+            json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }),
+        )
+        .await
+        .is_ok()
+    }
+
     /// Hapus pesan sementara (mis. gelembung status progres) secara best-effort.
     pub async fn delete_message(&self, chat_id: i64, message_id: i64) {
-        let _ = self
-            .post_json::<Value>(
-                "deleteMessage",
-                json!({
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                }),
-            )
-            .await;
+        let _ = self.delete_message_checked(chat_id, message_id).await;
     }
 
     pub async fn answer_callback_query(&self, callback_id: &str, text: Option<&str>) -> Result<()> {
@@ -1066,8 +1191,17 @@ impl TgApprovalHub {
         Arc::new(Self::default())
     }
 
-    /// Kirim pesan persetujuan dengan 3 tombol inline ke Telegram & daftarkan callback-nya.
-    /// Otomatis kedaluwarsa setelah `APPROVAL_TIMEOUT_SECS` agar chat tidak pernah macet selamanya.
+    /// Apakah masih ada permintaan persetujuan tertunda untuk `chat_id` ini?
+    /// Dipakai oleh collector progres agar gelembung progres tetap jeda saat menunggu tombol user.
+    pub fn has_pending_for_chat(&self, chat_id: i64) -> bool {
+        self.pending
+            .lock()
+            .map(|map| map.values().any(|v| v.chat_id == chat_id))
+            .unwrap_or(false)
+    }
+
+    /// Kirim pesan persetujuan dengan 3 tombol inline polos ke Telegram & daftarkan callback-nya.
+    /// Perintah/aksi ditampilkan UTUH (tidak pernah dipotong diam-diam); kedaluwarsa setelah `APPROVAL_TIMEOUT_SECS`.
     pub async fn dispatch(
         self: &Arc<Self>,
         tg: &TelegramClient,
@@ -1077,26 +1211,31 @@ impl TgApprovalHub {
     ) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let category = tool_category_from_title(&req.title);
-        let detail_block = if req.detail.trim().is_empty() {
-            String::new()
-        } else {
-            format!("\n\n{}", truncate_chars(req.detail.trim(), 1500))
-        };
-        let base_text = format!(
-            "🔐 Perlu Persetujuan SelenCode\nTool: {category}\nAksi: {}{detail_block}",
-            req.title
+        let (preamble_chunks, card_html, card_plain) = format_approval_card_html(
+            &category,
+            &req.title,
+            &req.detail,
+            APPROVAL_TIMEOUT_SECS,
         );
+        for chunk_html in preamble_chunks {
+            let _ = tg
+                .send_html_message(chat_id, &chunk_html, &req.title)
+                .await;
+        }
         let rows = vec![
             vec![
-                ("✅ Setuju".to_string(), format!("ap:{id}:y")),
-                ("❌ Tolak".to_string(), format!("ap:{id}:n")),
+                ("Setuju".to_string(), format!("ap:{id}:y")),
+                ("Tolak".to_string(), format!("ap:{id}:n")),
             ],
             vec![(
-                format!("⚡ Selalu {category} sesi ini"),
+                format!("Selalu untuk {category} — sesi ini"),
                 format!("ap:{id}:a"),
             )],
         ];
-        match tg.send_message_with_keyboard(chat_id, &base_text, rows).await {
+        match tg
+            .send_html_message_with_keyboard(chat_id, &card_html, &card_plain, rows)
+            .await
+        {
             Ok(message_id) => {
                 if let Ok(mut map) = self.pending.lock() {
                     map.insert(
@@ -1104,7 +1243,7 @@ impl TgApprovalHub {
                         PendingTgApproval {
                             chat_id,
                             message_id,
-                            base_text,
+                            base_text: card_html,
                             category,
                             policy,
                             reply: req.reply,
@@ -1118,12 +1257,17 @@ impl TgApprovalHub {
                     let expired = hub_exp.pending.lock().ok().and_then(|mut m| m.remove(&id));
                     if let Some(item) = expired {
                         let _ = item.reply.send(false);
-                        let updated = format!(
-                            "{}\n\n⏰ Persetujuan kedaluwarsa (ditolak otomatis).",
+                        let updated_html = format!(
+                            "{}\n\n<b>Status:</b> Kedaluwarsa (ditolak otomatis).",
                             item.base_text
                         );
                         let _ = tg_exp
-                            .edit_message_text(item.chat_id, item.message_id, &updated)
+                            .edit_html_message(
+                                item.chat_id,
+                                item.message_id,
+                                &updated_html,
+                                "Permintaan persetujuan kedaluwarsa (ditolak otomatis).",
+                            )
                             .await;
                     }
                 });
@@ -1197,24 +1341,24 @@ impl TgApprovalHub {
             return true;
         };
         let (approved, toast, badge) = match decision {
-            ApprovalDecision::ApproveOnce => (true, "Disetujui ✅", "✅ Disetujui"),
+            ApprovalDecision::ApproveOnce => (true, "Disetujui", "Disetujui."),
             ApprovalDecision::ApproveCategory => {
                 if let Ok(mut pol) = item.policy.lock() {
                     pol.allow_category(item.category.clone());
                 }
                 (
                     true,
-                    "Selalu diizinkan sesi ini ⚡",
-                    "⚡ Selalu diizinkan untuk sisa sesi ini",
+                    "Selalu diizinkan sesi ini",
+                    "Selalu diizinkan untuk kategori ini (sesi ini).",
                 )
             }
-            ApprovalDecision::Deny => (false, "Ditolak ❌", "❌ Ditolak"),
+            ApprovalDecision::Deny => (false, "Ditolak", "Ditolak."),
         };
         let _ = item.reply.send(approved);
         let _ = tg.answer_callback_query(&cb.id, Some(toast)).await;
-        let updated = format!("{}\n\n{badge}", item.base_text);
+        let updated_html = format!("{}\n\n<b>Status:</b> {badge}", item.base_text);
         let _ = tg
-            .edit_message_text(item.chat_id, item.message_id, &updated)
+            .edit_html_message(item.chat_id, item.message_id, &updated_html, badge)
             .await;
         true
     }

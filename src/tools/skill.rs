@@ -241,7 +241,8 @@ impl Tool for SkillCreate {
     }
 }
 
-/// Edit skill yang sudah ada — menampilkan unified diff & WAJIB meminta persetujuan pengguna!
+/// Edit skill yang sudah ada (`SKILL.md` atau 1 file referensi di `references/`/`templates/`/`scripts/`) —
+/// menampilkan unified diff & WAJIB meminta persetujuan pengguna!
 pub struct SkillEdit;
 
 #[async_trait]
@@ -249,7 +250,7 @@ impl Tool for SkillEdit {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "skill_edit".into(),
-            description: "Edit `SKILL.md` skill yang sudah ada. SELALU meminta persetujuan pengguna + diff sebelum menyimpan.".into(),
+            description: "Edit `SKILL.md` atau tulis/perbarui 1 file referensi (`ref_path`, mis. `references/audit.md`) di folder skill yang sudah ada. SELALU meminta persetujuan pengguna + diff sebelum menyimpan.".into(),
             parameters: schema(
                 json!({
                     "name": {
@@ -258,11 +259,15 @@ impl Tool for SkillEdit {
                     },
                     "description": {
                         "type": "string",
-                        "description": "Opsional: deskripsi baru satu baris"
+                        "description": "Opsional: deskripsi baru satu baris (untuk SKILL.md)"
                     },
                     "body": {
                         "type": "string",
-                        "description": "Opsional: isi Markdown baru (tanpa frontmatter)"
+                        "description": "Opsional: isi Markdown baru (untuk SKILL.md atau file `ref_path`)"
+                    },
+                    "ref_path": {
+                        "type": "string",
+                        "description": "Opsional: path relatif file referensi yang ingin ditulis/diperbarui di dalam folder skill (wajib di bawah references/, templates/, atau scripts/)"
                     },
                     "version": {
                         "type": "string",
@@ -295,6 +300,90 @@ impl Tool for SkillEdit {
             .into_iter()
             .find(|s| s.name == clean)
             .ok_or_else(|| anyhow!("skill '{clean}' tidak ditemukan untuk diedit"))?;
+
+        // Jalur khusus: menulis/memperbarui 1 file referensi di dalam folder skill (Perbaikan 3 v0.5.0).
+        if let Some(raw_ref) = str_arg(&args, "ref_path").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let ref_norm = raw_ref.replace('\\', "/");
+            let rel_path = std::path::Path::new(&ref_norm);
+            if rel_path.is_absolute()
+                || rel_path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(anyhow!(
+                    "ref_path '{raw_ref}' ditolak: path harus relatif tanpa `..`"
+                ));
+            }
+            if !(ref_norm.starts_with("references/")
+                || ref_norm.starts_with("templates/")
+                || ref_norm.starts_with("scripts/"))
+            {
+                return Err(anyhow!(
+                    "ref_path '{raw_ref}' harus berada di bawah references/, templates/, atau scripts/"
+                ));
+            }
+            if crate::security::is_secret_file(rel_path) {
+                return Err(anyhow!(
+                    "ref_path '{raw_ref}' ditolak: nama file rahasia tidak diizinkan"
+                ));
+            }
+            let body = str_arg(&args, "body")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("argumen 'body' wajib diisi saat menulis ref_path"))?;
+            let safe_body = format!("{}\n", crate::security::redact_secrets(body));
+
+            // Jika skill berasal dari folder pengguna, tulis ke folder proyek override agar aman.
+            let skill_dir = if existing.scope == "project" {
+                existing.dir.clone()
+            } else {
+                skill_file_path_for(&ctx.cwd, &clean, Some(&existing.category))?
+                    .parent()
+                    .unwrap_or(&existing.dir)
+                    .to_path_buf()
+            };
+            let target = skill_dir.join(rel_path);
+            let old_raw = std::fs::read_to_string(&target).unwrap_or_default();
+            let rel_display = target
+                .strip_prefix(&ctx.cwd)
+                .unwrap_or(&target)
+                .display()
+                .to_string();
+            let diff = build_unified_diff(&rel_display, &old_raw, &safe_body);
+
+            if !ctx
+                .approver
+                .ask(&format!("skill_edit {rel_display}"), &diff)
+                .await
+            {
+                return Ok(format!(
+                    "Ditolak user — penulisan referensi '{raw_ref}' dibatalkan."
+                ));
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("gagal membuat folder {}", parent.display()))?;
+            }
+            // Jika target berada di folder proyek baru (override dari skill pengguna), salin SKILL.md bila belum ada.
+            if existing.scope != "project" {
+                let dst_skill_md = skill_dir.join("SKILL.md");
+                if !dst_skill_md.exists() {
+                    if let Ok(orig) = std::fs::read_to_string(&existing.path) {
+                        let _ = std::fs::write(&dst_skill_md, orig);
+                    }
+                }
+            }
+            std::fs::write(&target, &safe_body)
+                .with_context(|| format!("gagal menulis referensi {}", target.display()))?;
+            return Ok(format!(
+                "Referensi skill '{clean}' ({raw_ref}) berhasil disimpan di {rel_display}.\n\n{diff}"
+            ));
+        }
 
         let old_raw = std::fs::read_to_string(&existing.path)
             .with_context(|| format!("gagal membaca {}", existing.path.display()))?;
@@ -358,7 +447,7 @@ impl Tool for SkillEdit {
         std::fs::write(&target, &new_md)
             .with_context(|| format!("gagal menyimpan skill {}", target.display()))?;
         Ok(format!(
-            "Skill '{clean}' berhasil diperbarui di {rel_display}."
+            "Skill '{clean}' berhasil diperbarui di {rel_display}.\n\n{diff}"
         ))
     }
 }
