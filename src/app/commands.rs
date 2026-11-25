@@ -240,10 +240,12 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
 
     pub(crate) async fn handle_verify(&self, arg: Option<&str>) -> Result<String> {
         let scope = arg.map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or("all");
-        let report = selencode::tools::verify::run_verify_plan(
+        let report = selencode::tools::verify::run_verify_plan_with_sandbox(
             &self.ctx.cwd,
             scope,
+            &[],
             self.cfg.shell.timeout_secs.max(120),
+            &self.ctx.sandbox,
         )
         .await?;
         Ok(report.format_menu_card())

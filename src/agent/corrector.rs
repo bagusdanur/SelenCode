@@ -189,7 +189,9 @@ impl SelfCorrectState {
             }
             "verify_project" => {
                 self.verified_after_last_edit = true;
-                let ok = !is_error && output.contains("LULUS");
+                let no_tests = output.contains("TIDAK ADA TEST") || output.contains("NO_TESTS");
+                let timed_out = output.contains("TIMEOUT");
+                let ok = !is_error && !no_tests && !timed_out && output.contains("LULUS");
                 self.last_verify_passed = Some(ok);
             }
             "run_shell" => {

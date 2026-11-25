@@ -418,27 +418,294 @@ pub fn parse_diagnostics(cwd: &Path, output: &str) -> Vec<Diagnostic> {
     out
 }
 
+/// Status verifikasi terstruktur yang membedakan secara jujur antara lulus,
+/// gagal, tidak ada test yang ditemukan/dijalankan, timeout, dan belum dijalankan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyStatus {
+    Passed,
+    Failed,
+    NoTestsFound,
+    TimedOut,
+    NotRun,
+}
+
+impl VerifyStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Passed => "LULUS ✅",
+            Self::Failed => "GAGAL ❌",
+            Self::NoTestsFound => "TIDAK ADA TEST ⚠️",
+            Self::TimedOut => "TIMEOUT ⏱",
+            Self::NotRun => "BELUM DIJALANKAN",
+        }
+    }
+
+    pub fn card_tag(self) -> &'static str {
+        match self {
+            Self::Passed => "LULUS",
+            Self::Failed => "GAGAL",
+            Self::NoTestsFound => "NO_TESTS",
+            Self::TimedOut => "TIMEOUT",
+            Self::NotRun => "NOT_RUN",
+        }
+    }
+}
+
+/// Bukti hasil 1 langkah verifikasi (perintah, status, exit code, durasi, & jumlah test).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepEvidence {
+    pub name: String,
+    pub command: String,
+    pub status: VerifyStatus,
+    pub exit_code: Option<i32>,
+    pub elapsed_ms: u64,
+    pub tests_passed: Option<usize>,
+}
+
+/// Deteksi status langkah dari kode keluar & output runner (membedakan `NoTestsFound` vs `Passed`).
+pub fn classify_step_output(step_name: &str, exit_code: Option<i32>, output: &str) -> (VerifyStatus, Option<usize>) {
+    let low = output.to_ascii_lowercase();
+    let is_test_step = step_name.to_ascii_lowercase().contains("test")
+        || step_name.to_ascii_lowercase().contains("pytest");
+
+    // Pytest exit code 5 = no tests collected.
+    if is_test_step && exit_code == Some(5) && low.contains("no tests ran") {
+        return (VerifyStatus::NoTestsFound, Some(0));
+    }
+
+    if exit_code != Some(0) {
+        return (VerifyStatus::Failed, None);
+    }
+
+    if is_test_step {
+        // Rust cargo test: hitung total `N passed` di seluruh baris `test result:`.
+        if low.contains("test result:") {
+            static RE_RUST_PASSED: OnceLock<Regex> = OnceLock::new();
+            let re = RE_RUST_PASSED.get_or_init(|| {
+                Regex::new(r"test result:\s+\w+\.\s+(\d+)\s+passed").expect("regex rust passed")
+            });
+            let mut total_passed = 0usize;
+            let mut saw_any = false;
+            for cap in re.captures_iter(&low) {
+                saw_any = true;
+                total_passed += cap[1].parse::<usize>().unwrap_or(0);
+            }
+            if saw_any {
+                if total_passed == 0 {
+                    return (VerifyStatus::NoTestsFound, Some(0));
+                }
+                return (VerifyStatus::Passed, Some(total_passed));
+            }
+        }
+        // Pytest / Go / Node zero-test indicators
+        if low.contains("collected 0 items")
+            || low.contains("no tests ran")
+            || low.contains("[no test files]")
+            || low.contains("[no tests to run]")
+            || low.contains("no tests found")
+            || low.contains("0 passing")
+        {
+            return (VerifyStatus::NoTestsFound, Some(0));
+        }
+    }
+
+    (VerifyStatus::Passed, None)
+}
+
+/// Susun rencana verifikasi tertarget berdasarkan `changed_files` (Fase 3: Advanced Verification).
+/// Memilih test yang paling relevan dengan file/modul yang berubah, sambil tetap
+/// menjalankan type-check/compile cepat agar regresi lintas modul tertangkap.
+pub fn detect_targeted_plan(cwd: &Path, scope: &str, changed_files: &[String]) -> VerifyPlan {
+    let norm_scope = scope.trim().to_ascii_lowercase();
+    if changed_files.is_empty() || matches!(norm_scope.as_str(), "check" | "lint" | "format") {
+        if norm_scope == "format" && cwd.join("Cargo.toml").exists() {
+            return VerifyPlan {
+                kind: ProjectKind::Rust,
+                steps: vec![VerifyStep {
+                    name: "cargo fmt".into(),
+                    command: "cargo fmt --check".into(),
+                }],
+            };
+        }
+        return detect_project_plan(cwd, scope);
+    }
+
+    // Rust: cocokkan file `tests/<name>.rs` atau `src/<stem>.rs` -> `tests/*<stem>*.rs`
+    if cwd.join("Cargo.toml").exists() {
+        let mut targeted_tests: Vec<String> = Vec::new();
+        for raw in changed_files {
+            let rel = raw.replace('\\', "/");
+            if let Some(rest) = rel.strip_prefix("tests/") {
+                if let Some(stem) = rest.strip_suffix(".rs") {
+                    if !stem.contains('/') && !targeted_tests.iter().any(|t| t == stem) {
+                        targeted_tests.push(stem.to_string());
+                    }
+                }
+            } else if let Some(stem) = Path::new(&rel)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())
+            {
+                if stem.len() >= 3 {
+                    if let Ok(entries) = std::fs::read_dir(cwd.join("tests")) {
+                        for ent in entries.flatten() {
+                            let fname = ent.file_name().to_string_lossy().to_string();
+                            if let Some(tstem) = fname.strip_suffix(".rs") {
+                                if tstem.to_ascii_lowercase().contains(&stem)
+                                    && !targeted_tests.iter().any(|t| t == tstem)
+                                {
+                                    targeted_tests.push(tstem.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !targeted_tests.is_empty() {
+            let mut steps = Vec::new();
+            if norm_scope != "test" {
+                steps.push(VerifyStep {
+                    name: "cargo check".into(),
+                    command: "cargo check --tests".into(),
+                });
+            }
+            let flags = targeted_tests
+                .iter()
+                .take(4)
+                .map(|t| format!("--test {t}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            steps.push(VerifyStep {
+                name: format!("cargo test (targeted: {})", targeted_tests.join(", ")),
+                command: format!("cargo test {flags}"),
+            });
+            return VerifyPlan {
+                kind: ProjectKind::Rust,
+                steps,
+            };
+        }
+    }
+
+    // Python: cocokkan file test yang berubah atau `tests/test_<stem>.py`
+    if cwd.join("pyproject.toml").exists()
+        || cwd.join("pytest.ini").exists()
+        || cwd.join("setup.py").exists()
+        || cwd.join("requirements.txt").exists()
+    {
+        let mut py_targets: Vec<String> = Vec::new();
+        for raw in changed_files {
+            let rel = raw.replace('\\', "/");
+            if !rel.ends_with(".py") {
+                continue;
+            }
+            let fname = Path::new(&rel)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if fname.starts_with("test_") || fname.ends_with("_test.py") {
+                if cwd.join(&rel).is_file() && !py_targets.contains(&rel) {
+                    py_targets.push(rel);
+                }
+            } else if let Some(stem) = Path::new(&rel).file_stem().and_then(|s| s.to_str()) {
+                for cand in [format!("tests/test_{stem}.py"), format!("test_{stem}.py")] {
+                    if cwd.join(&cand).is_file() && !py_targets.contains(&cand) {
+                        py_targets.push(cand);
+                    }
+                }
+            }
+        }
+        if !py_targets.is_empty() {
+            return VerifyPlan {
+                kind: ProjectKind::Python,
+                steps: vec![VerifyStep {
+                    name: format!("pytest (targeted: {})", py_targets.join(", ")),
+                    command: format!("pytest -q {}", py_targets.join(" ")),
+                }],
+            };
+        }
+    }
+
+    // Go: jalankan `go test` khusus pada paket direktori yang berubah
+    if cwd.join("go.mod").exists() {
+        let mut go_pkgs: Vec<String> = Vec::new();
+        for raw in changed_files {
+            let rel = raw.replace('\\', "/");
+            if !rel.ends_with(".go") {
+                continue;
+            }
+            let dir = Path::new(&rel)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or("");
+            let pkg = if dir.is_empty() {
+                ".".to_string()
+            } else {
+                format!("./{dir}")
+            };
+            if !go_pkgs.contains(&pkg) {
+                go_pkgs.push(pkg);
+            }
+        }
+        if !go_pkgs.is_empty() {
+            return VerifyPlan {
+                kind: ProjectKind::Go,
+                steps: vec![VerifyStep {
+                    name: format!("go test (targeted: {})", go_pkgs.join(", ")),
+                    command: format!("go test {}", go_pkgs.join(" ")),
+                }],
+            };
+        }
+    }
+
+    detect_project_plan(cwd, scope)
+}
+
 /// Hasil lengkap eksekusi `run_verify_plan`.
 #[derive(Debug, Clone)]
 pub struct VerifyReport {
     pub kind: ProjectKind,
+    pub status: VerifyStatus,
     pub passed: bool,
     pub steps_summary: Vec<(String, bool, Option<i32>)>,
+    pub evidence: Vec<StepEvidence>,
     pub diagnostics: Vec<Diagnostic>,
     pub raw_tail: String,
 }
 
 impl VerifyReport {
     pub fn format_for_agent(&self) -> String {
-        let status = if self.passed { "LULUS ✅" } else { "GAGAL ❌" };
+        let status = self.status.label();
         let mut out = format!(
             "Verifikasi proyek [{}]: {status}\n",
             self.kind.label()
         );
-        for (name, ok, code) in &self.steps_summary {
-            let icon = if *ok { "✓" } else { "✖" };
-            let c = code.map(|x| x.to_string()).unwrap_or_else(|| "?".into());
-            out.push_str(&format!("  {icon} {name} (exit {c})\n"));
+        for ev in &self.evidence {
+            let icon = match ev.status {
+                VerifyStatus::Passed => "✓",
+                VerifyStatus::NoTestsFound => "⚠",
+                VerifyStatus::TimedOut => "⏱",
+                _ => "✖",
+            };
+            let c = ev
+                .exit_code
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "?".into());
+            let test_note = ev
+                .tests_passed
+                .map(|n| format!(" · {n} test"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  {icon} {} (exit {c} · {}ms{test_note}) [{}]\n",
+                ev.name,
+                ev.elapsed_ms,
+                ev.status.card_tag()
+            ));
+        }
+        if self.status == VerifyStatus::NoTestsFound {
+            out.push_str(
+                "\nCatatan bukti verifikasi: 0 test dijalankan (NO_TESTS). Jangan mengklaim test lulus bila tidak ada test yang benar-benar dijalankan.\n",
+            );
         }
         if !self.diagnostics.is_empty() {
             out.push_str(&format!(
@@ -469,29 +736,52 @@ impl VerifyReport {
     }
 
     pub fn format_menu_card(&self) -> String {
-        let status = if self.passed { "LULUS" } else { "GAGAL" };
+        let status = self.status.card_tag();
         let mut out = format!("# Verifikasi Proyek ({} · {status})\n", self.kind.label());
-        for (name, ok, code) in &self.steps_summary {
-            let mark = if *ok { "*" } else { ">" };
-            let c = code.map(|x| x.to_string()).unwrap_or_else(|| "?".into());
-            let tag = if *ok { "lulus" } else { "gagal" };
-            out.push_str(&format!("{mark} {name} | exit {c} | {tag}\n"));
+        for ev in &self.evidence {
+            let mark = if ev.status == VerifyStatus::Passed { "*" } else { ">" };
+            let c = ev
+                .exit_code
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "?".into());
+            out.push_str(&format!(
+                "{mark} {} | exit {c} · {}ms | {}\n",
+                ev.name,
+                ev.elapsed_ms,
+                ev.status.card_tag()
+            ));
         }
         if !self.diagnostics.is_empty() {
             out.push_str("---\n");
             for d in self.diagnostics.iter().take(8) {
                 let loc = format!("{}:{}", d.file, d.line);
-                out.push_str(&format!("> {loc} | {} | {}\n", d.code.as_deref().unwrap_or("error"), d.message));
+                out.push_str(&format!(
+                    "> {loc} | {} | {}\n",
+                    d.code.as_deref().unwrap_or("error"),
+                    d.message
+                ));
             }
         }
         out
     }
 }
 
-/// Jalankan `VerifyPlan` di `cwd` secara berurutan (berhenti di langkah pertama yang gagal
-/// agar perbaikan terfokus pada akar masalah).
+/// Jalankan `VerifyPlan` di `cwd` secara berurutan (kompatibel penuh dengan API lama).
 pub async fn run_verify_plan(cwd: &Path, scope: &str, timeout_secs: u64) -> Result<VerifyReport> {
-    let plan = detect_project_plan(cwd, scope);
+    let default_sb = crate::sandbox::SandboxController::default();
+    run_verify_plan_with_sandbox(cwd, scope, &[], timeout_secs, &default_sb).await
+}
+
+/// Jalankan verifikasi tertarget/bertingkat melalui `SandboxController` (env scrubbed + audit log)
+/// dengan bukti lengkap per langkah (`VerifyStatus::Passed / Failed / NoTestsFound / TimedOut`).
+pub async fn run_verify_plan_with_sandbox(
+    cwd: &Path,
+    scope: &str,
+    changed_files: &[String],
+    timeout_secs: u64,
+    sandbox: &crate::sandbox::SandboxController,
+) -> Result<VerifyReport> {
+    let plan = detect_targeted_plan(cwd, scope, changed_files);
     if plan.steps.is_empty() {
         return Err(anyhow!(
             "tidak ada perintah validasi otomatis untuk proyek '{}' (scope='{scope}'). Jalankan `run_shell` secara eksplisit.",
@@ -500,53 +790,84 @@ pub async fn run_verify_plan(cwd: &Path, scope: &str, timeout_secs: u64) -> Resu
     }
 
     let mut steps_summary = Vec::new();
+    let mut evidence = Vec::new();
     let mut diagnostics = Vec::new();
-    let mut all_ok = true;
+    let mut overall = VerifyStatus::Passed;
     let mut raw_tail = String::new();
 
     for step in &plan.steps {
-        #[cfg(windows)]
-        let mut cmd = {
-            let mut c = tokio::process::Command::new("cmd");
-            c.args(["/C", &step.command]);
-            c
-        };
-        #[cfg(not(windows))]
-        let mut cmd = {
-            let mut c = tokio::process::Command::new("sh");
-            c.args(["-c", &step.command]);
-            c
-        };
-        cmd.current_dir(cwd)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true);
+        let started = std::time::Instant::now();
+        let mut cmd = sandbox.prepare_shell_command("verify_project", &step.command, cwd)?;
 
-        let (code, output) = run_timed(&mut cmd, timeout_secs.max(10))
-            .await
-            .map_err(|e| anyhow!("verifikasi '{}': {e}", step.name))?;
-        let ok = code == Some(0);
-        steps_summary.push((step.name.clone(), ok, code));
+        match run_timed(&mut cmd, timeout_secs.max(10)).await {
+            Ok((code, output)) => {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let (step_status, tests_passed) = classify_step_output(&step.name, code, &output);
+                let ok = step_status == VerifyStatus::Passed;
+                steps_summary.push((step.name.clone(), ok, code));
+                evidence.push(StepEvidence {
+                    name: step.name.clone(),
+                    command: step.command.clone(),
+                    status: step_status,
+                    exit_code: code,
+                    elapsed_ms,
+                    tests_passed,
+                });
 
-        if !ok {
-            all_ok = false;
-            diagnostics = parse_diagnostics(cwd, &output);
-            let tail_lines: Vec<&str> = output.lines().rev().take(35).collect();
-            let joined = tail_lines.into_iter().rev().collect::<Vec<_>>().join("\n");
-            raw_tail = truncate_output(joined, MAX_TOOL_OUTPUT / 3);
-            break;
+                match step_status {
+                    VerifyStatus::Passed => {}
+                    VerifyStatus::NoTestsFound => {
+                        if overall == VerifyStatus::Passed {
+                            overall = VerifyStatus::NoTestsFound;
+                        }
+                    }
+                    _ => {
+                        overall = VerifyStatus::Failed;
+                        diagnostics = parse_diagnostics(cwd, &output);
+                        let tail_lines: Vec<&str> = output.lines().rev().take(35).collect();
+                        let joined = tail_lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+                        raw_tail = truncate_output(joined, MAX_TOOL_OUTPUT / 3);
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let msg = e.to_string();
+                let is_timeout = msg.contains("timeout");
+                let st = if is_timeout {
+                    VerifyStatus::TimedOut
+                } else {
+                    VerifyStatus::Failed
+                };
+                overall = st;
+                steps_summary.push((step.name.clone(), false, None));
+                evidence.push(StepEvidence {
+                    name: step.name.clone(),
+                    command: step.command.clone(),
+                    status: st,
+                    exit_code: None,
+                    elapsed_ms,
+                    tests_passed: None,
+                });
+                raw_tail = msg;
+                break;
+            }
         }
     }
 
     Ok(VerifyReport {
         kind: plan.kind,
-        passed: all_ok,
+        status: overall,
+        passed: overall == VerifyStatus::Passed,
         steps_summary,
+        evidence,
         diagnostics,
         raw_tail,
     })
 }
 
-/// Tool `verify_project`: jalankan check/test/lint otomatis & kembalikan diagnostik terstruktur.
+/// Tool `verify_project`: jalankan check/test/lint/targeted otomatis & kembalikan bukti verifikasi terstruktur.
 pub struct VerifyProject {
     pub timeout_secs: u64,
 }
@@ -568,13 +889,18 @@ impl Tool for VerifyProject {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "verify_project".into(),
-            description: "Deteksi otomatis toolchain proyek (Rust/Node/Python/Go/Make) lalu jalankan pemeriksaan aman (`check`, `test`, `lint`, atau `all`) dan ekstrak error terstruktur (file, baris, kode, snippet) untuk perbaikan cepat.".into(),
+            description: "Deteksi otomatis toolchain proyek (Rust/Node/Python/Go/Make) lalu jalankan pemeriksaan aman (`check`, `test`, `lint`, `format`, `targeted`, atau `all`), pilih test relevan untuk file yang berubah, dan kembalikan bukti verifikasi terstruktur (LULUS / GAGAL / NO_TESTS / TIMEOUT).".into(),
             parameters: schema(
                 json!({
                     "scope": {
                         "type": "string",
-                        "enum": ["check", "test", "lint", "all"],
-                        "description": "Cakupan verifikasi: check (cepat), test, lint, atau all (default)."
+                        "enum": ["check", "test", "lint", "format", "targeted", "all"],
+                        "description": "Cakupan verifikasi: check (cepat), test, lint, format, targeted (khusus file berubah), atau all (default)."
+                    },
+                    "changed_files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Opsional: daftar path file yang baru diubah untuk pemilihan test tertarget."
                     }
                 }),
                 &[],
@@ -584,7 +910,23 @@ impl Tool for VerifyProject {
 
     async fn run(&self, args: Value, ctx: &Ctx) -> Result<String> {
         let scope = str_arg(&args, "scope").unwrap_or("all");
-        let report = run_verify_plan(&ctx.cwd, scope, self.timeout_secs).await?;
+        let changed: Vec<String> = args
+            .get("changed_files")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let report = run_verify_plan_with_sandbox(
+            &ctx.cwd,
+            scope,
+            &changed,
+            self.timeout_secs,
+            &ctx.sandbox,
+        )
+        .await?;
         Ok(report.format_for_agent())
     }
 }
