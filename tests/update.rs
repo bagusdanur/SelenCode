@@ -1,7 +1,10 @@
 //! Tes v0.1.2 — `selen update`: fungsi murni parse versi, perbandingan,
 //! dan pemetaan aset platform. Tanpa jaringan.
 
-use selencode::update::{asset_name_for, is_newer, parse_version, replace_binary};
+use selencode::update::{
+    asset_name_for, direct_download_url, extract_tag_from_release_url, is_newer, parse_version,
+    replace_binary,
+};
 
 #[test]
 fn parse_version_format_dikenal() {
@@ -60,4 +63,26 @@ fn replace_binary_menimpa_file_dengan_aman() {
     assert!(!exe.with_extension("tmp").exists());
     assert!(!exe.with_extension("tmp.exe").exists());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn redirect_url_parsing_dan_direct_download_bebas_rate_limit() {
+    assert_eq!(
+        extract_tag_from_release_url("https://github.com/bagusdanur/SelenCode/releases/tag/v0.2.0"),
+        Some("v0.2.0".to_string())
+    );
+    assert_eq!(
+        extract_tag_from_release_url(
+            "https://github.com/bagusdanur/SelenCode/releases/tag/v0.2.1?foo=1"
+        ),
+        Some("v0.2.1".to_string())
+    );
+    assert_eq!(
+        extract_tag_from_release_url("https://github.com/bagusdanur/SelenCode/releases"),
+        None
+    );
+    assert_eq!(
+        direct_download_url("bagusdanur/SelenCode", "v0.2.0", "selen-windows-x64.exe"),
+        "https://github.com/bagusdanur/SelenCode/releases/download/v0.2.0/selen-windows-x64.exe"
+    );
 }

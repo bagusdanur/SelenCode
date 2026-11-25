@@ -117,6 +117,102 @@ struct Asset {
     browser_download_url: String,
 }
 
+/// Ekstrak nama tag rilis (mis. `"v0.2.0"`) dari URL redirect GitHub
+/// `https://github.com/<owner>/<repo>/releases/tag/<tag>`.
+pub fn extract_tag_from_release_url(url: &str) -> Option<String> {
+    let (_, tail) = url.rsplit_once("/releases/tag/")?;
+    let tag = tail.split(['?', '#', '/']).next()?.trim();
+    if tag.is_empty() {
+        None
+    } else {
+        Some(tag.to_string())
+    }
+}
+
+/// Bangun URL unduhan langsung aset rilis GitHub (bebas batas rate-limit REST API).
+pub fn direct_download_url(repo: &str, tag: &str, asset_name: &str) -> String {
+    format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}")
+}
+
+/// Deteksi tag rilis terbaru via redirect web `https://github.com/{repo}/releases/latest`
+/// tanpa menyentuh `api.github.com` (tidak terkena 403 rate limit 60 req/jam di Wi-Fi/CGNAT).
+async fn fetch_latest_tag_via_redirect(repo: &str) -> Result<String> {
+    let no_redirect = reqwest::Client::builder()
+        .user_agent("selencode")
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("gagal membuat HTTP client redirect")?;
+    let url = format!("https://github.com/{repo}/releases/latest");
+    let resp = no_redirect
+        .head(&url)
+        .send()
+        .await
+        .context("gagal menghubungi GitHub — periksa koneksi internet (offline?)")?;
+    if resp.status().is_redirection() {
+        if let Some(loc) = resp.headers().get(reqwest::header::LOCATION) {
+            if let Ok(loc_str) = loc.to_str() {
+                if let Some(tag) = extract_tag_from_release_url(loc_str) {
+                    return Ok(tag);
+                }
+            }
+        }
+    }
+    // Fallback GET jika proxy tidak mengizinkan HEAD redirect.
+    let get_resp = no_redirect
+        .get(&url)
+        .send()
+        .await
+        .context("gagal memeriksa halaman rilis terbaru GitHub")?;
+    if get_resp.status().is_redirection() {
+        if let Some(loc) = get_resp.headers().get(reqwest::header::LOCATION) {
+            if let Ok(loc_str) = loc.to_str() {
+                if let Some(tag) = extract_tag_from_release_url(loc_str) {
+                    return Ok(tag);
+                }
+            }
+        }
+    }
+    anyhow::bail!("tidak menemukan redirect tag pada {url}")
+}
+
+/// Ambil `(tag_name, download_url)` dengan prioritas jalur bebas rate-limit (web redirect),
+/// dan fallback ke GitHub REST API bila perlu.
+async fn resolve_latest_release(
+    client: &reqwest::Client,
+    repo: &str,
+    asset_name: &str,
+) -> Result<(String, String)> {
+    if let Ok(tag) = fetch_latest_tag_via_redirect(repo).await {
+        let dl = direct_download_url(repo, &tag, asset_name);
+        return Ok((tag, dl));
+    }
+
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let release: Release = client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .context("gagal menghubungi GitHub — periksa koneksi internet (offline?)")?
+        .error_for_status()
+        .context("GitHub menolak permintaan rilis terbaru")?
+        .json()
+        .await
+        .context("respons GitHub tidak bisa dibaca")?;
+
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == asset_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "aset {asset_name} tidak ditemukan di rilis {}",
+                release.tag_name
+            )
+        })?;
+    Ok((release.tag_name, asset.browser_download_url.clone()))
+}
+
 /// Jalankan self-update. Semua kegagalan dikembalikan sebagai Err dengan
 /// pesan yang jelas — tidak ada panic.
 pub async fn run() -> Result<()> {
@@ -139,41 +235,18 @@ pub async fn run() -> Result<()> {
         .build()
         .context("gagal membuat HTTP client")?;
 
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let release: Release = client
-        .get(&url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .await
-        .context("gagal menghubungi GitHub — periksa koneksi internet (offline?)")?
-        .error_for_status()
-        .context("GitHub menolak permintaan rilis terbaru")?
-        .json()
-        .await
-        .context("respons GitHub tidak bisa dibaca")?;
+    let (tag_name, download_url) = resolve_latest_release(&client, &repo, asset_name).await?;
 
-    let remote = parse_version(&release.tag_name).ok_or_else(|| {
-        anyhow::anyhow!("tag rilis tidak dikenal: {}", release.tag_name)
-    })?;
+    let remote = parse_version(&tag_name)
+        .ok_or_else(|| anyhow::anyhow!("tag rilis tidak dikenal: {tag_name}"))?;
     if !is_newer(remote, current) {
         println!("Sudah versi terbaru (v{current_str}).");
         return Ok(());
     }
 
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == asset_name)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "aset {asset_name} tidak ditemukan di rilis {}",
-                release.tag_name
-            )
-        })?;
-
-    println!("Mengunduh SelenCode {} ({asset_name})…", release.tag_name);
+    println!("Mengunduh SelenCode {tag_name} ({asset_name})…");
     let bytes = client
-        .get(&asset.browser_download_url)
+        .get(&download_url)
         .send()
         .await
         .context("unduhan gagal — periksa koneksi internet")?
@@ -185,9 +258,6 @@ pub async fn run() -> Result<()> {
 
     let exe = std::env::current_exe().context("tidak bisa menemukan lokasi binary selen")?;
     replace_binary(&exe, &bytes)?;
-    println!(
-        "Diperbarui ke {} — jalankan `selen` lagi.",
-        release.tag_name
-    );
+    println!("Diperbarui ke {tag_name} — jalankan `selen` lagi.");
     Ok(())
 }
