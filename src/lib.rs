@@ -1,7 +1,9 @@
 pub mod agent;
 pub mod benchmark;
+pub mod builtin_skills;
 pub mod config;
 pub mod context_index;
+pub mod cron;
 pub mod doctor;
 pub mod hooks;
 pub mod lsp;

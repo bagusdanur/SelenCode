@@ -33,6 +33,8 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "fetch_url",
     "skills_list",
     "skill_view",
+    "session_search",
+    "ask_user",
 ];
 
 pub fn is_read_only(name: &str) -> bool {

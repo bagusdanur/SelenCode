@@ -11,7 +11,7 @@
 mod app;
 
 use anyhow::Result;
-use app::cli::{Cli, Commands};
+use app::cli::{Cli, Commands, CronCliAction};
 use app::plain_runner::interactive_plain;
 use app::session::Session;
 use app::telegram_runner::run_telegram_gateway;
@@ -110,6 +110,93 @@ async fn main() -> Result<()> {
             let joined = args.join(" ");
             let arg = (!joined.trim().is_empty()).then_some(joined.as_str());
             let card = s.handle_review(arg)?;
+            println!("{}", selencode::repl::strip_menu_markup(&card));
+            Ok(())
+        }
+        Some(Commands::Cron { action }) => {
+            let cfg = selencode::config::load_or_empty()?.0;
+            let store = selencode::store::Store::open()?;
+            match action {
+                CronCliAction::Add {
+                    name,
+                    schedule,
+                    prompt,
+                    cwd,
+                    allow_shell,
+                    allow_write,
+                    chat_id,
+                } => {
+                    let parsed = selencode::cron::parse_schedule(&schedule)?;
+                    let spec = parsed.canonical_spec();
+                    let next = selencode::cron::compute_next_run_after(&spec, chrono::Utc::now())?;
+                    let cwd_dir = cwd.unwrap_or_else(|| {
+                        std::env::current_dir()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| ".".to_string())
+                    });
+                    let target_chat = chat_id
+                        .or_else(|| cfg.telegram.allowed_users.first().copied())
+                        .unwrap_or(0);
+                    let job = store.add_cron_job(
+                        &name,
+                        &spec,
+                        &prompt,
+                        &cwd_dir,
+                        &allow_shell,
+                        allow_write,
+                        target_chat,
+                        &next,
+                    )?;
+                    println!(
+                        "Job terjadwal #{} '{}' ditambahkan ({}). Jadwal berikut: {}\n{}",
+                        job.id,
+                        job.name,
+                        selencode::cron::format_schedule_human(&job.schedule_spec),
+                        job.next_run_at,
+                        selencode::cron::CRON_GATEWAY_NOTE
+                    );
+                }
+                CronCliAction::List => {
+                    let s = Session::build(cli.provider.as_deref(), cli.yes, false, None, None, true)
+                        .await?;
+                    let card = s.handle_cron(Some("list"), None)?;
+                    println!("{}", selencode::repl::strip_menu_markup(&card));
+                }
+                CronCliAction::Remove { target } => {
+                    if store.remove_cron_job(&target)? {
+                        println!("Job '{target}' berhasil dihapus.");
+                    } else {
+                        anyhow::bail!("job '{target}' tidak ditemukan");
+                    }
+                }
+                CronCliAction::Pause { target } => {
+                    if let Some(j) = store.set_cron_job_enabled(&target, false, None)? {
+                        println!("Job '{}' dijeda.", j.name);
+                    } else {
+                        anyhow::bail!("job '{target}' tidak ditemukan");
+                    }
+                }
+                CronCliAction::Resume { target } => {
+                    let Some(ex) = store.get_cron_job(&target)? else {
+                        anyhow::bail!("job '{target}' tidak ditemukan");
+                    };
+                    let next = selencode::cron::compute_next_run_after(
+                        &ex.schedule_spec,
+                        chrono::Utc::now(),
+                    )?;
+                    if let Some(j) = store.set_cron_job_enabled(&target, true, Some(&next))? {
+                        println!("Job '{}' diaktifkan kembali (berikut: {}).", j.name, j.next_run_at);
+                    }
+                }
+            }
+            Ok(())
+        }
+        Some(Commands::Search { query }) => {
+            let s =
+                Session::build(cli.provider.as_deref(), cli.yes, false, None, None, true).await?;
+            let q = query.join(" ");
+            let arg = (!q.trim().is_empty()).then_some(q.as_str());
+            let card = s.handle_search(arg)?;
             println!("{}", selencode::repl::strip_menu_markup(&card));
             Ok(())
         }

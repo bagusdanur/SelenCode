@@ -563,6 +563,18 @@ impl ModelPickerState {
     }
 }
 
+/// State modal pertanyaan klarifikasi `ask_user` di TUI (v0.5.6 Bagian 2 — bukan approval!).
+pub struct PendingAsk {
+    pub question: String,
+    pub choices: Vec<String>,
+    pub context: Option<String>,
+    /// Indeks pilihan terpilih (`0..choices.len()` = pilihan preset; `choices.len()` = ketik jawaban sendiri).
+    pub selected: usize,
+    pub custom_input: String,
+    pub typing_custom: bool,
+    pub reply: Option<tokio::sync::oneshot::Sender<crate::tools::ask::AskUserAnswer>>,
+}
+
 pub struct App {
     pub cwd: String,
     pub provider: String,
@@ -588,6 +600,8 @@ pub struct App {
     pub approval_scroll: u16,
     /// Kebijakan persetujuan bersama dengan Approver (untuk tombol `[a]` & `/approve`).
     pub approval_policy: Option<Arc<Mutex<ApprovalPolicy>>>,
+    /// Modal pertanyaan klarifikasi `ask_user` (v0.5.6 Bagian 2 — terpisah total dari `approval`).
+    pub pending_ask: Option<PendingAsk>,
     /// Modal pemilih model interaktif (`/model` di TUI).
     pub model_picker: Option<ModelPickerState>,
     /// Modal Wizard Setup Provider interaktif (otomatis saat belum ada provider/key, atau via `/setup`).
@@ -733,6 +747,7 @@ impl App {
             approval_queue: VecDeque::new(),
             approval_scroll: 0,
             approval_policy: None,
+            pending_ask: None,
             model_picker: None,
             setup_wizard: None,
             should_quit: false,
@@ -1158,6 +1173,50 @@ impl App {
             self.approval = Some(next);
             break;
         }
+    }
+
+    /// Terima pertanyaan klarifikasi `ask_user` dari channel terpisah (Bagian 2 v0.5.6).
+    pub fn receive_ask(&mut self, req: crate::tools::ask::AskUserRequest) {
+        let typing_custom = req.choices.is_empty();
+        self.pending_ask = Some(PendingAsk {
+            question: req.question,
+            choices: req.choices,
+            context: req.context,
+            selected: 0,
+            custom_input: String::new(),
+            typing_custom,
+            reply: Some(req.reply),
+        });
+    }
+
+    /// Kirim jawaban modal `ask_user` (teks pilihan atau jawaban bebas).
+    pub fn submit_ask(&mut self, answer: String) -> bool {
+        let Some(mut p) = self.pending_ask.take() else {
+            return false;
+        };
+        if let Some(tx) = p.reply.take() {
+            let _ = tx.send(crate::tools::ask::AskUserAnswer {
+                response: answer,
+                timed_out: false,
+                non_interactive: false,
+            });
+        }
+        true
+    }
+
+    /// Batalkan modal `ask_user` (Esc -> biarkan agen melanjutkan dengan asumsi).
+    pub fn cancel_ask(&mut self) -> bool {
+        let Some(mut p) = self.pending_ask.take() else {
+            return false;
+        };
+        if let Some(tx) = p.reply.take() {
+            let _ = tx.send(crate::tools::ask::AskUserAnswer {
+                response: String::new(),
+                timed_out: true,
+                non_interactive: false,
+            });
+        }
+        true
     }
 
     /// Ambil isi kotak input & kosongkan. Mengembalikan teks apa adanya.

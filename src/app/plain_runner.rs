@@ -86,6 +86,11 @@ pub(crate) async fn interactive_plain(
         true,
     )
     .await?;
+    // Mode CLI polos interaktif (TTY): `ask_user` membaca pilihan bernomor/teks bebas dari stdin;
+    // bila dijalankan lewat pipe (non-TTY), tetap non-interaktif agar tidak menggantung.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        s.ctx.asker = std::sync::Arc::new(selencode::tools::ask::UserAsker::stdin());
+    }
     if s.needs_setup {
         println!(
             "☾ Provider belum siap ({}). Mulai setup interaktif…",
@@ -240,6 +245,14 @@ pub(crate) async fn interactive_plain(
                 Err(e) => eprintln!("[error] {e}"),
             },
             SlashCommand::Review(arg) => match s.handle_review(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Cron(arg) => match s.handle_cron(arg.as_deref(), None) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Search(arg) => match s.handle_search(arg.as_deref()) {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },

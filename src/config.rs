@@ -41,6 +41,69 @@ pub struct Config {
     /// Pengaturan Skills System SelenCode (`[skills]` di selencode.toml).
     #[serde(default, skip_serializing_if = "SkillsCfg::is_default")]
     pub skills: SkillsCfg,
+    /// Konfigurasi fallback model/provider global (`[fallback]`, v0.5.6 Bagian 1).
+    #[serde(default, skip_serializing_if = "FallbackCfg::is_default")]
+    pub fallback: FallbackCfg,
+    /// Konfigurasi tool bertanya `ask_user` (`[ask]`, v0.5.6 Bagian 2).
+    #[serde(default, skip_serializing_if = "AskCfg::is_default")]
+    pub ask: AskCfg,
+}
+
+/// Konfigurasi fallback model/provider global (`[fallback]`, v0.5.6 Bagian 1).
+/// Kosong secara default (mengisinya adalah keputusan pemilik per mesin).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FallbackCfg {
+    /// Daftar pasangan `"provider:model"` atau `"model"` cadangan terurut (default: kosong).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// Maksimum total model yang dicoba per giliran (termasuk model utama; default: 3).
+    #[serde(default = "default_fallback_max_attempts")]
+    pub max_attempts: usize,
+}
+
+fn default_fallback_max_attempts() -> usize {
+    3
+}
+
+impl Default for FallbackCfg {
+    fn default() -> Self {
+        Self {
+            models: Vec::new(),
+            max_attempts: default_fallback_max_attempts(),
+        }
+    }
+}
+
+impl FallbackCfg {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Konfigurasi tool `ask_user` / clarify (`[ask]`, v0.5.6 Bagian 2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AskCfg {
+    /// Batas waktu tunggu jawaban pengguna dalam detik (default: 600 = 10 menit).
+    #[serde(default = "default_ask_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_ask_timeout_secs() -> u64 {
+    600
+}
+
+impl Default for AskCfg {
+    fn default() -> Self {
+        Self {
+            timeout_secs: default_ask_timeout_secs(),
+        }
+    }
+}
+
+impl AskCfg {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Konfigurasi Skills System SelenCode (`[skills]`).
@@ -356,7 +419,7 @@ impl RoutingCfg {
 }
 
 /// Konfigurasi Telegram Bot Gateway (`[telegram]` di selencode.toml).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TelegramCfg {
     /// Nama env var berisi Bot API token dari @BotFather (mis. `SELENCODE_TELEGRAM_TOKEN`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -372,6 +435,25 @@ pub struct TelegramCfg {
     /// `"edits"` (otomatis edit file), atau `"auto"` (otomatis semua aksi aman).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub approval: String,
+    /// Batas waktu tunggu kartu persetujuan Telegram dalam menit (default: 10; 0 = tanpa batas).
+    #[serde(default = "default_tg_approval_timeout_mins")]
+    pub approval_timeout_mins: u64,
+}
+
+fn default_tg_approval_timeout_mins() -> u64 {
+    10
+}
+
+impl Default for TelegramCfg {
+    fn default() -> Self {
+        Self {
+            bot_token_env: String::new(),
+            bot_token: None,
+            allowed_users: Vec::new(),
+            approval: String::new(),
+            approval_timeout_mins: default_tg_approval_timeout_mins(),
+        }
+    }
 }
 
 impl TelegramCfg {
@@ -380,6 +462,7 @@ impl TelegramCfg {
             && self.bot_token.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true)
             && self.allowed_users.is_empty()
             && self.approval.trim().is_empty()
+            && self.approval_timeout_mins == default_tg_approval_timeout_mins()
     }
 
     /// Ambil token bot Telegram (prioritas: env var `bot_token_env` -> `SELENCODE_TELEGRAM_TOKEN` -> `bot_token`).
@@ -490,6 +573,10 @@ pub struct ProviderCfg {
     /// Bila kosong, SelenCode otomatis mendeteksi dari API `/models` atau nama model AI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_limit: Option<usize>,
+    /// Daftar model cadangan terurut saat model utama gagal karena 429/5xx/timeout/401/403/404 (v0.5.6).
+    /// Kosong secara default = tanpa fallback otomatis.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<String>,
 }
 
 fn default_kind() -> String {
@@ -800,6 +887,8 @@ impl Config {
             review: ReviewCfg::default(),
             tool_budget: ToolBudgetCfg::default(),
             skills: SkillsCfg::default(),
+            fallback: FallbackCfg::default(),
+            ask: AskCfg::default(),
         }
     }
 

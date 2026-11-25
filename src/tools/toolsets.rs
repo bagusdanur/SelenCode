@@ -81,13 +81,23 @@ pub const EXTENDED_TOOLSETS: &[(&str, &str, &[&str])] = &[
         "subagent paralel & orkestrasi multi-peran",
         &["delegate", "orchestrate"],
     ),
+    (
+        "clarify",
+        "tanya klarifikasi berpilihan ke pengguna saat ambigu atau kandidat mirip",
+        &["ask_user"],
+    ),
+    (
+        "history",
+        "cari percakapan/frasa lintas sesi tersimpan (FTS5)",
+        &["session_search"],
+    ),
 ];
 
 /// Spesifikasi meta-tool `activate_toolset` yang sangat ramping (~75 token).
 pub fn activate_toolset_spec() -> ToolSpec {
     ToolSpec {
         name: ACTIVATE_TOOLSET_NAME.to_string(),
-        description: "Aktifkan toolset tambahan secara on-demand: git_read, verify, git_write, code_nav, lsp, bg, web, plan, skills_mem, multi_agent, mcp.".to_string(),
+        description: "Aktifkan toolset tambahan secara on-demand: git_read, verify, git_write, code_nav, lsp, bg, web, plan, skills_mem, multi_agent, clarify, history, mcp.".to_string(),
         parameters: schema(
             json!({
                 "toolsets": {
@@ -250,6 +260,40 @@ pub fn select_initial_toolsets(
     .any(|kw| lower.contains(kw))
     {
         set.insert("multi_agent".to_string());
+    }
+
+    if [
+        "cari ",
+        "unduh",
+        "download",
+        "manga",
+        "komik",
+        "klarifikasi",
+        "ask_user",
+        "kandidat",
+        "ambigu",
+        "maksudnya",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+    {
+        set.insert("clarify".to_string());
+    }
+
+    if [
+        "sesi lalu",
+        "sesi sebelumnya",
+        "cari sesi",
+        "session_search",
+        "riwayat sesi",
+        "pernah kita bahas",
+        "percakapan lama",
+        "history",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+    {
+        set.insert("history".to_string());
     }
 
     if has_mcp

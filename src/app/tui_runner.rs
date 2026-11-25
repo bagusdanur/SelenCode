@@ -345,6 +345,22 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
+            TuiCommand::Cron(arg) => match s.handle_cron(arg.as_deref(), None) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::Search(arg) => match s.handle_search(arg.as_deref()) {
+                Ok(card) => {
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
             TuiCommand::UseSkill(arg) => match s.handle_use_skill(arg.as_deref()) {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
@@ -691,7 +707,9 @@ pub(crate) async fn interactive_tui(
     // config ikut berlaku di mode TUI.
     let (approval_tx, approval_rx) =
         tokio::sync::mpsc::channel::<ApprovalRequest>(8);
-    let s = Session::build_with_target(
+    let (ask_tx, ask_rx) =
+        tokio::sync::mpsc::channel::<selencode::tools::ask::AskUserRequest>(4);
+    let mut s = Session::build_with_target(
         cli.provider.as_deref(),
         cli.yes,
         resume,
@@ -701,6 +719,7 @@ pub(crate) async fn interactive_tui(
         true,
     )
     .await?;
+    s.ctx.asker = Arc::new(selencode::tools::ask::UserAsker::channel(ask_tx));
     let (init_in, init_out) = s.store.total_usage(&s.session_id).unwrap_or((0, 0));
     let mut app = App::new(
         s.ctx.cwd.to_string_lossy().to_string(),
@@ -767,6 +786,7 @@ pub(crate) async fn interactive_tui(
         cmd_tx,
         event_rx: ui_rx,
         approval_rx,
+        ask_rx,
         cancel,
         interrupt_pending,
     };

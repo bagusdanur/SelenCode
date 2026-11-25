@@ -150,6 +150,7 @@ impl Session {
                         price_in: None,
                         price_out: None,
                         context_limit: None,
+                        fallback: Vec::new(),
                     };
                     let stub: Arc<dyn Provider> = Arc::new(UnconfiguredProvider {
                         reason: reason.clone(),
@@ -167,6 +168,11 @@ impl Session {
         let cwd = std::env::current_dir()?;
         let cwd_str = cwd.to_string_lossy().to_string();
         let store = Arc::new(Store::open()?);
+        // Backfill FTS5 satu kali di thread latar (Bagian 4A v0.5.6 — non-blocking, tidak mengunci start sesi!).
+        let store_fts = store.clone();
+        std::thread::spawn(move || {
+            let _ = store_fts.backfill_fts_if_needed();
+        });
 
         let (session_id, messages, resumed_title) = if let Some(target) = resume_target
             .map(|s| s.trim())
@@ -239,6 +245,8 @@ impl Session {
             .with_guard(cfg.guard.clone())
             .with_tool_budget(cfg.tool_budget.clone())
             .with_skills(cfg.skills.clone())
+            .with_router_telemetry(router_telemetry.clone())
+            .with_ask_timeout_only(cfg.ask.timeout_secs)
             .with_store(store.clone(), session_id.clone());
         // P2.2: subagent `delegate` & `orchestrate` berbagi handle `shared_provider`
         // sehingga ganti provider/model lewat `/model` otomatis memperbarui subagent juga!
@@ -299,6 +307,7 @@ impl Session {
             price_in: None,
             price_out: None,
             context_limit: None,
+            fallback: Vec::new(),
         };
         self.cfg.providers.insert(res.name.clone(), pcfg);
         self.cfg.default_provider = res.name.clone();
@@ -787,6 +796,7 @@ impl Session {
                     price_in: None,
                     price_out: None,
                     context_limit: None,
+                    fallback: Vec::new(),
                 };
                 self.cfg.providers.insert(name.clone(), pcfg);
                 let saved_path = config::save(&self.cfg)?;

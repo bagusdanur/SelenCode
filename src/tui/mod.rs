@@ -101,6 +101,8 @@ pub enum TuiCommand {
     Memory(Option<String>),
     Skills(Option<String>),
     Review(Option<String>),
+    Cron(Option<String>),
+    Search(Option<String>),
     UseSkill(Option<String>),
     LearnSkill(Option<String>),
     InitAgents,
@@ -123,6 +125,8 @@ pub struct TuiChannels {
     pub cmd_tx: mpsc::Sender<TuiCommand>,
     pub event_rx: mpsc::Receiver<UiEvent>,
     pub approval_rx: mpsc::Receiver<ApprovalRequest>,
+    /// Kanal terpisah untuk pertanyaan klarifikasi `ask_user` (v0.5.6 Bagian 2).
+    pub ask_rx: mpsc::Receiver<crate::tools::ask::AskUserRequest>,
     /// Sinyal pembatalan giliran saat user menekan `Esc` / `/stop` / interupsi ketika agent sibuk.
     pub cancel: Arc<Notify>,
     /// True bila pembatalan dipicu oleh pesan interupsi baru (worker langsung lanjut ke giliran baru).
@@ -1749,6 +1753,85 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             sections[2],
         );
     }
+
+    // Modal pertanyaan klarifikasi `ask_user` (Bagian 2 v0.5.6 — visual & jalur terpisah dari approval!).
+    if let Some(ask) = &app.pending_ask {
+        let area = centered_rect(76, 56, frame.area());
+        frame.render_widget(Clear, area);
+        let modal_bg = moonlit::CARD;
+        let block = Block::default()
+            .title(" Pertanyaan dari Selena (Klarifikasi) ")
+            .title_style(
+                Style::default()
+                    .fg(moonlit::LAVENDER)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(moonlit::VIOLET))
+            .style(Style::default().bg(modal_bg));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if let Some(ctx) = ask.context.as_deref().filter(|s| !s.trim().is_empty()) {
+            lines.push(Line::from(Span::styled(
+                format!("  {ctx}"),
+                Style::default().fg(moonlit::DIM),
+            )));
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  {}", ask.question),
+            Style::default()
+                .fg(moonlit::STARLIGHT)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        for (idx, choice) in ask.choices.iter().enumerate() {
+            let active = !ask.typing_custom && ask.selected == idx;
+            let prefix = if active { "  > " } else { "    " };
+            let style = if active {
+                Style::default()
+                    .fg(moonlit::MINT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(moonlit::SILVER)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{}. {choice}", idx + 1),
+                style,
+            )));
+        }
+        let custom_idx = ask.choices.len();
+        let custom_active = ask.typing_custom || ask.selected == custom_idx;
+        let custom_prefix = if custom_active { "  > " } else { "    " };
+        let custom_label = if ask.typing_custom {
+            format!("{custom_prefix}Jawaban sendiri: {}_", ask.custom_input)
+        } else {
+            format!("{custom_prefix}Ketik jawaban sendiri… (Enter / ketik langsung)")
+        };
+        lines.push(Line::from(Span::styled(
+            custom_label,
+            if custom_active {
+                Style::default().fg(moonlit::LILAC).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(moonlit::DIM)
+            },
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  [↑/↓] pilih · [Enter] kirim · [Esc] lewati (lanjut dengan asumsi)",
+            Style::default().fg(moonlit::DIM),
+        )));
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().bg(modal_bg))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1912,6 +1995,12 @@ fn submit(
         }
         SlashCommand::Review(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Review(arg));
+        }
+        SlashCommand::Cron(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Cron(arg));
+        }
+        SlashCommand::Search(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Search(arg));
         }
         SlashCommand::Skill(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::UseSkill(arg));
@@ -2118,6 +2207,81 @@ fn handle_key(
             {
                 if let Some(w) = &mut app.setup_wizard {
                     w.push_char(c);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    // Modal pertanyaan klarifikasi `ask_user` (Bagian 2 v0.5.6 — terpisah dari approval!).
+    if app.pending_ask.is_some() {
+        let (num_choices, typing_custom, selected) = app
+            .pending_ask
+            .as_ref()
+            .map(|a| (a.choices.len(), a.typing_custom, a.selected))
+            .unwrap_or((0, false, 0));
+        match key.code {
+            KeyCode::Esc => {
+                app.cancel_ask();
+            }
+            KeyCode::Up if !typing_custom => {
+                if let Some(a) = &mut app.pending_ask {
+                    let total = a.choices.len() + 1;
+                    a.selected = if a.selected == 0 { total - 1 } else { a.selected - 1 };
+                }
+            }
+            KeyCode::Down if !typing_custom => {
+                if let Some(a) = &mut app.pending_ask {
+                    let total = a.choices.len() + 1;
+                    a.selected = (a.selected + 1) % total;
+                }
+            }
+            KeyCode::Enter => {
+                if typing_custom {
+                    let txt = app
+                        .pending_ask
+                        .as_ref()
+                        .map(|a| a.custom_input.trim().to_string())
+                        .unwrap_or_default();
+                    if !txt.is_empty() {
+                        app.submit_ask(txt);
+                    }
+                } else if selected < num_choices {
+                    let chosen = app
+                        .pending_ask
+                        .as_ref()
+                        .and_then(|a| a.choices.get(selected).cloned())
+                        .unwrap_or_default();
+                    if !chosen.is_empty() {
+                        app.submit_ask(chosen);
+                    }
+                } else if let Some(a) = &mut app.pending_ask {
+                    a.typing_custom = true;
+                }
+            }
+            KeyCode::Backspace if typing_custom => {
+                if let Some(a) = &mut app.pending_ask {
+                    a.custom_input.pop();
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !typing_custom && ('1'..='4').contains(&c) {
+                    let idx = (c as usize) - ('1' as usize);
+                    if idx < num_choices {
+                        let chosen = app
+                            .pending_ask
+                            .as_ref()
+                            .and_then(|a| a.choices.get(idx).cloned())
+                            .unwrap_or_default();
+                        if !chosen.is_empty() {
+                            app.submit_ask(chosen);
+                            return;
+                        }
+                    }
+                }
+                if let Some(a) = &mut app.pending_ask {
+                    a.typing_custom = true;
+                    a.custom_input.push(c);
                 }
             }
             _ => {}
@@ -2510,6 +2674,10 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
             }
             while let Ok(req) = ch.approval_rx.try_recv() {
                 app.receive_approval(req);
+                got_ui_event = true;
+            }
+            while let Ok(req) = ch.ask_rx.try_recv() {
+                app.receive_ask(req);
                 got_ui_event = true;
             }
             if got_ui_event {

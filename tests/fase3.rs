@@ -406,6 +406,7 @@ fn config_save_load_and_direct_api_key_fallback() {
             price_in: None,
             price_out: None,
             context_limit: None,
+            fallback: Vec::new(),
         },
     );
     let cfg = Config {
@@ -423,6 +424,8 @@ fn config_save_load_and_direct_api_key_fallback() {
         review: Default::default(),
         tool_budget: Default::default(),
         skills: Default::default(),
+        fallback: Default::default(),
+        ask: Default::default(),
     };
     save_to(&cfg, &path).unwrap();
     let loaded = load_from(&path).unwrap();

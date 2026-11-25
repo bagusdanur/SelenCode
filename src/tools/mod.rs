@@ -1,3 +1,4 @@
+pub mod ask;
 pub mod bg;
 pub mod delegate;
 pub mod file;
@@ -9,6 +10,7 @@ pub mod outline;
 pub mod plan;
 pub mod retrieve;
 pub mod search;
+pub mod session_search;
 pub mod shell;
 pub mod skill;
 pub mod task;
@@ -72,6 +74,12 @@ pub struct Ctx {
     /// (Tahap 1). Default false di Ctx::new agar tes mock lama tidak berubah;
     /// Session::build mengisinya dari `cfg.agent.self_correct` (default true).
     pub self_correct: bool,
+    /// Pengelola pertanyaan klarifikasi `ask_user` (v0.5.6 Bagian 2 — terpisah total dari `approver`).
+    pub asker: Arc<ask::UserAsker>,
+    /// Batas waktu tunggu `ask_user` dalam detik (`[ask] timeout_secs`, default 600).
+    pub ask_timeout_secs: u64,
+    /// Telemetri bersama router fallback agar loop mencatat model aktual & notifikasi sekali (v0.5.6 Bagian 1).
+    pub router_telemetry: Option<Arc<std::sync::Mutex<crate::providers::router::RouterTelemetry>>>,
 }
 
 impl Ctx {
@@ -98,7 +106,26 @@ impl Ctx {
             skills: crate::config::SkillsCfg::default(),
             auto_skills: false,
             self_correct: false,
+            asker: Arc::new(ask::UserAsker::non_interactive()),
+            ask_timeout_secs: 600,
+            router_telemetry: None,
         }
+    }
+    pub fn with_asker(mut self, asker: Arc<ask::UserAsker>, timeout_secs: u64) -> Self {
+        self.asker = asker;
+        self.ask_timeout_secs = timeout_secs.max(1);
+        self
+    }
+    pub fn with_ask_timeout_only(mut self, timeout_secs: u64) -> Self {
+        self.ask_timeout_secs = timeout_secs.max(1);
+        self
+    }
+    pub fn with_router_telemetry(
+        mut self,
+        tel: Arc<std::sync::Mutex<crate::providers::router::RouterTelemetry>>,
+    ) -> Self {
+        self.router_telemetry = Some(tel);
+        self
     }
     pub fn with_sandbox(mut self, sandbox: Arc<crate::sandbox::SandboxController>) -> Self {
         self.sandbox = sandbox;
@@ -278,6 +305,8 @@ pub fn default_registry_with_shell(shell_cfg: &ShellCfg) -> Registry {
         .register(Arc::new(memory::ManageMemory))
         .register(Arc::new(task::ManageTask))
         .register(Arc::new(verify::VerifyProject::new(shell_cfg.timeout_secs)))
+        .register(Arc::new(ask::AskUser))
+        .register(Arc::new(session_search::SessionSearch))
 }
 
 /// Registry BACA-SAJA (Fase 6): persis daftar agent::plan::READ_ONLY_TOOLS.
@@ -299,6 +328,7 @@ pub fn read_only_registry() -> Registry {
         .register(Arc::new(web::FetchUrl))
         .register(Arc::new(skill::SkillsList))
         .register(Arc::new(skill::SkillView))
+        .register(Arc::new(session_search::SessionSearch))
 }
 
 pub(crate) fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {

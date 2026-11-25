@@ -496,6 +496,13 @@ pub fn list_skills(cwd: &Path) -> Vec<SkillInfo> {
     res.skills
 }
 
+/// Cek apakah nama skill termasuk salah satu dari 14 skill bawaan resmi SelenCode.
+pub fn is_builtin_skill_name(name: &str) -> bool {
+    crate::builtin_skills::BUILTIN_SKILL_NAMES
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name))
+}
+
 /// Format indeks skill ringkas dikelompokkan per kategori (deskripsi dipotong maks 60 char)
 /// untuk disuntikkan ke snapshot dinamis awal sesi & tool `skills_list`.
 pub fn format_skills_index(skills: &[SkillInfo]) -> String {
@@ -517,6 +524,33 @@ pub fn format_skills_index(skills: &[SkillInfo]) -> String {
         }
     }
     out.trim_end().to_string()
+}
+
+/// Format indeks skill dengan pengaman pagu token (Bagian 5 #6 v0.5.6):
+/// bila indeks gabungan melebihi `max_tokens`, urutan pemangkasan prioritas adalah
+/// **bawaan (builtin) duluan -> user kustom -> proyek (dipertahankan paling akhir)**.
+pub fn format_skills_index_budgeted(skills: &[SkillInfo], max_tokens: usize) -> String {
+    let full = format_skills_index(skills);
+    if max_tokens == 0 || full.chars().count().div_ceil(3) <= max_tokens {
+        return full;
+    }
+    let mut kept: Vec<SkillInfo> = skills.to_vec();
+    let trim_pass = |list: &mut Vec<SkillInfo>, pred: &dyn Fn(&SkillInfo) -> bool| {
+        while format_skills_index(list).chars().count().div_ceil(3) > max_tokens {
+            if let Some(pos) = list.iter().rposition(pred) {
+                list.remove(pos);
+            } else {
+                break;
+            }
+        }
+    };
+    // 1. Pangkas skill bawaan (scope user + nama builtin) duluan.
+    trim_pass(&mut kept, &|s| s.scope != "project" && is_builtin_skill_name(&s.name));
+    // 2. Pangkas skill pengguna kustom berikutnya.
+    trim_pass(&mut kept, &|s| s.scope != "project" && !is_builtin_skill_name(&s.name));
+    // 3. Paling akhir pangkas skill proyek bila tetap melampaui pagu.
+    trim_pass(&mut kept, &|s| s.scope == "project");
+    format_skills_index(&kept)
 }
 
 /// Daftar file referensi opsional (`references/`, `templates/`, `scripts/`) di dalam folder skill.
@@ -772,9 +806,42 @@ pub const BUILTIN_TINJAU_RUST_REF: &str = "\
 - Pemotongan string memakai batas karakter UTF-8 (`chars()` / `is_char_boundary`).
 ";
 
-/// Semai 2 skill bawaan contoh (`rilis-github` & `tinjau-rust`) ke `<data_dir>/selencode/skills/dev/`
-/// saat pertama kali dijalankan agar langsung siap dicoba sejak hari pertama.
-/// Tidak menimpa folder yang sudah ada; bisa dimatikan dengan `SELENCODE_NO_DEFAULT_SKILLS=1`.
+/// Semai 14 skill bawaan resmi SelenCode (2 asli + 12 hasil adaptasi MIT) + file `NOTICE`
+/// ke direktori target `root`. Tidak pernah menimpa file yang sudah dimodifikasi user.
+pub fn seed_builtin_skills_to(root: &Path) {
+    let dev = root.join("dev");
+    let rilis_dir = dev.join("rilis-github");
+    let tinjau_dir = dev.join("tinjau-rust");
+    if !rilis_dir.join("SKILL.md").exists() && std::fs::create_dir_all(rilis_dir.join("references")).is_ok() {
+        let _ = std::fs::write(rilis_dir.join("SKILL.md"), BUILTIN_RILIS_GITHUB_MD);
+        let _ = std::fs::write(
+            rilis_dir.join("references").join("checklist-rilis.md"),
+            BUILTIN_RILIS_GITHUB_REF,
+        );
+    }
+    if !tinjau_dir.join("SKILL.md").exists() && std::fs::create_dir_all(tinjau_dir.join("references")).is_ok() {
+        let _ = std::fs::write(tinjau_dir.join("SKILL.md"), BUILTIN_TINJAU_RUST_MD);
+        let _ = std::fs::write(
+            tinjau_dir.join("references").join("checklist-rust.md"),
+            BUILTIN_TINJAU_RUST_REF,
+        );
+    }
+    for (rel_path, content) in crate::builtin_skills::BUILTIN_ADAPTED_FILES {
+        let dst = root.join(rel_path);
+        if dst.exists() {
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+        }
+        let _ = std::fs::write(&dst, content);
+    }
+}
+
+/// Semai 14 skill bawaan resmi SelenCode + `NOTICE` ke `<data_dir>/selencode/skills/`.
+/// Tidak menimpa skill yang sudah ada; bisa dimatikan dengan `SELENCODE_NO_DEFAULT_SKILLS=1`.
 pub fn seed_default_user_skills() {
     if std::env::var("SELENCODE_NO_DEFAULT_SKILLS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -785,26 +852,7 @@ pub fn seed_default_user_skills() {
     let Some(root) = user_skills_dir() else {
         return;
     };
-    if root.exists() {
-        return;
-    }
-    let dev = root.join("dev");
-    let rilis_dir = dev.join("rilis-github");
-    let tinjau_dir = dev.join("tinjau-rust");
-    if std::fs::create_dir_all(rilis_dir.join("references")).is_ok() {
-        let _ = std::fs::write(rilis_dir.join("SKILL.md"), BUILTIN_RILIS_GITHUB_MD);
-        let _ = std::fs::write(
-            rilis_dir.join("references").join("checklist-rilis.md"),
-            BUILTIN_RILIS_GITHUB_REF,
-        );
-    }
-    if std::fs::create_dir_all(tinjau_dir.join("references")).is_ok() {
-        let _ = std::fs::write(tinjau_dir.join("SKILL.md"), BUILTIN_TINJAU_RUST_MD);
-        let _ = std::fs::write(
-            tinjau_dir.join("references").join("checklist-rust.md"),
-            BUILTIN_TINJAU_RUST_REF,
-        );
-    }
+    seed_builtin_skills_to(&root);
 }
 
 /// Template skill bawaan SelenCode untuk efisiensi token & langkah minimal.

@@ -10,7 +10,7 @@ use selencode::repl::{
 use selencode::security::{ApprovalMode, ApprovalRequest};
 use selencode::telegram::{
     escape_telegram_html, format_telegram_progress_html, markdown_to_telegram_html,
-    parse_callback_review, TelegramClient, TgApprovalHub, TELEGRAM_BOT_COMMANDS,
+    parse_callback_review, TelegramClient, TgApprovalHub, TgAskHub, TELEGRAM_BOT_COMMANDS,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -102,6 +102,110 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
     }
 
     let hub = TgApprovalHub::new();
+    hub.set_timeout_mins(cfg.telegram.approval_timeout_mins);
+    let ask_hub = TgAskHub::new();
+
+    // BAGIAN 3 (v0.5.6): Penjadwal tugas terjadwal (Cron) hidup di dalam proses gateway Telegram.
+    // Kebijakan skip-missed saat startup: jadwal terlewat saat gateway mati dicatat terlewat, tidak dikejar.
+    if let Ok(cron_store) = selencode::store::Store::open() {
+        let skipped = selencode::cron::skip_missed_jobs_on_startup(&cron_store).unwrap_or(0);
+        if skipped > 0 {
+            println!("  Cron     : {skipped} jadwal terlewat saat gateway mati ditandai terlewat (skip-missed).");
+        }
+        let cron_tg = tg.clone();
+        let cron_prov_override = cli.provider.clone();
+        let cron_store_arc = Arc::new(cron_store);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                let Ok(cur_cfg) = config::load() else {
+                    continue;
+                };
+                let Ok(jobs) = cron_store_arc.list_cron_jobs() else {
+                    continue;
+                };
+                let now_utc = chrono::Utc::now();
+                // Antre serial: jalankan satu per satu, tidak pernah 2 job bersamaan.
+                for job in jobs {
+                    if !job.enabled {
+                        continue;
+                    }
+                    let is_due = chrono::DateTime::parse_from_rfc3339(&job.next_run_at)
+                        .map(|dt| dt.with_timezone(&chrono::Utc) <= now_utc)
+                        .unwrap_or(false);
+                    if !is_due {
+                        continue;
+                    }
+                    let Ok((pname, pcfg, key)) =
+                        cur_cfg.resolve_provider(cron_prov_override.as_deref())
+                    else {
+                        continue;
+                    };
+                    let tel = Arc::new(std::sync::Mutex::new(
+                        selencode::providers::router::RouterTelemetry::default(),
+                    ));
+                    let Ok(prov) =
+                        super::make_routed_provider(&cur_cfg, &pname, &pcfg, &key, tel)
+                    else {
+                        continue;
+                    };
+                    let sandbox = Arc::new(selencode::sandbox::SandboxController::from_config(
+                        &cur_cfg.sandbox,
+                        selencode::sandbox::default_audit_log_path(),
+                    ));
+                    let run_started = chrono::Utc::now()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Seconds, true);
+                    let next_slot = selencode::cron::compute_next_run_after(
+                        &job.schedule_spec,
+                        chrono::Utc::now(),
+                    )
+                    .unwrap_or_else(|_| run_started.clone());
+                    let _ = cron_store_arc.update_cron_job_run(
+                        job.id,
+                        &run_started,
+                        &next_slot,
+                        "berjalan",
+                        "Sedang dieksekusi...",
+                    );
+                    let (ok, summary) = selencode::cron::run_cron_job_once(
+                        prov,
+                        cron_store_arc.clone(),
+                        sandbox,
+                        &job,
+                        &cur_cfg.shell,
+                        cur_cfg.agent.max_steps,
+                    )
+                    .await;
+                    let status_lbl = if ok { "sukses" } else { "gagal" };
+                    let next_after = selencode::cron::compute_next_run_after(
+                        &job.schedule_spec,
+                        chrono::Utc::now(),
+                    )
+                    .unwrap_or(next_slot);
+                    let _ = cron_store_arc.update_cron_job_run(
+                        job.id,
+                        &run_started,
+                        &next_after,
+                        status_lbl,
+                        &summary,
+                    );
+                    let target_chat = if job.chat_id != 0 {
+                        job.chat_id
+                    } else {
+                        cur_cfg.telegram.allowed_users.first().copied().unwrap_or(0)
+                    };
+                    if target_chat != 0 {
+                        let report = selencode::cron::format_cron_report_message(
+                            &job.name,
+                            ok,
+                            &summary,
+                        );
+                        let _ = cron_tg.send_long_message(target_chat, &report).await;
+                    }
+                }
+            }
+        });
+    }
     let sessions: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let busy_chats: Arc<std::sync::Mutex<HashSet<i64>>> =
@@ -160,6 +264,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
 
         // Muat ulang config terbaru agar perubahan `/telegram allow`, `/model`, & `/provider` langsung berlaku.
         let latest_cfg = config::load().unwrap_or_else(|_| cfg.clone());
+        hub.set_timeout_mins(latest_cfg.telegram.approval_timeout_mins);
 
         for upd in updates {
             offset = upd.update_id + 1;
@@ -167,6 +272,9 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
             if let Some(cb) = upd.callback_query {
                 let chat_id = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
                 if latest_cfg.telegram.is_allowed(cb.from.id, chat_id) {
+                    if ask_hub.handle_callback(&tg, &cb).await {
+                        continue;
+                    }
                     if let Some((prop_id, approve)) = cb.data.as_deref().and_then(parse_callback_review) {
                         let res_msg = match selencode::store::Store::open() {
                             Ok(st) => {
@@ -287,11 +395,12 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 continue;
             }
 
-            // `/cancel` selalu diproses walau chat sedang sibuk — batalkan giliran & approval tertunda!
+            // `/cancel` selalu diproses walau chat sedang sibuk — batalkan giliran, approval, & ask_user tertunda!
             if display_text.eq_ignore_ascii_case("/cancel")
                 || display_text.eq_ignore_ascii_case("/stop")
             {
                 let cancelled_approvals = hub.cancel_chat_approvals(chat_id);
+                let _ = ask_hub.cancel_chat_asks(chat_id);
                 let notify_opt = cancel_tokens
                     .lock()
                     .ok()
@@ -306,6 +415,17 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 };
                 let _ = tg.send_message(chat_id, &msg).await;
                 continue;
+            }
+
+            // BAGIAN 2 (v0.5.6): Jika ada pertanyaan klarifikasi `ask_user` tertunda di chat ini
+            // dan user mengetik balasan bebas (bukan slash command), arahkan langsung sebagai jawaban `ask_user`!
+            if !display_text.starts_with('/') && ask_hub.has_pending_for_chat(chat_id) {
+                if ask_hub
+                    .try_consume_text_reply(&tg, chat_id, &display_text)
+                    .await
+                {
+                    continue;
+                }
             }
 
             let cancel_notify = {
@@ -341,6 +461,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
             println!("[telegram] {sender_name} ({chat_id}): {display_text}");
             let tg_clone = tg.clone();
             let hub_clone = hub.clone();
+            let ask_hub_clone = ask_hub.clone();
             let sessions_clone = sessions.clone();
             let busy_clone = busy_chats.clone();
             let active_prog_clone = active_progress.clone();
@@ -352,6 +473,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 let res = handle_telegram_chat_message(
                     tg_clone.clone(),
                     hub_clone,
+                    ask_hub_clone,
                     sessions_clone,
                     busy_clone.clone(),
                     active_prog_clone.clone(),
@@ -398,6 +520,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
 async fn handle_telegram_chat_message(
     tg: TelegramClient,
     hub: Arc<TgApprovalHub>,
+    ask_hub: Arc<TgAskHub>,
     sessions: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>>,
     busy_chats: Arc<std::sync::Mutex<HashSet<i64>>>,
     active_progress: Arc<std::sync::Mutex<HashMap<i64, i64>>>,
@@ -482,7 +605,9 @@ async fn handle_telegram_chat_message(
         } else {
             let (approval_tx, mut approval_rx) =
                 tokio::sync::mpsc::channel::<ApprovalRequest>(16);
-            let s = match Session::build(
+            let (ask_tx, mut ask_rx) =
+                tokio::sync::mpsc::channel::<selencode::tools::ask::AskUserRequest>(8);
+            let mut s = match Session::build(
                 provider_override.as_deref(),
                 yes_flag,
                 false,
@@ -500,6 +625,16 @@ async fn handle_telegram_chat_message(
                     return Err(e);
                 }
             };
+            let ask_timeout = s.cfg.ask.timeout_secs;
+            s.ctx.asker = Arc::new(selencode::tools::ask::UserAsker::channel(ask_tx));
+            s.ctx.ask_timeout_secs = ask_timeout;
+            let tg_ask = tg.clone();
+            let ask_hub_bg = ask_hub.clone();
+            tokio::spawn(async move {
+                while let Some(req) = ask_rx.recv().await {
+                    ask_hub_bg.dispatch(&tg_ask, chat_id, req).await;
+                }
+            });
             let policy = s.ctx.approver.policy();
             if !yes_flag && !tg_approval_cfg.trim().is_empty() {
                 let mode = ApprovalMode::from_config(&tg_approval_cfg, false);
@@ -707,6 +842,16 @@ async fn handle_telegram_chat_message(
         }
         SlashCommand::Skill(arg) => {
             let reply = s.handle_use_skill(arg.as_deref())?;
+            tg.send_menu_markup(chat_id, &reply).await?;
+            return Ok(());
+        }
+        SlashCommand::Cron(arg) => {
+            let reply = s.handle_cron(arg.as_deref(), Some(chat_id))?;
+            tg.send_menu_markup(chat_id, &reply).await?;
+            return Ok(());
+        }
+        SlashCommand::Search(arg) => {
+            let reply = s.handle_search(arg.as_deref())?;
             tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
@@ -955,6 +1100,10 @@ async fn handle_telegram_chat_message(
                         tools.push(format!("{name} — {short}"));
                     }
                     changed = true;
+                }
+                UiEvent::Info(info) if info.starts_with("Model utama gagal") => {
+                    // BAGIAN 1 (#4): Beri tahu pengguna 1x sebagai pesan baru singkat saat fallback aktif.
+                    let _ = tg_prog.send_message(chat_id, &info).await;
                 }
                 UiEvent::Info(info) if info.contains("Self-improvement") => {
                     notes.push(info);

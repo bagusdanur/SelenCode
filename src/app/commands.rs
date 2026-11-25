@@ -1476,6 +1476,200 @@ impl Session {
         Ok(out)
     }
 
+    /// Tangani `/search <kata kunci>` — pencarian lintas sesi berbasis SQLite FTS5 (v0.5.6 Bagian 4A).
+    pub(crate) fn handle_search(&self, arg: Option<&str>) -> Result<String> {
+        let Some(query) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            return Ok(
+                "# Pencarian Lintas Sesi (`/search`)\n\
+                 > /search <kata kunci> | | cari frasa/kata di seluruh transkrip sesi tersimpan (FTS5)\n\
+                 ! Contoh: `/search KODE-UNIK-7391` — lalu lanjutkan sesi dengan `/resume <id_sesi>`."
+                    .to_string(),
+            );
+        };
+        let _ = self.store.backfill_fts_if_needed();
+        let hits = self.store.search_sessions_fts(query, None, 10)?;
+        if hits.is_empty() {
+            return Ok(format!(
+                "# Hasil Pencarian Sesi: \"{query}\"\n\
+                 ! Tidak ada sesi tersimpan yang cocok di database sesi lokal.\n\
+                 ! Catatan: pencarian hanya mencakup teks percakapan yang tersimpan di DB sesi mesin ini."
+            ));
+        }
+        let mut out = format!("# Hasil Pencarian Sesi ({} cocok untuk \"{query}\")\n", hits.len());
+        for (i, h) in hits.iter().enumerate() {
+            let short_id: String = h.session_id.chars().take(10).collect();
+            let dt: String = h.created_at.chars().take(19).collect();
+            out.push_str(&format!(
+                "* #{} | {} ({dt}) | id: {short_id}\n",
+                i + 1,
+                h.title
+            ));
+            out.push_str(&format!("  > cuplikan | {} |\n", h.snippet));
+        }
+        out.push_str("---\n! Lanjutkan sesi: /resume <id_sesi>   ·   Cakupan: teks tersimpan di DB sesi lokal");
+        Ok(out)
+    }
+
+    /// Tangani `/cron [add|list|remove|pause|resume]` (v0.5.6 Bagian 3).
+    pub(crate) fn handle_cron(&self, arg: Option<&str>, chat_id: Option<i64>) -> Result<String> {
+        use selencode::cron::{
+            compute_next_run_after, format_schedule_human, parse_schedule, CRON_GATEWAY_NOTE,
+        };
+        let raw = arg.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let Some(cmd) = raw else {
+            return self.format_cron_list_menu();
+        };
+        let lower = cmd.to_ascii_lowercase();
+        if matches!(lower.as_str(), "list" | "ls" | "status") {
+            return self.format_cron_list_menu();
+        }
+        if let Some(rest) = cmd
+            .strip_prefix("add ")
+            .or_else(|| cmd.strip_prefix("ADD "))
+        {
+            // Format: `/cron add <nama> <jadwal_1_token_atau_every_5m> <prompt...>`
+            // Contoh: `/cron add cek-log 5m Baca file log.txt dan laporkan baris pertamanya`
+            // atau `/cron add pagi every 2h Cek status proyek` / `/cron add harian daily 08:30 Ringkas progress`
+            let mut toks = rest.trim().split_whitespace();
+            let Some(name) = toks.next() else {
+                anyhow::bail!("format: `/cron add <nama> <5m|2h|08:30> <prompt>`");
+            };
+            let Some(t1) = toks.next() else {
+                anyhow::bail!("jadwal wajib diisi. Contoh: `/cron add cek 5m Baca file X`");
+            };
+            let (sched_raw, prompt) = if matches!(
+                t1.to_ascii_lowercase().as_str(),
+                "every" | "tiap" | "setiap" | "daily" | "harian"
+            ) {
+                let Some(t2) = toks.next() else {
+                    anyhow::bail!("jadwal tidak lengkap setelah '{t1}'. Contoh: `every 5m` atau `daily 08:30`");
+                };
+                let rest_prompt: Vec<&str> = toks.collect();
+                (format!("{t1} {t2}"), rest_prompt.join(" "))
+            } else {
+                let rest_prompt: Vec<&str> = toks.collect();
+                (t1.to_string(), rest_prompt.join(" "))
+            };
+            if prompt.trim().is_empty() {
+                anyhow::bail!("prompt job tidak boleh kosong. Contoh: `/cron add cek 5m Baca file X`");
+            }
+            let parsed = parse_schedule(&sched_raw)?;
+            let spec = parsed.canonical_spec();
+            let next_run = compute_next_run_after(&spec, chrono::Utc::now())?;
+            let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
+            let target_chat = chat_id
+                .or_else(|| self.cfg.telegram.allowed_users.first().copied())
+                .unwrap_or(0);
+            let job = self.store.add_cron_job(
+                name,
+                &spec,
+                &prompt,
+                &cwd_str,
+                &[],
+                false,
+                target_chat,
+                &next_run,
+            )?;
+            return Ok(format!(
+                "# Job Terjadwal Ditambahkan (#{})\n\
+                 * {} | {} | izin: hanya baca (default aman)\n\
+                 > jadwal berikut | {} | folder: {}\n\
+                 ---\n\
+                 ! {CRON_GATEWAY_NOTE}\n\
+                 ! Untuk izin shell/tulis eksplisit per job, gunakan CLI: `selen cron add --name ... --allow-shell ...`",
+                job.id,
+                job.name,
+                format_schedule_human(&job.schedule_spec),
+                job.next_run_at,
+                job.cwd
+            ));
+        }
+        if let Some(rest) = cmd
+            .strip_prefix("remove ")
+            .or_else(|| cmd.strip_prefix("rm "))
+            .or_else(|| cmd.strip_prefix("del "))
+        {
+            let target = rest.trim();
+            if self.store.remove_cron_job(target)? {
+                return Ok(format!("# Job Terjadwal Dihapus\n> {target} | dihapus permanen"));
+            }
+            anyhow::bail!("job '{target}' tidak ditemukan");
+        }
+        if let Some(rest) = cmd.strip_prefix("pause ") {
+            let target = rest.trim();
+            if let Some(j) = self.store.set_cron_job_enabled(target, false, None)? {
+                return Ok(format!("# Job Terjadwal Dijeda\n> {} | nonaktif sementara", j.name));
+            }
+            anyhow::bail!("job '{target}' tidak ditemukan");
+        }
+        if let Some(rest) = cmd.strip_prefix("resume ") {
+            let target = rest.trim();
+            let Some(existing) = self.store.get_cron_job(target)? else {
+                anyhow::bail!("job '{target}' tidak ditemukan");
+            };
+            let next = compute_next_run_after(&existing.schedule_spec, chrono::Utc::now())?;
+            if let Some(j) = self.store.set_cron_job_enabled(target, true, Some(&next))? {
+                return Ok(format!(
+                    "# Job Terjadwal Diaktifkan Kembali\n* {} | {} | jadwal berikut: {}",
+                    j.name,
+                    format_schedule_human(&j.schedule_spec),
+                    j.next_run_at
+                ));
+            }
+            anyhow::bail!("job '{target}' tidak ditemukan");
+        }
+        Ok(format!(
+            "# Cara Pakai /cron\n\
+             > /cron list | | lihat semua job terjadwal\n\
+             > /cron add | <nama> <5m/2h/08:30> <prompt> | tambah job baca-saja\n\
+             > /cron pause | <nama/id> | jeda sementara\n\
+             > /cron resume | <nama/id> | aktifkan kembali\n\
+             > /cron remove | <nama/id> | hapus job\n\
+             ---\n\
+             ! {CRON_GATEWAY_NOTE}"
+        ))
+    }
+
+    fn format_cron_list_menu(&self) -> Result<String> {
+        use selencode::cron::{format_schedule_human, CRON_GATEWAY_NOTE};
+        let jobs = self.store.list_cron_jobs()?;
+        if jobs.is_empty() {
+            return Ok(format!(
+                "# Daftar Job Terjadwal (0)\n\
+                 ! Belum ada job terjadwal.\n\
+                 ! Tambah: `/cron add <nama> <5m/2h/08:30> <prompt>` atau `selen cron add --name ... --schedule ... --prompt ...`\n\
+                 ! {CRON_GATEWAY_NOTE}"
+            ));
+        }
+        let mut out = format!("# Daftar Job Terjadwal ({})\n", jobs.len());
+        for j in &jobs {
+            let st = if j.enabled { "aktif" } else { "dijeda" };
+            let last = if j.last_run_at.is_empty() {
+                "belum pernah".to_string()
+            } else {
+                format!("{} ({})", j.last_run_at.chars().take(19).collect::<String>(), j.last_status)
+            };
+            let perms = if j.allowed_shell.is_empty() && !j.allow_write {
+                "baca-saja".to_string()
+            } else {
+                format!(
+                    "shell:[{}] write:{}",
+                    j.allowed_shell.join(","),
+                    if j.allow_write { "ya" } else { "tidak" }
+                )
+            };
+            let mark = if j.enabled { "*" } else { ">" };
+            out.push_str(&format!(
+                "{mark} #{} {} | {} · {st} · izin: {perms} | terakhir: {last}\n",
+                j.id,
+                j.name,
+                format_schedule_human(&j.schedule_spec)
+            ));
+        }
+        out.push_str(&format!("---\n! {CRON_GATEWAY_NOTE}"));
+        Ok(out)
+    }
+
     pub(crate) fn handle_use_skill(&mut self, arg: Option<&str>) -> Result<String> {
         let name = arg
             .map(|s| s.trim())

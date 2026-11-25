@@ -28,9 +28,9 @@ fn persist_message(ctx: &Ctx, msg: &Message) {
     }
 }
 
-fn persist_usage(ctx: &Ctx, model: &str, usage: Option<Usage>) {
+fn persist_usage_kind(ctx: &Ctx, model: &str, usage: Option<Usage>, kind: &str) {
     if let (Some(store), Some(sid), Some(u)) = (&ctx.store, &ctx.session_id, usage) {
-        if let Err(e) = store.record_usage(sid, model, u.input_tokens, u.output_tokens) {
+        if let Err(e) = store.record_usage_with_kind(sid, model, u.input_tokens, u.output_tokens, kind) {
             eprintln!("[selen] gagal mencatat usage: {e}");
         }
     }
@@ -183,7 +183,12 @@ async fn run_turn_inner(
             dynamic_snapshot.push_str(&hint);
             dynamic_snapshot.push('\n');
         }
-        let skills_idx = crate::skills::format_skills_index(&installed_skills);
+        let dyn_cap = ctx
+            .skills
+            .index_max_tokens
+            .unwrap_or(ctx.tool_budget.dynamic_inject_max_tokens);
+        // Bagian 5 (#6): indeks gabungan dipangkas dengan prioritas bawaan -> user -> proyek bila melewati pagu.
+        let skills_idx = crate::skills::format_skills_index_budgeted(&installed_skills, dyn_cap);
         if !skills_idx.is_empty() {
             dynamic_snapshot.push_str(&skills_idx);
             dynamic_snapshot.push('\n');
@@ -202,10 +207,6 @@ async fn run_turn_inner(
             }
         }
         if !dynamic_snapshot.trim().is_empty() {
-            let dyn_cap = ctx
-                .skills
-                .index_max_tokens
-                .unwrap_or(ctx.tool_budget.dynamic_inject_max_tokens);
             let capped = cap_dynamic_injection(dynamic_snapshot.trim(), dyn_cap);
             sys.push_str("\n--- Konteks Sesi (Snapshot Awal) ---\n");
             sys.push_str(&capped);
@@ -328,6 +329,9 @@ async fn run_turn_inner(
         / 100_000)
         .clamp(24_000, 180_000) as usize;
     let mut last_step_deduped = 0usize;
+    let mut last_announced_fallback_model: Option<String> = None;
+    let mut unconfirmed_search_calls: usize = 0;
+    let mut anti_spin_reminded = false;
 
     for step in 0..max_steps {
         // Tahap 1 — Prune hasil tool lama (>200 char di luar 20 pesan terakhir) + arsip ke file (TANPA LLM).
@@ -401,7 +405,31 @@ async fn run_turn_inner(
         if printed {
             println!();
         }
-        persist_usage(ctx, provider.model_name(), reply.usage);
+        // BAGIAN 1 (#4 & #5): catat model aktual yang melayani panggilan & beri tahu user 1x per perpindahan fallback.
+        let (served_model_opt, was_fallback, fallback_notice) = ctx
+            .router_telemetry
+            .as_ref()
+            .and_then(|t| t.lock().ok().map(|mut g| g.take_last_call_info()))
+            .unwrap_or((None, false, None));
+        let actual_model = served_model_opt
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| provider.model_name());
+        if was_fallback {
+            if let Some(notice) = fallback_notice {
+                if last_announced_fallback_model.as_deref() != Some(actual_model) {
+                    last_announced_fallback_model = Some(actual_model.to_string());
+                    match &ui {
+                        Some(tx) => {
+                            let _ = tx.send(UiEvent::Info(notice)).await;
+                        }
+                        None => eprintln!("[selen] {notice}"),
+                    }
+                }
+            }
+        }
+        let usage_kind = if was_fallback { "fallback" } else { "main" };
+        persist_usage_kind(ctx, actual_model, reply.usage, usage_kind);
         // Tahap 0 — Catat rincian token per panggilan API ke SQLite `call_token_metrics`.
         if let (Some(store), Some(sid)) = (&ctx.store, &ctx.session_id) {
             let (act_in, act_out) = reply
@@ -410,7 +438,7 @@ async fn run_turn_inner(
                 .unwrap_or((0, 0));
             let _ = store.record_call_token_metric(&crate::store::CallTokenMetric {
                 session_id: sid.clone(),
-                model: provider.model_name().to_string(),
+                model: actual_model.to_string(),
                 est_system_tokens: breakdown.system_tokens,
                 est_tools_tokens: breakdown.tools_tokens,
                 est_history_tokens: breakdown.conversation_tokens,
@@ -755,6 +783,35 @@ async fn run_turn_inner(
                         let _ = tx.send(UiEvent::Info(note)).await;
                     }
                     None => eprintln!("[selen] {note}"),
+                }
+            }
+            // BAGIAN 2 (#4): Aturan anti-berputar — setelah >5 panggilan pencarian/eksplorasi tanpa konfirmasi,
+            // aktifkan toolset `clarify` dan instruksikan model BERHENTI mencari buta lalu bertanya ke user.
+            if call.name == "ask_user" {
+                unconfirmed_search_calls = 0;
+                anti_spin_reminded = false;
+            } else if matches!(
+                call.name.as_str(),
+                "search_text" | "list_files" | "run_shell" | "fetch_url"
+            ) {
+                unconfirmed_search_calls += 1;
+                if unconfirmed_search_calls >= 5
+                    && !anti_spin_reminded
+                    && registry.get("ask_user").is_some()
+                {
+                    anti_spin_reminded = true;
+                    if active_toolsets.insert("clarify".to_string()) {
+                        tools = crate::tools::toolsets::active_tool_specs_with_mcp(
+                            registry,
+                            &active_toolsets,
+                            &loaded_mcp_tools,
+                            mode,
+                        );
+                    }
+                    content.push_str(
+                        "\n\n[GUARD ANTI-BERPUTAR] Kamu sudah melakukan 5 panggilan pencarian/eksplorasi tanpa kandidat terkonfirmasi. \
+                         DILARANG melanjutkan pencarian buta — berhenti sekarang dan panggil `ask_user` dengan kandidat terbaik yang sudah ditemukan sebagai pilihan (maks 4).",
+                    );
                 }
             }
             if let Some(tx) = &ui {

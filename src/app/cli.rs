@@ -56,6 +56,52 @@ pub enum Commands {
         /// Subperintah: pending, approve <id>, discard <id>, status
         args: Vec<String>,
     },
+    /// Kelola tugas terjadwal (`selen cron add|list|remove|pause|resume`) — berjalan selama gateway Telegram hidup
+    Cron {
+        #[command(subcommand)]
+        action: CronCliAction,
+    },
+    /// Cari percakapan lintas sesi tersimpan (FTS5)
+    Search {
+        /// Kata kunci atau frasa yang dicari
+        query: Vec<String>,
+    },
     /// Perbarui selen ke rilis terbaru dari GitHub Releases
     Update,
+}
+
+#[derive(Subcommand)]
+pub enum CronCliAction {
+    /// Tambah job terjadwal baru (interval `every 5m`/`every 2h` atau harian `daily 08:30`)
+    Add {
+        /// Nama unik job
+        #[arg(long)]
+        name: String,
+        /// Jadwal sederhana: `every 5m`, `every 2h`, atau `daily 08:30`
+        #[arg(long)]
+        schedule: String,
+        /// Prompt tugas yang dijalankan agent
+        #[arg(long)]
+        prompt: String,
+        /// Folder kerja job (default: folder saat ini)
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Allowlist perintah shell eksplisit per job (boleh diulang); kosong = hanya tool baca
+        #[arg(long = "allow-shell")]
+        allow_shell: Vec<String>,
+        /// Izinkan tulis/edit file di dalam folder kerja job (default: false / baca saja)
+        #[arg(long)]
+        allow_write: bool,
+        /// Target Chat ID Telegram untuk laporan (opsional; default whitelist pertama)
+        #[arg(long)]
+        chat_id: Option<i64>,
+    },
+    /// Tampilkan semua job terjadwal
+    List,
+    /// Hapus job berdasarkan nama atau ID
+    Remove { target: String },
+    /// Jeda (nonaktifkan sementara) job berdasarkan nama atau ID
+    Pause { target: String },
+    /// Aktifkan kembali job berdasarkan nama atau ID
+    Resume { target: String },
 }

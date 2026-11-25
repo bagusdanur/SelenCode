@@ -277,6 +277,40 @@ pub struct ReviewRunRecord {
     pub created_at: String,
 }
 
+/// Definisi tugas terjadwal persisten (Bagian 3 v0.5.6 — berjalan selama gateway Telegram hidup).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronJobRecord {
+    pub id: i64,
+    pub name: String,
+    /// `every:<N>m` | `every:<N>h` | `daily:HH:MM`
+    pub schedule_spec: String,
+    pub prompt: String,
+    pub cwd: String,
+    /// Allowlist perintah shell eksplisit per job (kosong = `run_shell` tidak ditawarkan sama sekali).
+    pub allowed_shell: Vec<String>,
+    /// Izin tulis file eksplisit di folder `cwd` (default false = hanya tool baca).
+    pub allow_write: bool,
+    pub enabled: bool,
+    /// Target chat Telegram pemilik (0 = kirim ke semua `allowed_users` pertama).
+    pub chat_id: i64,
+    pub last_run_at: String,
+    pub next_run_at: String,
+    pub last_status: String,
+    pub last_summary: String,
+    pub created_at: String,
+}
+
+/// Satu hasil pencarian lintas sesi berbasis SQLite FTS5 (Bagian 4A v0.5.6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSearchHit {
+    pub session_id: String,
+    pub title: String,
+    pub created_at: String,
+    pub role: String,
+    pub snippet: String,
+    pub score: f64,
+}
+
 /// Lokasi DB: env SELENCODE_DB (dipakai tes) atau
 /// ~/.local/share/selencode/selen.db (dirs::data_dir).
 pub fn db_path() -> PathBuf {
@@ -336,6 +370,17 @@ CREATE TABLE IF NOT EXISTS review_runs (id INTEGER PRIMARY KEY, session_id TEXT 
                     report_text TEXT NOT NULL DEFAULT '',
                     delivered INTEGER NOT NULL DEFAULT 0,
                     input_tokens INT NOT NULL DEFAULT 0, output_tokens INT NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cron_jobs (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,
+                    schedule_spec TEXT NOT NULL, prompt TEXT NOT NULL, cwd TEXT NOT NULL,
+                    allowed_shell_json TEXT NOT NULL DEFAULT '[]',
+                    allow_write INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    chat_id INTEGER NOT NULL DEFAULT 0,
+                    last_run_at TEXT NOT NULL DEFAULT '',
+                    next_run_at TEXT NOT NULL DEFAULT '',
+                    last_status TEXT NOT NULL DEFAULT '',
+                    last_summary TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL);
 ";
 
@@ -439,6 +484,7 @@ impl Store {
         conn.execute_batch(SCHEMA).context("gagal membuat skema sesi")?;
         migrate_memories_schema(&conn)?;
         migrate_usage_schema(&conn)?;
+        init_fts_schema(&conn);
         Ok(Self {
             conn: Mutex::new(conn),
             pending_sessions: Mutex::new(HashMap::new()),
@@ -497,6 +543,10 @@ impl Store {
             "DELETE FROM messages WHERE session_id = ?1",
             rusqlite::params![session_id],
         )?;
+        let _ = conn.execute(
+            "DELETE FROM messages_fts WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        );
         conn.execute(
             "DELETE FROM usage WHERE session_id = ?1",
             rusqlite::params![session_id],
@@ -692,6 +742,17 @@ impl Store {
             "INSERT INTO messages (session_id, role, content, ts) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![session_id, role_str(msg.role), content, now()],
         )?;
+        let msg_id = conn.last_insert_rowid();
+        // Indeks FTS5 (Bagian 4A v0.5.6): bangun HANYA dari isi pesan tersimpan yang sudah teredaksi.
+        if msg.role != Role::System {
+            let searchable = extract_searchable_text_from_blocks(&msg.content);
+            if !searchable.is_empty() {
+                let _ = conn.execute(
+                    "INSERT INTO messages_fts (session_id, message_id, role, content_text) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![session_id, msg_id, role_str(msg.role), searchable],
+                );
+            }
+        }
         // Otomatis beri nama sesi sesuai konteks pesan user pertama yang substantif
         // bila judul sesi masih placeholder ("(sesi baru)" atau kosong).
         if msg.role == Role::User {
@@ -866,11 +927,25 @@ impl Store {
         input_tokens: u64,
         output_tokens: u64,
     ) -> Result<()> {
+        self.record_usage_with_kind(session_id, model, input_tokens, output_tokens, "main")
+    }
+
+    /// Catat pemakaian token dengan penanda jenis (`'main'`, `'fallback'`, `'review'`, `'cron'`).
+    pub fn record_usage_with_kind(
+        &self,
+        session_id: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        kind: &str,
+    ) -> Result<()> {
         let conn = self.conn.lock().expect("mutex store poisoned");
-        self.materialize_if_pending(&conn, session_id)?;
+        if matches!(kind, "main" | "fallback") {
+            self.materialize_if_pending(&conn, session_id)?;
+        }
         conn.execute(
-            "INSERT INTO usage (session_id, model, input_tokens, output_tokens, ts, kind) VALUES (?1, ?2, ?3, ?4, ?5, 'main')",
-            rusqlite::params![session_id, model, input_tokens as i64, output_tokens as i64, now()],
+            "INSERT INTO usage (session_id, model, input_tokens, output_tokens, ts, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![session_id, model, input_tokens as i64, output_tokens as i64, now(), kind],
         )?;
         Ok(())
     }
@@ -1318,6 +1393,275 @@ impl Store {
         Ok(out)
     }
 
+    // ---------- Tugas Terjadwal / Cron Persisten (v0.5.6 Bagian 3) ----------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_cron_job(
+        &self,
+        name: &str,
+        schedule_spec: &str,
+        prompt: &str,
+        cwd: &str,
+        allowed_shell: &[String],
+        allow_write: bool,
+        chat_id: i64,
+        next_run_at: &str,
+    ) -> Result<CronJobRecord> {
+        let clean_name = name.trim().to_string();
+        if clean_name.is_empty() {
+            anyhow::bail!("nama job tidak boleh kosong");
+        }
+        let safe_prompt = crate::security::redact_secrets(prompt.trim());
+        if safe_prompt.is_empty() {
+            anyhow::bail!("prompt job tidak boleh kosong");
+        }
+        let shell_json = serde_json::to_string(allowed_shell)?;
+        let ts = now();
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "INSERT INTO cron_jobs (name, schedule_spec, prompt, cwd, allowed_shell_json, allow_write, enabled, chat_id, last_run_at, next_run_at, last_status, last_summary, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, '', ?8, 'terjadwal', '', ?9)",
+            rusqlite::params![
+                clean_name,
+                schedule_spec,
+                safe_prompt,
+                cwd,
+                shell_json,
+                if allow_write { 1i64 } else { 0i64 },
+                chat_id,
+                next_run_at,
+                ts
+            ],
+        )
+        .with_context(|| format!("gagal menyimpan cron job '{clean_name}' (mungkin nama sudah dipakai)"))?;
+        let id = conn.last_insert_rowid();
+        Ok(CronJobRecord {
+            id,
+            name: clean_name,
+            schedule_spec: schedule_spec.to_string(),
+            prompt: safe_prompt,
+            cwd: cwd.to_string(),
+            allowed_shell: allowed_shell.to_vec(),
+            allow_write,
+            enabled: true,
+            chat_id,
+            last_run_at: String::new(),
+            next_run_at: next_run_at.to_string(),
+            last_status: "terjadwal".to_string(),
+            last_summary: String::new(),
+            created_at: ts,
+        })
+    }
+
+    pub fn list_cron_jobs(&self) -> Result<Vec<CronJobRecord>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, name, schedule_spec, prompt, cwd, allowed_shell_json, allow_write, enabled, chat_id, last_run_at, next_run_at, last_status, last_summary, created_at \
+             FROM cron_jobs ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_cron_job)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_cron_job(&self, name_or_id: &str) -> Result<Option<CronJobRecord>> {
+        let key = name_or_id.trim().trim_start_matches('#');
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        if let Ok(id) = key.parse::<i64>() {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, schedule_spec, prompt, cwd, allowed_shell_json, allow_write, enabled, chat_id, last_run_at, next_run_at, last_status, last_summary, created_at \
+                 FROM cron_jobs WHERE id = ?1",
+            )?;
+            if let Some(r) = stmt.query_map(rusqlite::params![id], row_to_cron_job)?.next() {
+                return Ok(Some(r?));
+            }
+        }
+        let mut stmt = conn.prepare(
+            "SELECT id, name, schedule_spec, prompt, cwd, allowed_shell_json, allow_write, enabled, chat_id, last_run_at, next_run_at, last_status, last_summary, created_at \
+             FROM cron_jobs WHERE LOWER(name) = LOWER(?1)",
+        )?;
+        match stmt.query_map(rusqlite::params![key], row_to_cron_job)?.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn remove_cron_job(&self, name_or_id: &str) -> Result<bool> {
+        let Some(job) = self.get_cron_job(name_or_id)? else {
+            return Ok(false);
+        };
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let n = conn.execute("DELETE FROM cron_jobs WHERE id = ?1", rusqlite::params![job.id])?;
+        Ok(n > 0)
+    }
+
+    pub fn set_cron_job_enabled(&self, name_or_id: &str, enabled: bool, next_run_at: Option<&str>) -> Result<Option<CronJobRecord>> {
+        let Some(mut job) = self.get_cron_job(name_or_id)? else {
+            return Ok(None);
+        };
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let next_s = next_run_at.unwrap_or(&job.next_run_at);
+        conn.execute(
+            "UPDATE cron_jobs SET enabled = ?2, next_run_at = ?3 WHERE id = ?1",
+            rusqlite::params![job.id, if enabled { 1i64 } else { 0i64 }, next_s],
+        )?;
+        job.enabled = enabled;
+        job.next_run_at = next_s.to_string();
+        Ok(Some(job))
+    }
+
+    pub fn update_cron_job_run(
+        &self,
+        id: i64,
+        last_run_at: &str,
+        next_run_at: &str,
+        last_status: &str,
+        last_summary: &str,
+    ) -> Result<()> {
+        let safe_sum = crate::security::redact_secrets(last_summary.trim());
+        let cut: String = safe_sum.chars().take(240).collect();
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "UPDATE cron_jobs SET last_run_at = ?2, next_run_at = ?3, last_status = ?4, last_summary = ?5 WHERE id = ?1",
+            rusqlite::params![id, last_run_at, next_run_at, last_status, cut],
+        )?;
+        Ok(())
+    }
+
+    // ---------- Pencarian Lintas Sesi FTS5 (v0.5.6 Bagian 4A) ----------
+
+    /// Backfill satu kali (atau inkremental) dari tabel `messages` yang sudah ada ke `messages_fts`
+    /// tanpa mengubah skema `messages`. Mengembalikan `(jumlah_diindeks, durasi_ms)`.
+    pub fn backfill_fts_if_needed(&self) -> Result<(usize, u128)> {
+        let started = std::time::Instant::now();
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let max_msg: i64 = conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0))
+            .unwrap_or(0);
+        if max_msg == 0 {
+            return Ok((0, started.elapsed().as_millis()));
+        }
+        let max_indexed: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(CAST(message_id AS INTEGER)), 0) FROM messages_fts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if max_indexed >= max_msg {
+            return Ok((0, started.elapsed().as_millis()));
+        }
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, role, content FROM messages WHERE id > ?1 AND role != 'system' ORDER BY id ASC",
+        )?;
+        let rows: Vec<(i64, String, String, String)> = stmt
+            .query_map(rusqlite::params![max_indexed], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        let mut indexed = 0usize;
+        let _ = conn.execute_batch("BEGIN IMMEDIATE;");
+        for (mid, sid, role, raw_json) in rows {
+            if let Ok(blocks) = blocks_from_json(&raw_json) {
+                let text = extract_searchable_text_from_blocks(&blocks);
+                if !text.is_empty() {
+                    if conn
+                        .execute(
+                            "INSERT INTO messages_fts (session_id, message_id, role, content_text) VALUES (?1, ?2, ?3, ?4)",
+                            rusqlite::params![sid, mid, role, text],
+                        )
+                        .is_ok()
+                    {
+                        indexed += 1;
+                    }
+                }
+            }
+        }
+        let _ = conn.execute_batch("COMMIT;");
+        Ok((indexed, started.elapsed().as_millis()))
+    }
+
+    /// Cari lintas sesi memakai SQLite FTS5 dengan cuplikan pendek (maks 180 char) & maks `limit` (<= 10).
+    pub fn search_sessions_fts(
+        &self,
+        query: &str,
+        cwd: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SessionSearchHit>> {
+        let fts_query = build_safe_fts_query(query);
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lim = limit.clamp(1, 10) as i64;
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut raw_hits: Vec<SessionSearchHit> = Vec::new();
+        let sql = if cwd.is_some() {
+            "SELECT f.session_id, COALESCE(s.title, '(tanpa judul)'), COALESCE(s.created_at, ''), f.role, \
+                    snippet(messages_fts, 3, '', '', '…', 24), bm25(messages_fts) \
+             FROM messages_fts f \
+             LEFT JOIN sessions s ON s.id = f.session_id \
+             WHERE messages_fts MATCH ?1 AND s.cwd = ?2 \
+             ORDER BY bm25(messages_fts) ASC LIMIT ?3"
+        } else {
+            "SELECT f.session_id, COALESCE(s.title, '(tanpa judul)'), COALESCE(s.created_at, ''), f.role, \
+                    snippet(messages_fts, 3, '', '', '…', 24), bm25(messages_fts) \
+             FROM messages_fts f \
+             LEFT JOIN sessions s ON s.id = f.session_id \
+             WHERE messages_fts MATCH ?1 \
+             ORDER BY bm25(messages_fts) ASC LIMIT ?2"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let fetch_limit = (lim * 4).min(40);
+        let mapper = |r: &rusqlite::Row<'_>| -> rusqlite::Result<SessionSearchHit> {
+            let snip: String = r.get::<_, String>(4).unwrap_or_default();
+            let clean_snip: String = snip
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(180)
+                .collect();
+            Ok(SessionSearchHit {
+                session_id: r.get(0)?,
+                title: r.get(1)?,
+                created_at: r.get(2)?,
+                role: r.get(3)?,
+                snippet: clean_snip,
+                score: r.get::<_, f64>(5).unwrap_or(0.0),
+            })
+        };
+        if let Some(c) = cwd {
+            for r in stmt.query_map(rusqlite::params![fts_query, c, fetch_limit], mapper)? {
+                raw_hits.push(r?);
+            }
+        } else {
+            for r in stmt.query_map(rusqlite::params![fts_query, fetch_limit], mapper)? {
+                raw_hits.push(r?);
+            }
+        }
+        // Ambil 1 cuplikan paling relevan per sesi agar daftar hasil tidak didominasi 1 sesi saja.
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for h in raw_hits {
+            if seen.insert(h.session_id.clone()) {
+                out.push(h);
+                if out.len() >= lim as usize {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     // ---------- Long-Horizon Task Persistence Lintas Sesi (/task, Tahap 5) ----------
 
     pub fn create_long_task(
@@ -1653,6 +1997,78 @@ fn migrate_usage_schema(conn: &Connection) -> Result<()> {
         .context("gagal migrasi kolom kind pada tabel usage")?;
     }
     Ok(())
+}
+
+/// Inisialisasi tabel bayangan FTS5 untuk pencarian lintas sesi tanpa menyentuh tabel `messages`.
+fn init_fts_schema(conn: &Connection) {
+    let _ = conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(\
+            session_id UNINDEXED, \
+            message_id UNINDEXED, \
+            role UNINDEXED, \
+            content_text, \
+            tokenize='unicode61'\
+        );",
+    );
+}
+
+fn extract_searchable_text_from_blocks(blocks: &[Block]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for b in blocks {
+        match b {
+            Block::Text(t) if !t.trim().is_empty() => {
+                let cut: String = t.trim().chars().take(4000).collect();
+                parts.push(cut);
+            }
+            Block::ToolUse { name, args, .. } => {
+                let a: String = args.to_string().chars().take(200).collect();
+                parts.push(format!("[tool:{name}] {a}"));
+            }
+            Block::ToolResult { content, .. } if !content.trim().is_empty() => {
+                let first: String = content.lines().take(3).collect::<Vec<_>>().join(" ");
+                let cut: String = first.chars().take(400).collect();
+                parts.push(cut);
+            }
+            _ => {}
+        }
+    }
+    parts.join("\n")
+}
+
+/// Ubah kueri pengguna bebas menjadi ekspresi FTS5 yang aman dari syntax error (tanda hubung/kutip).
+fn build_safe_fts_query(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let tokens: Vec<String> = trimmed
+        .split_whitespace()
+        .map(|tok| tok.replace('"', ""))
+        .filter(|tok| !tok.is_empty())
+        .map(|tok| format!("\"{tok}\""))
+        .collect();
+    tokens.join(" AND ")
+}
+
+fn row_to_cron_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJobRecord> {
+    let shell_json: String = row.get(5)?;
+    let allowed_shell: Vec<String> = serde_json::from_str(&shell_json).unwrap_or_default();
+    Ok(CronJobRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        schedule_spec: row.get(2)?,
+        prompt: row.get(3)?,
+        cwd: row.get(4)?,
+        allowed_shell,
+        allow_write: row.get::<_, i64>(6).unwrap_or(0) != 0,
+        enabled: row.get::<_, i64>(7).unwrap_or(1) != 0,
+        chat_id: row.get(8)?,
+        last_run_at: row.get(9)?,
+        next_run_at: row.get(10)?,
+        last_status: row.get(11)?,
+        last_summary: row.get(12)?,
+        created_at: row.get(13)?,
+    })
 }
 
 /// Guard keamanan Project Memory: tolak isi kosong atau yang mengandung rahasia/token/password.

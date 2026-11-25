@@ -209,6 +209,15 @@ impl Approver {
         Approver::Channel { policy, tx }
     }
 
+    /// Varian yang selalu menolak semua permintaan persetujuan tanpa blokir (dipakai cron job, v0.5.6).
+    pub fn deny_all() -> Self {
+        let (tx, _rx_dropped) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        Approver::Channel {
+            policy: Arc::new(Mutex::new(ApprovalPolicy::new(ApprovalMode::Ask))),
+            tx,
+        }
+    }
+
     pub fn policy(&self) -> Arc<Mutex<ApprovalPolicy>> {
         match self {
             Approver::Stdin { policy } | Approver::Channel { policy, .. } => policy.clone(),

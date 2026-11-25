@@ -142,6 +142,18 @@ pub fn parse_callback_review(data: &str) -> Option<(i64, bool)> {
     Some((id, approve))
 }
 
+/// Parse payload `callback_data` tombol klarifikasi `ask_user` (`ask:<id>:<choice_idx>`).
+/// Terpisah total dari callback approval (`ap:...`).
+pub fn parse_callback_ask(data: &str) -> Option<(u64, usize)> {
+    let mut parts = data.trim().split(':');
+    if parts.next()? != "ask" {
+        return None;
+    }
+    let id = parts.next()?.parse::<u64>().ok()?;
+    let idx = parts.next()?.parse::<usize>().ok()?;
+    Some((id, idx))
+}
+
 /// Potong teks panjang menjadi beberapa potongan aman UTF-8 <= `max_chars`
 /// karakter (mengutamakan batas baris `\n` agar blok kode tidak pecah di tengah baris).
 pub fn split_telegram_chunks(text: &str, max_chars: usize) -> Vec<String> {
@@ -222,6 +234,8 @@ pub const TELEGRAM_BOT_COMMANDS: &[(&str, &str)] = &[
     ("redo", "Ulangi edit yang dibatalkan"),
     ("task", "Kelola tugas panjang lintas sesi"),
     ("review", "Lihat & putuskan usulan background review"),
+    ("cron", "Kelola tugas terjadwal (add/list/remove/pause/resume)"),
+    ("search", "Cari percakapan lintas sesi tersimpan (FTS5)"),
     ("jobs", "Pantau proses latar belakang"),
     ("route", "Info & budget Dynamic Model Routing"),
     ("lsp", "Diagnostik & navigasi kode LSP"),
@@ -1186,6 +1200,23 @@ impl TelegramClient {
 
 // ---------- Jembatan persetujuan (ApprovalRequest <-> tombol inline Telegram) ----------
 
+/// Status pengiriman kartu approval ke Telegram (Bagian 4B v0.5.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalDeliveryStatus {
+    Sent { message_id: i64 },
+    Failed { reason: String },
+}
+
+/// Catatan terstruktur status pengiriman kartu persetujuan.
+#[derive(Debug, Clone)]
+pub struct ApprovalDeliveryRecord {
+    pub approval_id: u64,
+    pub chat_id: i64,
+    pub category: String,
+    pub status: ApprovalDeliveryStatus,
+    pub retried: bool,
+}
+
 pub struct PendingTgApproval {
     pub chat_id: i64,
     pub message_id: i64,
@@ -1196,15 +1227,94 @@ pub struct PendingTgApproval {
 }
 
 /// Penyimpan permintaan persetujuan aktif dari tool yang menunggu tap tombol di Telegram.
-#[derive(Default)]
 pub struct TgApprovalHub {
     next_id: AtomicU64,
+    /// Batas waktu tunggu dalam detik (default 600 = 10 menit; 0 = tanpa batas).
+    timeout_secs: AtomicU64,
     pending: Mutex<HashMap<u64, PendingTgApproval>>,
+    /// ID permintaan yang telah kedaluwarsa agar klik tombol lama dijawab "sudah kedaluwarsa".
+    expired_ids: Mutex<std::collections::HashSet<u64>>,
+    /// Log terstruktur status terkirim/gagal kartu persetujuan.
+    delivery_log: Mutex<Vec<ApprovalDeliveryRecord>>,
+}
+
+impl Default for TgApprovalHub {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicU64::new(0),
+            timeout_secs: AtomicU64::new(600), // default 10 menit (Bagian 4B)
+            pending: Mutex::new(HashMap::new()),
+            expired_ids: Mutex::new(std::collections::HashSet::new()),
+            delivery_log: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl TgApprovalHub {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Atur batas waktu approval dalam menit (`0` = tanpa batas / perilaku lama).
+    pub fn set_timeout_mins(&self, mins: u64) {
+        self.timeout_secs.store(mins.saturating_mul(60), Ordering::Relaxed);
+    }
+
+    /// Atur batas waktu approval dalam detik secara langsung (berguna untuk tes unit timeout pendek).
+    pub fn set_timeout_secs(&self, secs: u64) {
+        self.timeout_secs.store(secs, Ordering::Relaxed);
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs.load(Ordering::Relaxed)
+    }
+
+    /// Ambil salinan catatan pengiriman kartu approval (terkirim/gagal).
+    pub fn delivery_records(&self) -> Vec<ApprovalDeliveryRecord> {
+        self.delivery_log
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
+    }
+
+    fn push_delivery_record(&self, rec: ApprovalDeliveryRecord) {
+        match &rec.status {
+            ApprovalDeliveryStatus::Sent { message_id } => {
+                eprintln!(
+                    "[telegram][approval] id={} chat={} cat={} status=terkirim msg_id={} retried={}",
+                    rec.approval_id, rec.chat_id, rec.category, message_id, rec.retried
+                );
+            }
+            ApprovalDeliveryStatus::Failed { reason } => {
+                eprintln!(
+                    "[telegram][approval] id={} chat={} cat={} status=gagal retried={} sebab={}",
+                    rec.approval_id, rec.chat_id, rec.category, rec.retried, reason
+                );
+            }
+        }
+        if let Ok(mut log) = self.delivery_log.lock() {
+            log.push(rec);
+            if log.len() > 200 {
+                log.remove(0);
+            }
+        }
+    }
+
+    /// Tandai 1 approval kedaluwarsa (dipakai oleh timer maupun tes unit):
+    /// menolak aksi secara aman (`false`) dan mencatat ID di `expired_ids`.
+    pub fn expire_approval_now(&self, id: u64) -> Option<PendingTgApproval> {
+        let item = self.pending.lock().ok().and_then(|mut m| m.remove(&id))?;
+        if let Ok(mut exp) = self.expired_ids.lock() {
+            exp.insert(id);
+        }
+        Some(item)
+    }
+
+    pub fn is_expired(&self, id: u64) -> bool {
+        self.expired_ids
+            .lock()
+            .map(|s| s.contains(&id))
+            .unwrap_or(false)
     }
 
     /// Apakah masih ada permintaan persetujuan tertunda untuk `chat_id` ini?
@@ -1217,7 +1327,8 @@ impl TgApprovalHub {
     }
 
     /// Kirim pesan persetujuan dengan 3 tombol inline polos ke Telegram & daftarkan callback-nya.
-    /// Perintah/aksi ditampilkan UTUH (tidak pernah dipotong diam-diam); kedaluwarsa setelah `APPROVAL_TIMEOUT_SECS`.
+    /// Perintah/aksi ditampilkan UTUH; gagal kirim dicoba ulang TEPAT 1 kali lalu ditolak + lapor ke user;
+    /// kedaluwarsa mengikuti `[telegram] approval_timeout_mins` (default 10 menit, 0 = tanpa batas).
     pub async fn dispatch(
         self: &Arc<Self>,
         tg: &TelegramClient,
@@ -1227,11 +1338,13 @@ impl TgApprovalHub {
     ) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let category = tool_category_from_title(&req.title);
+        let t_secs = self.timeout_secs.load(Ordering::Relaxed);
+        let display_timeout = if t_secs == 0 { APPROVAL_TIMEOUT_SECS } else { t_secs };
         let (preamble_chunks, card_html, card_plain) = format_approval_card_html(
             &category,
             &req.title,
             &req.detail,
-            APPROVAL_TIMEOUT_SECS,
+            display_timeout,
         );
         for chunk_html in preamble_chunks {
             let _ = tg
@@ -1248,11 +1361,29 @@ impl TgApprovalHub {
                 format!("ap:{id}:a"),
             )],
         ];
-        match tg
-            .send_html_message_with_keyboard(chat_id, &card_html, &card_plain, rows)
+        // Bagian 4B (#1 & #2): catat status terkirim/gagal; bila gagal coba kirim ulang TEPAT 1 kali.
+        let mut retried = false;
+        let send_res = match tg
+            .send_html_message_with_keyboard(chat_id, &card_html, &card_plain, rows.clone())
             .await
         {
+            Ok(mid) => Ok(mid),
+            Err(_first_err) => {
+                retried = true;
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                tg.send_html_message_with_keyboard(chat_id, &card_html, &card_plain, rows)
+                    .await
+            }
+        };
+        match send_res {
             Ok(message_id) => {
+                self.push_delivery_record(ApprovalDeliveryRecord {
+                    approval_id: id,
+                    chat_id,
+                    category: category.clone(),
+                    status: ApprovalDeliveryStatus::Sent { message_id },
+                    retried,
+                });
                 if let Ok(mut map) = self.pending.lock() {
                     map.insert(
                         id,
@@ -1266,31 +1397,45 @@ impl TgApprovalHub {
                         },
                     );
                 }
-                let hub_exp = Arc::clone(self);
-                let tg_exp = tg.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(APPROVAL_TIMEOUT_SECS)).await;
-                    let expired = hub_exp.pending.lock().ok().and_then(|mut m| m.remove(&id));
-                    if let Some(item) = expired {
-                        let _ = item.reply.send(false);
-                        let updated_html = format!(
-                            "{}\n\n<b>Status:</b> Kedaluwarsa (ditolak otomatis).",
-                            item.base_text
-                        );
-                        let _ = tg_exp
-                            .edit_html_message(
-                                item.chat_id,
-                                item.message_id,
-                                &updated_html,
-                                "Permintaan persetujuan kedaluwarsa (ditolak otomatis).",
-                            )
-                            .await;
-                    }
-                });
+                if t_secs > 0 {
+                    let hub_exp = Arc::clone(self);
+                    let tg_exp = tg.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(t_secs)).await;
+                        if let Some(item) = hub_exp.expire_approval_now(id) {
+                            let _ = item.reply.send(false);
+                            let _ = tg_exp
+                                .edit_message_text(
+                                    item.chat_id,
+                                    item.message_id,
+                                    "Kedaluwarsa — aksi dibatalkan",
+                                )
+                                .await;
+                        }
+                    });
+                }
             }
-            Err(_) => {
-                // Gagal mengirim pesan approval -> tolak demi keamanan.
+            Err(e) => {
+                let reason = e.to_string();
+                self.push_delivery_record(ApprovalDeliveryRecord {
+                    approval_id: id,
+                    chat_id,
+                    category: category.clone(),
+                    status: ApprovalDeliveryStatus::Failed {
+                        reason: reason.clone(),
+                    },
+                    retried,
+                });
+                // Gagal mengirim kartu persetujuan sesudah 1x retry -> TOLAK demi keamanan + beri tahu user!
                 let _ = req.reply.send(false);
+                let _ = tg
+                    .send_message(
+                        chat_id,
+                        &format!(
+                            "Persetujuan untuk aksi `{category}` gagal dikirim ke Telegram — aksi dibatalkan demi keamanan."
+                        ),
+                    )
+                    .await;
             }
         }
     }
@@ -1324,7 +1469,7 @@ impl TgApprovalHub {
         count
     }
 
-    /// Proses `callback_query` dari Telegram. Mengembalikan `true` jika cocok dengan approval aktif.
+    /// Proses `callback_query` dari Telegram. Mengembalikan `true` jika cocok dengan approval aktif/kedaluwarsa.
     pub async fn handle_callback(&self, tg: &TelegramClient, cb: &TgCallbackQuery) -> bool {
         let Some(data) = cb.data.as_deref() else {
             return false;
@@ -1348,12 +1493,12 @@ impl TgApprovalHub {
             }
         };
         let Some(item) = entry else {
-            let _ = tg
-                .answer_callback_query(
-                    &cb.id,
-                    Some("Permintaan persetujuan ini sudah kedaluwarsa atau bukan dari chat ini."),
-                )
-                .await;
+            let msg = if self.is_expired(id) {
+                "sudah kedaluwarsa"
+            } else {
+                "Permintaan persetujuan ini sudah kedaluwarsa atau sudah diproses."
+            };
+            let _ = tg.answer_callback_query(&cb.id, Some(msg)).await;
             return true;
         };
         let (approved, toast, badge) = match decision {
@@ -1377,5 +1522,224 @@ impl TgApprovalHub {
             .edit_html_message(item.chat_id, item.message_id, &updated_html, badge)
             .await;
         true
+    }
+}
+
+// ---------- Jembatan klarifikasi `ask_user` Telegram (Bagian 2 v0.5.6 — TERPISAH dari approval!) ----------
+
+struct PendingTgAsk {
+    chat_id: i64,
+    message_id: i64,
+    question: String,
+    choices: Vec<String>,
+    reply: tokio::sync::oneshot::Sender<crate::tools::ask::AskUserAnswer>,
+}
+
+/// Hub pertanyaan klarifikasi `ask_user` di Telegram (jalur kode & visual 100% terpisah dari `TgApprovalHub`).
+#[derive(Default)]
+pub struct TgAskHub {
+    next_id: AtomicU64,
+    pending: Mutex<HashMap<u64, PendingTgAsk>>,
+}
+
+impl TgAskHub {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn has_pending_for_chat(&self, chat_id: i64) -> bool {
+        self.pending
+            .lock()
+            .map(|m| m.values().any(|p| p.chat_id == chat_id))
+            .unwrap_or(false)
+    }
+
+    /// Format kartu pertanyaan klarifikasi (gaya v0.5.0: polos, 0 emoji dekoratif, jelas bukan approval).
+    pub fn format_ask_card_html(
+        question: &str,
+        choices: &[String],
+        context: Option<&str>,
+    ) -> (String, String) {
+        let mut html = String::from("<b>Pertanyaan Klarifikasi</b>\n");
+        let mut plain = String::from("Pertanyaan Klarifikasi\n");
+        if let Some(ctx) = context.map(str::trim).filter(|s| !s.is_empty()) {
+            html.push_str(&format!("<i>{}</i>\n\n", escape_telegram_html(ctx)));
+            plain.push_str(&format!("{ctx}\n\n"));
+        }
+        html.push_str(&escape_telegram_html(question));
+        plain.push_str(question);
+        if choices.is_empty() {
+            html.push_str("\n\n<i>Balas pesan ini dengan jawabanmu.</i>");
+            plain.push_str("\n\nBalas pesan ini dengan jawabanmu.");
+        } else {
+            html.push_str("\n\n<i>Pilih tombol di bawah atau balas langsung dengan teks bebas.</i>");
+            plain.push_str("\n\nPilih tombol di bawah atau balas langsung dengan teks bebas.");
+        }
+        (html, plain)
+    }
+
+    /// Kirim pertanyaan `ask_user` sebagai pesan Telegram baru (tombol pilihan maks 4 + dukung teks bebas).
+    pub async fn dispatch(
+        self: &Arc<Self>,
+        tg: &TelegramClient,
+        chat_id: i64,
+        req: crate::tools::ask::AskUserRequest,
+    ) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (card_html, card_plain) =
+            Self::format_ask_card_html(&req.question, &req.choices, req.context.as_deref());
+        let rows: Vec<Vec<(String, String)>> = req
+            .choices
+            .iter()
+            .take(4)
+            .enumerate()
+            .map(|(idx, label)| {
+                let short_lbl: String = label.chars().take(48).collect();
+                vec![(short_lbl, format!("ask:{id}:{idx}"))]
+            })
+            .collect();
+
+        let send_res = if rows.is_empty() {
+            tg.send_html_message(chat_id, &card_html, &card_plain).await
+        } else {
+            tg.send_html_message_with_keyboard(chat_id, &card_html, &card_plain, rows)
+                .await
+        };
+
+        match send_res {
+            Ok(message_id) => {
+                if let Ok(mut map) = self.pending.lock() {
+                    map.insert(
+                        id,
+                        PendingTgAsk {
+                            chat_id,
+                            message_id,
+                            question: req.question,
+                            choices: req.choices,
+                            reply: req.reply,
+                        },
+                    );
+                }
+                let timeout = req.timeout_secs.max(1);
+                let hub_exp = Arc::clone(self);
+                let tg_exp = tg.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(timeout)).await;
+                    let expired = hub_exp.pending.lock().ok().and_then(|mut m| m.remove(&id));
+                    if let Some(item) = expired {
+                        let _ = item.reply.send(crate::tools::ask::AskUserAnswer {
+                            response: String::new(),
+                            timed_out: true,
+                            non_interactive: false,
+                        });
+                        let _ = tg_exp
+                            .edit_message_text(
+                                item.chat_id,
+                                item.message_id,
+                                &format!(
+                                    "Kedaluwarsa — lanjut dengan asumsi agen (pertanyaan: {})",
+                                    item.question.chars().take(120).collect::<String>()
+                                ),
+                            )
+                            .await;
+                    }
+                });
+            }
+            Err(_) => {
+                let _ = req.reply.send(crate::tools::ask::AskUserAnswer {
+                    response: String::new(),
+                    timed_out: false,
+                    non_interactive: true,
+                });
+            }
+        }
+    }
+
+    /// Tangani jawaban tombol inline `ask:<id>:<idx>`.
+    pub async fn handle_callback(&self, tg: &TelegramClient, cb: &TgCallbackQuery) -> bool {
+        let Some(data) = cb.data.as_deref() else {
+            return false;
+        };
+        let Some((id, idx)) = parse_callback_ask(data) else {
+            return false;
+        };
+        let cb_chat_id = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
+        let entry = self.pending.lock().ok().and_then(|mut m| {
+            if m.get(&id).map(|p| p.chat_id == cb_chat_id).unwrap_or(false) {
+                m.remove(&id)
+            } else {
+                None
+            }
+        });
+        let Some(item) = entry else {
+            let _ = tg
+                .answer_callback_query(&cb.id, Some("Pertanyaan ini sudah dijawab atau kedaluwarsa."))
+                .await;
+            return true;
+        };
+        let chosen = item
+            .choices
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| format!("Pilihan #{}", idx + 1));
+        let _ = item.reply.send(crate::tools::ask::AskUserAnswer {
+            response: chosen.clone(),
+            timed_out: false,
+            non_interactive: false,
+        });
+        let _ = tg.answer_callback_query(&cb.id, Some("Jawaban diterima")).await;
+        let summary = format!("Kamu memilih: {chosen}");
+        let _ = tg
+            .edit_message_text(item.chat_id, item.message_id, &summary)
+            .await;
+        true
+    }
+
+    /// Jika ada pertanyaan `ask_user` aktif untuk `chat_id`, konsumsi pesan teks biasa user sebagai jawaban bebas!
+    pub async fn try_consume_text_reply(&self, tg: &TelegramClient, chat_id: i64, text: &str) -> bool {
+        let id_opt = self.pending.lock().ok().and_then(|m| {
+            m.iter()
+                .find_map(|(k, v)| (v.chat_id == chat_id).then_some(*k))
+        });
+        let Some(id) = id_opt else {
+            return false;
+        };
+        let Some(item) = self.pending.lock().ok().and_then(|mut m| m.remove(&id)) else {
+            return false;
+        };
+        let clean = text.trim().to_string();
+        let _ = item.reply.send(crate::tools::ask::AskUserAnswer {
+            response: clean.clone(),
+            timed_out: false,
+            non_interactive: false,
+        });
+        let summary = format!("Kamu memilih: {clean}");
+        let _ = tg
+            .edit_message_text(item.chat_id, item.message_id, &summary)
+            .await;
+        true
+    }
+
+    /// Batalkan semua pertanyaan `ask_user` tertunda untuk `chat_id` (mis. saat `/cancel`).
+    pub fn cancel_chat_asks(&self, chat_id: i64) -> usize {
+        let removed: Vec<PendingTgAsk> = {
+            let Ok(mut map) = self.pending.lock() else {
+                return 0;
+            };
+            let ids: Vec<u64> = map
+                .iter()
+                .filter_map(|(k, v)| (v.chat_id == chat_id).then_some(*k))
+                .collect();
+            ids.into_iter().filter_map(|k| map.remove(&k)).collect()
+        };
+        let n = removed.len();
+        for item in removed {
+            let _ = item.reply.send(crate::tools::ask::AskUserAnswer {
+                response: String::new(),
+                timed_out: true,
+                non_interactive: false,
+            });
+        }
+        n
     }
 }

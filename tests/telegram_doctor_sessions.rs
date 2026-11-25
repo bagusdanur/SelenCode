@@ -147,6 +147,7 @@ fn doctor_command_and_diagnostics_report() {
         price_in: None,
         price_out: None,
         context_limit: None,
+        fallback: Vec::new(),
     };
     let sandbox = SandboxController::default();
     let rep = run_doctor(&cfg, std::path::Path::new("."), "test", &pcfg, &store, &sandbox);

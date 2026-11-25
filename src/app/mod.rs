@@ -139,6 +139,55 @@ pub(crate) fn make_routed_provider(
         }
     };
 
+    let push_fallback_spec = |routes: &mut Vec<ModelRoute>, spec: &str| {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return;
+        }
+        // Dukung baik `"provider:model"` maupun `"model-id"` (pada provider aktif).
+        let (pname, model_override) = match spec.split_once(':') {
+            Some((p, m))
+                if !p.trim().is_empty()
+                    && !m.trim().is_empty()
+                    && cfg.providers.contains_key(p.trim()) =>
+            {
+                (p.trim(), Some(m.trim()))
+            }
+            _ if cfg.providers.contains_key(spec) => (spec, None),
+            _ => (primary_name, Some(spec)),
+        };
+        let Ok((resolved_name, mut pcfg, key)) = cfg.resolve_provider(Some(pname)) else {
+            return;
+        };
+        if let Some(m) = model_override {
+            pcfg.model = m.to_string();
+        }
+        let id = format!("{resolved_name}:{}", pcfg.model);
+        if routes.iter().any(|r| r.id == id) {
+            return;
+        }
+        if let Ok(prov) = make_provider(cfg, &resolved_name, &pcfg, &key) {
+            routes.push(ModelRoute::new(
+                resolved_name,
+                pcfg.model,
+                prov,
+                pcfg.context_limit,
+                pcfg.price_in,
+                pcfg.price_out,
+                false,
+            ));
+        }
+    };
+
+    // BAGIAN 1 (v0.5.6): Prioritas daftar fallback terurut pada provider aktif, lalu `[fallback]` global, lalu `[routing].fallbacks`.
+    let has_explicit_fallback =
+        !primary_cfg.fallback.is_empty() || !cfg.fallback.models.is_empty();
+    for fb in &primary_cfg.fallback {
+        push_fallback_spec(&mut routes, fb);
+    }
+    for fb in &cfg.fallback.models {
+        push_fallback_spec(&mut routes, fb);
+    }
     for fb in &cfg.routing.fallbacks {
         push_spec(&mut routes, fb);
     }
@@ -169,6 +218,8 @@ pub(crate) fn make_routed_provider(
         cfg.routing.max_retries,
         telemetry,
     )
+    .with_max_fallback_models(cfg.fallback.max_attempts)
+    .with_non_sticky_manual(has_explicit_fallback)
     .with_max_cost_usd(cfg.routing.max_cost_usd);
     if let Ok(store) = selencode::store::Store::open() {
         router = router.with_store(Arc::new(store));

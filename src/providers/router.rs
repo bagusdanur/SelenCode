@@ -207,6 +207,77 @@ pub fn is_rate_limit_error(err: &str) -> bool {
     low.contains("429") || low.contains("rate limit") || low.contains("rate_limit") || low.contains("too many requests")
 }
 
+/// Klasifikasi ketat error yang LAYAK memicu fallback ke model/provider cadangan (v0.5.6 Bagian 1):
+/// - HANYA: HTTP 429 (kuota/rate limit), HTTP 5xx provider, timeout/koneksi putus,
+///   penolakan kredensial/kuota upstream (401/403), dan model tidak ditemukan/mati (404).
+/// - TIDAK PERNAH: HTTP 400 / bad request / format rusak, error tool lokal, penolakan approval,
+///   pembatalan pengguna, atau error ambigu yang tidak dikenal.
+pub fn is_fallback_eligible_error(err: &str) -> bool {
+    let low = err.to_ascii_lowercase();
+    // Tolak tegas 400 / kesalahan permintaan / pembatalan lokal terlebih dahulu!
+    if contains_any(
+        &low,
+        &[
+            "400",
+            "bad request",
+            "invalid_request",
+            "invalid request",
+            "malformed",
+            "context_length_exceeded",
+            "maximum context length",
+            "ditolak user",
+            "dibatalkan",
+            "cancelled",
+            "canceled",
+            "approval",
+        ],
+    ) {
+        return false;
+    }
+    if is_retryable_error(&low) {
+        return true;
+    }
+    // Upstream auth/quota rejection (401/403) atau model mati/tidak ditemukan (404)
+    contains_any(
+        &low,
+        &[
+            "401",
+            "403",
+            "unauthorized",
+            "forbidden",
+            "insufficient_quota",
+            "quota exceeded",
+            "billing",
+            "404",
+            "model_not_found",
+            "model not found",
+            "does not exist",
+            "dns error",
+            "failed to connect",
+            "error sending request",
+            "unexpected eof",
+        ],
+    )
+}
+
+/// Ringkas sebab kegagalan utama untuk pesan transparansi fallback 1 baris ke pengguna.
+pub fn short_fallback_reason(err: &str) -> &'static str {
+    let low = err.to_ascii_lowercase();
+    if is_rate_limit_error(&low) || low.contains("quota") {
+        "429 kuota"
+    } else if contains_any(&low, &["500", "502", "503", "504", "overloaded", "unavailable", "bad gateway"]) {
+        "5xx provider"
+    } else if contains_any(&low, &["401", "403", "unauthorized", "forbidden"]) {
+        "401/403 kredensial"
+    } else if contains_any(&low, &["404", "model_not_found", "model not found", "does not exist"]) {
+        "404 model tidak tersedia"
+    } else if contains_any(&low, &["timeout", "timed out", "connection", "eof", "dns", "sending request"]) {
+        "timeout/koneksi"
+    } else {
+        "error provider"
+    }
+}
+
 /// Satu kandidat rute (provider + model + kapabilitas + harga opsional).
 #[derive(Clone)]
 pub struct ModelRoute {
@@ -309,9 +380,21 @@ pub struct RouterTelemetry {
     pub total_fallbacks: u64,
     pub total_retries: u64,
     pub total_session_cost_usd: f64,
+    /// Info panggilan terakhir untuk pelaporan usage & transparansi fallback (v0.5.6 Bagian 1).
+    pub last_served_model: Option<String>,
+    pub last_was_fallback: bool,
+    pub pending_fallback_notice: Option<String>,
 }
 
 impl RouterTelemetry {
+    /// Ambil `(actual_model, was_fallback, one_time_notice)` dari panggilan terakhir.
+    pub fn take_last_call_info(&mut self) -> (Option<String>, bool, Option<String>) {
+        (
+            self.last_served_model.clone(),
+            self.last_was_fallback,
+            self.pending_fallback_notice.take(),
+        )
+    }
     /// Muat data performa historis dari SQLite (`model_perf`) agar router belajar lintas sesi.
     pub fn seed_from_perf_records(&mut self, records: &[crate::store::ModelPerfRecord]) {
         for r in records {
@@ -581,6 +664,10 @@ pub struct DynamicRouterProvider {
     pub max_retries: u8,
     pub retry_backoff_ms: u64,
     pub max_cost_usd: Option<f64>,
+    /// Maksimum total model/rute yang dicoba per giliran termasuk model utama (default 3, v0.5.6).
+    pub max_fallback_models: usize,
+    /// True = mode fallback non-lengket: giliran/sesi baru selalu mulai dari model utama lagi.
+    pub non_sticky_manual: bool,
     pub store: Option<Arc<crate::store::Store>>,
     pub telemetry: Arc<Mutex<RouterTelemetry>>,
 }
@@ -600,9 +687,21 @@ impl DynamicRouterProvider {
             max_retries: max_retries.min(3),
             retry_backoff_ms: 400,
             max_cost_usd: None,
+            max_fallback_models: 3,
+            non_sticky_manual: false,
             store: None,
             telemetry,
         }
+    }
+
+    pub fn with_max_fallback_models(mut self, max_models: usize) -> Self {
+        self.max_fallback_models = max_models.max(1);
+        self
+    }
+
+    pub fn with_non_sticky_manual(mut self, non_sticky: bool) -> Self {
+        self.non_sticky_manual = non_sticky;
+        self
     }
 
     pub fn with_backoff_ms(mut self, ms: u64) -> Self {
@@ -653,6 +752,22 @@ impl DynamicRouterProvider {
             .unwrap_or(false);
 
         if !self.auto_routing {
+            if self.non_sticky_manual {
+                // Fallback TIDAK lengket (v0.5.6 Bagian 1): sesi/giliran baru selalu mulai dari model utama lagi.
+                let ordered = self
+                    .routes
+                    .iter()
+                    .map(|r| {
+                        let lbl = if r.is_primary {
+                            format!("pilihan manual primary (tugas={})", task.as_str())
+                        } else {
+                            format!("fallback terurut (tugas={})", task.as_str())
+                        };
+                        (r.clone(), if r.is_primary { 20 } else { 0 }, lbl)
+                    })
+                    .collect();
+                return (task, escalated, ordered);
+            }
             let mut healthy = Vec::new();
             let mut cooled = Vec::new();
             for r in &self.routes {
@@ -754,8 +869,20 @@ impl Provider for DynamicRouterProvider {
         }
 
         let mut errors: Vec<String> = Vec::new();
+        let mut primary_error: Option<String> = None;
+        let mut primary_fail_short: Option<&'static str> = None;
+        let max_models_to_try = self.max_fallback_models.max(1);
+        let mut tried_route_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut models_tried = 0usize;
 
         for (cand_idx, (route, score, reason)) in candidates.iter().enumerate() {
+            if models_tried >= max_models_to_try {
+                break;
+            }
+            if !tried_route_ids.insert(route.id.clone()) {
+                continue;
+            }
+            models_tried += 1;
             let max_attempts = (self.max_retries as usize) + 1;
             for attempt in 0..max_attempts {
                 let started = Instant::now();
@@ -788,8 +915,20 @@ impl Provider for DynamicRouterProvider {
                             }
                             _ => 0.0,
                         };
+                        let used_fallback = cand_idx > 0 && primary_error.is_some();
                         if let Ok(mut tel) = self.telemetry.lock() {
                             tel.record_success(route, task, elapsed_ms, reply.usage, cand_idx > 0);
+                            tel.last_served_model = Some(route.model.clone());
+                            tel.last_was_fallback = used_fallback;
+                            if used_fallback {
+                                let cause = primary_fail_short.unwrap_or("error provider");
+                                tel.pending_fallback_notice = Some(format!(
+                                    "Model utama gagal ({cause}) — lanjut dengan {}",
+                                    route.model
+                                ));
+                            } else {
+                                tel.pending_fallback_notice = None;
+                            }
                             tel.record_decision(RoutingDecision {
                                 route_id: route.id.clone(),
                                 task,
@@ -817,7 +956,12 @@ impl Provider for DynamicRouterProvider {
                     }
                     Err(e) => {
                         let msg = e.to_string();
+                        if primary_error.is_none() {
+                            primary_error = Some(msg.clone());
+                            primary_fail_short = Some(short_fallback_reason(&msg));
+                        }
                         let retryable = is_retryable_error(&msg);
+                        let fallback_eligible = is_fallback_eligible_error(&msg);
                         let will_retry = retryable && !emitted_any && attempt + 1 < max_attempts;
                         if let Ok(mut tel) = self.telemetry.lock() {
                             tel.record_error(route, task, &msg, will_retry);
@@ -849,10 +993,26 @@ impl Provider for DynamicRouterProvider {
                                 msg
                             ));
                         }
+                        // BAGIAN 1 (#2): JANGAN fallback pada error 400 / permintaan rusak / lokal / ambigu!
+                        if !fallback_eligible {
+                            return Err(e);
+                        }
                         break;
                     }
                 }
             }
+        }
+
+        // BAGIAN 1 (#3): Bila semua cadangan habis, kembalikan error model utama (paling informatif).
+        if let Some(first_err) = primary_error {
+            if errors.len() > 1 {
+                return Err(anyhow!(
+                    "{first_err}\n(Fallback dicoba {} rute dan semua gagal: {})",
+                    models_tried,
+                    errors.join("; ")
+                ));
+            }
+            return Err(anyhow!("{first_err}"));
         }
 
         Err(anyhow!(

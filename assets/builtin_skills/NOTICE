@@ -1,0 +1,47 @@
+THIRD-PARTY SOFTWARE NOTICE AND ATTRIBUTION
+
+SelenCode includes 12 built-in skills adapted from the Hermes Agent skill library
+by Nous Research (https://github.com/NousResearch/hermes-agent), distributed under
+the MIT License.
+
+========================================================================
+MIT License
+
+Copyright (c) 2025 Nous Research
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+========================================================================
+
+Adapted Built-in Skills (12) & Upstream Author Credits:
+1.  dev/systematic-debugging    — adapted from obra/superpowers (Hermes Agent, Nous Research)
+2.  dev/test-driven-development — adapted from obra/superpowers (Hermes Agent, Nous Research)
+3.  dev/requesting-code-review  — adapted from obra/superpowers + MorAlekss (Hermes Agent, Nous Research)
+4.  dev/simplify-code           — Hermes Agent, Nous Research
+5.  dev/github                  — Ben Barclay (Hermes Agent, Nous Research)
+6.  dev/spike                   — Hermes Agent, Nous Research
+7.  dev/ast-grep                — Yeongyu Kim (code-yeongyu) (Hermes Agent, Nous Research)
+8.  dev/grill-me                — Rafael Zendron + Matt Pocock (Hermes Agent, Nous Research)
+9.  dev/codebase-inspection     — Hermes Agent, Nous Research
+10. devops/docker-management    — sprmn24 (Hermes Agent, Nous Research)
+11. riset/grounded-citations    — Hermes Agent, Nous Research
+12. web/blocked-page-recovery   — Hermes Agent, Nous Research
+
+Native SelenCode Skills (2):
+- dev/rilis-github
+- dev/tinjau-rust
