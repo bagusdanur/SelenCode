@@ -37,6 +37,12 @@ jobs:
           '
             exit $rc
           fi
+      - name: Cek Clippy (correctness)
+        env:
+          CARGO_TERM_COLOR: never
+        run: cargo clippy --all-targets -- -D clippy::correctness
+      - name: Smoke test binary CLI Linux
+        run: cargo run -- --version
       - name: Uji render frame TUI nyata (wide 116 & HP 52)
         run: |
           cargo run --example render_welcome -- /tmp/wide.dump 116 36
@@ -61,6 +67,8 @@ jobs:
         run: cargo test --test moonlit --test tui_app --test update --test nextgen --test stage1_reliability --test stage2_context_memory --test stage3_exec_model --test stage4_lsp --test stage5_autonomy --test fase2 --test fase3 --test fase6 --test loop_mock --test tools_file --test outline
       - name: Build preview selen.exe (Windows)
         run: cargo build --release
+      - name: Smoke test binary selen.exe (Windows)
+        run: .\target\release\selen.exe --version
       - uses: actions/upload-artifact@v4
         with:
           name: preview-selen-windows-x64.exe
