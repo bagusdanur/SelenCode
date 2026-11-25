@@ -60,9 +60,21 @@ pub const EXTENDED_TOOLSETS: &[(&str, &str, &[&str])] = &[
         &["update_plan", "manage_task"],
     ),
     (
+        "skills_view",
+        "muat isi skill & file referensi on-demand",
+        &["skill_view"],
+    ),
+    (
         "skills_mem",
-        "skill prosedural & memori proyek persisten",
-        &["manage_skill", "manage_memory"],
+        "daftar, buat, edit skill & memori proyek persisten",
+        &[
+            "skills_list",
+            "skill_view",
+            "skill_create",
+            "skill_edit",
+            "manage_skill",
+            "manage_memory",
+        ],
     ),
     (
         "multi_agent",
@@ -208,9 +220,17 @@ pub fn select_initial_toolsets(
         set.insert("plan".to_string());
     }
 
-    if ["skill", "memori", "memory", "manage_skill", "manage_memory", "/learn"]
-        .iter()
-        .any(|kw| lower.contains(kw))
+    if [
+        "skill",
+        "playbook",
+        "memori",
+        "memory",
+        "manage_skill",
+        "manage_memory",
+        "/learn",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
     {
         set.insert("skills_mem".to_string());
     }

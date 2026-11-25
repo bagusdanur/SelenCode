@@ -35,6 +35,27 @@ pub struct Config {
     /// Anggaran hasil tool: cap per tool, spillover ke file, & budget per turn (`[tool_budget]`).
     #[serde(default, skip_serializing_if = "ToolBudgetCfg::is_default")]
     pub tool_budget: ToolBudgetCfg,
+    /// Pengaturan Skills System ala Hermes (`[skills]` di selencode.toml).
+    #[serde(default, skip_serializing_if = "SkillsCfg::is_default")]
+    pub skills: SkillsCfg,
+}
+
+/// Konfigurasi Skills System ala Hermes (`[skills]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillsCfg {
+    /// Override batas token indeks dinamis awal sesi khusus saat banyak skill terpasang
+    /// (default `None` = berbagi anggaran `tool_budget.dynamic_inject_max_tokens` yaitu 1.500 token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_max_tokens: Option<usize>,
+    /// Daftar eksplisit nama skill yang dimuat otomatis di awal sesi (default kosong: TIDAK ada auto-load!).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_load: Vec<String>,
+}
+
+impl SkillsCfg {
+    pub fn is_default(&self) -> bool {
+        self.index_max_tokens.is_none() && self.auto_load.is_empty()
+    }
 }
 
 /// Konfigurasi dedup panggilan tool, loop guard, & batas putaran Self-correction (`[guard]`).
@@ -700,6 +721,7 @@ impl Config {
             guard: GuardCfg::default(),
             aux: AuxCfg::default(),
             tool_budget: ToolBudgetCfg::default(),
+            skills: SkillsCfg::default(),
         }
     }
 

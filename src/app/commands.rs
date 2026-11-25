@@ -8,7 +8,7 @@ use selencode::providers::{Message, Role};
 use selencode::repl::{strip_menu_markup, KeySpec, PROVIDER_PRESETS};
 use selencode::security::{redact_secrets, ApprovalMode};
 use selencode::skills::{
-    export_conversation_md, init_agents_md, list_skills, load_skill, remove_skill, save_skill,
+    export_conversation_md, init_agents_md, load_skill, remove_skill, save_skill,
 };
 use selencode::telegram::{parse_telegram_action, TelegramAction};
 use std::time::Duration;
@@ -1252,26 +1252,41 @@ impl Session {
 
     pub(crate) async fn handle_skills(&mut self, arg: Option<&str>) -> Result<String> {
         let Some(arg) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
-            let skills = list_skills(&self.ctx.cwd);
+            let scan = selencode::skills::scan_skills_with_warnings(&self.ctx.cwd);
             let auto_state = if self.ctx.auto_skills {
                 "AKTIF"
             } else {
                 "NONAKTIF"
             };
             let mut out = format!(
-                "# Daftar Skills (.selencode/skills · auto self-improvement: {auto_state})\n"
+                "# Daftar Skills (Proyek > Pengguna · {} terpasang · auto-review: {auto_state})\n",
+                scan.skills.len()
             );
-            if skills.is_empty() {
+            if scan.skills.is_empty() {
                 out.push_str("! Belum ada skill tersimpan.\n");
             } else {
-                for s in skills {
-                    out.push_str(&format!("> {} | {} | {}\n", s.name, s.scope, s.summary));
+                for s in &scan.skills {
+                    let desc = selencode::skills::truncate_index_desc(
+                        &s.summary,
+                        selencode::skills::SKILL_INDEX_DESC_MAX_CHARS,
+                    );
+                    let meta = match &s.version {
+                        Some(v) => format!("{} · {} · v{v}", s.scope, s.category),
+                        None => format!("{} · {}", s.scope, s.category),
+                    };
+                    out.push_str(&format!("> {} | {meta} | {desc}\n", s.name));
+                }
+            }
+            if !scan.warnings.is_empty() {
+                out.push_str("---\n");
+                for w in scan.warnings.iter().take(5) {
+                    out.push_str(&format!("! Peringatan: {w}\n"));
                 }
             }
             out.push_str("---\n");
-            out.push_str("! Pasang skill save token:  /skills save-token   ·   Review otomatis: /skills review\n");
-            out.push_str("! Lihat / hapus skill:      /skills show <nama>   ·   /skills rm <nama>\n");
-            out.push_str("! Pakai / buat manual:      /skill <nama>   ·   /learn <nama> <instruksi>");
+            out.push_str("! Muat paksa skill:         /skill <nama>   ·   Lihat isi: /skills show <nama>\n");
+            out.push_str("! Pasang save-token / rm:   /skills save-token   ·   /skills rm <nama>\n");
+            out.push_str("! Review / buat manual:     /skills review   ·   /learn <nama> <instruksi>");
             return Ok(out);
         };
 
@@ -1348,17 +1363,33 @@ impl Session {
         let name = arg
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("sebutkan nama skill. Contoh: /skill review"))?;
-        let (info, content) = load_skill(&self.ctx.cwd, name)?;
-        let sys = Message::text(
-            Role::System,
-            format!("[Skill aktif: {}]\n{content}", info.name),
-        );
-        let _ = self.store.save_message(&self.session_id, &sys);
-        self.messages.push(sys);
+            .ok_or_else(|| anyhow::anyhow!("sebutkan nama skill. Contoh: /skill tinjau-rust"))?;
+        let (info, content, refs) = selencode::skills::load_skill_with_refs(&self.ctx.cwd, name)?;
+        let mut msg_body = format!("[Skill dimuat manual via /skill: {}]\n{content}", info.name);
+        if !refs.is_empty() {
+            msg_body.push_str("\n---\nReferensi tersedia (muat dengan `skill_view(name, path)`):\n");
+            for r in &refs {
+                msg_body.push_str(&format!("- {r}\n"));
+            }
+        }
+        // Sisipkan sebagai pesan User (BUKAN System) agar prefix System Prompt statis tetap beku!
+        let msg = Message::text(Role::User, msg_body);
+        let _ = self.store.save_message(&self.session_id, &msg);
+        self.messages.push(msg);
+        let refs_note = if refs.is_empty() {
+            String::new()
+        } else {
+            format!("\n! Referensi: {}", refs.join(", "))
+        };
         Ok(format!(
-            "# Skill Diaktifkan\n* {} | {} | {}",
-            info.name, info.scope, info.summary
+            "# Skill Diaktifkan\n* {} | {} · {} | {}{refs_note}",
+            info.name,
+            info.scope,
+            info.category,
+            selencode::skills::truncate_index_desc(
+                &info.summary,
+                selencode::skills::SKILL_INDEX_DESC_MAX_CHARS
+            )
         ))
     }
 

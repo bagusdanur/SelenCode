@@ -421,6 +421,7 @@ fn config_save_load_and_direct_api_key_fallback() {
         guard: Default::default(),
         aux: Default::default(),
         tool_budget: Default::default(),
+        skills: Default::default(),
     };
     save_to(&cfg, &path).unwrap();
     let loaded = load_from(&path).unwrap();

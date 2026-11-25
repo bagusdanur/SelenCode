@@ -62,6 +62,8 @@ pub struct Ctx {
     pub guard: crate::config::GuardCfg,
     /// Pengaturan anggaran hasil tool (`[tool_budget]`: cap shell 40/60, spillover, turn budget).
     pub tool_budget: crate::config::ToolBudgetCfg,
+    /// Pengaturan Skills System ala Hermes (`[skills]`: `index_max_tokens`, `auto_load`).
+    pub skills: crate::config::SkillsCfg,
     /// Aktifkan review self-improvement otomatis pasca-giliran kompleks (ala Hermes).
     /// Default false di Ctx::new agar tes mock tidak memicu panggilan ekstra;
     /// Session::build mengisinya dari `cfg.agent.auto_skills` (default true).
@@ -93,6 +95,7 @@ impl Ctx {
             hooks: Arc::new(crate::hooks::HookEngine::default()),
             guard: crate::config::GuardCfg::default(),
             tool_budget: crate::config::ToolBudgetCfg::default(),
+            skills: crate::config::SkillsCfg::default(),
             auto_skills: false,
             self_correct: false,
         }
@@ -111,6 +114,10 @@ impl Ctx {
     }
     pub fn with_tool_budget(mut self, tool_budget: crate::config::ToolBudgetCfg) -> Self {
         self.tool_budget = tool_budget;
+        self
+    }
+    pub fn with_skills(mut self, skills: crate::config::SkillsCfg) -> Self {
+        self.skills = skills;
         self
     }
     pub fn with_auto_skills(mut self, enabled: bool) -> Self {
@@ -263,6 +270,10 @@ pub fn default_registry_with_shell(shell_cfg: &ShellCfg) -> Registry {
         .register(Arc::new(git::GitCommit))
         .register(Arc::new(web::FetchUrl))
         .register(Arc::new(plan::UpdatePlan))
+        .register(Arc::new(skill::SkillsList))
+        .register(Arc::new(skill::SkillView))
+        .register(Arc::new(skill::SkillCreate))
+        .register(Arc::new(skill::SkillEdit))
         .register(Arc::new(skill::ManageSkill))
         .register(Arc::new(memory::ManageMemory))
         .register(Arc::new(task::ManageTask))
@@ -286,6 +297,8 @@ pub fn read_only_registry() -> Registry {
         .register(Arc::new(git::GitStatus))
         .register(Arc::new(git::GitDiff))
         .register(Arc::new(web::FetchUrl))
+        .register(Arc::new(skill::SkillsList))
+        .register(Arc::new(skill::SkillView))
 }
 
 pub(crate) fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {

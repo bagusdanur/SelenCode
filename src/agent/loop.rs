@@ -155,11 +155,15 @@ async fn run_turn_inner(
     ui: Option<mpsc::Sender<UiEvent>>,
     mode: TurnMode,
 ) -> Result<(String, Option<Usage>)> {
-    // Progressive Disclosure (Hermes-style toolsets + Tahap 6 MCP >15 on-demand index):
+    // Progressive Disclosure (Hermes-style toolsets + Tahap 6 MCP >15 on-demand index + Skills v0.4.0):
     // Hanya kirim Core Toolset + toolset yang cocok dengan intent/workspace, bukan seluruh 29+ schema!
     let has_mcp = registry.names().iter().any(|n| n.starts_with("mcp__"));
+    let installed_skills = crate::skills::list_skills(&ctx.cwd);
     let mut active_toolsets =
         crate::tools::toolsets::select_initial_toolsets(user_prompt, &ctx.cwd, has_mcp, mode);
+    if !installed_skills.is_empty() {
+        active_toolsets.insert("skills_view".to_string());
+    }
     let mut loaded_mcp_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut tools = crate::tools::toolsets::active_tool_specs_with_mcp(
         registry,
@@ -167,14 +171,21 @@ async fn run_turn_inner(
         &loaded_mcp_tools,
         mode,
     );
-    // Tahap 3 & Tahap 6: Bekukan System Prompt di awal sesi (prefix statis byte-identik sepanjang sesi,
-    // diikuti snapshot blok dinamis dibatasi <= dynamic_inject_max_tokens di bagian paling akhir).
+    // Tahap 3 & Tahap 6 & Skills Tahap 2: Bekukan System Prompt statis di awal sesi (byte-identik),
+    // diikuti snapshot blok dinamis (toolsets + indeks skills maks 60 char/item + indeks MCP + memori)
+    // yang berbagi anggaran cap injeksi dinamis (default 1.500 token; override lewat `[skills] index_max_tokens`).
+    let mut auto_loaded_skill_msgs: Vec<Message> = Vec::new();
     if messages.is_empty() {
         let mut sys = build_system_prompt(&ctx.cwd, &tools);
         let mut dynamic_snapshot = String::new();
         let hint = crate::tools::toolsets::inactive_toolsets_hint(registry, &active_toolsets);
         if !hint.is_empty() {
             dynamic_snapshot.push_str(&hint);
+            dynamic_snapshot.push('\n');
+        }
+        let skills_idx = crate::skills::format_skills_index(&installed_skills);
+        if !skills_idx.is_empty() {
+            dynamic_snapshot.push_str(&skills_idx);
             dynamic_snapshot.push('\n');
         }
         if let Some(mcp_idx) = crate::tools::toolsets::build_mcp_compact_index(registry) {
@@ -191,10 +202,11 @@ async fn run_turn_inner(
             }
         }
         if !dynamic_snapshot.trim().is_empty() {
-            let capped = cap_dynamic_injection(
-                dynamic_snapshot.trim(),
-                ctx.tool_budget.dynamic_inject_max_tokens,
-            );
+            let dyn_cap = ctx
+                .skills
+                .index_max_tokens
+                .unwrap_or(ctx.tool_budget.dynamic_inject_max_tokens);
+            let capped = cap_dynamic_injection(dynamic_snapshot.trim(), dyn_cap);
             sys.push_str("\n--- Konteks Sesi (Snapshot Awal) ---\n");
             sys.push_str(&capped);
             sys.push('\n');
@@ -202,6 +214,25 @@ async fn run_turn_inner(
         let sys_msg = Message::text(Role::System, sys);
         persist_message(ctx, &sys_msg);
         messages.push(sys_msg);
+
+        // Tahap 5: Auto-load HANYA aktif jika user secara eksplisit mengonfigurasi `[skills] auto_load = [...]`
+        // (bawaan kosong = nol skill dimuat otomatis!).
+        for sk_name in &ctx.skills.auto_load {
+            let trimmed = sk_name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok((info, content)) = crate::skills::load_skill(&ctx.cwd, trimmed) {
+                auto_loaded_skill_msgs.push(Message::text(
+                    Role::User,
+                    format!("[Skill auto_load: {}]\n{content}", info.name),
+                ));
+            }
+        }
+        for sm in auto_loaded_skill_msgs.drain(..) {
+            persist_message(ctx, &sm);
+            messages.push(sm);
+        }
     }
     // Lampiran eksplisit `@path/to/file` (ala OpenCode) + konteks pintar auto-outline
     // (hanya untuk prompt substantif >= 25 karakter agar pertanyaan singkat `/resume` super hemat!).
@@ -754,6 +785,12 @@ async fn run_turn_inner(
             // update_plan (Fase 6): checklist ditampilkan ke user setiap
             // berhasil diperbarui — polos dicetak, TUI jadi blok khusus.
             tool_calls_executed += 1;
+            if matches!(call.name.as_str(), "skill_create" | "skill_edit")
+                && !is_error
+                && !content.starts_with("Ditolak user")
+            {
+                skill_touched_in_turn = true;
+            }
             if call.name == "manage_skill" && !is_error {
                 let act = call
                     .args

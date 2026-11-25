@@ -197,6 +197,7 @@ impl Session {
             &cfg.sandbox,
             selencode::sandbox::default_audit_log_path(),
         ));
+        selencode::skills::seed_default_user_skills();
         let hooks = Arc::new(selencode::hooks::HookEngine::from_config(&cfg.hooks));
         let ctx = Ctx::new(cwd, mode == ApprovalMode::AutoAll)
             .with_approver(approver)
@@ -207,6 +208,7 @@ impl Session {
             .with_hooks(hooks)
             .with_guard(cfg.guard.clone())
             .with_tool_budget(cfg.tool_budget.clone())
+            .with_skills(cfg.skills.clone())
             .with_store(store.clone(), session_id.clone());
         // P2.2: subagent `delegate` & `orchestrate` berbagi handle `shared_provider`
         // sehingga ganti provider/model lewat `/model` otomatis memperbarui subagent juga!

@@ -222,6 +222,7 @@ fn child_ctx_for_role(parent_ctx: &Ctx) -> Ctx {
         hooks: parent_ctx.hooks.clone(),
         guard: parent_ctx.guard.clone(),
         tool_budget: parent_ctx.tool_budget.clone(),
+        skills: parent_ctx.skills.clone(),
         auto_skills: false,
         self_correct: false,
     }

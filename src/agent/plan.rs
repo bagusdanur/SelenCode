@@ -31,6 +31,8 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "git_status",
     "git_diff",
     "fetch_url",
+    "skills_list",
+    "skill_view",
 ];
 
 pub fn is_read_only(name: &str) -> bool {
