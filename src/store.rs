@@ -169,6 +169,39 @@ impl LongTaskRecord {
     }
 }
 
+/// Catatan performa aktual per `(route_id, task_kind)` lintas sesi & benchmark (Fase 5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPerfRecord {
+    pub route_id: String,
+    pub task_kind: String,
+    pub successes: u64,
+    pub failures: u64,
+    pub total_latency_ms: u64,
+    pub total_tokens: u64,
+    pub total_cost_usd: f64,
+    pub updated_at: String,
+}
+
+impl ModelPerfRecord {
+    pub fn success_rate(&self) -> f64 {
+        let total = self.successes + self.failures;
+        if total == 0 {
+            0.5
+        } else {
+            self.successes as f64 / total as f64
+        }
+    }
+
+    pub fn avg_latency_ms(&self) -> u64 {
+        let total = self.successes + self.failures;
+        if total == 0 {
+            0
+        } else {
+            self.total_latency_ms / total
+        }
+    }
+}
+
 /// Lokasi DB: env SELENCODE_DB (dipakai tes) atau
 /// ~/.local/share/selencode/selen.db (dirs::data_dir).
 pub fn db_path() -> PathBuf {
@@ -203,6 +236,11 @@ CREATE TABLE IF NOT EXISTS benchmark_runs (id TEXT PRIMARY KEY, ts TEXT NOT NULL
                     task_success_rate REAL NOT NULL, test_pass_rate REAL NOT NULL,
                     regression_rate REAL NOT NULL, total_elapsed_ms INT NOT NULL,
                     report_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS model_perf (route_id TEXT NOT NULL, task_kind TEXT NOT NULL,
+                    successes INT NOT NULL DEFAULT 0, failures INT NOT NULL DEFAULT 0,
+                    total_latency_ms INT NOT NULL DEFAULT 0, total_tokens INT NOT NULL DEFAULT 0,
+                    total_cost_usd REAL NOT NULL DEFAULT 0.0, updated_at TEXT NOT NULL,
+                    PRIMARY KEY (route_id, task_kind));
 ";
 
 fn now() -> String {
@@ -708,6 +746,70 @@ impl Store {
             if let Ok(rep) = serde_json::from_str::<crate::benchmark::BenchRunReport>(&s) {
                 out.push(rep);
             }
+        }
+        Ok(out)
+    }
+
+    // ---------- Persistent Model Performance Registry (Fase 5) ----------
+
+    pub fn record_model_outcome(
+        &self,
+        route_id: &str,
+        task_kind: &str,
+        succeeded: bool,
+        latency_ms: u64,
+        tokens: u64,
+        cost_usd: f64,
+    ) -> Result<()> {
+        let succ_inc: i64 = if succeeded { 1 } else { 0 };
+        let fail_inc: i64 = if succeeded { 0 } else { 1 };
+        let ts = now();
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "INSERT INTO model_perf (route_id, task_kind, successes, failures, total_latency_ms, total_tokens, total_cost_usd, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(route_id, task_kind) DO UPDATE SET \
+               successes = successes + excluded.successes, \
+               failures = failures + excluded.failures, \
+               total_latency_ms = total_latency_ms + excluded.total_latency_ms, \
+               total_tokens = total_tokens + excluded.total_tokens, \
+               total_cost_usd = total_cost_usd + excluded.total_cost_usd, \
+               updated_at = excluded.updated_at",
+            rusqlite::params![
+                route_id,
+                task_kind,
+                succ_inc,
+                fail_inc,
+                latency_ms as i64,
+                tokens as i64,
+                cost_usd,
+                ts
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_model_perf(&self) -> Result<Vec<ModelPerfRecord>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT route_id, task_kind, successes, failures, total_latency_ms, total_tokens, total_cost_usd, updated_at \
+             FROM model_perf ORDER BY (successes + failures) DESC, route_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ModelPerfRecord {
+                route_id: row.get(0)?,
+                task_kind: row.get(1)?,
+                successes: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                failures: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
+                total_latency_ms: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+                total_tokens: row.get::<_, i64>(5).unwrap_or(0).max(0) as u64,
+                total_cost_usd: row.get::<_, f64>(6).unwrap_or(0.0).max(0.0),
+                updated_at: row.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
         }
         Ok(out)
     }

@@ -285,17 +285,51 @@ impl RouteMetrics {
     }
 }
 
-/// Penyimpan metrik bersama lintas panggilan router.
+/// Keputusan routing transparan untuk observabilitas (`/route` & `/route history`).
+#[derive(Debug, Clone)]
+pub struct RoutingDecision {
+    pub route_id: String,
+    pub task: TaskKind,
+    pub escalated: bool,
+    pub score: i32,
+    pub fallback_used: bool,
+    pub reason: String,
+}
+
+/// Penyimpan metrik bersama lintas panggilan router (termasuk histori performa lintas sesi).
 #[derive(Debug, Default)]
 pub struct RouterTelemetry {
     pub routes: HashMap<String, RouteMetrics>,
+    /// Performa historis lintas sesi & benchmark: `(route_id, task_kind)` -> `(successes, failures)`.
+    pub historical: HashMap<(String, String), (u64, u64)>,
     pub last_selected_route: Option<String>,
     pub last_task: Option<TaskKind>,
+    pub last_decision: Option<RoutingDecision>,
+    pub recent_decisions: Vec<RoutingDecision>,
     pub total_fallbacks: u64,
     pub total_retries: u64,
+    pub total_session_cost_usd: f64,
 }
 
 impl RouterTelemetry {
+    /// Muat data performa historis dari SQLite (`model_perf`) agar router belajar lintas sesi.
+    pub fn seed_from_perf_records(&mut self, records: &[crate::store::ModelPerfRecord]) {
+        for r in records {
+            self.historical.insert(
+                (r.route_id.clone(), r.task_kind.clone()),
+                (r.successes, r.failures),
+            );
+        }
+    }
+
+    pub fn record_decision(&mut self, decision: RoutingDecision) {
+        self.last_decision = Some(decision.clone());
+        self.recent_decisions.push(decision);
+        if self.recent_decisions.len() > 15 {
+            self.recent_decisions.remove(0);
+        }
+    }
+
     pub fn record_success(
         &mut self,
         route: &ModelRoute,
@@ -329,8 +363,14 @@ impl RouterTelemetry {
                     + (u.output_tokens as f64 / 1_000_000.0) * pout;
                 m.estimated_cost_usd += cost;
                 m.has_cost_data = true;
+                self.total_session_cost_usd += cost;
             }
         }
+        let hist = self
+            .historical
+            .entry((route.id.clone(), task.as_str().to_string()))
+            .or_insert((0, 0));
+        hist.0 += 1;
         self.last_selected_route = Some(route.id.clone());
         self.last_task = Some(task);
     }
@@ -363,6 +403,11 @@ impl RouterTelemetry {
         }
         m.last_error = Some(err.chars().take(120).collect());
         m.last_task = Some(task.as_str().to_string());
+        let hist = self
+            .historical
+            .entry((route.id.clone(), task.as_str().to_string()))
+            .or_insert((0, 0));
+        hist.1 += 1;
     }
 
     pub fn snapshot_routes(&self) -> Vec<RouteMetrics> {
@@ -372,26 +417,64 @@ impl RouterTelemetry {
     }
 }
 
-/// Skor kecocokan heuristik satu kandidat rute terhadap `task` (tanpa bias konteks terbesar!).
+/// Deteksi apakah giliran ini memerlukan eskalasi ke model yang lebih kuat
+/// (mis. pasca kegagalan verifikasi / Self-Correction Gate atau `>= 2` error tool terbaru).
+pub fn detect_escalation_needed(msgs: &[Message]) -> bool {
+    let mut recent_tool_errors = 0usize;
+    for m in msgs.iter().rev().take(6) {
+        for b in &m.content {
+            match b {
+                crate::providers::Block::Text(t) => {
+                    if t.contains("[Self-Correction Gate")
+                        || t.contains("[Self-Correction / Deteksi")
+                    {
+                        return true;
+                    }
+                }
+                crate::providers::Block::ToolResult { content, is_error, .. } => {
+                    if *is_error {
+                        recent_tool_errors += 1;
+                    }
+                    if content.contains("GAGAL ❌")
+                        || content.contains("TIMEOUT ⏱")
+                        || content.contains("NO_TESTS")
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    recent_tool_errors >= 2
+}
+
+/// Skor kecocokan satu kandidat rute berbasis performa aktual historis, eskalasi,
+/// budget biaya, kebutuhan konteks/tool, & heuristik tugas (mengembalikan skor + alasan).
 fn score_candidate(
     route: &ModelRoute,
     task: TaskKind,
     needed_tokens: usize,
     needs_tools: bool,
+    escalated: bool,
+    budget_tight: bool,
     metrics: Option<&RouteMetrics>,
-) -> i32 {
+    historical: Option<(u64, u64)>,
+) -> (i32, String) {
     let mut score = 0i32;
+    let mut reasons: Vec<String> = Vec::new();
 
     if route.is_primary {
         score += 20;
     }
 
-    // Kecocokan tool calling & kebutuhan konteks nyata (bukan makin besar makin bagus).
     if needs_tools && !route.supports_tools {
         score -= 100;
+        reasons.push("tanpa tool-calling".into());
     }
     if needed_tokens > 0 && route.context_limit < needed_tokens {
         score -= 60;
+        reasons.push("konteks sempit".into());
     }
 
     let m = route.model.to_ascii_lowercase();
@@ -399,10 +482,45 @@ fn score_candidate(
     let is_deep_reason = contains_any(&m, &["o1", "o3", "r1", "reasoner", "thinking", "opus", "pro", "sonnet"]);
     let is_coder = contains_any(&m, &["coder", "codex", "sonnet", "claude", "gpt-4", "gpt-5", "deepseek", "qwen"]);
 
+    // 1. Performa aktual historis dari SQLite / benchmark (bobot lebih tinggi dari tebakan nama!).
+    if let Some((succ, fail)) = historical {
+        let total = succ + fail;
+        if total >= 2 {
+            let rate = succ as f64 / total as f64;
+            let hist_bonus = ((rate - 0.5) * 90.0).round() as i32; // -45 .. +45
+            score += hist_bonus;
+            reasons.push(format!("histori {:.0}% ({succ}/{total})", rate * 100.0));
+        }
+    }
+
+    // 2. Eskalasi pasca-verifikasi gagal: hindari model kecil/cepat, promosikan model kuat.
+    if escalated {
+        if is_deep_reason || is_coder {
+            score += 35;
+            reasons.push("eskalasi model kuat".into());
+        }
+        if is_fast_cheap {
+            score -= 35;
+        }
+    }
+
+    // 3. Budget biaya ketat: prioritaskan rute ekonomis.
+    if budget_tight {
+        if let Some(pin) = route.price_in {
+            if pin <= 1.0 {
+                score += 28;
+                reasons.push("hemat budget".into());
+            } else if pin >= 3.0 {
+                score -= 30;
+            }
+        }
+    }
+
     match task {
         TaskKind::Summary => {
             if is_fast_cheap {
                 score += 30;
+                reasons.push("ringkasan cepat".into());
             }
             if let Some(pin) = route.price_in {
                 if pin <= 1.0 {
@@ -413,6 +531,7 @@ fn score_candidate(
         TaskKind::Reasoning | TaskKind::Review => {
             if is_deep_reason {
                 score += 28;
+                reasons.push("reasoning/review".into());
             }
             if is_fast_cheap {
                 score -= 10;
@@ -421,6 +540,7 @@ fn score_candidate(
         TaskKind::Coding | TaskKind::Debugging => {
             if is_coder {
                 score += 25;
+                reasons.push("coding/debug".into());
             }
             if is_deep_reason {
                 score += 12;
@@ -429,10 +549,10 @@ fn score_candidate(
         TaskKind::General => {}
     }
 
-    // Kesehatan & latensi nyata dari telemetri: rute dalam cooldown/error tinggi diturunkan!
     if let Some(met) = metrics {
         if met.in_cooldown() {
             score -= 80;
+            reasons.push("cooldown".into());
         }
         if met.errors > met.successes && met.calls >= 2 {
             score -= 25;
@@ -445,16 +565,23 @@ fn score_candidate(
         }
     }
 
-    score
+    let reason = if reasons.is_empty() {
+        format!("tugas={}", task.as_str())
+    } else {
+        format!("tugas={} · {}", task.as_str(), reasons.join(", "))
+    };
+    (score, reason)
 }
 
-/// Provider wrapper yang mengorkestrasi Dynamic Model Routing, Retry terbatas, & Fallback.
+/// Provider wrapper yang mengorkestrasi Intelligent Model Routing, Learning, Escalation, Retry, & Fallback.
 pub struct DynamicRouterProvider {
     pub routes: Vec<ModelRoute>,
     pub auto_routing: bool,
     pub task_routes: HashMap<String, String>,
     pub max_retries: u8,
     pub retry_backoff_ms: u64,
+    pub max_cost_usd: Option<f64>,
+    pub store: Option<Arc<crate::store::Store>>,
     pub telemetry: Arc<Mutex<RouterTelemetry>>,
 }
 
@@ -472,6 +599,8 @@ impl DynamicRouterProvider {
             task_routes,
             max_retries: max_retries.min(3),
             retry_backoff_ms: 400,
+            max_cost_usd: None,
+            store: None,
             telemetry,
         }
     }
@@ -481,20 +610,48 @@ impl DynamicRouterProvider {
         self
     }
 
-    /// Tentukan urutan kandidat rute untuk giliran saat ini.
-    pub fn plan_candidates(&self, msgs: &[Message], tools: &[ToolSpec]) -> (TaskKind, Vec<ModelRoute>) {
+    pub fn with_max_cost_usd(mut self, max_cost_usd: Option<f64>) -> Self {
+        self.max_cost_usd = max_cost_usd.filter(|c| *c > 0.0);
+        self
+    }
+
+    pub fn with_store(mut self, store: Arc<crate::store::Store>) -> Self {
+        if let Ok(records) = store.load_model_perf() {
+            if let Ok(mut tel) = self.telemetry.lock() {
+                tel.seed_from_perf_records(&records);
+            }
+        }
+        self.store = Some(store);
+        self
+    }
+
+    /// Tentukan urutan kandidat rute beserta skor & alasan transparan.
+    pub fn plan_candidates_explained(
+        &self,
+        msgs: &[Message],
+        tools: &[ToolSpec],
+    ) -> (TaskKind, bool, Vec<(ModelRoute, i32, String)>) {
         let task = classify_task(msgs, tools);
+        let escalated = detect_escalation_needed(msgs);
         let needed_tokens = estimate_tokens(msgs).saturating_add(4096);
         let needs_tools = !tools.is_empty();
 
         if self.routes.len() <= 1 {
-            return (task, self.routes.clone());
+            let list = self
+                .routes
+                .iter()
+                .map(|r| (r.clone(), 0, format!("rute tunggal (tugas={})", task.as_str())))
+                .collect();
+            return (task, escalated, list);
         }
 
         let tel = self.telemetry.lock().ok();
+        let budget_tight = self
+            .max_cost_usd
+            .zip(tel.as_ref().map(|t| t.total_session_cost_usd))
+            .map(|(cap, used)| used >= cap * 0.75)
+            .unwrap_or(false);
 
-        // Mode manual (`auto_routing == false`): hormati urutan primary lalu fallback,
-        // hanya menunda kandidat yang sedang cooldown rate-limit jika ada cadangan sehat.
         if !self.auto_routing {
             let mut healthy = Vec::new();
             let mut cooled = Vec::new();
@@ -505,39 +662,68 @@ impl DynamicRouterProvider {
                     .map(|m| m.in_cooldown())
                     .unwrap_or(false);
                 if in_cd {
-                    cooled.push(r.clone());
+                    cooled.push((r.clone(), -80, "mode manual (cooldown)".to_string()));
                 } else {
-                    healthy.push(r.clone());
+                    let lbl = if r.is_primary {
+                        format!("pilihan manual primary (tugas={})", task.as_str())
+                    } else {
+                        format!("fallback manual (tugas={})", task.as_str())
+                    };
+                    healthy.push((r.clone(), if r.is_primary { 20 } else { 0 }, lbl));
                 }
             }
             healthy.extend(cooled);
-            return (task, healthy);
+            return (task, escalated, healthy);
         }
 
-        // Mode dinamis (`auto_routing == true`):
-        // 1. Cek aturan eksplisit `task_routes[task]` terlebih dulu.
         let explicit_target = self.task_routes.get(task.as_str()).map(|s| s.trim());
-        let mut scored: Vec<(i32, usize, ModelRoute)> = self
+        let mut scored: Vec<(i32, usize, ModelRoute, String)> = self
             .routes
             .iter()
             .enumerate()
             .map(|(idx, r)| {
                 let met = tel.as_ref().and_then(|t| t.routes.get(&r.id));
-                let mut sc = score_candidate(r, task, needed_tokens, needs_tools, met);
+                let hist = tel
+                    .as_ref()
+                    .and_then(|t| t.historical.get(&(r.id.clone(), task.as_str().to_string())).copied());
+                let (mut sc, mut reason) = score_candidate(
+                    r,
+                    task,
+                    needed_tokens,
+                    needs_tools,
+                    escalated,
+                    budget_tight,
+                    met,
+                    hist,
+                );
                 if let Some(target) = explicit_target {
                     if r.id.eq_ignore_ascii_case(target)
                         || r.provider_name.eq_ignore_ascii_case(target)
                         || r.model.eq_ignore_ascii_case(target)
                     {
                         sc += 200;
+                        reason = format!("aturan eksplisit {} · {reason}", task.as_str());
                     }
                 }
-                (sc, idx, r.clone())
+                (sc, idx, r.clone(), reason)
             })
             .collect();
 
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        (task, scored.into_iter().map(|(_, _, r)| r).collect())
+        (
+            task,
+            escalated,
+            scored
+                .into_iter()
+                .map(|(sc, _, r, reason)| (r, sc, reason))
+                .collect(),
+        )
+    }
+
+    /// Kompatibel penuh dengan API Tahap 3.
+    pub fn plan_candidates(&self, msgs: &[Message], tools: &[ToolSpec]) -> (TaskKind, Vec<ModelRoute>) {
+        let (task, _, explained) = self.plan_candidates_explained(msgs, tools);
+        (task, explained.into_iter().map(|(r, _, _)| r).collect())
     }
 }
 
@@ -549,21 +735,33 @@ impl Provider for DynamicRouterProvider {
         tools: &[ToolSpec],
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<AssistantReply> {
-        let (task, candidates) = self.plan_candidates(msgs, tools);
+        if let Some(cap) = self.max_cost_usd {
+            let used = self
+                .telemetry
+                .lock()
+                .map(|t| t.total_session_cost_usd)
+                .unwrap_or(0.0);
+            if used >= cap {
+                return Err(anyhow!(
+                    "batas biaya routing sesi (${cap:.4}) telah tercapai (terpakai ${used:.4}). Naikkan atau hapus batas lewat `/route budget clear`."
+                ));
+            }
+        }
+
+        let (task, escalated, candidates) = self.plan_candidates_explained(msgs, tools);
         if candidates.is_empty() {
             return Err(anyhow!("tidak ada provider/rute yang tersedia di DynamicRouterProvider"));
         }
 
         let mut errors: Vec<String> = Vec::new();
 
-        for (cand_idx, route) in candidates.iter().enumerate() {
+        for (cand_idx, (route, score, reason)) in candidates.iter().enumerate() {
             let max_attempts = (self.max_retries as usize) + 1;
             for attempt in 0..max_attempts {
                 let started = Instant::now();
                 let (inner_tx, mut inner_rx) = mpsc::channel::<StreamEvent>(128);
                 let out_tx = tx.clone();
 
-                // Teruskan token streaming secara langsung & catat apakah sudah ada token terkirim.
                 let forwarder = tokio::spawn(async move {
                     let mut emitted = false;
                     while let Some(ev) = inner_rx.recv().await {
@@ -579,8 +777,41 @@ impl Provider for DynamicRouterProvider {
 
                 match res {
                     Ok(reply) => {
+                        let used_tokens = reply
+                            .usage
+                            .map(|u| u.input_tokens + u.output_tokens)
+                            .unwrap_or(0);
+                        let call_cost = match (reply.usage, route.price_in, route.price_out) {
+                            (Some(u), Some(pin), Some(pout)) => {
+                                (u.input_tokens as f64 / 1_000_000.0) * pin
+                                    + (u.output_tokens as f64 / 1_000_000.0) * pout
+                            }
+                            _ => 0.0,
+                        };
                         if let Ok(mut tel) = self.telemetry.lock() {
                             tel.record_success(route, task, elapsed_ms, reply.usage, cand_idx > 0);
+                            tel.record_decision(RoutingDecision {
+                                route_id: route.id.clone(),
+                                task,
+                                escalated,
+                                score: *score,
+                                fallback_used: cand_idx > 0,
+                                reason: if cand_idx > 0 {
+                                    format!("fallback · {reason}")
+                                } else {
+                                    reason.clone()
+                                },
+                            });
+                        }
+                        if let Some(st) = &self.store {
+                            let _ = st.record_model_outcome(
+                                &route.id,
+                                task.as_str(),
+                                true,
+                                elapsed_ms,
+                                used_tokens,
+                                call_cost,
+                            );
                         }
                         return Ok(reply);
                     }
@@ -591,6 +822,18 @@ impl Provider for DynamicRouterProvider {
                         if let Ok(mut tel) = self.telemetry.lock() {
                             tel.record_error(route, task, &msg, will_retry);
                         }
+                        if !will_retry {
+                            if let Some(st) = &self.store {
+                                let _ = st.record_model_outcome(
+                                    &route.id,
+                                    task.as_str(),
+                                    false,
+                                    elapsed_ms,
+                                    0,
+                                    0.0,
+                                );
+                            }
+                        }
                         errors.push(format!("{} (percobaan {}): {}", route.id, attempt + 1, msg));
                         if will_retry {
                             if self.retry_backoff_ms > 0 {
@@ -599,7 +842,6 @@ impl Provider for DynamicRouterProvider {
                             }
                             continue;
                         }
-                        // Bila token sudah terlanjur mengalir ke UI, jangan tumpuk jawaban ganda dari fallback.
                         if emitted_any {
                             return Err(anyhow!(
                                 "stream terputus di tengah jawaban ({}): {}",
@@ -607,7 +849,7 @@ impl Provider for DynamicRouterProvider {
                                 msg
                             ));
                         }
-                        break; // pindah ke provider fallback berikutnya!
+                        break;
                     }
                 }
             }

@@ -439,12 +439,27 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
             } else {
                 self.cfg.routing.fallbacks.join(" -> ")
             };
+            let budget_s = self
+                .cfg
+                .routing
+                .max_cost_usd
+                .map(|c| format!("${c:.4}"))
+                .unwrap_or_else(|| "(tanpa batas)".to_string());
             let mut out = format!(
-                "# Dynamic Model Routing & Telemetri\n\
-                 * mode | {mode} | retry maks {}\n\
+                "# Intelligent Model Orchestration & Telemetri\n\
+                 * mode | {mode} | retry maks {} · budget {budget_s}\n\
                  > primary | {}:{} | fallback: {fb}\n",
                 self.cfg.routing.max_retries, self.provider_name, self.pcfg.model
             );
+            if let Ok(tel) = self.router_telemetry.lock() {
+                if let Some(dec) = &tel.last_decision {
+                    let esc = if dec.escalated { " · ESKALASI" } else { "" };
+                    out.push_str(&format!(
+                        "> keputusan akhir | {} (skor {}{esc}) | {}\n",
+                        dec.route_id, dec.score, dec.reason
+                    ));
+                }
+            }
             if !self.cfg.routing.task_routes.is_empty() {
                 out.push_str("---\n");
                 let mut pairs: Vec<(&String, &String)> = self.cfg.routing.task_routes.iter().collect();
@@ -480,9 +495,78 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
             out.push_str("! Aktifkan auto:   /route auto on  (atau /route auto off)\n");
             out.push_str("! Atur fallback:   /route fallback <prov1,prov2>  (atau /route fallback clear)\n");
             out.push_str("! Atur per tugas:  /route set <coding/debugging/reasoning/review/summary> <prov[:model]>\n");
-            out.push_str("! Batas retry:     /route retries <0-3>");
+            out.push_str("! Batas retry:     /route retries <0-3>\n");
+            out.push_str("! Batas biaya:     /route budget <usd atau clear>   ·   Riwayat: /route history");
             return Ok(out);
         };
+
+        if raw.eq_ignore_ascii_case("history") || raw.eq_ignore_ascii_case("hist") {
+            let mut out = String::from("# Riwayat Keputusan & Performa Model\n");
+            if let Ok(tel) = self.router_telemetry.lock() {
+                if tel.recent_decisions.is_empty() {
+                    out.push_str("! Belum ada keputusan routing di sesi ini.\n");
+                } else {
+                    for d in tel.recent_decisions.iter().rev().take(8) {
+                        let esc = if d.escalated { " [eskalasi]" } else { "" };
+                        out.push_str(&format!(
+                            "* {} | skor {}{esc} | {}\n",
+                            d.route_id, d.score, d.reason
+                        ));
+                    }
+                }
+            }
+            if let Ok(perf) = self.store.load_model_perf() {
+                if !perf.is_empty() {
+                    out.push_str("---\n");
+                    for p in perf.iter().take(8) {
+                        out.push_str(&format!(
+                            "> {} ({}) | {:.0}% ({}/{}) | avg {}ms\n",
+                            p.route_id,
+                            p.task_kind,
+                            p.success_rate() * 100.0,
+                            p.successes,
+                            p.successes + p.failures,
+                            p.avg_latency_ms()
+                        ));
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
+        if let Some(rest) = raw.strip_prefix("budget ") {
+            let val = rest.trim();
+            if val.eq_ignore_ascii_case("clear")
+                || val.eq_ignore_ascii_case("off")
+                || val.eq_ignore_ascii_case("none")
+            {
+                self.cfg.routing.max_cost_usd = None;
+            } else {
+                let usd: f64 = val
+                    .trim_start_matches('$')
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("budget harus angka USD (mis. /route budget 1.50)"))?;
+                if usd <= 0.0 {
+                    anyhow::bail!("budget USD harus lebih besar dari 0");
+                }
+                self.cfg.routing.max_cost_usd = Some(usd);
+            }
+            let saved = config::save(&self.cfg)?;
+            if !self.needs_setup {
+                let pname = self.provider_name.clone();
+                let _ = self.switch_provider(&pname);
+            }
+            let disp = self
+                .cfg
+                .routing
+                .max_cost_usd
+                .map(|c| format!("${c:.4}"))
+                .unwrap_or_else(|| "(tanpa batas)".to_string());
+            return Ok(format!(
+                "# Batas Biaya Routing Diperbarui\n* max_cost_usd | {disp} | disimpan ke {}",
+                saved.display()
+            ));
+        }
 
         if let Some(rest) = raw.strip_prefix("auto ") {
             let val = rest.trim().to_ascii_lowercase();

@@ -61,6 +61,23 @@ pub(crate) async fn run_bench_cli(
     )
     .await?;
     let _ = store.save_benchmark_run(&report);
+    // Umpan balik langsung hasil benchmark objektif ke tabel `model_perf` untuk Intelligent Routing!
+    let route_id = format!("{prov_name}:{}", pcfg.model);
+    for tr in &report.results {
+        let task_kind = match tr.category.as_str() {
+            "bug_fix" => "debugging",
+            "refactoring" | "test_gen" | "coding" => "coding",
+            _ => "general",
+        };
+        let _ = store.record_model_outcome(
+            &route_id,
+            task_kind,
+            tr.succeeded,
+            tr.elapsed_ms,
+            tr.input_tokens + tr.output_tokens,
+            tr.estimated_cost_usd.unwrap_or(0.0),
+        );
+    }
 
     println!("{}", report.format_markdown());
     if let Some(out) = out_path {

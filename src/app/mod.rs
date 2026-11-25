@@ -162,12 +162,17 @@ pub(crate) fn make_routed_provider(
         }
     }
 
-    Ok(Arc::new(DynamicRouterProvider::new(
+    let mut router = DynamicRouterProvider::new(
         routes,
         cfg.routing.auto,
         cfg.routing.task_routes.clone(),
         cfg.routing.max_retries,
         telemetry,
-    )))
+    )
+    .with_max_cost_usd(cfg.routing.max_cost_usd);
+    if let Ok(store) = selencode::store::Store::open() {
+        router = router.with_store(Arc::new(store));
+    }
+    Ok(Arc::new(router))
 }
 

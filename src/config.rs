@@ -77,8 +77,8 @@ impl SandboxCfg {
     }
 }
 
-/// Konfigurasi Dynamic Model Routing (`[routing]` di selencode.toml, Tahap 3).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Konfigurasi Dynamic Model Routing (`[routing]` di selencode.toml, Tahap 3 & Fase 5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RoutingCfg {
     /// true = aktifkan pemilihan model dinamis berbasis jenis tugas (coding/debugging/reasoning/review/summary).
     /// false (default) = hormati pilihan model manual user, namun fallback + retry + metrik tetap aktif.
@@ -94,6 +94,9 @@ pub struct RoutingCfg {
     /// ke `"provider"` atau `"provider:model"`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub task_routes: HashMap<String, String>,
+    /// Batas biaya maksimum per sesi dalam USD (opsional, hanya berlaku untuk rute yang punya price_in/price_out).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
 }
 
 fn default_routing_retries() -> u8 {
@@ -107,6 +110,7 @@ impl Default for RoutingCfg {
             fallbacks: Vec::new(),
             max_retries: default_routing_retries(),
             task_routes: HashMap::new(),
+            max_cost_usd: None,
         }
     }
 }
@@ -117,6 +121,7 @@ impl RoutingCfg {
             && self.fallbacks.is_empty()
             && self.max_retries == default_routing_retries()
             && self.task_routes.is_empty()
+            && self.max_cost_usd.is_none()
     }
 }
 
