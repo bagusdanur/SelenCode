@@ -209,11 +209,21 @@ pub struct LoopGuard {
     tool_fail_counts: HashMap<String, usize>,
     consecutive_errors: usize,
     stagnated: bool,
+    /// Batas kegagalan tool yang sama sebelum peringatan (aktif di runtime Tahap 2 = `Some(3)`).
+    tool_fail_limit: Option<usize>,
 }
 
 impl LoopGuard {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Guard lengkap Tahap 2 (Hermes): peringatkan pada 2x gagal identik ATAU 3x gagal tool yang sama.
+    pub fn with_hermes_guards() -> Self {
+        Self {
+            tool_fail_limit: Some(3),
+            ..Self::default()
+        }
     }
 
     pub fn is_stagnated(&self) -> bool {
@@ -243,8 +253,13 @@ impl LoopGuard {
                     consecutive_errors: self.consecutive_errors,
                 };
             }
-            // Tahap 2: peringatan pada 2x kegagalan identik ATAU 3x kegagalan tool yang sama.
-            if id_fail_now >= 2 || t_fail_now >= 3 {
+            // Tahap 2: peringatan pada 2x kegagalan identik, atau 3x kegagalan tool sama bila guard aktif.
+            if id_fail_now >= 2
+                || self
+                    .tool_fail_limit
+                    .map(|lim| t_fail_now >= lim)
+                    .unwrap_or(false)
+            {
                 return LoopWarning::RepeatedCall {
                     name: tool_name.to_string(),
                     count: id_fail_now.max(t_fail_now),

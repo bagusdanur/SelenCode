@@ -2518,17 +2518,10 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
                 last_anim_tick = std::time::Instant::now();
             }
 
-            // Saat streaming cepat, coalesce burst token hingga maks ~12 fps (80ms) bila
+            // Saat streaming cepat, coalesce burst token hingga maks ~12 fps (65-80ms) bila
             // tidak ada input user, agar CPU lemah tidak pernah freeze.
-            let should_draw = if dirty {
-                if !got_ui_event || !app.busy || last_draw.elapsed() >= Duration::from_millis(65) {
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+            let should_draw =
+                dirty && (!got_ui_event || !app.busy || last_draw.elapsed() >= Duration::from_millis(65));
 
             if should_draw {
                 terminal.draw(|f| draw(f, &mut app))?;

@@ -274,7 +274,11 @@ async fn run_turn_inner(
     } else {
         None
     };
-    let mut loop_guard = LoopGuard::new();
+    let mut loop_guard = if ctx.guard.enabled {
+        LoopGuard::with_hermes_guards()
+    } else {
+        LoopGuard::new()
+    };
     let mut dedup = ToolDedupCache::new();
     let sc_max = if ctx.guard.enabled {
         ctx.guard.max_self_correct_rounds
@@ -425,7 +429,7 @@ async fn run_turn_inner(
                     let info = format!(
                         "✦ Self-correction ({}/{}): memverifikasi perubahan sebelum selesai…",
                         corrector.repair_attempts,
-                        super::corrector::MAX_REPAIR_ATTEMPTS
+                        corrector.max_attempts
                     );
                     match &ui {
                         Some(tx) => {

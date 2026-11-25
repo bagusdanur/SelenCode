@@ -166,10 +166,14 @@ fn tahap2_canonical_fingerprint_dedup_and_self_correct_rem() {
     assert!(sc.completion_gate(5).is_some()); // putaran 1/1
     assert!(sc.completion_gate(5).is_none()); // putaran ke-2 ditahan!
 
-    // LoopGuard: 2x gagal identik -> peringatan!
-    let mut lg = LoopGuard::new();
+    // LoopGuard: 2x gagal identik -> peringatan, dan 3x gagal tool sama (arg berbeda) pada guard Hermes!
+    let mut lg = LoopGuard::with_hermes_guards();
     let _ = lg.record("run_shell", &sh_args, true);
     assert!(lg.record("run_shell", &sh_args, true).hint_message().is_some());
+    let mut lg_same_tool = LoopGuard::with_hermes_guards();
+    assert!(lg_same_tool.record("run_shell", &json!({"command": "e1"}), true).hint_message().is_none());
+    assert!(lg_same_tool.record("run_shell", &json!({"command": "e2"}), true).hint_message().is_none());
+    assert!(lg_same_tool.record("run_shell", &json!({"command": "e3"}), true).hint_message().is_some());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
