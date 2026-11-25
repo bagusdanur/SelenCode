@@ -136,13 +136,6 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
             let Some(msg) = upd.message else {
                 continue;
             };
-            let Some(raw_text) = msg.text else {
-                continue;
-            };
-            let text = normalize_tg_command(&raw_text);
-            if text.is_empty() {
-                continue;
-            }
             let chat_id = msg.chat.id;
             let user_id = msg.from.as_ref().map(|u| u.id).unwrap_or(chat_id);
             let sender_name = msg
@@ -150,6 +143,57 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 .as_ref()
                 .and_then(|u| u.username.clone().or_else(|| Some(u.first_name.clone())))
                 .unwrap_or_else(|| user_id.to_string());
+
+            // Dukungan pesan teks MAUPUN foto + caption (multimodal vision Telegram!).
+            let text = if let Some(raw_text) = msg.text.clone() {
+                normalize_tg_command(&raw_text)
+            } else if !msg.photo.is_empty() {
+                if !latest_cfg.telegram.is_allowed(user_id, chat_id) {
+                    let _ = tg
+                        .send_message(
+                            chat_id,
+                            &format!(
+                                "🔒 Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode."
+                            ),
+                        )
+                        .await;
+                    continue;
+                }
+                let best_photo = msg.photo.last().unwrap();
+                let mut attached_path: Option<String> = None;
+                if let Ok(fi) = tg.get_file(&best_photo.file_id).await {
+                    if let Some(fp) = fi.file_path {
+                        if let Ok(bytes) = tg.download_file_bytes(&fp).await {
+                            if bytes.len() <= 6 * 1024 * 1024 {
+                                let ext = fp.rsplit('.').next().unwrap_or("jpg");
+                                let rel = format!(".selencode/tg_uploads/tg_{}.{ext}", msg.message_id);
+                                let full = cwd.join(&rel);
+                                if let Some(parent) = full.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                if std::fs::write(&full, &bytes).is_ok() {
+                                    attached_path = Some(rel);
+                                }
+                            }
+                        }
+                    }
+                }
+                let caption = msg
+                    .caption
+                    .as_deref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Analisis gambar ini dan jelaskan hal penting atau error yang terlihat.");
+                match attached_path {
+                    Some(rel) => format!("@{rel} {caption}"),
+                    None => caption.to_string(),
+                }
+            } else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
 
             // `/id` selalu dijawab agar pemilik bisa langsung tahu ID untuk whitelist.
             if text.eq_ignore_ascii_case("/id") {
@@ -469,7 +513,7 @@ async fn handle_telegram_chat_message(
             return Ok(());
         }
         SlashCommand::Worktree(arg) => {
-            let reply = s.handle_worktree(arg.as_deref())?;
+            let reply = s.handle_worktree(arg.as_deref()).await?;
             tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }

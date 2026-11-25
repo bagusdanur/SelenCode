@@ -247,7 +247,7 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
         Ok(out)
     }
 
-    pub(crate) fn handle_worktree(&self, arg: Option<&str>) -> Result<String> {
+    pub(crate) async fn handle_worktree(&self, arg: Option<&str>) -> Result<String> {
         use selencode::worktree;
         let Some(raw) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
             let list = worktree::list_worktrees(&self.ctx.cwd)?;
@@ -267,11 +267,33 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
             }
             out.push_str("---\n");
             out.push_str("! Buat baru:      /worktree new <label>\n");
+            out.push_str("! Verifikasi:     /worktree verify <id> [check/test/lint/all]\n");
             out.push_str("! Preview diff:   /worktree diff <id>\n");
             out.push_str("! Terapkan aman:  /worktree apply <id>  (otomatis buat checkpoint + blokir konflik user)\n");
             out.push_str("! Hapus:          /worktree rm <id>");
             return Ok(out);
         };
+        if let Some(rest) = raw.strip_prefix("verify ") {
+            let mut parts = rest.trim().splitn(2, char::is_whitespace);
+            let id = parts.next().unwrap_or("").trim();
+            let scope = parts
+                .next()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("all");
+            if id.is_empty() {
+                anyhow::bail!("format: `/worktree verify <id> [check|test|lint|all]`");
+            }
+            let report = worktree::verify_worktree(
+                &self.ctx.cwd,
+                id,
+                scope,
+                self.cfg.shell.timeout_secs.max(120),
+                &self.ctx.sandbox,
+            )
+            .await?;
+            return Ok(report.format_menu_card());
+        }
         if let Some(rest) = raw
             .strip_prefix("new ")
             .or_else(|| raw.strip_prefix("create "))
@@ -379,9 +401,15 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
         );
         for srv in &self.cfg.mcp_servers {
             let trust = if srv.trust { "trust=true" } else { "approval aktif" };
+            let target = srv
+                .url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|u| format!("http: {u}"))
+                .unwrap_or_else(|| format!("stdio: {}", srv.command));
             out.push_str(&format!(
-                "> {} | {} | {trust} · timeout {}s\n",
-                srv.name, srv.command, srv.timeout_secs
+                "> {} | {target} | {trust} · timeout {}s\n",
+                srv.name, srv.timeout_secs
             ));
         }
         out.push_str("---\n");

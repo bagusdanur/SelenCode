@@ -36,11 +36,11 @@ pub const SUPPORTED_MCP_FEATURES: &[&str] = &[
     "prompts/list & prompts/get",
     "ping & notifications/cancelled on timeout",
     "auto-reconnect on dead stdio server",
+    "Streamable HTTP / SSE JSON-RPC remote transport (+ custom/Bearer headers)",
 ];
 
 pub const UNSUPPORTED_MCP_FEATURES: &[&str] = &[
     "sampling/createMessage (server-initiated LLM sampling)",
-    "SSE / Streamable HTTP transport (saat ini stdio transport)",
 ];
 
 /// Kapabilitas yang diiklankan server pada respons `initialize`.
@@ -163,9 +163,21 @@ struct Transport {
     stdin: ChildStdin,
 }
 
+struct HttpTransport {
+    client: reqwest::Client,
+    url: String,
+    headers: HashMap<String, String>,
+    session_id: Mutex<Option<String>>,
+}
+
+enum TransportKind {
+    Stdio(Mutex<Transport>),
+    Http(HttpTransport),
+}
+
 struct Inner {
     cfg: McpServerCfg,
-    transport: Mutex<Transport>,
+    transport: TransportKind,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
     next_id: AtomicU64,
     dead: AtomicBool,
@@ -173,6 +185,57 @@ struct Inner {
     server_name: String,
     capabilities: Mutex<McpCapabilities>,
     reconnect_lock: Mutex<()>,
+}
+
+/// Ekspansi pola `${ENV_VAR}` di nilai header HTTP MCP remote (mis. `Bearer ${MCP_TOKEN}`).
+pub fn expand_env_header(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        if let Some(end) = after.find('}') {
+            let var = &after[..end];
+            if let Ok(val) = std::env::var(var) {
+                out.push_str(&val);
+            }
+            rest = &after[end + 1..];
+        } else {
+            out.push_str("${");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Parse respons HTTP MCP: mendukung JSON langsung MAUPUN format SSE (`data: {...}`).
+pub fn parse_http_or_sse_jsonrpc(body: &str) -> Result<Value> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Ok(Value::Null);
+    }
+    if trimmed.starts_with('{') {
+        return Ok(serde_json::from_str(trimmed)?);
+    }
+    // Format SSE: ambil event JSON-RPC terakhir yang punya `result` atau `error`.
+    let mut last_valid: Option<Value> = None;
+    for line in trimmed.lines() {
+        let l = line.trim();
+        if let Some(payload) = l.strip_prefix("data:") {
+            let p = payload.trim();
+            if p.is_empty() || p == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(p) {
+                if v.get("result").is_some() || v.get("error").is_some() {
+                    return Ok(v);
+                }
+                last_valid = Some(v);
+            }
+        }
+    }
+    last_valid.ok_or_else(|| anyhow!("respons HTTP/SSE MCP bukan JSON-RPC 2.0 valid"))
 }
 
 pub struct McpClient {
@@ -235,9 +298,11 @@ fn spawn_reader_task(inner: Arc<Inner>, stdout: tokio::process::ChildStdout) {
                             }
                         })
                     };
-                    let mut tr = inner.transport.lock().await;
-                    let _ = tr.stdin.write_all(encode_message(&reply).as_bytes()).await;
-                    let _ = tr.stdin.flush().await;
+                    if let TransportKind::Stdio(ref tr_mu) = inner.transport {
+                        let mut tr = tr_mu.lock().await;
+                        let _ = tr.stdin.write_all(encode_message(&reply).as_bytes()).await;
+                        let _ = tr.stdin.flush().await;
+                    }
                 }
                 continue;
             }
@@ -266,22 +331,53 @@ fn spawn_reader_task(inner: Arc<Inner>, stdout: tokio::process::ChildStdout) {
 }
 
 impl McpClient {
-    /// Spawn server dari config, jalankan handshake MCP, negosiasi kapabilitas,
-    /// lalu ambil daftar tool via `tools/list`.
+    /// Hubungkan server dari config (`stdio` lokal atau `url` Streamable HTTP/SSE remote),
+    /// jalankan handshake MCP, negosiasi kapabilitas, lalu ambil daftar tool via `tools/list`.
     pub async fn start(cfg: &McpServerCfg) -> Result<(Arc<Self>, Vec<McpToolInfo>)> {
-        let (transport, stdout) = spawn_transport(cfg)?;
-        let inner = Arc::new(Inner {
-            cfg: cfg.clone(),
-            transport: Mutex::new(transport),
-            pending: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-            dead: AtomicBool::new(false),
-            timeout: Duration::from_secs(cfg.timeout_secs.max(1)),
-            server_name: cfg.name.clone(),
-            capabilities: Mutex::new(McpCapabilities::default()),
-            reconnect_lock: Mutex::new(()),
-        });
-        spawn_reader_task(inner.clone(), stdout);
+        let timeout = Duration::from_secs(cfg.timeout_secs.max(1));
+        let inner = if let Some(url) = cfg
+            .url
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            let http_client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(timeout)
+                .build()
+                .map_err(|e| anyhow!("gagal membuat HTTP client MCP '{}': {e}", cfg.name))?;
+            Arc::new(Inner {
+                cfg: cfg.clone(),
+                transport: TransportKind::Http(HttpTransport {
+                    client: http_client,
+                    url: url.to_string(),
+                    headers: cfg.headers.clone(),
+                    session_id: Mutex::new(None),
+                }),
+                pending: Mutex::new(HashMap::new()),
+                next_id: AtomicU64::new(1),
+                dead: AtomicBool::new(false),
+                timeout,
+                server_name: cfg.name.clone(),
+                capabilities: Mutex::new(McpCapabilities::default()),
+                reconnect_lock: Mutex::new(()),
+            })
+        } else {
+            let (transport, stdout) = spawn_transport(cfg)?;
+            let arc = Arc::new(Inner {
+                cfg: cfg.clone(),
+                transport: TransportKind::Stdio(Mutex::new(transport)),
+                pending: Mutex::new(HashMap::new()),
+                next_id: AtomicU64::new(1),
+                dead: AtomicBool::new(false),
+                timeout,
+                server_name: cfg.name.clone(),
+                capabilities: Mutex::new(McpCapabilities::default()),
+                reconnect_lock: Mutex::new(()),
+            });
+            spawn_reader_task(arc.clone(), stdout);
+            arc
+        };
 
         let client = Arc::new(McpClient { inner });
         client.perform_handshake().await?;
@@ -320,20 +416,29 @@ impl McpClient {
         Ok(())
     }
 
-    /// Sambungkan ulang server MCP jika proses mati di tengah sesi.
+    /// Sambungkan ulang server MCP jika proses stdio mati di tengah sesi.
     pub async fn reconnect(&self) -> Result<()> {
         let _guard = self.inner.reconnect_lock.lock().await;
         if !self.inner.dead.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let (new_transport, stdout) = spawn_transport(&self.inner.cfg)?;
-        {
-            let mut tr = self.inner.transport.lock().await;
-            *tr = new_transport;
+        match &self.inner.transport {
+            TransportKind::Stdio(tr_mu) => {
+                let (new_transport, stdout) = spawn_transport(&self.inner.cfg)?;
+                {
+                    let mut tr = tr_mu.lock().await;
+                    *tr = new_transport;
+                }
+                self.inner.dead.store(false, Ordering::SeqCst);
+                spawn_reader_task(self.inner.clone(), stdout);
+                self.perform_handshake().await
+            }
+            TransportKind::Http(http) => {
+                *http.session_id.lock().await = None;
+                self.inner.dead.store(false, Ordering::SeqCst);
+                self.perform_handshake().await
+            }
         }
-        self.inner.dead.store(false, Ordering::SeqCst);
-        spawn_reader_task(self.inner.clone(), stdout);
-        self.perform_handshake().await
     }
 
     pub fn server_name(&self) -> &str {
@@ -367,6 +472,16 @@ impl McpClient {
     }
 
     async fn request_raw(&self, method: &str, params: Value) -> Result<Value> {
+        if let TransportKind::Http(ref http) = self.inner.transport {
+            let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
+            let msg = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            });
+            return self.send_http_jsonrpc(http, &msg, true).await;
+        }
         if self.inner.dead.load(Ordering::SeqCst) {
             return Err(anyhow!(
                 "server MCP '{}' sudah mati — panggilan '{method}' dibatalkan",
@@ -410,6 +525,59 @@ impl McpClient {
         }
     }
 
+    async fn send_http_jsonrpc(
+        &self,
+        http: &HttpTransport,
+        msg: &Value,
+        expect_result: bool,
+    ) -> Result<Value> {
+        let mut req = http
+            .client
+            .post(&http.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(sid) = http.session_id.lock().await.clone() {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        for (k, v) in &http.headers {
+            req = req.header(k, expand_env_header(v));
+        }
+        let resp = req.json(msg).send().await.map_err(|e| {
+            anyhow!(
+                "gagal menghubungi server MCP HTTP '{}' ({}): {e}",
+                self.inner.server_name,
+                http.url
+            )
+        })?;
+        if let Some(sid) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            if !sid.trim().is_empty() {
+                *http.session_id.lock().await = Some(sid.trim().to_string());
+            }
+        }
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!(
+                "server MCP HTTP '{}' menolak (HTTP {}): {}",
+                self.inner.server_name,
+                status,
+                body.chars().take(300).collect::<String>()
+            ));
+        }
+        if !expect_result || body.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        let parsed = parse_http_or_sse_jsonrpc(&body)?;
+        if let Some(err) = parsed.get("error") {
+            return Err(anyhow!("error JSON-RPC dari server MCP HTTP: {err}"));
+        }
+        Ok(parsed.get("result").cloned().unwrap_or(Value::Null))
+    }
+
     /// Kirim notifikasi JSON-RPC (tanpa id, tanpa menunggu jawaban).
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let msg = json!({
@@ -417,11 +585,18 @@ impl McpClient {
             "method": method,
             "params": params,
         });
+        if let TransportKind::Http(ref http) = self.inner.transport {
+            let _ = self.send_http_jsonrpc(http, &msg, false).await;
+            return Ok(());
+        }
         self.write_line(&encode_message(&msg)).await
     }
 
     async fn write_line(&self, line: &str) -> Result<()> {
-        let mut tr = self.inner.transport.lock().await;
+        let TransportKind::Stdio(ref tr_mu) = self.inner.transport else {
+            return Ok(());
+        };
+        let mut tr = tr_mu.lock().await;
         tr.stdin.write_all(line.as_bytes()).await.map_err(|e| {
             anyhow!(
                 "gagal menulis ke stdin server MCP '{}': {e}",

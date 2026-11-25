@@ -54,6 +54,7 @@ pub async fn run_subagent(
         bg_manager: parent_ctx.bg_manager.clone(),
         lsp_manager: parent_ctx.lsp_manager.clone(),
         sandbox: parent_ctx.sandbox.clone(),
+        hooks: parent_ctx.hooks.clone(),
         auto_skills: false,
         self_correct: false,
     };

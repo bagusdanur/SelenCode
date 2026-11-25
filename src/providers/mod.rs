@@ -22,6 +22,11 @@ pub enum Role {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
     Text(String),
+    /// Lampiran gambar multimodal (`@screenshot.png` / foto Telegram) untuk model vision.
+    Image {
+        media_type: String,
+        data_base64: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -32,6 +37,43 @@ pub enum Block {
         content: String,
         is_error: bool,
     },
+}
+
+/// Deteksi tipe MIME gambar dari ekstensi file.
+pub fn detect_image_mime(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
+/// Encoder Base64 standar RFC 4648 murni Rust (tanpa dependency eksternal ekstra).
+pub fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -58,6 +58,7 @@ async fn mcp_resources_prompts_ping_and_auto_reconnect_end_to_end() {
         env: HashMap::new(),
         trust: true,
         timeout_secs: 10,
+        ..Default::default()
     };
 
     let (client, tools) = McpClient::start(&cfg).await.unwrap();

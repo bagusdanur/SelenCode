@@ -205,7 +205,7 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
                 }
             },
-            TuiCommand::Worktree(arg) => match s.handle_worktree(arg.as_deref()) {
+            TuiCommand::Worktree(arg) => match s.handle_worktree(arg.as_deref()).await {
                 Ok(card) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
                 }

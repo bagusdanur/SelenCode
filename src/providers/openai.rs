@@ -98,9 +98,39 @@ fn messages_to_openai(msgs: &[Message]) -> Vec<Value> {
     let mut out = Vec::new();
     for m in msgs {
         match m.role {
-            Role::System | Role::User => {
-                out.push(json!({"role": if m.role == Role::System {"system"} else {"user"},
-                                "content": m.plain_text()}));
+            Role::System => {
+                out.push(json!({"role": "system", "content": m.plain_text()}));
+            }
+            Role::User => {
+                let has_image = m
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, Block::Image { .. }));
+                if has_image {
+                    let mut parts: Vec<Value> = Vec::new();
+                    for b in &m.content {
+                        match b {
+                            Block::Text(t) if !t.is_empty() => {
+                                parts.push(json!({"type": "text", "text": t}));
+                            }
+                            Block::Image {
+                                media_type,
+                                data_base64,
+                            } => {
+                                parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!("data:{media_type};base64,{data_base64}")
+                                    }
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+                    out.push(json!({"role": "user", "content": parts}));
+                } else {
+                    out.push(json!({"role": "user", "content": m.plain_text()}));
+                }
             }
             Role::Assistant => {
                 let mut obj = Map::new();

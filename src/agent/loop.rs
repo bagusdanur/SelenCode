@@ -210,7 +210,22 @@ async fn run_turn_inner(
             }
         }
     }
-    let user_msg = Message::text(Role::User, user_text);
+    let (image_blocks, attached_images) = extract_at_images(&ctx.cwd, user_prompt);
+    if !attached_images.is_empty() {
+        let note = format!("Melampirkan gambar: {}", attached_images.join(", "));
+        match &ui {
+            Some(tx) => {
+                let _ = tx.send(UiEvent::Info(note)).await;
+            }
+            None => eprintln!("[selen] {note}"),
+        }
+    }
+    let mut user_blocks = vec![Block::Text(user_text)];
+    user_blocks.extend(image_blocks);
+    let user_msg = Message {
+        role: Role::User,
+        content: user_blocks,
+    };
     persist_message(ctx, &user_msg);
     messages.push(user_msg);
     let mut last_text = String::new();
@@ -452,12 +467,42 @@ async fn run_turn_inner(
                         true,
                     )
                 } else {
-                    match registry.get(&call.name) {
-                        Some(tool) => match tool.run(call.args.clone(), ctx).await {
-                            Ok(out) => (redact_secrets(&truncate(out)), false),
-                            Err(e) => (redact_secrets(&format!("ERROR: {e}")), true),
-                        },
-                        None => (format!("ERROR: tool '{}' tidak dikenal", call.name), true),
+                    let args_str = call.args.to_string();
+                    let pre_res = if !ctx.hooks.is_empty() {
+                        ctx.hooks
+                            .run_pre_tool(&call.name, &args_str, &ctx.cwd, &ctx.sandbox)
+                            .await
+                    } else {
+                        Ok(Vec::new())
+                    };
+                    match pre_res {
+                        Err(block_err) => (redact_secrets(&format!("ERROR: {block_err}")), true),
+                        Ok(_pre_notes) => {
+                            let (mut out_txt, err_flag) = match registry.get(&call.name) {
+                                Some(tool) => match tool.run(call.args.clone(), ctx).await {
+                                    Ok(out) => (redact_secrets(&truncate(out)), false),
+                                    Err(e) => (redact_secrets(&format!("ERROR: {e}")), true),
+                                },
+                                None => (format!("ERROR: tool '{}' tidak dikenal", call.name), true),
+                            };
+                            if !ctx.hooks.is_empty() {
+                                let post_notes = ctx
+                                    .hooks
+                                    .run_post_tool(
+                                        &call.name,
+                                        &args_str,
+                                        err_flag,
+                                        &ctx.cwd,
+                                        &ctx.sandbox,
+                                    )
+                                    .await;
+                                if !post_notes.is_empty() {
+                                    out_txt.push_str("\n\n");
+                                    out_txt.push_str(&post_notes.join("\n"));
+                                }
+                            }
+                            (out_txt, err_flag)
+                        }
                     }
                 };
             corrector.observe_tool(&call.name, &call.args, &content, is_error);
@@ -591,4 +636,56 @@ fn truncate(s: String) -> String {
         cut.push_str("\n... (hasil dipotong 30KB)");
         cut
     }
+}
+
+/// Ekstrak lampiran gambar multimodal `@path/ke/gambar.(png|jpg|jpeg|webp|gif)` dari prompt user.
+/// Maksimal 4 gambar & 6 MB per gambar; menolak file rahasia.
+fn extract_at_images(cwd: &std::path::Path, prompt: &str) -> (Vec<Block>, Vec<String>) {
+    const MAX_IMAGES: usize = 4;
+    const MAX_IMAGE_BYTES: u64 = 6 * 1024 * 1024;
+    let mut blocks = Vec::new();
+    let mut names = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for raw_tok in prompt.split_whitespace() {
+        if blocks.len() >= MAX_IMAGES {
+            break;
+        }
+        let tok = raw_tok.trim_matches(|c: char| matches!(c, ',' | ';' | ')' | '(' | '"' | '\'' | '`'));
+        let Some(rel) = tok.strip_prefix('@') else {
+            continue;
+        };
+        if rel.is_empty() || !seen.insert(rel.to_string()) {
+            continue;
+        }
+        let cand = std::path::Path::new(rel);
+        let Some(mime) = crate::providers::detect_image_mime(cand) else {
+            continue;
+        };
+        let resolved = if cand.is_absolute() {
+            cand.to_path_buf()
+        } else {
+            match crate::security::resolve_in_sandbox(cwd, cand) {
+                Ok(p) => p,
+                Err(_) => continue,
+            }
+        };
+        if crate::security::is_secret_file(&resolved) || !resolved.is_file() {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&resolved) else {
+            continue;
+        };
+        if meta.len() == 0 || meta.len() > MAX_IMAGE_BYTES {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&resolved) {
+            blocks.push(Block::Image {
+                media_type: mime.to_string(),
+                data_base64: crate::providers::encode_base64(&bytes),
+            });
+            names.push(rel.to_string());
+        }
+    }
+    (blocks, names)
 }

@@ -41,6 +41,9 @@ fn build_turn_digest(messages: &[Message]) -> String {
                     let s: String = t.chars().take(400).collect();
                     format!("[{role}] {s}\n")
                 }
+                Block::Image { media_type, .. } => {
+                    format!("[{role}] [image: {media_type}]\n")
+                }
                 Block::ToolUse { name, args, .. } => {
                     let a: String = args.to_string().chars().take(200).collect();
                     format!("[CALL] {name} {a}\n")

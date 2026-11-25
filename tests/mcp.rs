@@ -34,6 +34,7 @@ fn echo_cfg(trust: bool) -> McpServerCfg {
         env: HashMap::new(),
         trust,
         timeout_secs: 10,
+        ..Default::default()
     }
 }
 
@@ -109,6 +110,7 @@ async fn mcp_dead_server_fails_gracefully() {
         env: HashMap::new(),
         trust: false,
         timeout_secs: 5,
+        ..Default::default()
     };
     let r = McpClient::start(&cfg).await;
     assert!(r.is_err(), "server yang langsung mati harus menghasilkan Err");

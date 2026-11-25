@@ -250,6 +250,7 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
         .flat_map(|m| m.content.iter())
         .map(|b| match b {
             Block::Text(t) => t.chars().count(),
+            Block::Image { .. } => 1200, // estimasi ~300 token per lampiran gambar
             Block::ToolUse { name, args, .. } => {
                 name.chars().count() + args.to_string().chars().count()
             }

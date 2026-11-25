@@ -51,6 +51,17 @@ impl AnthropicProvider {
 fn block_to_anthropic(b: &Block) -> Value {
     match b {
         Block::Text(t) => json!({"type": "text", "text": t}),
+        Block::Image {
+            media_type,
+            data_base64,
+        } => json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data_base64
+            }
+        }),
         Block::ToolUse { id, name, args } => {
             json!({"type": "tool_use", "id": id, "name": name, "input": args})
         }

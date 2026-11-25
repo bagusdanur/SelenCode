@@ -289,6 +289,10 @@ fn blocks_to_json(blocks: &[Block]) -> String {
         .iter()
         .map(|b| match b {
             Block::Text(t) => serde_json::json!({"type": "text", "text": t}),
+            Block::Image {
+                media_type,
+                data_base64,
+            } => serde_json::json!({"type": "image", "media_type": media_type, "data_base64": data_base64}),
             Block::ToolUse { id, name, args } => {
                 serde_json::json!({"type": "tool_use", "id": id, "name": name, "args": args})
             }
@@ -311,6 +315,13 @@ fn blocks_from_json(s: &str) -> Result<Vec<Block>> {
             Some("text") => out.push(Block::Text(
                 b["text"].as_str().unwrap_or_default().to_string(),
             )),
+            Some("image") => out.push(Block::Image {
+                media_type: b["media_type"]
+                    .as_str()
+                    .unwrap_or("image/png")
+                    .to_string(),
+                data_base64: b["data_base64"].as_str().unwrap_or_default().to_string(),
+            }),
             Some("tool_use") => out.push(Block::ToolUse {
                 id: b["id"].as_str().unwrap_or_default().to_string(),
                 name: b["name"].as_str().unwrap_or_default().to_string(),

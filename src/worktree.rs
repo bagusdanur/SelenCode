@@ -383,3 +383,24 @@ pub fn discard_worktree(cwd: &Path, id: &str) -> Result<()> {
     let _ = run_git(cwd, &["branch", "-D", &wt.branch]);
     Ok(())
 }
+
+/// Jalankan verifikasi proyek (build / test / lint) secara langsung DI DALAM worktree terisolasi
+/// sebelum perubahan diterapkan ke workspace utama.
+pub async fn verify_worktree(
+    cwd: &Path,
+    id: &str,
+    scope: &str,
+    timeout_secs: u64,
+    sandbox: &crate::sandbox::SandboxController,
+) -> Result<crate::tools::verify::VerifyReport> {
+    let wt = find_worktree(cwd, id)?;
+    let prev = preview_diff(cwd, &wt.id)?;
+    crate::tools::verify::run_verify_plan_with_sandbox(
+        &wt.path,
+        scope,
+        &prev.changed_files,
+        timeout_secs,
+        sandbox,
+    )
+    .await
+}

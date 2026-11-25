@@ -3,6 +3,7 @@ pub mod benchmark;
 pub mod config;
 pub mod context_index;
 pub mod doctor;
+pub mod hooks;
 pub mod lsp;
 pub mod mcp;
 pub mod outline;

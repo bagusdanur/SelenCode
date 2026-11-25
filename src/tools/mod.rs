@@ -55,6 +55,8 @@ pub struct Ctx {
     pub lsp_manager: Arc<crate::lsp::LspManager>,
     /// Kebijakan Security Sandbox v2 (mode izin, env scrubbing, isolasi OS, & audit log).
     pub sandbox: Arc<crate::sandbox::SandboxController>,
+    /// Custom Hooks (`pre_tool` & `post_tool`) dari `selencode.toml`.
+    pub hooks: Arc<crate::hooks::HookEngine>,
     /// Aktifkan review self-improvement otomatis pasca-giliran kompleks (ala Hermes).
     /// Default false di Ctx::new agar tes mock tidak memicu panggilan ekstra;
     /// Session::build mengisinya dari `cfg.agent.auto_skills` (default true).
@@ -83,12 +85,17 @@ impl Ctx {
             bg_manager: Arc::new(bg::BgManager::new()),
             lsp_manager,
             sandbox: Arc::new(crate::sandbox::SandboxController::default()),
+            hooks: Arc::new(crate::hooks::HookEngine::default()),
             auto_skills: false,
             self_correct: false,
         }
     }
     pub fn with_sandbox(mut self, sandbox: Arc<crate::sandbox::SandboxController>) -> Self {
         self.sandbox = sandbox;
+        self
+    }
+    pub fn with_hooks(mut self, hooks: Arc<crate::hooks::HookEngine>) -> Self {
+        self.hooks = hooks;
         self
     }
     pub fn with_auto_skills(mut self, enabled: bool) -> Self {

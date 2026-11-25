@@ -70,6 +70,17 @@ pub fn build_request(msgs: &[Message], tools: &[ToolSpec]) -> Value {
                                 parts.push(json!({"text": t}));
                             }
                         }
+                        Block::Image {
+                            media_type,
+                            data_base64,
+                        } => {
+                            parts.push(json!({
+                                "inlineData": {
+                                    "mimeType": media_type,
+                                    "data": data_base64
+                                }
+                            }));
+                        }
                         Block::ToolResult {
                             id,
                             content,
@@ -97,6 +108,17 @@ pub fn build_request(msgs: &[Message], tools: &[ToolSpec]) -> Value {
                             if !t.is_empty() {
                                 parts.push(json!({"text": t}));
                             }
+                        }
+                        Block::Image {
+                            media_type,
+                            data_base64,
+                        } => {
+                            parts.push(json!({
+                                "inlineData": {
+                                    "mimeType": media_type,
+                                    "data": data_base64
+                                }
+                            }));
                         }
                         Block::ToolUse { name, args, .. } => {
                             parts.push(json!({"functionCall": {"name": name, "args": args}}));

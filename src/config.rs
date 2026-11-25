@@ -23,6 +23,35 @@ pub struct Config {
     /// Pengaturan Security Sandbox v2 (`[sandbox]` di selencode.toml).
     #[serde(default, skip_serializing_if = "SandboxCfg::is_empty")]
     pub sandbox: SandboxCfg,
+    /// Custom Hooks (`[[hooks]]` di selencode.toml) — `pre_tool` & `post_tool`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<HookCfg>,
+}
+
+/// Konfigurasi 1 Custom Hook (`[[hooks]]` di selencode.toml).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HookCfg {
+    /// Event pemicu: `"pre_tool"` atau `"post_tool"`.
+    pub event: String,
+    /// Pola nama tool: `"*"`, `"edit_file"`, `"edit_file,write_file"`, atau `"mcp__*"`.
+    #[serde(default = "default_hook_matcher")]
+    pub matcher: String,
+    /// Perintah shell yang dijalankan di workspace.
+    pub command: String,
+    /// Batas waktu eksekusi hook dalam detik (default 15s).
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_secs: u64,
+    /// Khusus `pre_tool`: true = blokir eksekusi tool bila hook keluar non-zero.
+    #[serde(default)]
+    pub block_on_error: bool,
+}
+
+fn default_hook_matcher() -> String {
+    "*".to_string()
+}
+
+fn default_hook_timeout() -> u64 {
+    15
 }
 
 /// Konfigurasi Security Sandbox v2 (`[sandbox]` di selencode.toml).
@@ -185,17 +214,25 @@ impl TelegramCfg {
     }
 }
 
-/// Satu server MCP stdio (Fase 7): proses lokal yang di-spawn selen,
+/// Satu server MCP (stdio lokal ATAU Streamable HTTP/SSE remote):
 /// tool-nya muncul di registry sebagai `mcp__<name>__<tool>`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerCfg {
     pub name: String,
+    /// Perintah executable untuk transport `stdio` (kosongkan jika memakai `url` HTTP/SSE).
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    /// Env tambahan untuk proses server (opsional).
+    /// Env tambahan untuk proses server stdio (opsional).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// URL endpoint Streamable HTTP / JSON-RPC remote (opsional; jika diisi memakai transport HTTP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Header HTTP opsional untuk transport remote (mis. `Authorization: "Bearer ${TOKEN}"`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
     /// true = tool server ini berjalan TANPA approval. Default false:
     /// server eksternal tidak dikenal, jadi setiap panggilan ditanya dulu.
     #[serde(default)]
@@ -203,6 +240,21 @@ pub struct McpServerCfg {
     /// Timeout per request JSON-RPC ke server ini (detik).
     #[serde(default = "default_mcp_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+impl Default for McpServerCfg {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+            trust: false,
+            timeout_secs: default_mcp_timeout_secs(),
+        }
+    }
 }
 
 fn default_mcp_timeout_secs() -> u64 {
@@ -441,6 +493,7 @@ impl Config {
             telegram: TelegramCfg::default(),
             routing: RoutingCfg::default(),
             sandbox: SandboxCfg::default(),
+            hooks: Vec::new(),
         }
     }
 
