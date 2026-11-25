@@ -76,6 +76,14 @@ fn welcome_lebar_116_memuat_identitas() {
     assert!(text.contains("SelenCode"), "nama produk tampil");
     assert!(text.contains("edisi Moonlit"));
     assert!(text.contains("Selena"), "persona tampil");
+    assert!(
+        text.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+        "versi aktif tampil di banner"
+    );
+    assert!(
+        !text.contains("asisten coding terminal") && !text.contains("full Rust"),
+        "subtitle lama sudah dihapus"
+    );
     assert!(text.contains("ag/gemini-3-flash"), "model tampil");
     assert!(
         text.contains("Kemampuan") && text.contains("Perintah"),

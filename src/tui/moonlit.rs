@@ -382,7 +382,7 @@ fn welcome_wide(width: usize, info: &WelcomeInfo) -> Vec<Line<'static>> {
     }
     right_rows.push(vec![
         sp("☾ Selena", stb(LAV)),
-        sp("  ·  asisten coding terminal  ·  full Rust", st(DIM)),
+        sp(concat!("  ·  v", env!("CARGO_PKG_VERSION")), st(DIM)),
     ]);
     right_rows.push(vec![
         sp("● ", st(MINT)),
@@ -503,7 +503,10 @@ fn welcome_narrow(width: usize, info: &WelcomeInfo) -> Vec<Line<'static>> {
             }
             2 => {
                 row.push(sp("    ", st(DIM)));
-                row.push(sp("Selena · edisi Moonlit", st(LAV)));
+                row.push(sp(
+                    concat!("Selena · v", env!("CARGO_PKG_VERSION")),
+                    st(LAV),
+                ));
             }
             4 => {
                 row.push(sp("    ", st(DIM)));
