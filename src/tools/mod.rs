@@ -12,6 +12,7 @@ pub mod search;
 pub mod shell;
 pub mod skill;
 pub mod task;
+pub mod toolsets;
 pub mod undo;
 pub mod verify;
 pub mod web;

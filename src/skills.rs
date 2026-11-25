@@ -116,6 +116,26 @@ pub fn upsert_skill(
     Ok((path, clean, existed))
 }
 
+/// Template skill bawaan ala Hermes Agent untuk efisiensi token & langkah minimal.
+pub const TOKEN_EFFICIENCY_SKILL_BODY: &str = "\
+Gunakan disiplin hemat token ala Hermes Agent (Progressive Disclosure):
+1. Jangan baca file penuh jika cukup memakai `search_text` atau rentang baris (`start_line`/`end_line`).
+2. Jangan aktifkan toolset tambahan lewat `activate_toolset` kecuali benar-benar diperlukan giliran ini.
+3. Lakukan perubahan kode seminimal mungkin dalam 1–2 panggilan `edit_file`, bukan berulang kali.
+4. Verifikasi CUKUP 1 KALI dengan perintah paling langsung (jalankan program atau test yang sudah ada); bila lulus langsung selesai.
+5. Jangan membuat file test baru, `git init`, atau membaca file di luar ruang lingkup pertanyaan user.";
+
+/// Pasang skill bawaan `hemat-token` ke `.selencode/skills/hemat-token.md`.
+pub fn install_token_efficiency_skill(cwd: &Path) -> Result<PathBuf> {
+    let (path, _, _) = upsert_skill(
+        cwd,
+        "hemat-token",
+        Some("Disiplin hemat token & langkah minimal ala Hermes Agent"),
+        TOKEN_EFFICIENCY_SKILL_BODY,
+    )?;
+    Ok(path)
+}
+
 /// Simpan skill baru ke `.selencode/skills/<nama>.md` (dipakai `/learn`).
 pub fn save_skill(cwd: &Path, name: &str, instruction: &str) -> Result<PathBuf> {
     let (path, _, _) = upsert_skill(cwd, name, None, instruction)?;

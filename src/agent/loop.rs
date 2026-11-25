@@ -153,17 +153,24 @@ async fn run_turn_inner(
     ui: Option<mpsc::Sender<UiEvent>>,
     mode: TurnMode,
 ) -> Result<(String, Option<Usage>)> {
-    // Plan mode (Fase 6): specs yang dikirim ke provider HANYA tool
-    // baca-saja. Penegakan kedua ada di titik eksekusi tool di bawah.
-    let tools = match mode {
-        TurnMode::Plan => registry.specs_where(is_read_only),
-        TurnMode::Execute => registry.specs(),
-    };
+    // Progressive Disclosure (Hermes-style toolsets):
+    // Hanya kirim Core Toolset + toolset yang cocok dengan intent/workspace, bukan seluruh 29 schema!
+    // Model dapat membuka toolset lain kapan saja lewat `activate_toolset`.
+    let has_mcp = registry.names().iter().any(|n| n.starts_with("mcp__"));
+    let mut active_toolsets =
+        crate::tools::toolsets::select_initial_toolsets(user_prompt, &ctx.cwd, has_mcp, mode);
+    let mut tools = crate::tools::toolsets::active_tool_specs(registry, &active_toolsets, mode);
     if messages.is_empty() {
         let mut sys = build_system_prompt(&ctx.cwd, &tools);
+        let hint = crate::tools::toolsets::inactive_toolsets_hint(registry, &active_toolsets);
+        if !hint.is_empty() {
+            sys.push('\n');
+            sys.push_str(&hint);
+            sys.push('\n');
+        }
         if let Some(store) = &ctx.store {
             let cwd_str = ctx.cwd.to_string_lossy().to_string();
-            if let Ok(mems) = store.list_memories(&cwd_str, 20) {
+            if let Ok(mems) = store.list_memories(&cwd_str, 15) {
                 let mem_sec = format_memories_section(&mems);
                 if !mem_sec.is_empty() {
                     sys.push_str(&mem_sec);
@@ -174,7 +181,8 @@ async fn run_turn_inner(
         persist_message(ctx, &sys_msg);
         messages.push(sys_msg);
     }
-    // Lampiran eksplisit `@path/to/file` (ala OpenCode) + konteks pintar auto-outline.
+    // Lampiran eksplisit `@path/to/file` (ala OpenCode) + konteks pintar auto-outline
+    // (hanya untuk prompt substantif >= 25 karakter agar pertanyaan singkat `/resume` super hemat!).
     let mut user_text = user_prompt.to_string();
     let (at_block, attached_files) = expand_at_mentions(&ctx.cwd, user_prompt);
     if !at_block.is_empty() {
@@ -187,22 +195,22 @@ async fn run_turn_inner(
             }
             None => eprintln!("[selen] {note}"),
         }
-    } else {
+    } else if user_prompt.trim().chars().count() >= 25 {
         let auto = auto_outline(&ctx.cwd, user_prompt);
         if !auto.is_empty() {
             user_text.push_str("\n\n");
             user_text.push_str(&auto);
         } else if ctx.self_correct {
-            // Tahap 2: Smart Context Retrieval otomatis (hanya saat skor simbol/path tinggi >= 30,
-            // budget ketat 3 KB agar hemat token & tidak mengganggu sapaan biasa).
+            // Tahap 2: Smart Context Retrieval otomatis (hanya saat skor simbol/path tinggi >= 35,
+            // budget ketat 2 KB agar hemat token & tidak mengganggu sapaan biasa).
             let hits = ctx
                 .repo_index
                 .lock()
                 .ok()
-                .map(|mut idx| idx.query(user_prompt, 3, 3072))
+                .map(|mut idx| idx.query(user_prompt, 3, 2048))
                 .unwrap_or_default();
-            if hits.first().map(|h| h.score >= 30).unwrap_or(false) {
-                let smart_block = crate::context_index::format_hits_for_prompt(&hits, 3072);
+            if hits.first().map(|h| h.score >= 35).unwrap_or(false) {
+                let smart_block = crate::context_index::format_hits_for_prompt(&hits, 2048);
                 if !smart_block.is_empty() {
                     user_text.push_str("\n\n[Konteks relevan otomatis (Smart Index)]\n");
                     user_text.push_str(&smart_block);
@@ -456,7 +464,40 @@ async fn run_turn_inner(
             // nama tool di stderr / ringkasan teredaksi di TUI), jadi redaksi
             // di sini murni melindungi sisi provider.
             let (mut content, is_error) =
-                if mode == TurnMode::Plan && !is_read_only(&call.name) {
+                if call.name == crate::tools::toolsets::ACTIVATE_TOOLSET_NAME {
+                    let requested: Vec<String> = call
+                        .args
+                        .get("toolsets")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.trim().to_ascii_lowercase()))
+                                .filter(|s| !s.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut activated = Vec::new();
+                    for ts in requested {
+                        if active_toolsets.insert(ts.clone()) {
+                            activated.push(ts);
+                        }
+                    }
+                    tools = crate::tools::toolsets::active_tool_specs(
+                        registry,
+                        &active_toolsets,
+                        mode,
+                    );
+                    let active_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+                    (
+                        format!(
+                            "Toolset diaktifkan: {:?}. Tool aktif sekarang ({}): {}",
+                            activated,
+                            active_names.len(),
+                            active_names.join(", ")
+                        ),
+                        false,
+                    )
+                } else if mode == TurnMode::Plan && !is_read_only(&call.name) {
                     // Penegakan plan mode (Fase 6): model tetap memanggil
                     // tool menulis (halusinasi) -> tolak TANPA menjalankan.
                     (

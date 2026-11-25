@@ -1226,11 +1226,21 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
                 }
             }
             out.push_str("---\n");
-            out.push_str("! Review otomatis sekarang: /skills review   |   Toggle auto: /skills auto\n");
-            out.push_str("! Lihat / hapus skill:      /skills show <nama>   |   /skills rm <nama>\n");
-            out.push_str("! Pakai / buat manual:      /skill <nama>   |   /learn <nama> <instruksi>");
+            out.push_str("! Pasang skill hemat token: /skills hemat   ·   Review otomatis: /skills review\n");
+            out.push_str("! Lihat / hapus skill:      /skills show <nama>   ·   /skills rm <nama>\n");
+            out.push_str("! Pakai / buat manual:      /skill <nama>   ·   /learn <nama> <instruksi>");
             return Ok(out);
         };
+
+        if arg.eq_ignore_ascii_case("hemat") || arg.eq_ignore_ascii_case("hemat-token") {
+            let p = selencode::skills::install_token_efficiency_skill(&self.ctx.cwd)?;
+            return Ok(format!(
+                "# Skill `hemat-token` Terpasang\n\
+                 * lokasi | {} | siap dipakai via `/skill hemat-token`\n\
+                 ! Mengikuti pola Progressive Disclosure Hermes Agent (langkah & pembacaan minimal).",
+                p.display()
+            ));
+        }
 
         if arg.eq_ignore_ascii_case("auto") {
             let next = !self.ctx.auto_skills;
@@ -1587,14 +1597,30 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
     }
 
     pub(crate) fn session_info_menu(&self) -> String {
-        let est = estimate_tokens(&self.messages);
+        let active_ts = selencode::tools::toolsets::select_initial_toolsets(
+            "",
+            &self.ctx.cwd,
+            !self.cfg.mcp_servers.is_empty(),
+            selencode::agent::plan::TurnMode::Execute,
+        );
+        let active_specs = selencode::tools::toolsets::active_tool_specs(
+            &self.registry,
+            &active_ts,
+            selencode::agent::plan::TurnMode::Execute,
+        );
+        let bd = selencode::agent::context::analyze_token_breakdown(
+            &self.messages,
+            &active_specs,
+            self.registry.names().len(),
+        );
+        let est = bd.total_tokens();
         let lim = self.ctx.context_limit_tokens;
         let pct = calc_context_pct(est, lim);
         format!(
             "# Info Sesi Aktif\n\
              * sesi | {} | {}\n\
              > provider | {} | model {} (kind {})\n\
-             > konteks | {} / {} ({pct}%) | kapasitas model AI\n\
+             > konteks | {} / {} ({pct}%) | sys ~{} · tools ~{} ({}/{}) · chat ~{} · tool_res ~{}\n\
              > folder | {} | {} pesan di memori",
             self.session_id.chars().take(12).collect::<String>(),
             self.usage_line(),
@@ -1603,6 +1629,12 @@ impl Session {    /// Tangani `/telegram [setup|allow|rm|approve|off]`.
             self.pcfg.kind,
             format_context_compact(est),
             format_context_compact(lim),
+            bd.system_tokens,
+            bd.tools_tokens,
+            bd.active_tools,
+            bd.total_tools,
+            bd.conversation_tokens,
+            bd.tool_results_tokens,
             self.ctx.cwd.display(),
             self.messages.len(),
         )

@@ -396,8 +396,10 @@ pub fn load() -> Result<Config> {
     let env_hint = r#"$env:SELENCODE_ROUTER_KEY="isi-api-key-kamu""#;
     #[cfg(not(windows))]
     let env_hint = r#"export SELENCODE_ROUTER_KEY="isi-api-key-kamu""#;
+    let cfg_path = active_config_path();
     Err(anyhow!(
-        "Config SelenCode tidak ditemukan. Jalankan `selen` untuk setup interaktif otomatis, atau buat file:\n  ./selencode.toml\n  ~/.config/selencode/config.toml\n\nContoh set API key di terminal:\n  {env_hint}"
+        "Config SelenCode tidak ditemukan. Jalankan `selen` untuk setup interaktif otomatis, atau buat file:\n  ./selencode.toml\n  {}\n\nContoh set API key di terminal:\n  {env_hint}",
+        cfg_path.display()
     ))
 }
 
