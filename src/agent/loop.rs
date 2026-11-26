@@ -366,9 +366,10 @@ async fn run_turn_inner(
     let mut forced_stop_reason: Option<String> = None;
 
     for step in 0..max_steps {
-        // Perbaikan 1 (v0.5.9) — Prune lebih dini hasil `skill_view` lama (di luar 4 pesan terakhir = ~2 langkah tool)
-        // ke stub ringkas + arsip byte-exact agar isi skill tidak terbawa penuh selamanya.
-        let pruned_skills = prune_old_skill_results_with_archive(messages, &prune_dir, 4);
+        // Perbaikan 1 (v0.5.9) — Prune lebih dini hasil `skill_view` lama (di luar 2 pesan terakhir =
+        // tepat sesudah model memakainya di 1 giliran berikutnya) ke stub ringkas + arsip byte-exact
+        // agar isi skill tidak terbawa penuh di sisa sesi.
+        let pruned_skills = prune_old_skill_results_with_archive(messages, &prune_dir, 2);
         // Tahap 1 — Prune hasil tool lama (>200 char di luar 20 pesan terakhir) + arsip ke file (TANPA LLM).
         let pruned_now = pruned_skills + prune_old_tool_results_with_archive(messages, &prune_dir, 20);
         // Kompresi dua tahap: hanya ringkas jika MASIH > 50% sesudah Tahap 1 prune!

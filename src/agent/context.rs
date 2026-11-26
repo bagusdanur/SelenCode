@@ -906,7 +906,7 @@ pub fn prune_old_skill_results_with_archive(
             );
             let archive_path = archive_dir.join(fname);
             let _ = std::fs::write(&archive_path, content.as_str());
-            let headings = extract_markdown_headings(content, 8);
+            let headings = extract_markdown_headings(content, 6);
             let headings_line = if headings.is_empty() {
                 String::new()
             } else {
@@ -914,7 +914,7 @@ pub fn prune_old_skill_results_with_archive(
             };
             *content = format!(
                 "[Skill `{skill_name}` aktif — isi penuh terarsip: {}]{headings_line}\n\
-                 (Panduan skill `{skill_name}` tetap berlaku; panggil `skill_view(name=\"{skill_name}\", full=true)` bila butuh membaca ulang isi penuhnya.)",
+                 (Panggil `skill_view(name=\"{skill_name}\", full=true)` bila butuh detail penuh.)",
                 archive_path.display()
             );
             pruned += 1;

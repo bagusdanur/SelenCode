@@ -76,11 +76,11 @@ impl Tool for SkillsList {
 /// Skill kecil (<= 4.500 char) tetap dikembalikan utuh apa adanya; isi penuh selalu bisa
 /// dimuat kapan saja via `skill_view(name, full=true)`.
 pub const SKILL_WORKING_COPY_THRESHOLD: usize = 4_500;
-/// Batas karakter target untuk salinan kerja prosedural `skill_view`.
-pub const SKILL_WORKING_COPY_MAX_CHARS: usize = 2_400;
+/// Batas karakter target untuk salinan kerja prosedural `skill_view` (~450 token; hemat >90% dari 14,6k char).
+pub const SKILL_WORKING_COPY_MAX_CHARS: usize = 1_500;
 
 /// Bangun salinan kerja prosedural ringkas untuk `SKILL.md` berukuran besar (> 4.500 char):
-/// - Mempertahankan aturan inti (Iron Law, fase prosedural, checklist langkah, red flags),
+/// - Mempertahankan aturan inti (Iron Law, fase 1–4 prosedural, checklist kunci),
 /// - Membuang contoh kode panjang, tabel rasionalisasi, dan prosa referensi yang bisa dimuat ulang,
 /// - Menyertakan daftar judul bagian lengkap & petunjuk `skill_view(name, full=true)`.
 pub fn build_skill_working_copy(skill_name: &str, raw_content: &str) -> String {
@@ -103,10 +103,11 @@ pub fn build_skill_working_copy(skill_name: &str, raw_content: &str) -> String {
     let mut in_code_block = false;
     let mut code_lines_buf: Vec<&str> = Vec::new();
     let mut skip_section = false;
+    let mut skip_sub = false;
     let mut section_bullets = 0usize;
 
     let push_if_fits = |dst: &mut String, text: &str| -> bool {
-        if dst.chars().count() + text.chars().count() + 220 > SKILL_WORKING_COPY_MAX_CHARS {
+        if dst.chars().count() + text.chars().count() + 260 > SKILL_WORKING_COPY_MAX_CHARS {
             return false;
         }
         dst.push_str(text);
@@ -116,18 +117,16 @@ pub fn build_skill_working_copy(skill_name: &str, raw_content: &str) -> String {
 
     for line in body.lines() {
         let trimmed = line.trim();
-        // Lewati baris atribusi lisensi / garis pemisah murni
         if trimmed.starts_with("> Diadaptasi dari") || trimmed == "---" {
             continue;
         }
-        // Tangani blok kode: pertahankan hanya blok sangat pendek (<= 2 baris, mis. Iron Law).
         if trimmed.starts_with("```") {
             if !in_code_block {
                 in_code_block = true;
                 code_lines_buf.clear();
             } else {
                 in_code_block = false;
-                if !skip_section && !code_lines_buf.is_empty() && code_lines_buf.len() <= 2 {
+                if !skip_section && !skip_sub && !code_lines_buf.is_empty() && code_lines_buf.len() <= 2 {
                     for cl in &code_lines_buf {
                         if !push_if_fits(&mut out, cl) {
                             break;
@@ -144,7 +143,6 @@ pub fn build_skill_working_copy(skill_name: &str, raw_content: &str) -> String {
             }
             continue;
         }
-        // Lewati tabel Markdown panjang (rasionalisasi/quick ref)
         if trimmed.starts_with('|') {
             continue;
         }
@@ -155,7 +153,10 @@ pub fn build_skill_working_copy(skill_name: &str, raw_content: &str) -> String {
                 || low.contains("integration")
                 || low.contains("quick reference")
                 || low.contains("when to use")
-                || low.contains("example");
+                || low.contains("example")
+                || low.contains("red flags")
+                || low.contains("the four phases");
+            skip_sub = false;
             section_bullets = 0;
             if !skip_section && !push_if_fits(&mut out, trimmed) {
                 break;
@@ -165,63 +166,45 @@ pub fn build_skill_working_copy(skill_name: &str, raw_content: &str) -> String {
         if skip_section {
             continue;
         }
-        if trimmed.starts_with("# ") || trimmed.starts_with("### ") {
+        if trimmed.starts_with("# ") {
+            let _ = push_if_fits(&mut out, trimmed);
+            continue;
+        }
+        if let Some(h3) = trimmed.strip_prefix("### ") {
+            let low = h3.to_ascii_lowercase();
+            skip_sub = low.contains("checklist") || low.contains("when you don't know");
             section_bullets = 0;
-            if !push_if_fits(&mut out, trimmed) {
-                break;
+            if !skip_sub && !push_if_fits(&mut out, trimmed) {
+                // Jika ruang sempit, lanjut ke bagian ## berikutnya agar semua Phase tercakup.
+                skip_sub = true;
             }
             continue;
         }
-        if trimmed.is_empty() {
+        if skip_sub || trimmed.is_empty() {
             continue;
         }
-        // Pertahankan aturan kunci, checklist, & maks 4 butir per sub-bagian agar tetap tajam.
-        let is_bullet = trimmed.starts_with("- ")
-            || trimmed.starts_with("* ")
-            || trimmed
-                .as_bytes()
-                .first()
-                .map(|b| b.is_ascii_digit())
-                .unwrap_or(false)
-                && trimmed.contains(". ");
-        let is_imperative = trimmed.starts_with("**")
-            || trimmed.contains("MUST")
-            || trimmed.contains("WAJIB")
-            || trimmed.contains("STOP")
-            || trimmed.contains("NEVER")
-            || trimmed.contains("ALWAYS");
-        if is_bullet {
-            if section_bullets < 4 {
-                section_bullets += 1;
-                let short_line: String = if trimmed.chars().count() > 140 {
-                    format!("{}…", trimmed.chars().take(139).collect::<String>())
-                } else {
-                    trimmed.to_string()
-                };
-                if !push_if_fits(&mut out, &short_line) {
-                    break;
-                }
-            }
-        } else if is_imperative && section_bullets < 3 {
+        let is_bullet = trimmed.starts_with("- ") || trimmed.starts_with("* ");
+        let is_imperative = trimmed.starts_with("**Core")
+            || trimmed.starts_with("**STOP")
+            || trimmed.contains("NO FIXES");
+        if (is_bullet || is_imperative) && section_bullets < 1 {
             section_bullets += 1;
-            let short_line: String = if trimmed.chars().count() > 180 {
-                format!("{}…", trimmed.chars().take(179).collect::<String>())
+            let short_line: String = if trimmed.chars().count() > 105 {
+                format!("{}…", trimmed.chars().take(104).collect::<String>())
             } else {
                 trimmed.to_string()
             };
-            if !push_if_fits(&mut out, &short_line) {
-                break;
-            }
+            let _ = push_if_fits(&mut out, &short_line);
         }
     }
 
     if !all_headings.is_empty() {
-        out.push_str("\nBagian lengkap: ");
+        out.push_str("\nBagian: ");
         out.push_str(&all_headings.join(" | "));
         out.push('\n');
     }
     out.push_str(&format!(
-        "(Salinan kerja ringkas dari {} char — panggil `skill_view(name=\"{skill_name}\", full=true)` bila butuh detail/contoh lengkap.)",
+        "(Salinan kerja ringkas dari {} char — panggil `skill_view(name=\"{skill_name}\", full=true)` untuk isi penuh.)",
         raw_content.chars().count()
     ));
     out
