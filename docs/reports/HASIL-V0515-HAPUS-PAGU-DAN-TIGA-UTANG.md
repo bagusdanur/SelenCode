@@ -106,3 +106,14 @@
 - Gerbang verifikasi sebelum menutup `v0.5.14` di luar integritas perintah mapan & kutipan penutup (Butir 3).
 - Konverter tampilan Telegram HTML + fallback anti-gagal-parse (`v0.5.12`, hanya menambahkan cabang `langkah {n}` saat `max_steps == 0` di `format_telegram_progress_html` sesuai Butir 1 #5).
 - Seluruh hasil `v0.5.7`–`v0.5.13`: gerbang skill + opt-out, gerbang laporan rilis terperiksa mesin (ditambah penerimaan pernyataan `"pengukuran penerimaan oleh Muse"` sesuai pembagian kerja baru), timeout & watchdog gateway + trim memori sesi, `watch_job` + status segar + polling watch CLI, store memory tunggal, jalur resume ramping, salinan kerja `skill_view` + prune teks penuh `full=true`, peringatan config + `selen doctor`, pembatalan provider ~1×, `send_file`, `delegate_work`, `/usage`, `skills install`, fallback rute berbeda, `ask_user`, `cron`, `session_search`, pelacakan approval, serta 12 skill bawaan + `NOTICE`.
+
+---
+
+## Bukti CI & Rilis Publik `v0.5.15`
+
+- **CI GitHub Actions (Linux + Windows x64):** Run `#45896525974` pada commit `5c4e716` — **LULUS** (`Cargo Test & Visual Render (Linux)` & `Cargo Test & Check (Windows x64)` keduanya `success`, termasuk seluruh tes `v0515_unbounded_steps_integrity_test_notice`).
+- **Release Workflow & Gerbang Laporan Rilis Mesin:** Run `#45897833818` pada tag `v0.5.15` — **LULUS** (`scripts/check_release_report.py --tag v0.5.15` lulus untuk 4 baris vonis + pernyataan `pengukuran penerimaan oleh Muse`; 5/5 job `success`).
+- **Halaman Rilis Publik:** https://github.com/bagusdanur/SelenCode/releases/tag/v0.5.15 (`draft = false`, 3 aset lengkap):
+  - `selen-linux-x64` (`16.928.496` byte)
+  - `selen-termux-arm64` (`15.241.400` byte)
+  - `selen-windows-x64.exe` (`15.623.168` byte)
