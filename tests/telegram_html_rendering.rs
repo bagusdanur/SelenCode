@@ -125,6 +125,7 @@ async fn telegram_html_parse_error_400_falls_back_to_clean_plain_text_and_upload
                 let mut raw = Vec::new();
                 let mut buf = [0u8; 4096];
                 let mut expected_total: Option<usize> = None;
+                let mut is_chunked = false;
                 loop {
                     let Ok(n) = sock.read(&mut buf).await else {
                         break;
@@ -133,21 +134,30 @@ async fn telegram_html_parse_error_400_falls_back_to_clean_plain_text_and_upload
                         break;
                     }
                     raw.extend_from_slice(&buf[..n]);
-                    if expected_total.is_none() {
+                    if expected_total.is_none() && !is_chunked {
                         if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
                             let head = String::from_utf8_lossy(&raw[..pos]);
-                            let cl = head
-                                .lines()
-                                .find_map(|l| {
-                                    let low = l.to_ascii_lowercase();
-                                    low.strip_prefix("content-length:")
-                                        .and_then(|v| v.trim().parse::<usize>().ok())
-                                })
-                                .unwrap_or(0);
-                            expected_total = Some(pos + 4 + cl);
+                            let low_head = head.to_ascii_lowercase();
+                            if low_head.contains("transfer-encoding: chunked") {
+                                is_chunked = true;
+                            } else {
+                                let cl = head
+                                    .lines()
+                                    .find_map(|l| {
+                                        let low = l.to_ascii_lowercase();
+                                        low.strip_prefix("content-length:")
+                                            .and_then(|v| v.trim().parse::<usize>().ok())
+                                    })
+                                    .unwrap_or(0);
+                                expected_total = Some(pos + 4 + cl);
+                            }
                         }
                     }
-                    if let Some(tot) = expected_total {
+                    if is_chunked {
+                        if raw.windows(5).any(|w| w == b"0\r\n\r\n") {
+                            break;
+                        }
+                    } else if let Some(tot) = expected_total {
                         if raw.len() >= tot {
                             break;
                         }
