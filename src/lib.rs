@@ -5,6 +5,7 @@ pub mod config;
 pub mod context_index;
 pub mod cron;
 pub mod doctor;
+pub mod gateway_health;
 pub mod hooks;
 pub mod lsp;
 pub mod mcp;

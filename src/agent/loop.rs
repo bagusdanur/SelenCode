@@ -423,10 +423,23 @@ async fn run_turn_inner(
                 .await;
         }
         // Provider dipindah ke task agar StreamEvent bisa dikonsumsi sambil jalan.
+        // Bungkus dalam `AbortOnDrop` (v0.5.10 Perbaikan 1) agar saat giliran dibatalkan
+        // (timeout / `/cancel` / interupsi), soket HTTPS provider LANGSUNG ditutup, bukan dibiarkan
+        // menggantung ESTABLISHED di latar belakang!
+        struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+        impl<T> Drop for AbortOnDrop<T> {
+            fn drop(&mut self) {
+                if let Some(h) = self.0.take() {
+                    h.abort();
+                }
+            }
+        }
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(128);
         let p = provider.clone();
         let tools_c = tools.clone();
-        let handle = tokio::spawn(async move { p.stream_chat(&snapshot, &tools_c, tx).await });
+        let mut handle_guard = AbortOnDrop(Some(tokio::spawn(async move {
+            p.stream_chat(&snapshot, &tools_c, tx).await
+        })));
         let mut printed = false;
         while let Some(ev) = rx.recv().await {
             match ev {
@@ -442,7 +455,10 @@ async fn run_turn_inner(
                 },
             }
         }
-        let reply = handle
+        let reply = handle_guard
+            .0
+            .take()
+            .expect("handle provider tersedia")
             .await
             .map_err(|e| anyhow::anyhow!("task provider panik: {e}"))??;
         if printed {

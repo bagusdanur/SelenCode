@@ -4,6 +4,11 @@ use anyhow::Result;
 use selencode::agent::context::sanitize_interrupted_messages;
 use selencode::agent::{run_turn_counted, run_turn_ui, UiEvent};
 use selencode::config;
+use selencode::gateway_health::{
+    format_recovery_notice, spawn_os_watchdog, trim_gateway_session_memory, GatewayHealthClock,
+    StallTracker, GATEWAY_SESSION_IDLE_SECS, MAX_CACHED_GATEWAY_SESSIONS,
+};
+use selencode::providers::{Message, Role};
 use selencode::repl::{
     help_menu_markup, parse_model_action, parse_slash_command, ModelAction, SlashCommand,
 };
@@ -105,16 +110,16 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
     hub.set_timeout_mins(cfg.telegram.approval_timeout_mins);
     let ask_hub = TgAskHub::new();
 
-    // BAGIAN 3 (v0.5.6): Penjadwal tugas terjadwal (Cron) hidup di dalam proses gateway Telegram.
-    // Kebijakan skip-missed saat startup: jadwal terlewat saat gateway mati dicatat terlewat, tidak dikejar.
-    if let Ok(cron_store) = selencode::store::Store::open() {
-        let skipped = selencode::cron::skip_missed_jobs_on_startup(&cron_store).unwrap_or(0);
+    // BAGIAN 3 (v0.5.6) & Perbaikan 1 (v0.5.10): Store bersama untuk Cron, Job Watch, & Watchdog Gateway.
+    let gw_store: Option<Arc<selencode::store::Store>> =
+        selencode::store::Store::open().ok().map(Arc::new);
+    if let Some(cron_store_arc) = gw_store.clone() {
+        let skipped = selencode::cron::skip_missed_jobs_on_startup(&cron_store_arc).unwrap_or(0);
         if skipped > 0 {
             println!("  Cron     : {skipped} jadwal terlewat saat gateway mati ditandai terlewat (skip-missed).");
         }
         let cron_tg = tg.clone();
         let cron_prov_override = cli.provider.clone();
-        let cron_store_arc = Arc::new(cron_store);
         // Perbaikan 3 (v0.5.7): Loop pemantau tugas asinkron (`job_watches`) persisten di gateway.
         // Otomatis melanjutkan semua pantauan aktif sesudah gateway restart — 0 panggilan LLM!
         let watch_tg = tg.clone();
@@ -264,6 +269,8 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
     }
     let sessions: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_last_used: Arc<std::sync::Mutex<HashMap<i64, Instant>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
     let busy_chats: Arc<std::sync::Mutex<HashSet<i64>>> =
         Arc::new(std::sync::Mutex::new(HashSet::new()));
     let cancel_tokens: Arc<std::sync::Mutex<HashMap<i64, Arc<tokio::sync::Notify>>>> =
@@ -276,22 +283,83 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
     let provider_override = cli.provider.clone();
     let yes_flag = cli.yes;
 
-    // Lewati antrean pesan lama sebelum gateway dinyalakan agar tidak mengeksekusi perintah usang.
-    let mut offset: i64 = tg.skip_backlog().await;
-    if offset > 0 {
-        println!("  (Antrean pesan lama sebelum startup dilewati; siap menerima pesan baru.)\n");
+    // Perbaikan 1 (#4 v0.5.10): Pengawas kelangsungan eksternal di thread OS terpisah (di luar Tokio)
+    // + catatan pemulihan sekali pakai sesudah restart watchdog.
+    let initial_chat = cfg.telegram.allowed_users.first().copied().unwrap_or(0);
+    let health_clock = Arc::new(GatewayHealthClock::new(initial_chat));
+    if cfg.telegram.poll_watchdog_secs > 0 {
+        if let Some(wd_store) = gw_store.clone() {
+            println!(
+                "  Watchdog : aktif (ambang polling/loop {} dtk, turn timeout {} dtk, stall notice {} dtk)",
+                cfg.telegram.poll_watchdog_secs,
+                cfg.telegram.turn_timeout_secs,
+                cfg.telegram.stall_notice_secs
+            );
+            let _wd_handle = spawn_os_watchdog(
+                health_clock.clone(),
+                wd_store,
+                cfg.telegram.poll_watchdog_secs,
+                Duration::from_secs(2),
+                |_verdict| std::process::exit(2),
+            );
+        }
     }
+
+    let pending_recovery = gw_store
+        .as_ref()
+        .and_then(|st| st.take_gateway_recovery().ok().flatten());
+    let mut offset: i64 = if let Some((rec_chat, reason, crashed_at)) = pending_recovery {
+        let saved_offset = gw_store
+            .as_ref()
+            .and_then(|st| st.load_gateway_offset().ok().flatten())
+            .unwrap_or(0);
+        println!(
+            "  [pemulihan] Gateway pulih dari restart watchdog ({reason}) — melanjutkan offset {saved_offset} tanpa membuang pesan tertahan.\n"
+        );
+        let notify_chat = if rec_chat != 0 { rec_chat } else { initial_chat };
+        if notify_chat != 0 {
+            let notice = format_recovery_notice(&reason, &crashed_at);
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                tg.send_message(notify_chat, &notice),
+            )
+            .await;
+        }
+        saved_offset
+    } else {
+        // Startup normal: lewati antrean pesan lama sebelum gateway dinyalakan agar tidak mengeksekusi perintah usang.
+        let off = tg.skip_backlog().await;
+        if off > 0 {
+            if let Some(st) = &gw_store {
+                let _ = st.save_gateway_offset(off);
+            }
+            println!("  (Antrean pesan lama sebelum startup dilewati; siap menerima pesan baru.)\n");
+        }
+        off
+    };
+
     let mut poll_err_streak: u32 = 0;
+    let mut last_session_gc = Instant::now();
     loop {
+        health_clock.mark_loop_heartbeat();
+
+        // Pembersihan berkala sesi chat idle dari RAM (Perbaikan 1 #5 v0.5.10 — anti-kebocoran memori).
+        if last_session_gc.elapsed() >= Duration::from_secs(300) {
+            last_session_gc = Instant::now();
+            evict_idle_gateway_sessions(&sessions, &session_last_used, &busy_chats).await;
+        }
+
         let updates = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
+                health_clock.request_shutdown();
                 println!("\n☾ Telegram Gateway dihentikan.");
                 break;
             }
             res = tg.get_updates(offset, 20) => match res {
                 Ok(u) => {
+                    health_clock.mark_poll_ok();
                     if poll_err_streak > 0 {
-                        println!("[telegram] ✅ koneksi polling Telegram pulih.");
+                        println!("[telegram] koneksi polling Telegram pulih.");
                         poll_err_streak = 0;
                     }
                     u
@@ -307,7 +375,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     };
                     if err_s.contains("409") || err_s.contains("Conflict") {
                         eprintln!(
-                            "[telegram] ⚠ 409 Conflict: bot token ini sedang dipakai instance `selen telegram` lain atau webhook aktif! Hentikan instance lain (coba lagi {wait_secs}s)."
+                            "[telegram] 409 Conflict: bot token ini sedang dipakai instance `selen telegram` lain atau webhook aktif! Hentikan instance lain (coba lagi {wait_secs}s)."
                         );
                     } else {
                         eprintln!("[telegram] gagal polling: {err_s} (coba lagi {wait_secs} detik)");
@@ -322,12 +390,15 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
         let latest_cfg = config::load().unwrap_or_else(|_| cfg.clone());
         hub.set_timeout_mins(latest_cfg.telegram.approval_timeout_mins);
 
+        let offset_before_batch = offset;
         for upd in updates {
             offset = upd.update_id + 1;
+            health_clock.mark_loop_heartbeat();
 
             if let Some(cb) = upd.callback_query {
                 let chat_id = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
                 if latest_cfg.telegram.is_allowed(cb.from.id, chat_id) {
+                    health_clock.set_last_active_chat(chat_id);
                     if ask_hub.handle_callback(&tg, &cb).await {
                         continue;
                     }
@@ -451,6 +522,11 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 continue;
             }
 
+            health_clock.set_last_active_chat(chat_id);
+            if let Ok(mut used) = session_last_used.lock() {
+                used.insert(chat_id, Instant::now());
+            }
+
             // `/cancel` selalu diproses walau chat sedang sibuk — batalkan giliran, approval, & ask_user tertunda!
             if display_text.eq_ignore_ascii_case("/cancel")
                 || display_text.eq_ignore_ascii_case("/stop")
@@ -511,7 +587,14 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 } else {
                     "Menginterupsi giliran sebelumnya — memproses pesan baru.".to_string()
                 };
-                let _ = tg.send_message(chat_id, &notice).await;
+                let tg_int = tg.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        tg_int.send_message(chat_id, &notice),
+                    )
+                    .await;
+                });
             }
 
             println!("[telegram] {sender_name} ({chat_id}): {display_text}");
@@ -561,15 +644,74 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     }
                     Err(e) => {
                         eprintln!("[telegram] error ({chat_id}): {e}");
-                        let _ = tg_clone
-                            .send_long_message(chat_id, &format!("Error: {e}"))
-                            .await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(15),
+                            tg_clone.send_long_message(chat_id, &format!("Error: {e}")),
+                        )
+                        .await;
                     }
                 }
             });
         }
+        if offset != offset_before_batch {
+            if let Some(st) = &gw_store {
+                let _ = st.save_gateway_offset(offset);
+            }
+        }
     }
     Ok(())
+}
+
+/// Keluarkan sesi chat yang sudah lama idle atau melebihi pagu cache dari RAM gateway
+/// (data riwayat penuh tetap persisten di SQLite; sesi aktif/sibuk tidak pernah disentuh).
+async fn evict_idle_gateway_sessions(
+    sessions: &Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>>,
+    session_last_used: &Arc<std::sync::Mutex<HashMap<i64, Instant>>>,
+    busy_chats: &Arc<std::sync::Mutex<HashSet<i64>>>,
+) {
+    let busy: HashSet<i64> = busy_chats
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    let idle_limit = Duration::from_secs(GATEWAY_SESSION_IDLE_SECS);
+    let mut map = sessions.lock().await;
+    let mut used = match session_last_used.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let mut to_remove: Vec<i64> = map
+        .keys()
+        .copied()
+        .filter(|cid| {
+            !busy.contains(cid)
+                && used
+                    .get(cid)
+                    .map(|t| t.elapsed() >= idle_limit)
+                    .unwrap_or(false)
+        })
+        .collect();
+
+    if map.len().saturating_sub(to_remove.len()) > MAX_CACHED_GATEWAY_SESSIONS {
+        let mut candidates: Vec<(i64, Instant)> = map
+            .keys()
+            .copied()
+            .filter(|cid| !busy.contains(cid) && !to_remove.contains(cid))
+            .map(|cid| (cid, used.get(&cid).copied().unwrap_or_else(Instant::now)))
+            .collect();
+        candidates.sort_by_key(|(_, ts)| *ts);
+        let excess = map
+            .len()
+            .saturating_sub(to_remove.len())
+            .saturating_sub(MAX_CACHED_GATEWAY_SESSIONS);
+        for (cid, _) in candidates.into_iter().take(excess) {
+            to_remove.push(cid);
+        }
+    }
+
+    for cid in to_remove {
+        map.remove(&cid);
+        used.remove(&cid);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1115,7 +1257,10 @@ async fn handle_telegram_chat_message(
     let (ui_tx, mut ui_rx) = tokio::sync::mpsc::channel::<UiEvent>(256);
     let tg_prog = tg.clone();
     let hub_for_col = hub.clone();
+    let ask_hub_col = ask_hub.clone();
     let max_steps_ui = s.cfg.agent.max_steps;
+    let stall_notice_secs = latest_cfg.telegram.stall_notice_secs;
+    let turn_timeout_secs = latest_cfg.telegram.turn_timeout_secs;
     let collector = tokio::spawn(async move {
         let mut tool_events: Vec<selencode::tool_display::ToolActionEvent> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
@@ -1127,83 +1272,121 @@ async fn handle_telegram_chat_message(
             .checked_sub(Duration::from_secs(2))
             .unwrap_or_else(Instant::now);
         let mut last_sent_html = String::new();
+        let mut stall_tracker =
+            StallTracker::new(Duration::from_secs(stall_notice_secs), Instant::now());
+        let mut stall_tick = tokio::time::interval(Duration::from_secs(5));
+        stall_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        while let Some(ev) = ui_rx.recv().await {
-            let mut changed = false;
-            match ev {
-                UiEvent::Step { current, .. } => {
-                    cur_step = current;
-                    changed = true;
-                }
-                UiEvent::Token(tok) => {
-                    live_preview.push_str(&tok);
-                    if live_preview.len() > 2400 {
-                        let tail: String = live_preview
-                            .chars()
-                            .rev()
-                            .take(1200)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect();
-                        live_preview = tail;
-                    }
-                    changed = true;
-                }
-                UiEvent::ToolStart { name, args } => {
-                    active_tool_preview = args.clone();
-                    active_tool_display = Some(
-                        selencode::tool_display::format_tool_event_from_preview(&name, &args),
-                    );
-                    live_preview.clear();
-                    changed = true;
-                }
-                UiEvent::ToolDone {
-                    name,
-                    summary,
-                    is_error,
-                } => {
-                    active_tool_display = None;
-                    let preview = std::mem::take(&mut active_tool_preview);
-                    tool_events.push(selencode::tool_display::ToolActionEvent {
-                        name,
-                        preview,
-                        is_error,
-                        error_reason: is_error
-                            .then(|| selencode::tool_display::short_error_reason(&summary)),
-                    });
-                    changed = true;
-                }
-                UiEvent::Info(info) if info.starts_with("Model utama gagal") => {
-                    // BAGIAN 1 (#4): Beri tahu pengguna 1x sebagai pesan baru singkat saat fallback aktif.
-                    let _ = tg_prog.send_message(chat_id, &info).await;
-                }
-                UiEvent::Info(info) if info.contains("Self-improvement") => {
-                    notes.push(info);
-                }
-                _ => {}
-            }
-            if changed {
-                // Perbaikan 1 (#3): jangan edit gelembung progres selama persetujuan sedang menunggu user.
-                if hub_for_col.has_pending_for_chat(chat_id) {
-                    continue;
-                }
-                if let Some(mid) = progress_msg_id {
-                    if last_edit.elapsed() >= Duration::from_millis(1800) {
-                        let html = format_telegram_progress_html(
-                            cur_step,
-                            max_steps_ui,
-                            active_tool_display.as_deref(),
-                            tool_events.len(),
-                            &live_preview,
-                        );
-                        if html != last_sent_html {
-                            let _ = tg_prog
-                                .edit_html_message(chat_id, mid, &html, "Sedang bekerja...")
-                                .await;
-                            last_sent_html = html;
-                            last_edit = Instant::now();
+        loop {
+            tokio::select! {
+                ev_opt = ui_rx.recv() => {
+                    let Some(ev) = ev_opt else {
+                        break;
+                    };
+                    let mut changed = false;
+                    match ev {
+                        UiEvent::Step { current, .. } => {
+                            cur_step = current;
+                            stall_tracker.record_progress(Instant::now());
+                            changed = true;
                         }
+                        UiEvent::Token(tok) => {
+                            stall_tracker.record_progress(Instant::now());
+                            live_preview.push_str(&tok);
+                            if live_preview.len() > 2400 {
+                                let tail: String = live_preview
+                                    .chars()
+                                    .rev()
+                                    .take(1200)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect();
+                                live_preview = tail;
+                            }
+                            changed = true;
+                        }
+                        UiEvent::ToolStart { name, args } => {
+                            stall_tracker.record_progress(Instant::now());
+                            active_tool_preview = args.clone();
+                            active_tool_display = Some(
+                                selencode::tool_display::format_tool_event_from_preview(&name, &args),
+                            );
+                            live_preview.clear();
+                            changed = true;
+                        }
+                        UiEvent::ToolDone {
+                            name,
+                            summary,
+                            is_error,
+                        } => {
+                            stall_tracker.record_progress(Instant::now());
+                            active_tool_display = None;
+                            let preview = std::mem::take(&mut active_tool_preview);
+                            tool_events.push(selencode::tool_display::ToolActionEvent {
+                                name,
+                                preview,
+                                is_error,
+                                error_reason: is_error
+                                    .then(|| selencode::tool_display::short_error_reason(&summary)),
+                            });
+                            changed = true;
+                        }
+                        UiEvent::Info(info) if info.starts_with("Model utama gagal") => {
+                            // BAGIAN 1 (#4): Beri tahu pengguna 1x sebagai pesan baru singkat saat fallback aktif.
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                tg_prog.send_message(chat_id, &info),
+                            )
+                            .await;
+                        }
+                        UiEvent::Info(info) if info.contains("Self-improvement") => {
+                            notes.push(info);
+                        }
+                        _ => {}
+                    }
+                    if changed {
+                        // Perbaikan 1 (#3): jangan edit gelembung progres selama persetujuan sedang menunggu user.
+                        if hub_for_col.has_pending_for_chat(chat_id) {
+                            continue;
+                        }
+                        if let Some(mid) = progress_msg_id {
+                            if last_edit.elapsed() >= Duration::from_millis(1800) {
+                                let html = format_telegram_progress_html(
+                                    cur_step,
+                                    max_steps_ui,
+                                    active_tool_display.as_deref(),
+                                    tool_events.len(),
+                                    &live_preview,
+                                );
+                                if html != last_sent_html {
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(10),
+                                        tg_prog.edit_html_message(
+                                            chat_id,
+                                            mid,
+                                            &html,
+                                            "Sedang bekerja...",
+                                        ),
+                                    )
+                                    .await;
+                                    last_sent_html = html;
+                                    last_edit = Instant::now();
+                                }
+                            }
+                        }
+                    }
+                }
+                _ = stall_tick.tick() => {
+                    let waiting_user = hub_for_col.has_pending_for_chat(chat_id)
+                        || ask_hub_col.has_pending_for_chat(chat_id);
+                    stall_tracker.set_paused(waiting_user, Instant::now());
+                    if let Some(notice) = stall_tracker.check_stall(Instant::now()) {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            tg_prog.send_message(chat_id, &notice),
+                        )
+                        .await;
                     }
                 }
             }
@@ -1211,7 +1394,13 @@ async fn handle_telegram_chat_message(
         (tool_events, notes)
     });
 
-    let turn_res = tokio::select! {
+    enum TurnOutcome {
+        Finished(Result<String>),
+        Cancelled,
+        TimedOut(u64),
+    }
+
+    let turn_outcome = tokio::select! {
         r = run_turn_ui(
             s.provider.clone(),
             &s.registry,
@@ -1220,39 +1409,112 @@ async fn handle_telegram_chat_message(
             &text,
             s.cfg.agent.max_steps,
             ui_tx,
-        ) => Some(r),
-        _ = cancel.notified() => None,
+        ) => TurnOutcome::Finished(r),
+        _ = cancel.notified() => TurnOutcome::Cancelled,
+        _ = async {
+            if turn_timeout_secs > 0 {
+                tokio::time::sleep(Duration::from_secs(turn_timeout_secs)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => TurnOutcome::TimedOut(turn_timeout_secs),
     };
 
     typing_stop.notify_waiters();
-    let _ = typing_task.await;
-    let (tool_events, notes) = collector.await.unwrap_or_default();
+    let _ = tokio::time::timeout(Duration::from_secs(2), typing_task).await;
+    let (tool_events, notes) = tokio::time::timeout(Duration::from_secs(3), collector)
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
     if let Ok(mut map) = active_progress.lock() {
         map.remove(&chat_id);
     }
 
-    let Some(turn_res) = turn_res else {
-        if let Some(syn) = sanitize_interrupted_messages(&mut s.messages) {
-            let _ = s.store.save_message(&s.session_id, &syn);
-        }
-        if gen_counter.load(Ordering::SeqCst) == my_gen {
-            if let Some(mid) = progress_msg_id {
-                if !tg.delete_message_checked(chat_id, mid).await {
-                    let _ = tg.edit_message_text(chat_id, mid, "Giliran dibatalkan.").await;
+    let archive_dir = s.ctx.cwd.join(".selencode").join("tool_archive");
+
+    let answer = match turn_outcome {
+        TurnOutcome::Cancelled => {
+            if let Some(syn) = sanitize_interrupted_messages(&mut s.messages) {
+                let _ = s.store.save_message(&s.session_id, &syn);
+            }
+            let _ = trim_gateway_session_memory(&mut s.messages, &archive_dir);
+            if gen_counter.load(Ordering::SeqCst) == my_gen {
+                if let Some(mid) = progress_msg_id {
+                    if !tg.delete_message_checked(chat_id, mid).await {
+                        let _ = tg.edit_message_text(chat_id, mid, "Giliran dibatalkan.").await;
+                    } else {
+                        tg.send_message(chat_id, "Giliran dibatalkan.").await?;
+                    }
                 } else {
                     tg.send_message(chat_id, "Giliran dibatalkan.").await?;
                 }
-            } else {
-                tg.send_message(chat_id, "Giliran dibatalkan.").await?;
+            } else if let Some(mid) = progress_msg_id {
+                tg.delete_message(chat_id, mid).await;
             }
-        } else if let Some(mid) = progress_msg_id {
-            tg.delete_message(chat_id, mid).await;
+            return Ok(());
         }
-        return Ok(());
-    };
-    let answer = match turn_res {
-        Ok(a) => a,
-        Err(e) => {
+        TurnOutcome::TimedOut(secs) => {
+            let _ = hub.cancel_chat_approvals(chat_id);
+            let _ = ask_hub.cancel_chat_asks(chat_id);
+            if let Some(syn) = sanitize_interrupted_messages(&mut s.messages) {
+                let _ = s.store.save_message(&s.session_id, &syn);
+            }
+            let reason = format!("batas waktu giliran ({secs} detik) tercapai");
+            let summary_md = if !tool_events.is_empty() {
+                selencode::tool_display::build_template_closing_summary(&tool_events, &reason)
+            } else {
+                format!(
+                    "Giliran dibatalkan otomatis karena {reason} tanpa jawaban selesai. Gateway tetap aktif — silakan kirim pesan lanjutan atau ulangi permintaan."
+                )
+            };
+            let timeout_msg = Message::text(Role::Assistant, summary_md.clone());
+            let _ = s.store.save_message(&s.session_id, &timeout_msg);
+            s.messages.push(timeout_msg);
+            let _ = trim_gateway_session_memory(&mut s.messages, &archive_dir);
+
+            let (total_tools, summary_lines) = selencode::tool_display::build_action_summary_lines(
+                &tool_events,
+                selencode::tool_display::DEFAULT_ACTION_BLOCK_MAX_LINES,
+            );
+            if total_tools > 0 {
+                let shown: Vec<String> = summary_lines
+                    .into_iter()
+                    .map(|t| escape_telegram_html(&t))
+                    .collect();
+                let tool_block = format!(
+                    "<blockquote expandable><b>Aksi Tool ({total_tools})</b>\n{}</blockquote>",
+                    shown.join("\n")
+                );
+                let body_html = markdown_to_telegram_html(&summary_md);
+                let combined = format!("{tool_block}\n\n{body_html}");
+                if combined.chars().count() <= 4050 {
+                    let _ = tg.send_html_message(chat_id, &combined, &summary_md).await;
+                } else {
+                    let _ = tg
+                        .send_html_message(chat_id, &tool_block, "Aksi tool terhenti karena batas waktu.")
+                        .await;
+                    let _ = tg.send_long_markdown(chat_id, &summary_md).await;
+                }
+            } else {
+                let _ = tg.send_long_markdown(chat_id, &summary_md).await;
+            }
+            if let Some(mid) = progress_msg_id {
+                if !tg.delete_message_checked(chat_id, mid).await {
+                    let _ = tg
+                        .edit_message_text(chat_id, mid, &format!("Terhenti — batas waktu ({secs} dtk)"))
+                        .await;
+                }
+            }
+            eprintln!("[telegram] turn timeout ({chat_id}) setelah {secs}s — dibatalkan bersih");
+            return Ok(());
+        }
+        TurnOutcome::Finished(Ok(a)) => a,
+        TurnOutcome::Finished(Err(e)) => {
+            if let Some(syn) = sanitize_interrupted_messages(&mut s.messages) {
+                let _ = s.store.save_message(&s.session_id, &syn);
+            }
+            let _ = trim_gateway_session_memory(&mut s.messages, &archive_dir);
             if let Some(mid) = progress_msg_id {
                 tg.delete_message(chat_id, mid).await;
             }
@@ -1326,6 +1588,15 @@ async fn handle_telegram_chat_message(
             };
             let _ = tg.edit_message_text(chat_id, mid, &done_line).await;
         }
+    }
+
+    // Perbaikan 1 (#5 v0.5.10): pangkas lampiran gambar lama & batasi retensi RAM sesi gateway.
+    let trim = trim_gateway_session_memory(&mut s.messages, &archive_dir);
+    if trim.images_stripped > 0 || trim.compacted {
+        println!(
+            "[telegram] trim memori sesi ({chat_id}): {} -> {} byte (gambar dilepas: {}, padatkan: {})",
+            trim.bytes_before, trim.bytes_after, trim.images_stripped, trim.compacted
+        );
     }
 
     // Background Self-Improvement Review (v0.5.1): picu di latar setiap 15 giliran tuntas

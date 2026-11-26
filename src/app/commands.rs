@@ -1750,8 +1750,14 @@ impl Session {
             } else {
                 format!("{} ({})", w.last_stage, w.last_progress)
             };
+            let checked = if w.last_checked_at.trim().is_empty() {
+                "belum dicek".to_string()
+            } else {
+                let ts: String = w.last_checked_at.chars().take(19).collect();
+                format!("dicek {} UTC", ts.replace('T', " "))
+            };
             out.push_str(&format!(
-                "{mark} #{} {} | {} · {} | tiap {} dtk ({})\n",
+                "{mark} #{} {} | {} · {} | {checked} · tiap {} dtk ({})\n",
                 w.id, w.label, w.status, stage, w.interval_secs, w.check_kind
             ));
         }

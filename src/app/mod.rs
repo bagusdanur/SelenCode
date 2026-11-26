@@ -42,17 +42,19 @@ pub(crate) fn make_provider(
     api_key: &str,
 ) -> Result<Arc<dyn Provider>> {
     let max_tokens = cfg.agent.max_output_tokens;
+    let timeouts = cfg.timeouts.to_durations();
     match pcfg.kind.as_str() {
         "openai" => {
             let base_url = pcfg
                 .base_url
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("base_url wajib untuk provider '{name}' kind=openai"))?;
-            Ok(Arc::new(OpenAiProvider::new(
+            Ok(Arc::new(OpenAiProvider::with_timeouts(
                 base_url,
                 api_key.to_string(),
                 pcfg.model.clone(),
                 max_tokens,
+                timeouts,
             )))
         }
         "anthropic" => {
@@ -60,11 +62,12 @@ pub(crate) fn make_provider(
                 .base_url
                 .clone()
                 .unwrap_or_else(|| selencode::providers::anthropic::DEFAULT_BASE_URL.to_string());
-            Ok(Arc::new(AnthropicProvider::new(
+            Ok(Arc::new(AnthropicProvider::with_timeouts(
                 base_url,
                 api_key.to_string(),
                 pcfg.model.clone(),
                 max_tokens,
+                timeouts,
             )))
         }
         "gemini" => {
@@ -72,11 +75,12 @@ pub(crate) fn make_provider(
                 .base_url
                 .clone()
                 .unwrap_or_else(|| selencode::providers::gemini::DEFAULT_BASE_URL.to_string());
-            Ok(Arc::new(GeminiProvider::new(
+            Ok(Arc::new(GeminiProvider::with_timeouts(
                 base_url,
                 api_key.to_string(),
                 pcfg.model.clone(),
                 max_tokens,
+                timeouts,
             )))
         }
         other => anyhow::bail!(

@@ -7,7 +7,32 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Tenggat waktu panggilan HTTP/streaming ke provider (Perbaikan 1 v0.5.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderTimeouts {
+    /// Tenggat sambung TCP/TLS (default: 20s).
+    pub connect: Duration,
+    /// Tenggat menunggu respons header awal (default: 60s).
+    pub response: Duration,
+    /// Tenggat ketidakaktifan streaming tanpa potongan data baru (default: 90s).
+    pub stream_idle: Duration,
+    /// Tenggat keras total satu panggilan ke provider (default: 300s).
+    pub total: Duration,
+}
+
+impl Default for ProviderTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(20),
+            response: Duration::from_secs(60),
+            stream_idle: Duration::from_secs(90),
+            total: Duration::from_secs(300),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

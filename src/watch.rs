@@ -107,8 +107,119 @@ pub fn validate_readonly_watch_command(cmd: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+fn pick_json_str(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> String {
+    for k in keys {
+        if let Some(v) = obj.get(*k) {
+            if let Some(s) = v.as_str() {
+                let t = s.trim();
+                if !t.is_empty()
+                    && !t.eq_ignore_ascii_case("null")
+                    && !t.eq_ignore_ascii_case("none")
+                {
+                    return t.to_string();
+                }
+            } else if v.is_number() || v.is_boolean() {
+                return v.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn fill_from_json_obj(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    status_field: &mut String,
+    stage: &mut String,
+    progress: &mut String,
+    summary: &mut String,
+    output_location: &mut String,
+    error_text: &mut String,
+) {
+    if status_field.is_empty() {
+        *status_field = pick_json_str(obj, &["status", "state", "job_status"]);
+    }
+    if stage.is_empty() {
+        *stage = pick_json_str(
+            obj,
+            &[
+                "stage",
+                "current_stage",
+                "active_stage",
+                "tahap",
+                "phase",
+                "step",
+                "current_step",
+            ],
+        );
+    }
+    if progress.is_empty() {
+        *progress = pick_json_str(
+            obj,
+            &["progress", "progres", "percent", "pct", "pages", "count"],
+        );
+    }
+    if progress.is_empty() {
+        let done = pick_json_str(
+            obj,
+            &[
+                "completed_pages",
+                "done_pages",
+                "processed_pages",
+                "current_page",
+                "completed",
+                "done",
+            ],
+        );
+        let total = pick_json_str(obj, &["total_pages", "pages_total", "total"]);
+        if !done.is_empty() && !total.is_empty() {
+            *progress = format!("{done}/{total}");
+        }
+    }
+    if summary.is_empty() {
+        *summary = pick_json_str(obj, &["summary", "result", "hasil", "message", "msg", "note"]);
+    }
+    if output_location.is_empty() {
+        *output_location = pick_json_str(
+            obj,
+            &[
+                "output",
+                "output_path",
+                "output_dir",
+                "location",
+                "lokasi",
+                "path",
+                "file",
+                "artifact",
+            ],
+        );
+    }
+    if error_text.is_empty() {
+        let candidate = pick_json_str(
+            obj,
+            &[
+                "error",
+                "error_message",
+                "err",
+                "reason",
+                "failure_reason",
+                "last_error",
+                "detail",
+                "exception",
+            ],
+        );
+        if !candidate.is_empty()
+            && candidate != "-"
+            && candidate != "0"
+            && !candidate.eq_ignore_ascii_case("false")
+        {
+            *error_text = candidate;
+        }
+    }
+}
+
 /// Parse keluaran teks atau JSON dari perintah pemeriksaan / berkas status secara deterministik
-/// (0 panggilan LLM, 0 token).
+/// (0 panggilan LLM, 0 token). Mendukung JSON datar & bersarang (`{"job": {...}}`), key=value,
+/// serta deteksi kegagalan kelas satu (v0.5.10 Perbaikan 2).
 pub fn parse_watch_output(raw: &str, done_marker: &str, fail_marker: &str) -> ParsedWatchStatus {
     let cleaned = redact_secrets(raw.trim());
     let mut stage = String::new();
@@ -118,30 +229,32 @@ pub fn parse_watch_output(raw: &str, done_marker: &str, fail_marker: &str) -> Pa
     let mut error_text = String::new();
     let mut status_field = String::new();
 
-    // 1. Coba parse sebagai JSON object bila berbentuk `{...}`.
+    // 1. Coba parse sebagai JSON object bila berbentuk `{...}` (termasuk wrapper `job`/`data`/`task`/`result`).
     if cleaned.starts_with('{') {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&cleaned) {
             if let Some(obj) = val.as_object() {
-                let pick = |keys: &[&str]| -> String {
-                    for k in keys {
-                        if let Some(v) = obj.get(*k) {
-                            if let Some(s) = v.as_str() {
-                                if !s.trim().is_empty() {
-                                    return s.trim().to_string();
-                                }
-                            } else if !v.is_null() {
-                                return v.to_string();
-                            }
-                        }
+                fill_from_json_obj(
+                    obj,
+                    &mut status_field,
+                    &mut stage,
+                    &mut progress,
+                    &mut summary,
+                    &mut output_location,
+                    &mut error_text,
+                );
+                for nested_key in ["job", "data", "task", "result", "payload", "metadata"] {
+                    if let Some(nested) = obj.get(nested_key).and_then(|v| v.as_object()) {
+                        fill_from_json_obj(
+                            nested,
+                            &mut status_field,
+                            &mut stage,
+                            &mut progress,
+                            &mut summary,
+                            &mut output_location,
+                            &mut error_text,
+                        );
                     }
-                    String::new()
-                };
-                status_field = pick(&["status", "state"]);
-                stage = pick(&["stage", "tahap", "phase", "step"]);
-                progress = pick(&["progress", "progres", "percent", "count"]);
-                summary = pick(&["summary", "result", "hasil", "message"]);
-                output_location = pick(&["output", "output_path", "location", "lokasi", "path", "file"]);
-                error_text = pick(&["error", "err", "reason", "detail"]);
+                }
             }
         }
     }
@@ -156,22 +269,38 @@ pub fn parse_watch_output(raw: &str, done_marker: &str, fail_marker: &str) -> Pa
         if let Some((k, v)) = pair {
             let key = k.trim().to_ascii_lowercase();
             let val = v.trim();
-            if val.is_empty() {
+            if val.is_empty()
+                || val.eq_ignore_ascii_case("null")
+                || val.eq_ignore_ascii_case("none")
+            {
                 continue;
             }
             match key.as_str() {
-                "status" | "state" if status_field.is_empty() => status_field = val.to_string(),
-                "stage" | "tahap" | "phase" | "step" if stage.is_empty() => stage = val.to_string(),
-                "progress" | "progres" if progress.is_empty() => progress = val.to_string(),
-                "summary" | "result" | "hasil" | "message" if summary.is_empty() => {
+                "status" | "state" | "job_status" if status_field.is_empty() => {
+                    status_field = val.to_string()
+                }
+                "stage" | "current_stage" | "active_stage" | "tahap" | "phase" | "step"
+                | "current_step"
+                    if stage.is_empty() =>
+                {
+                    stage = val.to_string()
+                }
+                "progress" | "progres" | "pages" | "percent" | "pct" if progress.is_empty() => {
+                    progress = val.to_string()
+                }
+                "summary" | "result" | "hasil" | "message" | "msg" if summary.is_empty() => {
                     summary = val.to_string()
                 }
-                "output" | "output_path" | "location" | "lokasi" | "file"
+                "output" | "output_path" | "output_dir" | "location" | "lokasi" | "file"
+                | "artifact"
                     if output_location.is_empty() =>
                 {
                     output_location = val.to_string()
                 }
-                "error" | "err" | "reason" if error_text.is_empty() => {
+                "error" | "error_message" | "err" | "reason" | "failure_reason" | "last_error"
+                | "exception"
+                    if error_text.is_empty() && val != "-" && val != "0" =>
+                {
                     error_text = val.to_string()
                 }
                 _ => {}
@@ -197,6 +326,16 @@ pub fn parse_watch_output(raw: &str, done_marker: &str, fail_marker: &str) -> Pa
 
     let check_haystack = format!("{status_field}\n{stage}\n{cleaned}");
     let upper = check_haystack.to_ascii_uppercase();
+    let status_up = status_field.trim().to_ascii_uppercase();
+    let stage_up = stage.trim().to_ascii_uppercase();
+    let is_explicit_running = matches!(
+        status_up.as_str(),
+        "PROCESSING" | "RUNNING" | "QUEUED" | "PENDING" | "IN_PROGRESS" | "ACTIVE" | "STARTED"
+    );
+    let is_explicit_done = matches!(
+        status_up.as_str(),
+        "DONE" | "SELESAI" | "COMPLETED" | "COMPLETE" | "SUCCESS" | "SUCCEEDED" | "FINISHED" | "OK"
+    );
 
     let fail_hit = if !fail_marker.trim().is_empty() {
         check_haystack
@@ -205,21 +344,33 @@ pub fn parse_watch_output(raw: &str, done_marker: &str, fail_marker: &str) -> Pa
     } else {
         false
     } || matches!(
-        status_field.trim().to_ascii_uppercase().as_str(),
-        "FAILED" | "FAIL" | "ERROR" | "GAGAL" | "CRASHED" | "ABORTED"
-    ) || upper.lines().any(|l| {
-        let t = l.trim();
-        t == "FAILED"
-            || t == "GAGAL"
-            || t == "ERROR"
-            || t.starts_with("FAILED:")
-            || t.starts_with("FAILED ")
-            || t.starts_with("GAGAL:")
-            || t.starts_with("GAGAL ")
-            || t.starts_with("STATUS=FAILED")
-            || t.starts_with("STATUS=GAGAL")
-            || t.starts_with("STATUS=ERROR")
-    });
+        status_up.as_str(),
+        "FAILED" | "FAIL" | "ERROR" | "GAGAL" | "CRASHED" | "ABORTED" | "REJECTED" | "FATAL"
+    ) || matches!(
+        stage_up.as_str(),
+        "FAILED" | "FAIL" | "ERROR" | "GAGAL" | "CRASHED" | "ABORTED" | "FATAL"
+    ) || (!error_text.is_empty() && !is_explicit_running && !is_explicit_done)
+        || upper.contains("PIXEL_OUTSIDE_ALLOWED_MASK")
+        || upper.lines().any(|l| {
+            let t = l.trim();
+            t == "FAILED"
+                || t == "GAGAL"
+                || t == "ERROR"
+                || t.starts_with("FAILED:")
+                || t.starts_with("FAILED ")
+                || t.starts_with("FAIL:")
+                || t.starts_with("ERROR:")
+                || t.starts_with("ERROR ")
+                || t.starts_with("GAGAL:")
+                || t.starts_with("GAGAL ")
+                || t.starts_with("STATUS=FAILED")
+                || t.starts_with("STATUS=GAGAL")
+                || t.starts_with("STATUS=ERROR")
+                || t.starts_with("STATE=FAILED")
+                || t.starts_with("STATE=ERROR")
+                || t.starts_with("TRACEBACK")
+                || t.starts_with("EXCEPTION:")
+        });
 
     let done_hit = if !done_marker.trim().is_empty() {
         check_haystack
@@ -227,23 +378,23 @@ pub fn parse_watch_output(raw: &str, done_marker: &str, fail_marker: &str) -> Pa
             .contains(&done_marker.trim().to_ascii_lowercase())
     } else {
         false
-    } || matches!(
-        status_field.trim().to_ascii_uppercase().as_str(),
-        "DONE" | "SELESAI" | "COMPLETED" | "COMPLETE" | "SUCCESS" | "SUCCEEDED" | "FINISHED" | "OK"
-    ) || upper.lines().any(|l| {
-        let t = l.trim();
-        t == "DONE"
-            || t == "SELESAI"
-            || t == "COMPLETED"
-            || t == "SUCCESS"
-            || t.starts_with("SELESAI ")
-            || t.starts_with("SELESAI:")
-            || t.starts_with("DONE ")
-            || t.starts_with("DONE:")
-            || t.starts_with("STATUS=DONE")
-            || t.starts_with("STATUS=SELESAI")
-            || t.starts_with("STATUS=COMPLETED")
-    });
+    } || is_explicit_done
+        || upper.lines().any(|l| {
+            let t = l.trim();
+            t == "DONE"
+                || t == "SELESAI"
+                || t == "COMPLETED"
+                || t == "SUCCESS"
+                || t.starts_with("SELESAI ")
+                || t.starts_with("SELESAI:")
+                || t.starts_with("DONE ")
+                || t.starts_with("DONE:")
+                || t.starts_with("STATUS=DONE")
+                || t.starts_with("STATUS=SELESAI")
+                || t.starts_with("STATUS=COMPLETED")
+                || t.starts_with("STATE=COMPLETED")
+                || t.starts_with("STATE=DONE")
+        });
 
     let kind = if fail_hit {
         if error_text.is_empty() {
@@ -263,6 +414,73 @@ pub fn parse_watch_output(raw: &str, done_marker: &str, fail_marker: &str) -> Pa
         summary: summary.chars().take(240).collect(),
         output_location: output_location.chars().take(200).collect(),
         error_text: error_text.chars().take(300).collect(),
+    }
+}
+
+/// Format laporan status segar bertanggal dari satu kali cek langsung sumber kebenaran
+/// (Perbaikan 2 v0.5.10 — dipakai `watch_job(action="check")` agar model tidak pernah
+/// menjawab status pekerjaan dari ingatan/ringkasan basi, dan jujur saat cek gagal).
+pub fn format_watch_fresh_status(
+    watch: &JobWatchRecord,
+    poll_res: Result<&str, &str>,
+    checked_at: &str,
+) -> String {
+    let ts_short: String = checked_at.chars().take(19).collect();
+    match poll_res {
+        Ok(raw) => {
+            let parsed = parse_watch_output(raw, &watch.done_marker, &watch.fail_marker);
+            let state_lbl = match parsed.kind {
+                WatchStateKind::Running => "BERJALAN",
+                WatchStateKind::Done => "SELESAI",
+                WatchStateKind::Failed => "GAGAL",
+            };
+            let mut out = format!(
+                "[Status segar #{id} '{}' · dicek {ts_short} UTC]\nKeadaan: {state_lbl}",
+                watch.label,
+                id = watch.id,
+            );
+            if !parsed.stage.is_empty() {
+                out.push_str(&format!("\nTahap: {}", parsed.stage));
+            }
+            if !parsed.progress.is_empty() {
+                out.push_str(&format!("\nProgres: {}", parsed.progress));
+            }
+            if parsed.kind == WatchStateKind::Failed && !parsed.error_text.is_empty() {
+                out.push_str(&format!("\nError: {}", parsed.error_text));
+            } else if !parsed.summary.is_empty() && parsed.summary != parsed.stage {
+                out.push_str(&format!("\nRingkasan: {}", parsed.summary));
+            }
+            if !parsed.output_location.is_empty() {
+                out.push_str(&format!("\nLokasi: {}", parsed.output_location));
+            }
+            out
+        }
+        Err(err) => {
+            let clean_err = redact_secrets(err.trim());
+            let prev_ts = if watch.last_checked_at.trim().is_empty() {
+                "belum pernah dicek".to_string()
+            } else {
+                format!(
+                    "{} UTC",
+                    watch.last_checked_at.chars().take(19).collect::<String>()
+                )
+            };
+            let prev_stage = if watch.last_stage.is_empty() {
+                "-".to_string()
+            } else if watch.last_progress.is_empty() {
+                watch.last_stage.clone()
+            } else {
+                format!("{} ({})", watch.last_stage, watch.last_progress)
+            };
+            format!(
+                "[Gagal cek status segar #{id} '{}' · percobaan {ts_short} UTC]\n\
+                 Belum bisa mengecek sumber kebenaran saat ini: {clean_err}\n\
+                 Catatan pantauan terakhir ({prev_ts}): status={}, tahap={prev_stage}.",
+                watch.label,
+                watch.status,
+                id = watch.id,
+            )
+        }
     }
 }
 

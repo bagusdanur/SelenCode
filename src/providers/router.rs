@@ -187,6 +187,13 @@ pub fn is_retryable_error(err: &str) -> bool {
             "too many requests",
             "timeout",
             "timed out",
+            "ketidakaktifan",
+            "stream provider macet",
+            "stream anthropic macet",
+            "stream gemini macet",
+            "tidak ada data selama",
+            "tidak merespons",
+            "terputus",
             "500",
             "502",
             "503",
@@ -289,7 +296,22 @@ pub fn short_fallback_reason(err: &str) -> &'static str {
         ],
     ) {
         "404 model tidak tersedia"
-    } else if contains_any(&low, &["timeout", "timed out", "connection", "eof", "dns", "sending request"]) {
+    } else if contains_any(
+        &low,
+        &[
+            "timeout",
+            "timed out",
+            "ketidakaktifan",
+            "macet",
+            "tidak ada data",
+            "tidak merespons",
+            "terputus",
+            "connection",
+            "eof",
+            "dns",
+            "sending request",
+        ],
+    ) {
         "timeout/koneksi"
     } else {
         "error provider"

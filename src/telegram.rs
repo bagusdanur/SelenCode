@@ -833,6 +833,12 @@ pub struct TelegramClient {
 
 impl TelegramClient {
     pub fn new(bot_token: &str) -> Result<Self> {
+        let tok = bot_token.trim();
+        Self::with_base_url(tok, &format!("https://api.telegram.org/bot{tok}"))
+    }
+
+    /// Konstruktor dengan `base_url` khusus (dipakai pengujian mock HTTP lokal v0.5.10).
+    pub fn with_base_url(bot_token: &str, base_url: &str) -> Result<Self> {
         let api_http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
@@ -849,12 +855,11 @@ impl TelegramClient {
             .http1_only()
             .build()
             .context("gagal membuat HTTP polling client Telegram")?;
-        let tok = bot_token.trim().to_string();
         Ok(Self {
             api_http,
             poll_http,
-            base_url: format!("https://api.telegram.org/bot{tok}"),
-            token: tok,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            token: bot_token.trim().to_string(),
         })
     }
 

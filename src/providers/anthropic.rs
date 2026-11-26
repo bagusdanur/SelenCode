@@ -1,17 +1,14 @@
 use super::{
-    AssistantReply, Block, Message, Provider, Role, StreamEvent, ToolCall, ToolSpec, Usage,
+    AssistantReply, Block, Message, Provider, ProviderTimeouts, Role, StreamEvent, ToolCall,
+    ToolSpec, Usage,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
-const CHUNK_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Adapter Anthropic Messages API (Fase 3).
 /// POST {base_url}/v1/messages, header x-api-key + anthropic-version, SSE stream.
@@ -25,6 +22,7 @@ pub struct AnthropicProvider {
     pub api_key: String,
     pub model: String,
     pub max_output_tokens: u32,
+    timeouts: ProviderTimeouts,
     client: reqwest::Client,
 }
 
@@ -33,8 +31,25 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 impl AnthropicProvider {
     pub fn new(base_url: String, api_key: String, model: String, max_output_tokens: u32) -> Self {
+        Self::with_timeouts(
+            base_url,
+            api_key,
+            model,
+            max_output_tokens,
+            ProviderTimeouts::default(),
+        )
+    }
+
+    pub fn with_timeouts(
+        base_url: String,
+        api_key: String,
+        model: String,
+        max_output_tokens: u32,
+        timeouts: ProviderTimeouts,
+    ) -> Self {
         let client = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
+            .connect_timeout(timeouts.connect)
+            .tcp_keepalive(Duration::from_secs(15))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -42,6 +57,7 @@ impl AnthropicProvider {
             api_key,
             model,
             max_output_tokens,
+            timeouts,
             client,
         }
     }
@@ -316,8 +332,10 @@ impl Provider for AnthropicProvider {
         let mut body = build_request(msgs, tools, &self.model, self.max_output_tokens);
         apply_prompt_caching(&mut body);
         let url = format!("{}/v1/messages", self.base_url);
+        let req_deadline = Instant::now() + self.timeouts.total;
+        let resp_wait = self.timeouts.response.min(self.timeouts.total);
         let resp = tokio::time::timeout(
-            RESPONSE_TIMEOUT,
+            resp_wait,
             self.client
                 .post(&url)
                 .header("x-api-key", &self.api_key)
@@ -329,14 +347,18 @@ impl Provider for AnthropicProvider {
         .await
         .map_err(|_| {
             anyhow!(
-                "timeout {} detik menunggu respons awal Anthropic di {url}",
-                RESPONSE_TIMEOUT.as_secs()
+                "timeout {} detik menunggu respons awal Anthropic di {url} — provider tidak merespons",
+                resp_wait.as_secs()
             )
         })?
         .with_context(|| format!("gagal menghubungi Anthropic di {url}"))?;
         if !resp.status().is_success() {
             let st = resp.status();
-            let txt = resp.text().await.unwrap_or_default();
+            let txt = tokio::time::timeout(Duration::from_secs(15), resp.text())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
             return Err(anyhow!(
                 "Anthropic membalas {st}: {}",
                 txt.chars().take(500).collect::<String>()
@@ -347,13 +369,29 @@ impl Provider for AnthropicProvider {
         let mut buf = String::new();
         let mut parser = AnthropicStreamParser::new();
         'stream: loop {
-            let next_chunk = tokio::time::timeout(CHUNK_TIMEOUT, stream.next())
+            let rem_total = req_deadline.saturating_duration_since(Instant::now());
+            if rem_total.is_zero() {
+                return Err(anyhow!(
+                    "timeout total panggilan Anthropic ({} detik) — panggilan dibatalkan",
+                    self.timeouts.total.as_secs()
+                ));
+            }
+            let wait_for = self.timeouts.stream_idle.min(rem_total);
+            let hit_total = rem_total <= self.timeouts.stream_idle;
+            let next_chunk = tokio::time::timeout(wait_for, stream.next())
                 .await
                 .map_err(|_| {
-                    anyhow!(
-                        "stream Anthropic macet (tidak ada data selama {} detik)",
-                        CHUNK_TIMEOUT.as_secs()
-                    )
+                    if hit_total {
+                        anyhow!(
+                            "timeout total panggilan Anthropic ({} detik) — panggilan dibatalkan",
+                            self.timeouts.total.as_secs()
+                        )
+                    } else {
+                        anyhow!(
+                            "timeout ketidakaktifan stream Anthropic (tidak ada data selama {} detik) — panggilan dibatalkan",
+                            self.timeouts.stream_idle.as_secs()
+                        )
+                    }
                 })?;
             let Some(chunk) = next_chunk else {
                 break 'stream;

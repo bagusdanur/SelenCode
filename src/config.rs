@@ -56,6 +56,65 @@ pub struct Config {
     /// Konfigurasi tampilan aksi tool (`[display]`, v0.5.8 Perbaikan 3).
     #[serde(default, skip_serializing_if = "DisplayCfg::is_default")]
     pub display: DisplayCfg,
+    /// Konfigurasi tenggat waktu panggilan provider (`[timeouts]`, v0.5.10 Perbaikan 1).
+    #[serde(default, skip_serializing_if = "ProviderTimeoutsCfg::is_default")]
+    pub timeouts: ProviderTimeoutsCfg,
+}
+
+/// Konfigurasi tenggat waktu panggilan HTTP/streaming ke provider (`[timeouts]`, v0.5.10 Perbaikan 1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderTimeoutsCfg {
+    /// Tenggat sambung TCP/TLS ke provider dalam detik (default: 20).
+    #[serde(default = "default_provider_connect_secs")]
+    pub connect_secs: u64,
+    /// Tenggat menunggu header respons awal dari provider dalam detik (default: 60).
+    #[serde(default = "default_provider_response_secs")]
+    pub response_secs: u64,
+    /// Tenggat ketidakaktifan streaming (tanpa byte/potongan baru) dalam detik (default: 90).
+    #[serde(default = "default_provider_stream_idle_secs")]
+    pub stream_idle_secs: u64,
+    /// Tenggat keras total 1 panggilan HTTP/stream ke provider dalam detik (default: 300).
+    #[serde(default = "default_provider_total_secs")]
+    pub total_secs: u64,
+}
+
+fn default_provider_connect_secs() -> u64 {
+    20
+}
+fn default_provider_response_secs() -> u64 {
+    60
+}
+fn default_provider_stream_idle_secs() -> u64 {
+    90
+}
+fn default_provider_total_secs() -> u64 {
+    300
+}
+
+impl Default for ProviderTimeoutsCfg {
+    fn default() -> Self {
+        Self {
+            connect_secs: default_provider_connect_secs(),
+            response_secs: default_provider_response_secs(),
+            stream_idle_secs: default_provider_stream_idle_secs(),
+            total_secs: default_provider_total_secs(),
+        }
+    }
+}
+
+impl ProviderTimeoutsCfg {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn to_durations(&self) -> crate::providers::ProviderTimeouts {
+        crate::providers::ProviderTimeouts {
+            connect: std::time::Duration::from_secs(self.connect_secs.max(1)),
+            response: std::time::Duration::from_secs(self.response_secs.max(1)),
+            stream_idle: std::time::Duration::from_secs(self.stream_idle_secs.max(1)),
+            total: std::time::Duration::from_secs(self.total_secs.max(1)),
+        }
+    }
 }
 
 /// Konfigurasi konteks harness (`[context]`, v0.5.8 Perbaikan 1 Lapis A2).
@@ -541,10 +600,28 @@ pub struct TelegramCfg {
     /// Batas waktu tunggu kartu persetujuan Telegram dalam menit (default: 10; 0 = tanpa batas).
     #[serde(default = "default_tg_approval_timeout_mins")]
     pub approval_timeout_mins: u64,
+    /// Batas waktu keras 1 giliran agent di gateway Telegram dalam detik (default: 900 = 15 menit, v0.5.10).
+    #[serde(default = "default_tg_turn_timeout_secs")]
+    pub turn_timeout_secs: u64,
+    /// Ambang diam tanpa kemajuan sebelum 1 peringatan macet dikirim ke pengguna (default: 180 detik, v0.5.10).
+    #[serde(default = "default_tg_stall_notice_secs")]
+    pub stall_notice_secs: u64,
+    /// Ambang keras kegagalan/kemacetan polling Telegram sebelum gateway keluar non-nol untuk restart supervisor (default: 300 detik, v0.5.10).
+    #[serde(default = "default_tg_poll_watchdog_secs")]
+    pub poll_watchdog_secs: u64,
 }
 
 fn default_tg_approval_timeout_mins() -> u64 {
     10
+}
+fn default_tg_turn_timeout_secs() -> u64 {
+    900
+}
+fn default_tg_stall_notice_secs() -> u64 {
+    180
+}
+fn default_tg_poll_watchdog_secs() -> u64 {
+    300
 }
 
 impl Default for TelegramCfg {
@@ -555,6 +632,9 @@ impl Default for TelegramCfg {
             allowed_users: Vec::new(),
             approval: String::new(),
             approval_timeout_mins: default_tg_approval_timeout_mins(),
+            turn_timeout_secs: default_tg_turn_timeout_secs(),
+            stall_notice_secs: default_tg_stall_notice_secs(),
+            poll_watchdog_secs: default_tg_poll_watchdog_secs(),
         }
     }
 }
@@ -566,6 +646,9 @@ impl TelegramCfg {
             && self.allowed_users.is_empty()
             && self.approval.trim().is_empty()
             && self.approval_timeout_mins == default_tg_approval_timeout_mins()
+            && self.turn_timeout_secs == default_tg_turn_timeout_secs()
+            && self.stall_notice_secs == default_tg_stall_notice_secs()
+            && self.poll_watchdog_secs == default_tg_poll_watchdog_secs()
     }
 
     /// Ambil token bot Telegram (prioritas: env var `bot_token_env` -> `SELENCODE_TELEGRAM_TOKEN` -> `bot_token`).
@@ -995,6 +1078,7 @@ impl Config {
             memory: MemoryCfg::default(),
             context: ContextCfg::default(),
             display: DisplayCfg::default(),
+            timeouts: ProviderTimeoutsCfg::default(),
         }
     }
 

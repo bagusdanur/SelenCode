@@ -225,25 +225,84 @@ impl Ctx {
     }
 }
 
-/// Jalankan command sampai selesai dengan timeout; gabungkan stdout+stderr.
+/// Batas keras tangkapan stdout/stderr per pipa dalam `run_timed` (2 MB per stream = maks 4 MB di RAM,
+/// Perbaikan 1 #5 v0.5.10) agar proses anak yang mencetak puluhan/ratusan MB tidak memicu puncak RAM berlebih.
+pub const MAX_RUN_TIMED_PIPE_BYTES: usize = 2 * 1024 * 1024;
+
+async fn read_bounded_pipe<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    max_bytes: usize,
+) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut kept = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut overflowed = false;
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if kept.len() < max_bytes {
+                    let take = n.min(max_bytes - kept.len());
+                    kept.extend_from_slice(&chunk[..take]);
+                    if take < n {
+                        overflowed = true;
+                    }
+                } else {
+                    overflowed = true;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if overflowed {
+        kept.extend_from_slice(b"\n[output stream dipotong batas memori 2MB]\n");
+    }
+    kept
+}
+
+/// Jalankan command sampai selesai dengan timeout; gabungkan stdout+stderr secara terikat memori.
 /// Error timeout berbunyi "timeout setelah N detik" (disengaja: jelas di log).
 /// Command harus sudah di-set `kill_on_drop(true)` oleh pemanggil.
 pub(crate) async fn run_timed(
     cmd: &mut tokio::process::Command,
     timeout_secs: u64,
 ) -> Result<(Option<i32>, String)> {
-    let out = match tokio::time::timeout(
+    use std::process::Stdio;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_task = tokio::spawn(async move {
+        match stdout_pipe {
+            Some(r) => read_bounded_pipe(r, MAX_RUN_TIMED_PIPE_BYTES).await,
+            None => Vec::new(),
+        }
+    });
+    let err_task = tokio::spawn(async move {
+        match stderr_pipe {
+            Some(r) => read_bounded_pipe(r, MAX_RUN_TIMED_PIPE_BYTES).await,
+            None => Vec::new(),
+        }
+    });
+    let status = match tokio::time::timeout(
         Duration::from_secs(timeout_secs.max(1)),
-        cmd.output(),
+        child.wait(),
     )
     .await
     {
         Ok(r) => r?,
-        Err(_) => anyhow::bail!("timeout setelah {timeout_secs} detik"),
+        Err(_) => {
+            let _ = child.kill().await;
+            out_task.abort();
+            err_task.abort();
+            anyhow::bail!("timeout setelah {timeout_secs} detik");
+        }
     };
-    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
-    s.push_str(&String::from_utf8_lossy(&out.stderr));
-    Ok((out.status.code(), s))
+    let stdout_bytes = out_task.await.unwrap_or_default();
+    let stderr_bytes = err_task.await.unwrap_or_default();
+    let mut s = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    s.push_str(&String::from_utf8_lossy(&stderr_bytes));
+    Ok((status.code(), s))
 }
 
 /// Potong output di batas `max` byte (aman UTF-8) + penanda "[output dipotong]".

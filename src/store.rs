@@ -397,6 +397,9 @@ CREATE TABLE IF NOT EXISTS job_watches (id INTEGER PRIMARY KEY, label TEXT NOT N
                     last_checked_at TEXT NOT NULL DEFAULT '',
                     final_report TEXT NOT NULL DEFAULT '',
                     delivered INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS gateway_state (key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL);
 ";
 
 fn now() -> String {
@@ -2168,6 +2171,82 @@ impl Store {
             );
         }
         Ok(out)
+    }
+
+    // ---------- Perbaikan 1 (v0.5.10): Persistensi state & pemulihan watchdog Gateway ----------
+
+    pub fn set_gateway_state(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let ts = now();
+        conn.execute(
+            "INSERT INTO gateway_state (key, value, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            rusqlite::params![key, value, ts],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_gateway_state(&self, key: &str) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare("SELECT value, updated_at FROM gateway_state WHERE key = ?1")?;
+        let mut rows = stmt.query_map(rusqlite::params![key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_gateway_state(&self, key: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute("DELETE FROM gateway_state WHERE key = ?1", rusqlite::params![key])?;
+        Ok(())
+    }
+
+    /// Catat penanda bahwa gateway keluar karena watchdog agar saat bangun kembali
+    /// ia mengirim 1 catatan pemulihan dan memproses pesan tertahan (tanpa `skip_backlog`).
+    pub fn record_gateway_recovery(&self, chat_id: i64, reason: &str) -> Result<()> {
+        let payload = serde_json::json!({
+            "chat_id": chat_id,
+            "reason": reason,
+            "ts": now(),
+        })
+        .to_string();
+        self.set_gateway_state("pending_recovery", &payload)
+    }
+
+    /// Ambil dan langsung hapus penanda pemulihan watchdog (tepat sekali pakai, anti-loop restart).
+    pub fn take_gateway_recovery(&self) -> Result<Option<(i64, String, String)>> {
+        let Some((raw, updated_at)) = self.get_gateway_state("pending_recovery")? else {
+            return Ok(None);
+        };
+        let _ = self.delete_gateway_state("pending_recovery");
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let chat_id = v.get("chat_id").and_then(|x| x.as_i64()).unwrap_or(0);
+            let reason = v
+                .get("reason")
+                .and_then(|x| x.as_str())
+                .unwrap_or("watchdog macet")
+                .to_string();
+            let ts = v
+                .get("ts")
+                .and_then(|x| x.as_str())
+                .unwrap_or(&updated_at)
+                .to_string();
+            return Ok(Some((chat_id, reason, ts)));
+        }
+        Ok(Some((0, raw, updated_at)))
+    }
+
+    pub fn save_gateway_offset(&self, offset: i64) -> Result<()> {
+        self.set_gateway_state("last_update_offset", &offset.to_string())
+    }
+
+    pub fn load_gateway_offset(&self) -> Result<Option<i64>> {
+        Ok(self
+            .get_gateway_state("last_update_offset")?
+            .and_then(|(v, _)| v.trim().parse::<i64>().ok()))
     }
 
     // ---------- Perbaikan 7 (v0.5.7): Laporan `/usage` langsung dari tabel `usage` ----------

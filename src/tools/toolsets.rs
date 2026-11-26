@@ -305,6 +305,13 @@ pub fn select_initial_toolsets(
         "kerjain",
         "job_queue",
         "status file",
+        "status job",
+        "cek job",
+        "cek status",
+        "udah belum",
+        "sudah belum",
+        "sampai mana",
+        "gimana job",
         "asinkron",
         "proses panjang",
     ]

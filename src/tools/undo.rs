@@ -13,6 +13,9 @@ use std::path::PathBuf;
 
 const MAX_UNDO_ENTRIES: usize = 200;
 const MAX_CHECKPOINTS: usize = 30;
+/// Batas total memori RAM seluruh snapshot di `UndoStack` (32 MB, Perbaikan 1 #5 v0.5.10)
+/// agar sesi panjang yang sering mengedit berkas besar tidak menahan ratusan MB di RAM.
+pub const MAX_UNDO_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct FileSnapshot {
@@ -53,8 +56,21 @@ pub struct UndoStack {
 }
 
 impl UndoStack {
+    fn snapshot_bytes(snap: &FileSnapshot) -> usize {
+        snap.before.as_ref().map(|b| b.len()).unwrap_or(0) + snap.after.len() + snap.rel.len()
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.undo
+            .iter()
+            .chain(self.redo.iter())
+            .map(Self::snapshot_bytes)
+            .sum()
+    }
+
     pub fn record(&mut self, snap: FileSnapshot) {
         self.undo.push(snap);
+        self.redo.clear();
         if self.undo.len() > MAX_UNDO_ENTRIES {
             let overflow = self.undo.len() - MAX_UNDO_ENTRIES;
             self.undo.drain(0..overflow);
@@ -62,7 +78,17 @@ impl UndoStack {
                 cp.undo_mark = cp.undo_mark.saturating_sub(overflow);
             }
         }
-        self.redo.clear();
+        // Tegakkan pagu memori 32 MB: buang snapshot tertua (tetap sisakan min 1 snapshot terbaru).
+        let mut drained = 0usize;
+        while self.undo.len() > 1 && self.total_bytes() > MAX_UNDO_TOTAL_BYTES {
+            self.undo.remove(0);
+            drained += 1;
+        }
+        if drained > 0 {
+            for cp in &mut self.checkpoints {
+                cp.undo_mark = cp.undo_mark.saturating_sub(drained);
+            }
+        }
     }
 
     pub fn undo_len(&self) -> usize {

@@ -1,17 +1,16 @@
 use super::{
-    AssistantReply, Block, Message, Provider, Role, StreamEvent, ToolCall, ToolSpec, Usage,
+    AssistantReply, Block, Message, Provider, ProviderTimeouts, Role, StreamEvent, ToolCall,
+    ToolSpec, Usage,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
-const CHUNK_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Provider OpenAI-compatible: 9Router, OpenRouter, OpenAI, dsb.
 /// POST {base_url}/chat/completions dengan stream=true + SSE.
@@ -20,13 +19,31 @@ pub struct OpenAiProvider {
     pub api_key: String,
     pub model: String,
     pub max_output_tokens: u32,
+    timeouts: ProviderTimeouts,
     client: reqwest::Client,
 }
 
 impl OpenAiProvider {
     pub fn new(base_url: String, api_key: String, model: String, max_output_tokens: u32) -> Self {
+        Self::with_timeouts(
+            base_url,
+            api_key,
+            model,
+            max_output_tokens,
+            ProviderTimeouts::default(),
+        )
+    }
+
+    pub fn with_timeouts(
+        base_url: String,
+        api_key: String,
+        model: String,
+        max_output_tokens: u32,
+        timeouts: ProviderTimeouts,
+    ) -> Self {
         let client = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
+            .connect_timeout(timeouts.connect)
+            .tcp_keepalive(Duration::from_secs(15))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -34,6 +51,7 @@ impl OpenAiProvider {
             api_key,
             model,
             max_output_tokens,
+            timeouts,
             client,
         }
     }
@@ -217,8 +235,10 @@ impl Provider for OpenAiProvider {
         }
 
         let url = format!("{}/chat/completions", self.base_url);
+        let req_deadline = Instant::now() + self.timeouts.total;
+        let resp_wait = self.timeouts.response.min(self.timeouts.total);
         let resp = tokio::time::timeout(
-            RESPONSE_TIMEOUT,
+            resp_wait,
             self.client
                 .post(&url)
                 .bearer_auth(&self.api_key)
@@ -228,15 +248,22 @@ impl Provider for OpenAiProvider {
         .await
         .map_err(|_| {
             anyhow!(
-                "timeout {} detik menunggu respons awal provider di {url}",
-                RESPONSE_TIMEOUT.as_secs()
+                "timeout {} detik menunggu respons awal provider di {url} — provider tidak merespons",
+                resp_wait.as_secs()
             )
         })?
         .with_context(|| format!("gagal menghubungi provider di {url}"))?;
         if !resp.status().is_success() {
             let st = resp.status();
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("provider membalas {st}: {}", txt.chars().take(500).collect::<String>()));
+            let txt = tokio::time::timeout(Duration::from_secs(15), resp.text())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            return Err(anyhow!(
+                "provider membalas {st}: {}",
+                txt.chars().take(500).collect::<String>()
+            ));
         }
 
         let mut stream = resp.bytes_stream();
@@ -247,13 +274,29 @@ impl Provider for OpenAiProvider {
         let mut usage: Option<Usage> = None;
 
         'stream: loop {
-            let next_chunk = tokio::time::timeout(CHUNK_TIMEOUT, stream.next())
+            let rem_total = req_deadline.saturating_duration_since(Instant::now());
+            if rem_total.is_zero() {
+                return Err(anyhow!(
+                    "timeout total panggilan provider ({} detik) — panggilan dibatalkan",
+                    self.timeouts.total.as_secs()
+                ));
+            }
+            let wait_for = self.timeouts.stream_idle.min(rem_total);
+            let hit_total = rem_total <= self.timeouts.stream_idle;
+            let next_chunk = tokio::time::timeout(wait_for, stream.next())
                 .await
                 .map_err(|_| {
-                    anyhow!(
-                        "stream provider macet (tidak ada data selama {} detik)",
-                        CHUNK_TIMEOUT.as_secs()
-                    )
+                    if hit_total {
+                        anyhow!(
+                            "timeout total panggilan provider ({} detik) — panggilan dibatalkan",
+                            self.timeouts.total.as_secs()
+                        )
+                    } else {
+                        anyhow!(
+                            "timeout ketidakaktifan stream provider (tidak ada data selama {} detik) — panggilan dibatalkan",
+                            self.timeouts.stream_idle.as_secs()
+                        )
+                    }
                 })?;
             let Some(chunk) = next_chunk else {
                 break 'stream;
