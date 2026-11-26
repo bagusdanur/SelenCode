@@ -639,7 +639,10 @@ async fn run_turn_inner(
                         ),
                         false,
                     )
-                } else if mode == TurnMode::Plan && !is_read_only(&call.name) {
+                } else if mode == TurnMode::Plan
+                    && !is_read_only(&call.name)
+                    && call.name != "ask_user"
+                {
                     // Penegakan plan mode (Fase 6): model tetap memanggil
                     // tool menulis (halusinasi) -> tolak TANPA menjalankan.
                     (
