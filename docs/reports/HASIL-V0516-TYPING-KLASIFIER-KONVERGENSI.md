@@ -90,3 +90,14 @@
 - Penghapusan pagu bawaan (`max_steps = 0`) + notice tanpa-pagu ambang 20 + tag langkah Telegram/TUI (`v0.5.15`), penempelan pasca-generasi kalimat kegagalan nol-edit (`v0.5.15`), integritas keadaan verifikasi mapan + kutipan penutup (`v0.5.15`), catatan berkas tes diubah (`v0.5.15`).
 - Checkpoint rasio 0,7 + panggilan anugerah + isi wrap-up paksa + penjaga pengulangan 3× (`v0.5.14`), konverter tampilan Telegram HTML + fallback anti-gagal-parse (`v0.5.12`), gerbang skill + opt-out (`v0.5.11`/`v0.5.13`), gerbang laporan rilis terperiksa mesin (`v0.5.13`/`v0.5.15`).
 - Seluruh hasil `v0.5.7`–`v0.5.11`: timeout & watchdog gateway + trim memori sesi, `watch_job` + status segar + polling watch CLI, store memory tunggal, jalur resume ramping, salinan kerja `skill_view` + prune teks penuh `full=true`, peringatan config + `selen doctor`, pembatalan provider ~1×, `send_file`, `delegate_work`, `/usage`, `skills install`, fallback rute berbeda, `ask_user`, `cron`, `session_search`, pelacakan approval, serta 12 skill bawaan + `NOTICE`.
+
+---
+
+## Bukti CI & Rilis Publik `v0.5.16`
+
+- **CI GitHub Actions (Linux + Windows x64):** Run `#45902924285` pada commit `a2919b6` — **LULUS** (`Cargo Test & Visual Render (Linux)` & `Cargo Test & Check (Windows x64)` keduanya `success`, termasuk seluruh tes `v0516_typing_leak_classifier_small_budget`).
+- **Release Workflow & Gerbang Laporan Rilis Mesin:** Run `#45904268616` pada tag `v0.5.16` — **LULUS** (`scripts/check_release_report.py --tag v0.5.16` lulus untuk 3 baris vonis + pernyataan `pengukuran penerimaan oleh Muse`; 5/5 job `success`).
+- **Halaman Rilis Publik:** https://github.com/bagusdanur/SelenCode/releases/tag/v0.5.16 (`draft = false`, 3 aset lengkap):
+  - `selen-linux-x64` (`16.951.600` byte)
+  - `selen-termux-arm64` (`15.260.600` byte)
+  - `selen-windows-x64.exe` (`15.645.184` byte)
