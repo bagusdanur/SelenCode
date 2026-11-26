@@ -32,7 +32,7 @@
   - 3 panggilan identik `list_files({})` berturut-turut: panggilan ke-1 & ke-2 bersih, panggilan ke-3 ditempeli `[PERINGATAN PENGULANGAN IDENTIK — 3x beruntun]`.
   - 5 panggilan berturut-turut `watch_job(status)` → `LoopWarning::None`.
 
-*(Transkrip uji LIVE biner `v0.5.14` untuk skenario paksa pagu kecil, pengulangan ke-3, dan pengulangan `pylint-6506` akan dilengkapi tepat setelah biner rilis diterbitkan.)*
+*(Uji LIVE pada biner rilis `v0.5.14` untuk skenario pagu kecil, pengulangan ke-3, dan `pylint-6506` diserahkan ke Muse atas instruksi pemilik.)*
 
 ---
 
@@ -53,7 +53,7 @@
   - **Kontrol tanpa verifikasi:** `write_file("helper.py")` tanpa perintah tes/repro → gerbang diam total (2 panggilan total, 0 suntikan).
   - **Batas 3 putaran + penutupan jujur:** tetap gagal 4× → gerbang menahan tepat 3 kali, lalu penutupan diterima dengan `[Status Verifikasi Akhir — GAGAL]` menyebut `node test_hitung.js`.
 
-*(Transkrip uji LIVE biner `v0.5.14` untuk tiga skenario gerbang dan pengulangan `sympy-24909` akan dilengkapi tepat setelah biner rilis diterbitkan.)*
+*(Uji LIVE pada biner rilis `v0.5.14` untuk tiga skenario gerbang dan `sympy-24909` diserahkan ke Muse atas instruksi pemilik.)*
 
 ---
 
@@ -66,15 +66,15 @@
 | Gerbang verifikasi (salah arah → hijau) | 2 penahanan (1 belum verif ulang + 1 keluaran mentah) → 31500 | LULUS |
 | Gerbang verifikasi (batas 3× jujur) | 3 penahanan maks + `[Status Verifikasi Akhir — GAGAL]` | LULUS |
 | Kontrol hijau & kontrol tanpa verifikasi | 0 suntikan gerbang (0 token tambahan) | LULUS |
-| Proyek A (`usage` LIVE) | Tidak diukur | Menunggu biner rilis |
-| Proyek B (`usage` LIVE) | Tidak diukur | Menunggu biner rilis |
-| Resume E (`usage` LIVE) | Tidak diukur | Menunggu biner rilis |
-| SWE-bench `pylint-6506` & `sympy-24909` | Tidak diukur | Menunggu biner rilis |
+| Proyek A (`usage` LIVE) | Tidak diukur | Diserahkan ke Muse |
+| Proyek B (`usage` LIVE) | Tidak diukur | Diserahkan ke Muse |
+| Resume E (`usage` LIVE) | Tidak diukur | Diserahkan ke Muse |
+| SWE-bench `pylint-6506` & `sympy-24909` | Tidak diukur | Diserahkan ke Muse |
 
-- Tidak diukur — Proyek A (`usage` LIVE): Laporan pra-tag diverifikasi lewat uji terintegrasi sebelum rilis; pengukuran LIVE dari tabel `usage` ditambahkan segera setelah biner `v0.5.14` terbit.
-- Tidak diukur — Proyek B (`usage` LIVE): Laporan pra-tag diverifikasi lewat uji terintegrasi sebelum rilis; pengukuran LIVE dari tabel `usage` ditambahkan segera setelah biner `v0.5.14` terbit.
-- Tidak diukur — Resume E (`usage` LIVE): Laporan pra-tag diverifikasi lewat uji terintegrasi sebelum rilis; pengukuran LIVE dari tabel `usage` ditambahkan segera setelah biner `v0.5.14` terbit.
-- Tidak diukur — SWE-bench `pylint-6506` & `sympy-24909`: Pengulangan LIVE terhadap biner rilis `v0.5.14` (`ag/gemini-4-neon-medium`) dijalankan segera setelah biner terbit dan hasilnya ditempelkan ke laporan ini.
+- Tidak diukur — Proyek A (`usage` LIVE): Pemilik meminta uji live (termasuk regresi A/B/E `usage`) dijalankan langsung oleh Muse memakai biner rilis `v0.5.14`; jalur non-pemicu (0 suntikan saat jauh dari pagu & tanpa verifikasi merah) terverifikasi lewat tes otomatis.
+- Tidak diukur — Proyek B (`usage` LIVE): Pemilik meminta uji live dijalankan langsung oleh Muse memakai biner rilis `v0.5.14`; jalur kontrol hijau & kontrol tanpa verifikasi terverifikasi 0 suntikan di tes otomatis.
+- Tidak diukur — Resume E (`usage` LIVE): Pemilik meminta uji live dijalankan langsung oleh Muse memakai biner rilis `v0.5.14`; jalur resume ramping (`v0.5.11`) tidak diubah dan lolos seluruh suite CI.
+- Tidak diukur — SWE-bench `pylint-6506` & `sympy-24909`: Pemilik meminta pengulangan uji live SWE-bench (`ag/gemini-4-neon-medium`) dijalankan langsung oleh Muse pada biner rilis `v0.5.14`.
 
 ---
 
@@ -85,3 +85,14 @@
 - Gerbang laporan rilis terperiksa mesin + format baris vonis (`scripts/check_release_report.py`, `v0.5.13`).
 - Mesin prune/stub + arsip byte-exact `skill_view(full=true)` (`src/agent/context.rs`, `v0.5.9`/`v0.5.13`).
 - Seluruh hasil `v0.5.7`–`v0.5.11`: timeout & watchdog gateway + trim memori sesi, `watch_job` + status segar + polling watch CLI, store memory tunggal, jalur resume ramping (`E = 6.013`), salinan kerja `skill_view`, peringatan config + `selen doctor`, pembatalan provider ~1× response timeout, disiplin riset/verifikasi + peta folder, isi daftar periksa penutup v0.5.8, `send_file`, `delegate_work`, `/usage`, `skills install`, fallback rute berbeda, `ask_user`, `cron`, `session_search`, pelacakan approval, serta 12 skill bawaan + `NOTICE`.
+
+---
+
+## Bukti CI & Rilis Publik `v0.5.14`
+
+- **CI GitHub Actions (Linux + Windows x64):** Run `#45886938200` pada commit `a2dddf5` — **LULUS** (`Cargo Test & Visual Render (Linux)` & `Cargo Test & Check (Windows x64)` keduanya `success`, termasuk seluruh tes `v0514_step_budget_and_verify_gate`).
+- **Release Workflow & Gerbang Laporan Rilis Mesin:** Run `#45889466602` pada tag `v0.5.14` — **LULUS** (`scripts/check_release_report.py --tag v0.5.14` lulus; 5/5 job `success`: `Unit & Integration Tests`, `Termux (aarch64-linux-android)`, `Linux x64`, `Windows x64`, `GitHub Release`).
+- **Halaman Rilis Publik:** https://github.com/bagusdanur/SelenCode/releases/tag/v0.5.14 (`draft = false`, 3 aset lengkap):
+  - `selen-linux-x64` (`16.907.376` byte)
+  - `selen-termux-arm64` (`15.218.680` byte)
+  - `selen-windows-x64.exe` (`15.599.104` byte)
