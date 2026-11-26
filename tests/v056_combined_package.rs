@@ -93,8 +93,14 @@ async fn bagian1_fallback_dead_model_400_no_fallback_and_non_sticky() {
     assert!(is_fallback_eligible_error("HTTP 503 Service Unavailable"));
     assert!(is_fallback_eligible_error("HTTP 401 Unauthorized: token rejected"));
     assert!(is_fallback_eligible_error("HTTP 404 model_not_found"));
+    assert!(is_fallback_eligible_error(
+        r#"provider membalas 404 Not Found: {"error":{"message":"No active credentials for provider: nonexistent","type":"invalid_request_error","code":"model_not_found"}}"#
+    ));
     assert!(is_fallback_eligible_error("request timed out"));
     assert!(!is_fallback_eligible_error("HTTP 400 Bad Request: malformed json"));
+    assert!(!is_fallback_eligible_error(
+        r#"provider membalas 400 Bad Request: {"error":{"type":"invalid_request_error","message":"invalid temperature"}}"#
+    ));
     assert!(!is_fallback_eligible_error("invalid_request_error: bad parameter"));
     assert!(!is_fallback_eligible_error("Ditolak user — approval dibatalkan"));
     assert!(!is_fallback_eligible_error("error misterius tidak dikenal"));

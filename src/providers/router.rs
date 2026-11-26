@@ -214,14 +214,15 @@ pub fn is_rate_limit_error(err: &str) -> bool {
 ///   pembatalan pengguna, atau error ambigu yang tidak dikenal.
 pub fn is_fallback_eligible_error(err: &str) -> bool {
     let low = err.to_ascii_lowercase();
-    // Tolak tegas 400 / kesalahan permintaan / pembatalan lokal terlebih dahulu!
+    // 1. Tolak tegas HTTP 400 / format rusak / konteks melebihi batas / pembatalan lokal.
+    //    Catatan: jangan menolak `"invalid_request"` sebelum mengecek 404/model_not_found/401/403,
+    //    karena gateway OpenAI-compatible (termasuk 9Router) membungkus 404 model mati di dalam
+    //    `{"type":"invalid_request_error","code":"model_not_found"}`.
     if contains_any(
         &low,
         &[
             "400",
             "bad request",
-            "invalid_request",
-            "invalid request",
             "malformed",
             "context_length_exceeded",
             "maximum context length",
@@ -237,8 +238,8 @@ pub fn is_fallback_eligible_error(err: &str) -> bool {
     if is_retryable_error(&low) {
         return true;
     }
-    // Upstream auth/quota rejection (401/403) atau model mati/tidak ditemukan (404)
-    contains_any(
+    // 2. Upstream auth/quota rejection (401/403), kredensial provider tidak aktif, atau model mati/tidak ditemukan (404).
+    if contains_any(
         &low,
         &[
             "401",
@@ -248,6 +249,7 @@ pub fn is_fallback_eligible_error(err: &str) -> bool {
             "insufficient_quota",
             "quota exceeded",
             "billing",
+            "no active credentials",
             "404",
             "model_not_found",
             "model not found",
@@ -257,7 +259,14 @@ pub fn is_fallback_eligible_error(err: &str) -> bool {
             "error sending request",
             "unexpected eof",
         ],
-    )
+    ) {
+        return true;
+    }
+    // 3. `invalid_request` murni tanpa status fallback yang sah tetap ditolak.
+    if contains_any(&low, &["invalid_request", "invalid request"]) {
+        return false;
+    }
+    false
 }
 
 /// Ringkas sebab kegagalan utama untuk pesan transparansi fallback 1 baris ke pengguna.
@@ -269,7 +278,16 @@ pub fn short_fallback_reason(err: &str) -> &'static str {
         "5xx provider"
     } else if contains_any(&low, &["401", "403", "unauthorized", "forbidden"]) {
         "401/403 kredensial"
-    } else if contains_any(&low, &["404", "model_not_found", "model not found", "does not exist"]) {
+    } else if contains_any(
+        &low,
+        &[
+            "404",
+            "model_not_found",
+            "model not found",
+            "does not exist",
+            "no active credentials",
+        ],
+    ) {
         "404 model tidak tersedia"
     } else if contains_any(&low, &["timeout", "timed out", "connection", "eof", "dns", "sending request"]) {
         "timeout/koneksi"
