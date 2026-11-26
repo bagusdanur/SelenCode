@@ -144,7 +144,7 @@ async fn perbaikan1_resume_lean_toolset_snapshot_and_on_demand_activation() {
         Message {
             role: Role::Tool,
             content: vec![Block::ToolResult {
-                tool_use_id: "tc1".into(),
+                id: "tc1".into(),
                 content: format!("OK: kata.txt ditulis.\n{}", "diff ".repeat(200)),
                 is_error: false,
             }],
