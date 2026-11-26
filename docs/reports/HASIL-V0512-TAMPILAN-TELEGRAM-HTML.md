@@ -73,3 +73,17 @@ Seluruh 6 contoh diverifikasi otomatis di `tests/telegram_html_rendering.rs::tel
 ## 4. Bagian yang Sengaja Tidak Diubah
 
 - Seluruh struktur pesan baru & kartu persetujuan Telegram (`v0.5.0`), timeout & watchdog gateway + batas memori (`v0.5.10`), pantauan `watch_job` & status segar (`v0.5.10`), gerbang skill level loop & konsistensi muat-ulang (`v0.5.11`), store memory tunggal & migrasi (`v0.5.9`), lantai resume ramping (`v0.5.7`/`v0.5.11`), peringatan kunci config & gerbang laporan rilis (`v0.5.11`), pembatalan timeout 1× (`v0.5.11`), serta tampilan Markdown terminal CLI/plain apa adanya.
+
+---
+
+## 5. Bukti CI, Rilis Publik `v0.5.12`, & Smoke Check Biner Live (**LULUS**)
+
+- **CI GitHub Actions (Linux + Windows x64):** Run `#45858670196` pada commit `1c8731d` — **LULUS** (`Cargo Test & Visual Render (Linux)` & `Cargo Test & Check (Windows x64)` keduanya `success`, termasuk 3 tes baru di `tests/telegram_html_rendering.rs`).
+- **Release Workflow & Gerbang Laporan Rilis:** Run `#45860194831` pada tag `v0.5.12` — **LULUS** (5/5 job `success`: `Unit & Integration Tests`, `Linux x64`, `Termux (aarch64-linux-android)`, `Windows x64`, `GitHub Release`).
+- **Halaman Rilis Publik:** https://github.com/bagusdanur/SelenCode/releases/tag/v0.5.12 (`draft = false`, 3 aset lengkap):
+  - `selen-linux-x64` (`16.868.688` byte)
+  - `selen-termux-arm64` (`15.186.728` byte)
+  - `selen-windows-x64.exe` (`15.565.312` byte)
+- **Smoke Check Ringan Biner Rilis (`selen-windows-x64.exe` `v0.5.12`):**
+  - `selen --version` → `selen 0.5.12`
+  - 1 giliran tanya-jawab normal (`selen --yes run "Jawab satu kalimat singkat: apa fungsi HTML escape pada Telegram?"`) → menjawab akurat dalam 1 kalimat dengan Markdown CLI normal (`<`, `>`, `&` tetap dalam backtick tanpa tag HTML bocor ke CLI).
