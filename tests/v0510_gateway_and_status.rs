@@ -13,14 +13,16 @@ use selencode::gateway_health::{
     trim_gateway_session_memory_with_limits, GatewayHealthClock, StallTracker, WatchdogVerdict,
 };
 use selencode::providers::openai::OpenAiProvider;
-use selencode::providers::router::{is_retryable_error, RoutedProvider, RouterTelemetry};
+use selencode::providers::router::{
+    is_retryable_error, DynamicRouterProvider, ModelRoute, RouterTelemetry,
+};
 use selencode::providers::{
     AssistantReply, Block, Message, Provider, ProviderTimeouts, Role, StreamEvent, ToolSpec, Usage,
 };
 use selencode::sandbox::SandboxController;
 use selencode::store::Store;
 use selencode::tools::toolsets::select_initial_toolsets;
-use selencode::tools::undo::{UndoStack, MAX_UNDO_TOTAL_BYTES};
+use selencode::tools::undo::{FileSnapshot, UndoStack, MAX_UNDO_TOTAL_BYTES};
 use selencode::tools::watch::WatchJob;
 use selencode::tools::{default_registry, Ctx, Tool};
 use selencode::watch::{
@@ -28,6 +30,7 @@ use selencode::watch::{
     poll_active_watches_for_cli, WatchStateKind,
 };
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -101,14 +104,13 @@ async fn p1_silent_provider_aborts_on_response_timeout_and_falls_back() {
         stream_idle: Duration::from_secs(1),
         total: Duration::from_secs(4),
     };
-    let silent_primary: Arc<dyn Provider> = Arc::new(
-        OpenAiProvider::new(
-            format!("http://{addr}/v1"),
-            "test-key".into(),
-            "silent-primary".into(),
-        )
-        .with_timeouts(short_timeouts),
-    );
+    let silent_primary: Arc<dyn Provider> = Arc::new(OpenAiProvider::with_timeouts(
+        format!("http://{addr}/v1"),
+        "test-key".into(),
+        "silent-primary".into(),
+        1024,
+        short_timeouts,
+    ));
 
     // 1. Panggilan langsung ke provider membisu HARUS gagal dalam ~1-2 detik (tidak menggantung!).
     let t0 = Instant::now();
@@ -128,7 +130,7 @@ async fn p1_silent_provider_aborts_on_response_timeout_and_falls_back() {
         "error timeout provider wajib dianggap retryable/fallback-eligible: {err_msg}"
     );
 
-    // 2. Lewat RoutedProvider: provider membisu otomatis dialihkan ke fallback dan permintaan sukses!
+    // 2. Lewat DynamicRouterProvider: provider membisu otomatis dialihkan ke fallback dan permintaan sukses!
     let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr2 = listener2.local_addr().unwrap();
     let server2 = tokio::spawn(async move {
@@ -138,27 +140,30 @@ async fn p1_silent_provider_aborts_on_response_timeout_and_falls_back() {
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
-    let primary2: Arc<dyn Provider> = Arc::new(
-        OpenAiProvider::new(
-            format!("http://{addr2}/v1"),
-            "test-key".into(),
-            "silent-primary-2".into(),
-        )
-        .with_timeouts(short_timeouts),
-    );
+    let primary2: Arc<dyn Provider> = Arc::new(OpenAiProvider::with_timeouts(
+        format!("http://{addr2}/v1"),
+        "test-key".into(),
+        "silent-primary-2".into(),
+        1024,
+        short_timeouts,
+    ));
     let fb_calls = Arc::new(AtomicUsize::new(0));
     let fallback: Arc<dyn Provider> = Arc::new(HealthyMockProvider {
         label: "fallback-ok".into(),
         calls: fb_calls.clone(),
     });
     let tel = Arc::new(Mutex::new(RouterTelemetry::default()));
-    let routed = RoutedProvider::new(
-        primary2,
-        vec![("fb".into(), fallback)],
-        true,
-        0, // tidak perlu retry ekstra, langsung jatuh ke fallback
+    let routed = DynamicRouterProvider::new(
+        vec![
+            ModelRoute::new("primary", "silent-primary-2", primary2, None, None, None, true),
+            ModelRoute::new("fb", "fallback-ok", fallback, None, None, None, false),
+        ],
+        false,
+        HashMap::new(),
+        0,
         tel.clone(),
-    );
+    )
+    .with_backoff_ms(10);
 
     let (tx2, _rx2) = mpsc::channel(8);
     let reply = routed
@@ -202,14 +207,13 @@ async fn p1_mid_stream_stalled_provider_aborts_on_stream_idle_and_falls_back() {
         stream_idle: Duration::from_secs(1),
         total: Duration::from_secs(10),
     };
-    let stalled_primary: Arc<dyn Provider> = Arc::new(
-        OpenAiProvider::new(
-            format!("http://{addr}/v1"),
-            "test-key".into(),
-            "stalled-stream".into(),
-        )
-        .with_timeouts(short_timeouts),
-    );
+    let stalled_primary: Arc<dyn Provider> = Arc::new(OpenAiProvider::with_timeouts(
+        format!("http://{addr}/v1"),
+        "test-key".into(),
+        "stalled-stream".into(),
+        1024,
+        short_timeouts,
+    ));
 
     let t0 = Instant::now();
     let (tx, mut rx) = mpsc::channel(16);
@@ -240,13 +244,17 @@ async fn p1_mid_stream_stalled_provider_aborts_on_stream_idle_and_falls_back() {
         calls: fb_calls.clone(),
     });
     let tel = Arc::new(Mutex::new(RouterTelemetry::default()));
-    let routed = RoutedProvider::new(
-        stalled_primary,
-        vec![("fb".into(), fallback)],
-        true,
+    let routed = DynamicRouterProvider::new(
+        vec![
+            ModelRoute::new("primary", "stalled-stream", stalled_primary, None, None, None, true),
+            ModelRoute::new("fb", "fallback-stream", fallback, None, None, None, false),
+        ],
+        false,
+        HashMap::new(),
         0,
         tel,
-    );
+    )
+    .with_backoff_ms(10);
     let (tx2, _rx2) = mpsc::channel(16);
     let reply = routed
         .stream_chat(&[Message::text(Role::User, "uji")], &[], tx2)
@@ -486,19 +494,19 @@ fn p1_os_watchdog_triggers_records_recovery_and_preserves_watches_and_cron() {
 fn p1_memory_bounds_cap_undo_stack_and_gateway_session_ram() {
     // 1. UndoStack tidak boleh melampaui pagu MAX_UNDO_TOTAL_BYTES (32 MB)
     let mut stack = UndoStack::default();
-    let big_payload = "A".repeat(6 * 1024 * 1024); // 6 MB per snapshot
+    let big_payload = vec![b'A'; 6 * 1024 * 1024]; // 6 MB per snapshot
     for i in 0..8 {
-        stack.record(
-            PathBuf::from(format!("file_{i}.txt")),
-            Some(big_payload.clone()),
-            Some("new".into()),
-            "write_file",
-        );
+        stack.record(FileSnapshot {
+            path: PathBuf::from(format!("file_{i}.txt")),
+            rel: format!("file_{i}.txt"),
+            before: Some(big_payload.clone()),
+            after: b"new".to_vec(),
+        });
     }
     assert!(
-        stack.approx_bytes() <= MAX_UNDO_TOTAL_BYTES,
+        stack.total_bytes() <= MAX_UNDO_TOTAL_BYTES,
         "UndoStack RAM ({}) wajib <= MAX_UNDO_TOTAL_BYTES ({})",
-        stack.approx_bytes(),
+        stack.total_bytes(),
         MAX_UNDO_TOTAL_BYTES
     );
 
