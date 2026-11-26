@@ -78,7 +78,7 @@ async fn p1_resume_followup_calls_stay_lean_and_lazy_toolsets_work() {
 
     // Seed sesi lama untuk uji `session_search` (tool malas di toolset `history`).
     let old_sid = store
-        .create_session(&dir.to_string_lossy(), "9router", "mock-model")
+        .create_session(&dir.to_string_lossy(), "9router", "mock-model", "sesi lama")
         .unwrap();
     store
         .save_message(
@@ -87,7 +87,7 @@ async fn p1_resume_followup_calls_stay_lean_and_lazy_toolsets_work() {
         )
         .unwrap();
     let cur_sid = store
-        .create_session(&dir.to_string_lossy(), "9router", "mock-model")
+        .create_session(&dir.to_string_lossy(), "9router", "mock-model", "sesi resume")
         .unwrap();
 
     struct InspectResumeProv {
@@ -310,7 +310,7 @@ async fn p2_loop_skill_gate_enforces_bug_and_tdd_and_consistent_reload() {
     let db_path = dir.join("selen.db");
     let store = Arc::new(Store::open_at(&db_path).unwrap());
     let sid = store
-        .create_session(&dir.to_string_lossy(), "9router", "mock-gate")
+        .create_session(&dir.to_string_lossy(), "9router", "mock-gate", "uji gate")
         .unwrap();
 
     struct SkipSkillEditProv {
