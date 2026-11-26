@@ -221,7 +221,7 @@ async fn p1_resume_followup_calls_stay_lean_and_lazy_toolsets_work() {
         &reg,
         &ctx,
         &mut msgs,
-        "Baca big.log lalu cari frasa ARSIP-V0511-OK dari sesi lain",
+        "Baca big.log lalu temukan frasa ARSIP-V0511-OK",
         8,
     )
     .await
@@ -352,8 +352,8 @@ async fn p2_loop_skill_gate_enforces_bug_and_tdd_and_consistent_reload() {
                         name: "edit_file".into(),
                         args: json!({
                             "path": "hitung_total.js",
-                            "old_text": "35000 - 10",
-                            "new_text": "35000 * 0.9"
+                            "old": "35000 - 10",
+                            "new": "35000 * 0.9"
                         }),
                     }],
                     finish_reason: Some("tool_calls".into()),
@@ -379,8 +379,8 @@ async fn p2_loop_skill_gate_enforces_bug_and_tdd_and_consistent_reload() {
                         name: "edit_file".into(),
                         args: json!({
                             "path": "hitung_total.js",
-                            "old_text": "35000 - 10",
-                            "new_text": "35000 * 0.9"
+                            "old": "35000 - 10",
+                            "new": "35000 * 0.9"
                         }),
                     }],
                     finish_reason: Some("tool_calls".into()),
