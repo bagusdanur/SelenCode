@@ -849,7 +849,12 @@ pub fn seed_builtin_skills_to(root: &Path) {
             (
                 "dev/systematic-debugging/SKILL.md",
                 "description: Debug 4 fase: temukan akar masalah dulu",
+                "description: WAJIB untuk bug/error/job gagal/ulang: debug 4 fase",
+            ),
+            (
+                "dev/systematic-debugging/SKILL.md",
                 "description: WAJIB untuk bug/error/salah hitung: debug 4 fase",
+                "description: WAJIB untuk bug/error/job gagal/ulang: debug 4 fase",
             ),
             (
                 "dev/test-driven-development/SKILL.md",

@@ -233,6 +233,8 @@ fn child_ctx_for_role(parent_ctx: &Ctx) -> Ctx {
         is_resumed_session: false,
         telegram_chat_id: None,
         tg_file_sender: None,
+        context_cfg: parent_ctx.context_cfg.clone(),
+        tool_preview_length: parent_ctx.tool_preview_length,
     }
 }
 

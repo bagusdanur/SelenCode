@@ -279,7 +279,7 @@ impl LoopGuard {
     }
 }
 
-/// Apakah perintah shell ini merupakan aksi verifikasi (test / build / check / lint)?
+/// Apakah perintah shell ini merupakan aksi verifikasi (test / build / check / lint / repro skrip)?
 fn is_verification_shell_cmd(args: &Value) -> bool {
     let Some(cmd) = args.get("command").and_then(|v| v.as_str()) else {
         return false;
@@ -306,9 +306,29 @@ fn is_verification_shell_cmd(args: &Value) -> bool {
         "make check",
         "unittest",
         "ruff check",
+        "node --test",
+        "node --check",
+        "python -m unittest",
+        "python3 -m unittest",
+        "python -m pytest",
+        "python3 -m pytest",
     ]
     .iter()
     .any(|kw| lower.contains(kw))
+}
+
+/// Apakah nama file terlihat seperti skrip sampah/repro sementara ciptaan sesi?
+fn is_scratch_repro_file(rel: &str) -> bool {
+    let fname = Path::new(rel)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    fname.starts_with("repro")
+        || fname.starts_with("tmp_")
+        || fname.starts_with("_tmp")
+        || fname.starts_with("debug_tmp")
+        || fname.ends_with(".tmp")
 }
 
 /// Apakah ekstensi file termasuk kode sumber yang idealnya diverifikasi setelah diedit?
@@ -327,24 +347,30 @@ fn is_code_file(rel: &str) -> bool {
 #[derive(Debug)]
 pub struct SelfCorrectState {
     pub edited_files: Vec<String>,
+    /// File baru yang dibuat via `write_file` sepanjang giliran ini (untuk daftar periksa sampah/repro SWE-agent).
+    pub created_files: Vec<String>,
     pub edited_code_file: bool,
     pub verified_after_last_edit: bool,
     pub last_verify_passed: Option<bool>,
     pub repair_attempts: usize,
     pub max_attempts: usize,
     pub checkpoint_id: Option<usize>,
+    /// True sesudah daftar periksa penutup SWE-agent (`review_on_submit`) dijalankan sekali.
+    pub checklist_checked: bool,
 }
 
 impl Default for SelfCorrectState {
     fn default() -> Self {
         Self {
             edited_files: Vec::new(),
+            created_files: Vec::new(),
             edited_code_file: false,
             verified_after_last_edit: false,
             last_verify_passed: None,
             repair_attempts: 0,
             max_attempts: MAX_REPAIR_ATTEMPTS,
             checkpoint_id: None,
+            checklist_checked: false,
         }
     }
 }
@@ -373,6 +399,9 @@ impl SelfCorrectState {
                 if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
                     if !self.edited_files.iter().any(|p| p == path) {
                         self.edited_files.push(path.to_string());
+                    }
+                    if name == "write_file" && !self.created_files.iter().any(|p| p == path) {
+                        self.created_files.push(path.to_string());
                     }
                     if is_code_file(path) {
                         self.edited_code_file = true;
@@ -458,5 +487,66 @@ impl SelfCorrectState {
             ));
         }
         None
+    }
+
+    /// Daftar periksa penutup tugas coding ala SWE-agent `review_on_submit` (Perbaikan 2 #4 v0.5.8):
+    /// (a) verifikasi terakhir (tes/repro/bukti) WAJIB dijalankan SETELAH perubahan terakhir;
+    /// (b) berkas sampah/repro sementara ciptaan sesi dibersihkan atau disebutkan eksplisit;
+    /// (c) jawaban akhir menyebut berkas yang diubah sebagai ringkasan perubahan.
+    pub fn completion_gate_with_checklist(
+        &mut self,
+        remaining_steps: usize,
+        final_reply: &str,
+        cwd: &Path,
+    ) -> Option<String> {
+        if let Some(base_gate) = self.completion_gate(remaining_steps) {
+            return Some(base_gate);
+        }
+        if !self.edited_code_file || self.checklist_checked || remaining_steps < 2 {
+            return None;
+        }
+        // Cari berkas sampah/repro yang dibuat sesi ini, masih ada di disk, dan belum disebut di jawaban.
+        let lingering_scratch: Vec<String> = self
+            .created_files
+            .iter()
+            .filter(|rel| {
+                is_scratch_repro_file(rel)
+                    && cwd.join(rel).exists()
+                    && !final_reply.contains(rel.as_str())
+            })
+            .cloned()
+            .collect();
+        // Cek apakah jawaban akhir sudah menyebut minimal satu berkas kode yang diubah.
+        let mentions_edited = self.edited_files.iter().any(|f| {
+            let base = Path::new(f)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(f.as_str());
+            final_reply.contains(f.as_str()) || final_reply.contains(base)
+        });
+
+        if lingering_scratch.is_empty() && mentions_edited {
+            self.checklist_checked = true;
+            return None;
+        }
+        self.checklist_checked = true;
+        let mut items = Vec::new();
+        if !lingering_scratch.is_empty() {
+            items.push(format!(
+                "berkas sementara/repro masih tersisa ({}) — hapus jika tidak diperlukan atau sebutkan secara eksplisit",
+                lingering_scratch.join(", ")
+            ));
+        }
+        if !mentions_edited {
+            items.push(format!(
+                "sebutkan ringkasan perubahan beserta daftar berkas yang diubah ({})",
+                self.edited_files.join(", ")
+            ));
+        }
+        Some(format!(
+            "[Daftar Periksa Penutup] Sebelum menyatakan selesai: {}. \
+             Jangan menjalankan ulang tes yang sudah lulus bila tidak ada edit baru.",
+            items.join("; ")
+        ))
     }
 }

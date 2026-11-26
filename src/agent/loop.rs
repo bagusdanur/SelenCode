@@ -7,11 +7,15 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::context::{
-    analyze_token_breakdown, auto_outline, build_resume_snapshot, build_system_prompt,
-    cap_dynamic_injection, compact_messages_hermes, estimate_tokens, expand_at_mentions,
-    format_memories_section, head_tail_truncate, needs_compaction,
+    analyze_token_breakdown, auto_outline, build_folder_map, build_resume_snapshot,
+    build_system_prompt, cap_dynamic_injection, compact_messages_hermes, estimate_tokens,
+    expand_at_mentions, format_memories_section, head_tail_truncate, needs_compaction,
     prune_old_tool_results_with_archive, session_archive_dir, spillover_if_needed,
     spillover_with_preview,
+};
+use crate::tool_display::{
+    build_template_closing_summary, format_tool_event_from_preview, prepare_tool_preview,
+    short_error_reason, ToolActionEvent,
 };
 use super::corrector::{LoopGuard, SelfCorrectState, ToolDedupCache};
 use super::plan::{is_read_only, TurnMode, PLAN_NOTE};
@@ -184,7 +188,8 @@ async fn run_turn_inner(
     // Helper lokal untuk menyusun System Prompt + Konteks Sesi (Snapshot Awal) yang identik untuk sesi baru
     // maupun penyegaran snapshot resume ramping.
     let build_fresh_system_prompt = |cur_tools: &[crate::providers::ToolSpec],
-                                     cur_active: &std::collections::HashSet<String>|
+                                     cur_active: &std::collections::HashSet<String>,
+                                     include_folder_map: bool|
      -> String {
         let mut sys = build_system_prompt(&ctx.cwd, cur_tools);
         let mut dynamic_snapshot = String::new();
@@ -197,6 +202,15 @@ async fn run_turn_inner(
             .skills
             .index_max_tokens
             .unwrap_or(ctx.tool_budget.dynamic_inject_max_tokens);
+        // Perbaikan 1 Lapis A2 (v0.5.8): peta folder kerja + simbol kunci (pagu ~300 token)
+        // disiapkan oleh harness pada awal sesi baru bila `[context] folder_map = true`.
+        if include_folder_map && ctx.context_cfg.folder_map {
+            let fmap = build_folder_map(&ctx.cwd, ctx.context_cfg.folder_map_max_tokens);
+            if !fmap.is_empty() {
+                dynamic_snapshot.push_str(&fmap);
+                dynamic_snapshot.push('\n');
+            }
+        }
         let skills_idx = crate::skills::format_skills_index_budgeted(&installed_skills, dyn_cap);
         if !skills_idx.is_empty() {
             dynamic_snapshot.push_str(&skills_idx);
@@ -232,10 +246,10 @@ async fn run_turn_inner(
     };
 
     // Tahap 3 & Tahap 6 & Skills Tahap 2: Bekukan System Prompt statis di awal sesi (byte-identik),
-    // diikuti snapshot blok dinamis (toolsets + indeks skills maks 60 char/item + indeks MCP + memori beku).
+    // diikuti snapshot blok dinamis (toolsets + peta folder kerja + indeks skills + indeks MCP + memori beku).
     let mut auto_loaded_skill_msgs: Vec<Message> = Vec::new();
     if messages.is_empty() {
-        let sys = build_fresh_system_prompt(&tools, &active_toolsets);
+        let sys = build_fresh_system_prompt(&tools, &active_toolsets, true);
         let sys_msg = Message::text(Role::System, sys);
         persist_message(ctx, &sys_msg);
         messages.push(sys_msg);
@@ -356,6 +370,8 @@ async fn run_turn_inner(
     let mut last_announced_fallback_model: Option<String> = None;
     let mut unconfirmed_search_calls: usize = 0;
     let mut anti_spin_reminded = false;
+    let mut turn_actions: Vec<ToolActionEvent> = Vec::new();
+    let mut forced_stop_reason: Option<String> = None;
 
     for step in 0..max_steps {
         // Tahap 1 — Prune hasil tool lama (>200 char di luar 20 pesan terakhir) + arsip ke file (TANPA LLM).
@@ -372,10 +388,10 @@ async fn run_turn_inner(
             }
             *messages = compact_messages_hermes(messages);
         }
-        // Perbaikan 1 (v0.5.7): untuk sesi RESUME, bangun snapshot ramping (system prompt segar +
-        // ringkas riwayat tool giliran sebelumnya) tanpa mengubah riwayat mentah di DB!
+        // Perbaikan 1 (v0.5.7): untuk sesi RESUME, bangun snapshot ramping (system prompt segar tanpa
+        // folder_map ulang + ringkas riwayat tool giliran sebelumnya) tanpa mengubah riwayat mentah di DB!
         let mut snapshot = if lean_resume {
-            let fresh_sys = build_fresh_system_prompt(&tools, &active_toolsets);
+            let fresh_sys = build_fresh_system_prompt(&tools, &active_toolsets, false);
             build_resume_snapshot(messages, Some(&fresh_sys))
         } else {
             messages.clone()
@@ -511,15 +527,18 @@ async fn run_turn_inner(
         }
 
         if reply.tool_calls.is_empty() {
-            // Self-Correction Gate (Tahap 1): bila file kode baru diubah tetapi belum
-            // diverifikasi (atau verifikasi terakhir gagal), arahkan agent memverifikasi
-            // & memperbaiki sebelum menyatakan selesai (maks MAX_REPAIR_ATTEMPTS siklus).
+            // Self-Correction Gate (Tahap 1) + Daftar Periksa Penutup ala SWE-agent (Perbaikan 2 #4 v0.5.8):
+            // verifikasi terakhir WAJIB sesudah edit terakhir, berkas sampah/repro dicek, & ringkasan menyebut file diubah.
             if ctx.self_correct && mode == TurnMode::Execute {
-                if let Some(gate_msg) = corrector.completion_gate(max_steps.saturating_sub(step + 1)) {
+                if let Some(gate_msg) = corrector.completion_gate_with_checklist(
+                    max_steps.saturating_sub(step + 1),
+                    &last_text,
+                    &ctx.cwd,
+                ) {
                     let info = format!(
-                        "✦ Self-correction ({}/{}): memverifikasi perubahan sebelum selesai…",
-                        corrector.repair_attempts,
-                        corrector.max_attempts
+                        "✦ Self-correction ({}/{}): memeriksa verifikasi & daftar periksa penutup…",
+                        corrector.repair_attempts.max(1),
+                        corrector.max_attempts.max(1)
                     );
                     match &ui {
                         Some(tx) => {
@@ -584,18 +603,26 @@ async fn run_turn_inner(
         }
 
         // Jalankan tool satu per satu; error -> ToolResult is_error.
+        // Catat apakah giliran ini melakukan pencarian ter-batch (maks +1 terhadap guard anti-berputar
+        // per giliran assistant agar riset ter-batch paralel TIDAK dihukum — Perbaikan 1 Lapis A #3).
         let mut results: Vec<Block> = Vec::new();
+        let mut step_had_search = false;
+        let mut step_asked_user = false;
         for call in &reply.tool_calls {
+            let preview_arg = prepare_tool_preview(&call.name, &call.args, ctx.tool_preview_length);
             match &ui {
                 Some(tx) => {
                     let _ = tx
                         .send(UiEvent::ToolStart {
                             name: call.name.clone(),
-                            args: summarize(&call.args.to_string(), 120),
+                            args: preview_arg.clone(),
                         })
                         .await;
                 }
-                None => eprintln!("[tool] {} {}", call.name, call.args),
+                None => eprintln!(
+                    "[tool] {}",
+                    format_tool_event_from_preview(&call.name, &preview_arg)
+                ),
             }
             // Redaksi rahasia diterapkan di SATU titik pusat ini (Fase 2):
             // semua output tool — sekarang dan yang akan datang — teredaksi
@@ -821,34 +848,22 @@ async fn run_turn_inner(
                     None => eprintln!("[selen] {note}"),
                 }
             }
-            // BAGIAN 2 (#4): Aturan anti-berputar — setelah >5 panggilan pencarian/eksplorasi tanpa konfirmasi,
-            // aktifkan toolset `clarify` dan instruksikan model BERHENTI mencari buta lalu bertanya ke user.
+            // Rekam aksi teredaksi untuk ringkasan penutup (Perbaikan 2) & blok aksi (Perbaikan 3).
+            turn_actions.push(ToolActionEvent {
+                name: call.name.clone(),
+                preview: preview_arg.clone(),
+                is_error,
+                error_reason: is_error.then(|| short_error_reason(&content)),
+            });
+            // BAGIAN 2 (#4) & Perbaikan 1 Lapis A (#3): hitung pencarian per giliran assistant (bukan per tool)
+            // agar riset ter-batch (mis. 4 baca paralel dalam 1 giliran) tidak memicu false-positive anti-spin.
             if call.name == "ask_user" {
-                unconfirmed_search_calls = 0;
-                anti_spin_reminded = false;
+                step_asked_user = true;
             } else if matches!(
                 call.name.as_str(),
                 "search_text" | "list_files" | "run_shell" | "fetch_url"
             ) {
-                unconfirmed_search_calls += 1;
-                if unconfirmed_search_calls >= 5
-                    && !anti_spin_reminded
-                    && registry.get("ask_user").is_some()
-                {
-                    anti_spin_reminded = true;
-                    if active_toolsets.insert("clarify".to_string()) {
-                        tools = crate::tools::toolsets::active_tool_specs_with_mcp(
-                            registry,
-                            &active_toolsets,
-                            &loaded_mcp_tools,
-                            mode,
-                        );
-                    }
-                    content.push_str(
-                        "\n\n[GUARD ANTI-BERPUTAR] Kamu sudah melakukan 5 panggilan pencarian/eksplorasi tanpa kandidat terkonfirmasi. \
-                         DILARANG melanjutkan pencarian buta — berhenti sekarang dan panggil `ask_user` dengan kandidat terbaik yang sudah ditemukan sebagai pilihan (maks 4).",
-                    );
-                }
+                step_had_search = true;
             }
             if let Some(tx) = &ui {
                 let _ = tx
@@ -904,6 +919,34 @@ async fn run_turn_inner(
                 is_error,
             });
         }
+        // Perbarui counter anti-berputar per giliran (bukan per tool paralel).
+        if step_asked_user {
+            unconfirmed_search_calls = 0;
+            anti_spin_reminded = false;
+        } else if step_had_search {
+            unconfirmed_search_calls += 1;
+            if unconfirmed_search_calls >= 5
+                && !anti_spin_reminded
+                && registry.get("ask_user").is_some()
+            {
+                anti_spin_reminded = true;
+                if active_toolsets.insert("clarify".to_string()) {
+                    tools = crate::tools::toolsets::active_tool_specs_for_turn(
+                        registry,
+                        &active_toolsets,
+                        &loaded_mcp_tools,
+                        mode,
+                        lean_resume,
+                    );
+                }
+                if let Some(Block::ToolResult { content, .. }) = results.last_mut() {
+                    content.push_str(
+                        "\n\n[GUARD ANTI-BERPUTAR] Kamu sudah melakukan 5 giliran pencarian/eksplorasi tanpa kandidat terkonfirmasi. \
+                         DILARANG melanjutkan pencarian buta — berhenti sekarang dan panggil `ask_user` dengan kandidat terbaik yang sudah ditemukan sebagai pilihan (maks 4).",
+                    );
+                }
+            }
+        }
         let tool_msg = Message {
             role: Role::Tool,
             content: results,
@@ -920,9 +963,7 @@ async fn run_turn_inner(
                 }
                 None => eprintln!("[selen] {stop_note}"),
             }
-            if last_text.trim().is_empty() {
-                last_text = stop_note.to_string();
-            }
+            forced_stop_reason = Some("stagnasi beruntun".to_string());
             break;
         }
 
@@ -931,13 +972,58 @@ async fn run_turn_inner(
                 Some(tx) => {
                     let _ = tx
                         .send(UiEvent::Info(format!(
-                            "max_steps ({max_steps}) tercapai — berhenti."
+                            "max_steps ({max_steps}) tercapai — menyusun ringkasan penutup…"
                         )))
                         .await;
                 }
-                None => eprintln!("[selen] max_steps ({max_steps}) tercapai — berhenti."),
+                None => eprintln!("[selen] max_steps ({max_steps}) tercapai — menyusun ringkasan penutup…"),
             }
+            forced_stop_reason = Some(format!("batas langkah ({max_steps}) tercapai"));
         }
+    }
+
+    // Perbaikan 2 (v0.5.8): Giliran terpotong (max_steps / stagnasi) TIDAK BOLEH berakhir pada
+    // pesan ToolResult kosong tanpa ringkasan penutup untuk pengguna!
+    if let Some(stop_reason) = forced_stop_reason {
+        let mut summary_msgs = messages.clone();
+        summary_msgs.push(Message::text(
+            Role::User,
+            format!(
+                "[Ringkasan Penutup Wajib — {stop_reason}] Giliran berhenti di tengah jalan. \
+                 Tulis ringkasan penutup singkat untuk pengguna: (1) yang sudah dikerjakan & hasilnya, \
+                 (2) yang sedang berjalan termasuk ID job/proses bila ada, (3) langkah berikutnya atau kendalanya. \
+                 Jangan memanggil tool."
+            ),
+        ));
+        let (stx, _srx) = mpsc::channel::<StreamEvent>(64);
+        let p_close = provider.clone();
+        let closing_res = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            p_close.stream_chat(&summary_msgs, &[], stx),
+        )
+        .await;
+        let closing_text = match closing_res {
+            Ok(Ok(rep)) if !rep.text.trim().is_empty() => {
+                if let Some(u) = rep.usage {
+                    persist_usage_kind(ctx, provider.model_name(), Some(u), "main");
+                    turn_usage.input_tokens += u.input_tokens;
+                    turn_usage.output_tokens += u.output_tokens;
+                    have_usage = true;
+                }
+                rep.text.trim().to_string()
+            }
+            _ => build_template_closing_summary(&turn_actions, &stop_reason),
+        };
+        let closing_msg = Message::text(Role::Assistant, closing_text.clone());
+        persist_message(ctx, &closing_msg);
+        messages.push(closing_msg);
+        match &ui {
+            Some(tx) => {
+                let _ = tx.send(UiEvent::Token(closing_text.clone())).await;
+            }
+            None => println!("{closing_text}"),
+        }
+        last_text = closing_text;
     }
     if let Some(cp_id) = turn_checkpoint_id {
         if corrector.edited_files.is_empty() {

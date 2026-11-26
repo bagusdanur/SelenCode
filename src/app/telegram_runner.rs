@@ -1137,10 +1137,11 @@ async fn handle_telegram_chat_message(
     let hub_for_col = hub.clone();
     let max_steps_ui = s.cfg.agent.max_steps;
     let collector = tokio::spawn(async move {
-        let mut tools: Vec<String> = Vec::new();
+        let mut tool_events: Vec<selencode::tool_display::ToolActionEvent> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
         let mut cur_step: usize = 0;
-        let mut active_tool: Option<String> = None;
+        let mut active_tool_display: Option<String> = None;
+        let mut active_tool_preview = String::new();
         let mut live_preview = String::new();
         let mut last_edit = Instant::now()
             .checked_sub(Duration::from_secs(2))
@@ -1169,8 +1170,11 @@ async fn handle_telegram_chat_message(
                     }
                     changed = true;
                 }
-                UiEvent::ToolStart { name, .. } => {
-                    active_tool = Some(name);
+                UiEvent::ToolStart { name, args } => {
+                    active_tool_preview = args.clone();
+                    active_tool_display = Some(
+                        selencode::tool_display::format_tool_event_from_preview(&name, &args),
+                    );
                     live_preview.clear();
                     changed = true;
                 }
@@ -1179,13 +1183,15 @@ async fn handle_telegram_chat_message(
                     summary,
                     is_error,
                 } => {
-                    active_tool = None;
-                    let short: String = summary.chars().take(70).collect();
-                    if is_error {
-                        tools.push(format!("{name} — gagal: {short}"));
-                    } else {
-                        tools.push(format!("{name} — {short}"));
-                    }
+                    active_tool_display = None;
+                    let preview = std::mem::take(&mut active_tool_preview);
+                    tool_events.push(selencode::tool_display::ToolActionEvent {
+                        name,
+                        preview,
+                        is_error,
+                        error_reason: is_error
+                            .then(|| selencode::tool_display::short_error_reason(&summary)),
+                    });
                     changed = true;
                 }
                 UiEvent::Info(info) if info.starts_with("Model utama gagal") => {
@@ -1207,8 +1213,8 @@ async fn handle_telegram_chat_message(
                         let html = format_telegram_progress_html(
                             cur_step,
                             max_steps_ui,
-                            active_tool.as_deref(),
-                            tools.len(),
+                            active_tool_display.as_deref(),
+                            tool_events.len(),
                             &live_preview,
                         );
                         if html != last_sent_html {
@@ -1222,7 +1228,7 @@ async fn handle_telegram_chat_message(
                 }
             }
         }
-        (tools, notes)
+        (tool_events, notes)
     });
 
     let turn_res = tokio::select! {
@@ -1240,7 +1246,7 @@ async fn handle_telegram_chat_message(
 
     typing_stop.notify_waiters();
     let _ = typing_task.await;
-    let (tools, notes) = collector.await.unwrap_or_default();
+    let (tool_events, notes) = collector.await.unwrap_or_default();
     if let Ok(mut map) = active_progress.lock() {
         map.remove(&chat_id);
     }
@@ -1274,6 +1280,14 @@ async fn handle_telegram_chat_message(
         }
     };
     let mut answer_md = answer.trim().to_string();
+    // Perbaikan 2 (v0.5.8): jaring pengaman gateway — bila jawaban akhir masih kosong sesudah aksi tool,
+    // susun ringkasan templat dari daftar aksi sehingga Telegram tidak pernah mengirim blok aksi kosong.
+    if answer_md.is_empty() && !tool_events.is_empty() {
+        answer_md = selencode::tool_display::build_template_closing_summary(
+            &tool_events,
+            "giliran berakhir",
+        );
+    }
     for note in &notes {
         if !answer_md.is_empty() {
             answer_md.push_str("\n\n");
@@ -1281,15 +1295,17 @@ async fn handle_telegram_chat_message(
         answer_md.push_str(&format!("> {note}"));
     }
 
-    let total_tools = tools.len();
+    let (total_tools, summary_lines) = selencode::tool_display::build_action_summary_lines(
+        &tool_events,
+        selencode::tool_display::DEFAULT_ACTION_BLOCK_MAX_LINES,
+    );
 
-    // Perbaikan 1 (#1, #4, #5) & Perbaikan 4 (#4):
-    // Jawaban akhir SELALU dikirim sebagai PESAN BARU (`sendMessage`) agar urutan kronologis benar
-    // (muncul paling bawah sesudah pesan approval) dan memicu notifikasi Telegram.
-    if !tools.is_empty() {
-        let shown: Vec<String> = tools
+    // Perbaikan 1 (#1, #4, #5) & Perbaikan 3 v0.5.8:
+    // Jawaban akhir SELALU dikirim sebagai PESAN BARU (`sendMessage`) dengan blok `Aksi Tool (N)`
+    // yang menampilkan pratinjau argumen teredaksi, penggabungan pengulangan, & semua baris gagal.
+    if total_tools > 0 {
+        let shown: Vec<String> = summary_lines
             .into_iter()
-            .take(10)
             .map(|t| escape_telegram_html(&t))
             .collect();
         let tool_block = format!(

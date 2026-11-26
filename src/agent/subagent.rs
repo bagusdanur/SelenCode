@@ -99,6 +99,11 @@ pub async fn run_subagent(
         is_resumed_session: false,
         telegram_chat_id: None,
         tg_file_sender: None,
+        context_cfg: crate::config::ContextCfg {
+            folder_map: false,
+            ..parent_ctx.context_cfg.clone()
+        },
+        tool_preview_length: parent_ctx.tool_preview_length,
     };
     let mut messages = vec![Message::text(
         Role::System,
@@ -163,6 +168,11 @@ pub async fn run_worktree_subagent(
         is_resumed_session: false,
         telegram_chat_id: None,
         tg_file_sender: None,
+        context_cfg: crate::config::ContextCfg {
+            folder_map: false,
+            ..parent_ctx.context_cfg.clone()
+        },
+        tool_preview_length: parent_ctx.tool_preview_length,
     };
 
     let mut messages = vec![Message::text(

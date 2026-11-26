@@ -92,6 +92,10 @@ pub struct Ctx {
     pub telegram_chat_id: Option<i64>,
     /// Pengirim lampiran berkas Telegram untuk tool `send_file` (None di CLI, Perbaikan 4 v0.5.7).
     pub tg_file_sender: Option<Arc<send_file::TgFileSender>>,
+    /// Konfigurasi peta folder kerja otomatis (`[context]`, Perbaikan 1 Lapis A2 v0.5.8).
+    pub context_cfg: crate::config::ContextCfg,
+    /// Panjang maksimum pratinjau argumen utama tool (`[display]`, Perbaikan 3 v0.5.8).
+    pub tool_preview_length: usize,
 }
 
 impl Ctx {
@@ -126,7 +130,17 @@ impl Ctx {
             is_resumed_session: false,
             telegram_chat_id: None,
             tg_file_sender: None,
+            context_cfg: crate::config::ContextCfg::default(),
+            tool_preview_length: crate::tool_display::DEFAULT_TOOL_PREVIEW_LENGTH,
         }
+    }
+    pub fn with_context_cfg(mut self, cfg: crate::config::ContextCfg) -> Self {
+        self.context_cfg = cfg;
+        self
+    }
+    pub fn with_tool_preview_length(mut self, len: usize) -> Self {
+        self.tool_preview_length = len.max(12);
+        self
     }
     pub fn with_memory_cfg(mut self, cfg: crate::config::MemoryCfg) -> Self {
         self.memory_cfg = cfg;

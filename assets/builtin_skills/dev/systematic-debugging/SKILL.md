@@ -1,6 +1,6 @@
 ---
 name: systematic-debugging
-description: WAJIB untuk bug/error/salah hitung: debug 4 fase
+description: WAJIB untuk bug/error/job gagal/ulang: debug 4 fase
 version: 1.0.0
 tags: [debugging, root-cause, diagnostics, testing]
 ---

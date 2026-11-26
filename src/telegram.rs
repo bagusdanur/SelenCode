@@ -728,7 +728,15 @@ pub fn format_telegram_progress_html(
         parts.push(step_tag);
     }
     if let Some(tool) = active_tool {
-        parts.push(format!("<code>{}</code>", escape_telegram_html(tool)));
+        if let Some((tname, tprev)) = tool.split_once(" — ") {
+            parts.push(format!(
+                "<code>{}</code> — <code>{}</code>",
+                escape_telegram_html(tname),
+                escape_telegram_html(tprev)
+            ));
+        } else {
+            parts.push(format!("<code>{}</code>", escape_telegram_html(tool)));
+        }
     }
     let mut out = if parts.is_empty() {
         "<b>Sedang bekerja...</b>".to_string()

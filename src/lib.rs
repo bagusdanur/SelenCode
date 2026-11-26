@@ -17,6 +17,7 @@ pub mod skill_installer;
 pub mod skills;
 pub mod store;
 pub mod telegram;
+pub mod tool_display;
 pub mod tools;
 pub mod tui;
 pub mod update;

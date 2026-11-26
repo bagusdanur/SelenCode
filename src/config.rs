@@ -50,6 +50,72 @@ pub struct Config {
     /// Konfigurasi pagu memori persisten & profil pemilik (`[memory]`, v0.5.7 Perbaikan 5).
     #[serde(default, skip_serializing_if = "MemoryCfg::is_default")]
     pub memory: MemoryCfg,
+    /// Konfigurasi peta folder kerja otomatis (`[context]`, v0.5.8 Perbaikan 1 Lapis A2).
+    #[serde(default, skip_serializing_if = "ContextCfg::is_default")]
+    pub context: ContextCfg,
+    /// Konfigurasi tampilan aksi tool (`[display]`, v0.5.8 Perbaikan 3).
+    #[serde(default, skip_serializing_if = "DisplayCfg::is_default")]
+    pub display: DisplayCfg,
+}
+
+/// Konfigurasi konteks harness (`[context]`, v0.5.8 Perbaikan 1 Lapis A2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextCfg {
+    /// Sertakan peta folder kerja ringkas + simbol kunci di snapshot awal sesi (default: true).
+    #[serde(default = "default_context_folder_map")]
+    pub folder_map: bool,
+    /// Pagu token maksimum peta folder kerja (default: 300 token).
+    #[serde(default = "default_folder_map_max_tokens")]
+    pub folder_map_max_tokens: usize,
+}
+
+fn default_context_folder_map() -> bool {
+    true
+}
+
+fn default_folder_map_max_tokens() -> usize {
+    300
+}
+
+impl Default for ContextCfg {
+    fn default() -> Self {
+        Self {
+            folder_map: default_context_folder_map(),
+            folder_map_max_tokens: default_folder_map_max_tokens(),
+        }
+    }
+}
+
+impl ContextCfg {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Konfigurasi tampilan pratinjau aksi tool (`[display]`, v0.5.8 Perbaikan 3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisplayCfg {
+    /// Panjang maksimum pratinjau argumen utama tool (default: 40 karakter, meniru Hermes).
+    #[serde(default = "default_tool_preview_length")]
+    pub tool_preview_length: usize,
+}
+
+fn default_tool_preview_length() -> usize {
+    crate::tool_display::DEFAULT_TOOL_PREVIEW_LENGTH
+}
+
+impl Default for DisplayCfg {
+    fn default() -> Self {
+        Self {
+            tool_preview_length: default_tool_preview_length(),
+        }
+    }
+}
+
+impl DisplayCfg {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Konfigurasi memori pengguna persisten (`[memory]`, v0.5.7 Perbaikan 5).
@@ -927,6 +993,8 @@ impl Config {
             fallback: FallbackCfg::default(),
             ask: AskCfg::default(),
             memory: MemoryCfg::default(),
+            context: ContextCfg::default(),
+            display: DisplayCfg::default(),
         }
     }
 

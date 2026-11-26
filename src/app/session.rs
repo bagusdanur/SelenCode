@@ -253,6 +253,8 @@ impl Session {
             .with_router_telemetry(router_telemetry.clone())
             .with_ask_timeout_only(cfg.ask.timeout_secs)
             .with_memory_cfg(cfg.memory.clone())
+            .with_context_cfg(cfg.context.clone())
+            .with_tool_preview_length(cfg.display.tool_preview_length)
             .with_frozen_user_memory(frozen_user_mem)
             .with_resumed_session(is_resumed)
             .with_store(store.clone(), session_id.clone());
