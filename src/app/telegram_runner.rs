@@ -15,7 +15,8 @@ use selencode::repl::{
 use selencode::security::{ApprovalMode, ApprovalRequest};
 use selencode::telegram::{
     escape_telegram_html, format_telegram_progress_html, markdown_to_telegram_html,
-    parse_callback_review, TelegramClient, TgApprovalHub, TgAskHub, TELEGRAM_BOT_COMMANDS,
+    parse_callback_review, TelegramClient, TgApprovalHub, TgAskHub, TypingLoopGuard,
+    TELEGRAM_BOT_COMMANDS,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -737,12 +738,28 @@ async fn handle_telegram_chat_message(
         IncomingTgPayload::Photo { .. } => false,
     };
 
+    // Pengawal abort-on-drop untuk task per-giliran agar tidak ada satu pun task yang pernah ter-detach yatim.
+    struct AbortTaskOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+    impl<T> AbortTaskOnDrop<T> {
+        fn abort_now(&mut self) {
+            if let Some(h) = self.0.take() {
+                h.abort();
+            }
+        }
+    }
+    impl<T> Drop for AbortTaskOnDrop<T> {
+        fn drop(&mut self) {
+            self.abort_now();
+        }
+    }
+
     // Umpan balik instan (<300ms): indikator mengetik + gelembung status sementara polos tanpa emoji dekoratif.
     let mut progress_msg_id: Option<i64> = None;
     let tg_typing_init = tg.clone();
-    tokio::spawn(async move {
-        tg_typing_init.send_typing(chat_id).await;
-    });
+    let mut typing_init_guard = AbortTaskOnDrop(Some(tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(5), tg_typing_init.send_typing(chat_id))
+            .await;
+    })));
     if !is_slash_cmd {
         let initial_html = match &payload {
             IncomingTgPayload::Photo { .. } => "<i>Mengunduh foto...</i>",
@@ -1241,27 +1258,21 @@ async fn handle_telegram_chat_message(
 
     // Giliran agent normal: indikator mengetik tiap 4s + gelembung progres sementara
     // (otomatis jeda saat menunggu persetujuan tombol, dan hasil akhir SELALU dikirim sebagai pesan BARU!).
-    let typing_stop = Arc::new(tokio::sync::Notify::new());
-    let typing_stop_clone = typing_stop.clone();
-    let tg_typing = tg.clone();
-    let typing_task = tokio::spawn(async move {
-        loop {
-            tg_typing.send_typing(chat_id).await;
-            tokio::select! {
-                _ = typing_stop_clone.notified() => break,
-                _ = tokio::time::sleep(Duration::from_secs(4)) => {}
-            }
-        }
-    });
+    // Perbaikan 1 (v0.5.16): hentikan ping mengetik awal & jalankan `TypingLoopGuard` berbasis `watch`
+    // yang mengingat sinyal berhenti + abort eksplisit agar tidak pernah bocor sebagai task yatim.
+    typing_init_guard.abort_now();
+    let typing_guard =
+        TypingLoopGuard::spawn_for_client(tg.clone(), chat_id, Duration::from_secs(4));
 
     let (ui_tx, mut ui_rx) = tokio::sync::mpsc::channel::<UiEvent>(256);
+    let (col_stop_tx, mut col_stop_rx) = tokio::sync::watch::channel(false);
     let tg_prog = tg.clone();
     let hub_for_col = hub.clone();
     let ask_hub_col = ask_hub.clone();
     let max_steps_ui = s.cfg.agent.max_steps;
     let stall_notice_secs = latest_cfg.telegram.stall_notice_secs;
     let turn_timeout_secs = latest_cfg.telegram.turn_timeout_secs;
-    let collector = tokio::spawn(async move {
+    let mut collector_guard = AbortTaskOnDrop(Some(tokio::spawn(async move {
         let mut tool_events: Vec<selencode::tool_display::ToolActionEvent> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
         let mut cur_step: usize = 0;
@@ -1278,7 +1289,18 @@ async fn handle_telegram_chat_message(
         stall_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            if *col_stop_rx.borrow() {
+                break;
+            }
             tokio::select! {
+                biased;
+                _ = async {
+                    while !*col_stop_rx.borrow() {
+                        if col_stop_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                } => break,
                 ev_opt = ui_rx.recv() => {
                     let Some(ev) = ev_opt else {
                         break;
@@ -1392,7 +1414,7 @@ async fn handle_telegram_chat_message(
             }
         }
         (tool_events, notes)
-    });
+    })));
 
     enum TurnOutcome {
         Finished(Result<String>),
@@ -1420,13 +1442,23 @@ async fn handle_telegram_chat_message(
         } => TurnOutcome::TimedOut(turn_timeout_secs),
     };
 
-    typing_stop.notify_waiters();
-    let _ = tokio::time::timeout(Duration::from_secs(2), typing_task).await;
-    let (tool_events, notes) = tokio::time::timeout(Duration::from_secs(3), collector)
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or_default();
+    // Perbaikan 1 (v0.5.16): hentikan & pastikan kedua task per-giliran (`typing_guard` & `collector`)
+    // benar-benar mati (abort eksplisit bila melewati tenggang tunggu — tidak pernah ter-detach!).
+    typing_guard.stop_and_join(Duration::from_secs(2)).await;
+    let _ = col_stop_tx.send(true);
+    let (tool_events, notes) = if let Some(mut col_handle) = collector_guard.0.take() {
+        match tokio::time::timeout(Duration::from_secs(3), &mut col_handle).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => (Vec::new(), Vec::new()),
+            Err(_) => {
+                col_handle.abort();
+                let _ = col_handle.await;
+                (Vec::new(), Vec::new())
+            }
+        }
+    } else {
+        (Vec::new(), Vec::new())
+    };
     if let Ok(mut map) = active_progress.lock() {
         map.remove(&chat_id);
     }

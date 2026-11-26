@@ -1712,6 +1712,107 @@ impl TelegramClient {
             )
             .await;
     }
+}
+
+/// Pengawal siklus hidup task indikator mengetik (`sendChatAction(typing)`) per giliran Telegram
+/// (Perbaikan 1 v0.5.16):
+/// - Memakai `tokio::sync::watch::channel(false)` agar sinyal berhenti SELALU diingat dan tidak
+///   pernah hilang meskipun tiba saat panggilan `send_typing().await` sedang berlangsung.
+/// - `stop_and_join` menunggu masa tenggang wajar lalu memanggil `JoinHandle::abort()` + await
+///   bila task belum berhenti — tidak pernah me-detach task menjadi yatim.
+/// - `Drop` ikut mengirim sinyal berhenti dan meng-abort handle yang masih tersisa agar aman
+///   pada jalur keluar mana pun (selesai, `/cancel`, timeout, galat, maupun panik).
+pub struct TypingLoopGuard {
+    stop_tx: tokio::sync::watch::Sender<bool>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TypingLoopGuard {
+    /// Jalankan loop pengetik generik (dapat diuji langsung dengan pengirim tiruan lambat).
+    pub fn spawn<F, Fut>(interval: Duration, mut send_fn: F) -> Self
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            loop {
+                if *stop_rx.borrow() {
+                    break;
+                }
+                let stopped_during_send = tokio::select! {
+                    biased;
+                    _ = async {
+                        while !*stop_rx.borrow() {
+                            if stop_rx.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    } => true,
+                    _ = send_fn() => false,
+                };
+                if stopped_during_send || *stop_rx.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = async {
+                        while !*stop_rx.borrow() {
+                            if stop_rx.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    } => break,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+            }
+        });
+        Self {
+            stop_tx,
+            handle: Some(handle),
+        }
+    }
+
+    /// Jalankan loop `sendChatAction(typing)` untuk `TelegramClient` pada `chat_id` tertentu.
+    pub fn spawn_for_client(tg: TelegramClient, chat_id: i64, interval: Duration) -> Self {
+        Self::spawn(interval, move || {
+            let tg_c = tg.clone();
+            async move {
+                tg_c.send_typing(chat_id).await;
+            }
+        })
+    }
+
+    /// Kirim sinyal berhenti yang teringat, tunggu hingga `grace`, lalu abort eksplisit bila belum selesai.
+    pub async fn stop_and_join(mut self, grace: Duration) {
+        let _ = self.stop_tx.send(true);
+        if let Some(mut handle) = self.handle.take() {
+            if tokio::time::timeout(grace, &mut handle).await.is_err() {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+    }
+
+    /// Apakah task latar sudah benar-benar selesai?
+    pub fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(true)
+    }
+}
+
+impl Drop for TypingLoopGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl TelegramClient {
 
     /// Unggah berkas lampiran (`sendDocument`, maks 50 MB Bot API) sebagai pesan tersendiri (Perbaikan 4 v0.5.7).
     pub async fn send_document(

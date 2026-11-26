@@ -468,15 +468,21 @@ pub const ZERO_EDIT_FAILURE_HEADER: &str =
     "Gagal: pagu langkah habis sebelum ada perubahan apa pun dibuat.";
 
 /// Hitung langkah (1-based) pemicu konvergensi belum-ada-edit untuk mode berpagu (`max_steps > 0`):
-/// tepat sesuai spesifikasi: sisa <= 5 langkah ATAU pemakaian >= 85%, mana yang tercapai lebih dulu
-/// (Perbaikan 1 #2 v0.5.15: pagu 15 -> langkah 10; pagu 25 -> langkah 20; pagu 100 -> langkah 85).
+/// - Rumus inti (v0.5.15): sisa <= 5 langkah ATAU pemakaian >= 85%, mana yang tercapai lebih dulu
+///   (`max_steps = 15` -> langkah `10`; `max_steps = 25` -> langkah `20`; `max_steps = 100` -> langkah `85`).
+/// - Lantai eksplorasi bermakna (Perbaikan 3 v0.5.16): minimal 50% pagu dan minimal 3 langkah
+///   sebelum konvergensi boleh menembak (dibatasi `max_steps - 1`), sehingga pada pagu kecil (<= 6)
+///   notice tidak pernah menembak prematur di langkah 1–2 (`max_steps = 6` -> langkah `3`).
 pub fn compute_convergence_step(max_steps: usize) -> usize {
     if max_steps == 0 {
         return 0;
     }
     let by_remaining = max_steps.saturating_sub(5);
     let by_ratio = ((max_steps as f64) * 0.85).ceil() as usize;
-    by_remaining.min(by_ratio).max(1)
+    let raw = by_remaining.min(by_ratio);
+    let min_explore = (max_steps / 2).max(3);
+    let cap = max_steps.saturating_sub(1).max(1);
+    raw.max(min_explore).min(cap)
 }
 
 /// Tegakkan kalimat kegagalan baku secara programatis PASCA-GENERASI (Perbaikan 2 v0.5.15):
@@ -497,28 +503,16 @@ pub fn enforce_zero_edit_failure_header(closing_text: &str, zero_edit_failure: b
     }
 }
 
-/// Deteksi apakah giliran pengguna meminta perubahan kode/berkas (untuk pemicu konvergensi
-/// belum-ada-edit & pelabelan jujur akhir pagu nol-edit, Perbaikan 1 #2-#3 v0.5.14 + Perbaikan 2 v0.5.15).
+/// Deteksi apakah giliran pengguna meminta perubahan kode/berkas (Perbaikan 1 v0.5.14 +
+/// Perbaikan 2 v0.5.15 + Perbaikan 2 v0.5.16: mengenali bentuk verba, pasif, maupun nomina
+/// Indonesia seperti "ada perbaikan yang harus dilakukan", "perlu perubahan", "butuh penambahan",
+/// sambil menolak kontrol negatif diskusi/penjelasan seperti "apa perbaikan terbaik...?",
+/// "jelaskan perubahan...", dan "kenapa perbaikan kemarin gagal?").
 pub fn prompt_requests_file_change(prompt: &str) -> bool {
     let norm = normalize_ws_ascii_lower(prompt);
     if norm.is_empty() {
         return false;
     }
-    let read_only_prefixes = [
-        "jelaskan ",
-        "apa itu ",
-        "ringkas ",
-        "balas ",
-        "tulis satu kalimat",
-        "sapa ",
-        "cek status",
-        "cek lagi status",
-        "udah belum",
-        "sudah belum",
-        "sampai mana",
-        "sebutkan ",
-        "daftar file",
-    ];
     let explicitly_readonly = [
         "jangan ubah",
         "tanpa mengubah",
@@ -532,22 +526,47 @@ pub fn prompt_requests_file_change(prompt: &str) -> bool {
     if explicitly_readonly {
         return false;
     }
-    let has_change_signal = [
+
+    // Verba aksi imperatif / pasif langsung yang menandakan permintaan eksekusi perubahan nyata
+    // (tetap menang walau diawali pertanyaan, mis. "Kenapa salah? Tolong perbaiki sekalian.").
+    let imperative_action_verbs = [
         "perbaiki",
+        "diperbaiki",
         "benerin",
+        "dibenerin",
         "betulkan",
+        "dibetulkan",
         "ubah ",
+        "diubah",
         "ganti ",
+        "diganti",
         "edit ",
+        "diedit",
         "tulis ",
+        "ditulis",
         "buat ",
         "buatkan ",
+        "dibuat",
         "tambah ",
         "tambahkan ",
+        "ditambah",
+        "ditambahkan",
         "hapus ",
+        "dihapus",
+        "sesuaikan",
+        "disesuaikan",
+        "perbarui",
+        "diperbarui",
         "selesaikan",
+        "diselesaikan",
         "lengkapi",
+        "dilengkapi",
         "rapikan",
+        "dirapikan",
+        "koreksi",
+        "dikoreksi",
+        "terapkan",
+        "diterapkan",
         "refactor",
         "implement",
         "fix",
@@ -562,7 +581,111 @@ pub fn prompt_requests_file_change(prompt: &str) -> bool {
         "add ",
         "remove ",
         "delete ",
-        "koreksi",
+    ];
+    let has_imperative_action = imperative_action_verbs.iter().any(|kw| norm.contains(kw));
+
+    // Kontrol negatif wajib (Perbaikan 2 #2 v0.5.16): pertanyaan diskusi/penjelasan/analisis tentang
+    // perubahan ("apa perbaikan terbaik...?", "jelaskan perubahan...", "kenapa perbaikan kemarin gagal?")
+    // BUKAN tugas perubahan selama tidak disertai instruksi aksi perubahan eksplisit.
+    let discussion_prefixes = [
+        "apa ",
+        "apakah ",
+        "kenapa ",
+        "mengapa ",
+        "bagaimana ",
+        "gimana ",
+        "jelaskan ",
+        "ceritakan ",
+        "uraikan ",
+        "ringkas ",
+        "rangkum ",
+        "bandingkan ",
+        "sebutkan ",
+        "balas ",
+        "tulis satu kalimat",
+        "sapa ",
+        "cek status",
+        "cek lagi status",
+        "udah belum",
+        "sudah belum",
+        "sampai mana",
+        "daftar file",
+        "menurutmu ",
+        "kira-kira ",
+        "what is ",
+        "what are ",
+        "why did ",
+        "why is ",
+        "how does ",
+        "explain ",
+        "summarize ",
+        "describe ",
+    ];
+    if discussion_prefixes.iter().any(|p| norm.starts_with(p)) && !has_imperative_action {
+        return false;
+    }
+
+    if has_imperative_action {
+        return true;
+    }
+
+    // Bentuk nomina perubahan Indonesia + konstruksi kebutuhan/permintaan yang lazim (Perbaikan 2 #1 v0.5.16):
+    // mis. "ada perbaikan yang harus dilakukan", "perlu perubahan", "butuh penambahan", "sekalian perbaikannya".
+    let change_nouns = [
+        "perbaikan",
+        "perubahan",
+        "penambahan",
+        "penghapusan",
+        "pembaruan",
+        "penyesuaian",
+        "pembenahan",
+        "perapian",
+        "pembetulan",
+        "penggantian",
+        "pembuatan",
+        "penerapan",
+        "penyelesaian",
+        "revisi",
+        "modifikasi",
+    ];
+    let nominal_demand_cues = [
+        "ada ",
+        "perlu ",
+        "butuh ",
+        "harus ",
+        "wajib ",
+        "minta ",
+        "tolong ",
+        "mohon ",
+        "bantu ",
+        "coba ",
+        "silakan ",
+        "sekalian ",
+        "lakukan ",
+        "dilakukan",
+        "kerjakan ",
+        "dikerjakan",
+        "eksekusi ",
+        "diperlukan",
+        "dibutuhkan",
+        "ingin ",
+        "mau ",
+    ];
+    let has_nominal_request = change_nouns.iter().any(|n| norm.contains(n))
+        && nominal_demand_cues.iter().any(|c| norm.contains(c));
+    if has_nominal_request {
+        // Jika seluruh prompt murni pertanyaan tanpa permintaan tindakan (berakhir `?` tanpa cue permintaan/kewajiban), tolak.
+        let is_pure_question = norm.ends_with('?')
+            && !["harus ", "tolong ", "mohon ", "bantu ", "sekalian ", "lakukan ", "kerjakan ", "dilakukan"]
+                .iter()
+                .any(|c| norm.contains(c));
+        if !is_pure_question {
+            return true;
+        }
+    }
+
+    // Sinyal laporan bug / issue teknis (mis. problem_statement SWE-bench Lite tanpa verba imperatif langsung).
+    let problem_signals = [
         "bug",
         "error",
         "crash",
@@ -583,13 +706,13 @@ pub fn prompt_requests_file_change(prompt: &str) -> bool {
         "issue",
         "problem",
         "regression",
-    ]
-    .iter()
-    .any(|kw| norm.contains(kw));
-    if read_only_prefixes.iter().any(|p| norm.starts_with(p)) && !has_change_signal {
-        return false;
+    ];
+    let is_pure_question_without_action = norm.ends_with('?') && !has_nominal_request;
+    if !is_pure_question_without_action && problem_signals.iter().any(|kw| norm.contains(kw)) {
+        return true;
     }
-    has_change_signal
+
+    false
 }
 
 /// Loop (Blueprint Bagian 2): provider → tool_call? → jalankan → ToolResult →
