@@ -1134,6 +1134,8 @@ pub fn format_telegram_progress_html(
 ) -> String {
     let step_tag = if step > 0 && max_steps > 0 {
         format!("langkah {step}/{max_steps}")
+    } else if step > 0 {
+        format!("langkah {step}")
     } else {
         String::new()
     };

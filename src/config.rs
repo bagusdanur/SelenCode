@@ -302,6 +302,10 @@ pub struct GuardCfg {
     /// Rasio pemakaian `max_steps` saat checkpoint satu-kali disuntikkan ke model (default: 0.7, rentang 0.1..=0.95).
     #[serde(default = "default_budget_warning_ratio")]
     pub budget_warning_ratio: f64,
+    /// Ambang langkah tanpa satu pun mutasi berkas di mode tanpa pagu (`max_steps = 0`) sebelum
+    /// menyuntikkan satu notice konvergensi keras (default: 20 langkah, v0.5.15).
+    #[serde(default = "default_no_edit_convergence_steps")]
+    pub no_edit_convergence_steps: usize,
 }
 
 fn default_max_self_correct_rounds() -> usize {
@@ -312,6 +316,10 @@ fn default_budget_warning_ratio() -> f64 {
     0.7
 }
 
+fn default_no_edit_convergence_steps() -> usize {
+    20
+}
+
 impl Default for GuardCfg {
     fn default() -> Self {
         Self {
@@ -319,6 +327,7 @@ impl Default for GuardCfg {
             max_self_correct_rounds: default_max_self_correct_rounds(),
             budget_warning_enabled: true,
             budget_warning_ratio: default_budget_warning_ratio(),
+            no_edit_convergence_steps: default_no_edit_convergence_steps(),
         }
     }
 }
@@ -830,8 +839,9 @@ fn default_max_parallel_subagents() -> usize {
     3
 }
 
+/// Bawaan tanpa batas langkah ala Hermes (`0` = tanpa batas; angka > 0 = pagu keras, v0.5.15).
 fn default_max_steps() -> usize {
-    25
+    0
 }
 fn default_max_output_tokens() -> u32 {
     8192
@@ -1085,6 +1095,7 @@ pub fn validate_toml_keys(val: &toml::Value) -> Vec<ConfigWarning> {
                 "max_self_correct_rounds",
                 "budget_warning_enabled",
                 "budget_warning_ratio",
+                "no_edit_convergence_steps",
             ],
         ),
         ("aux", &["compression_model", "review_model"]),

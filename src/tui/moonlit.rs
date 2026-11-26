@@ -611,7 +611,14 @@ pub fn status_line(
             st(DIM),
         ),
         sp(" │ ", st(FAINT)),
-        sp(format!("langkah {step_current}/{step_max}"), st(DIM)),
+        sp(
+            if step_max > 0 {
+                format!("langkah {step_current}/{step_max}")
+            } else {
+                format!("langkah {step_current}")
+            },
+            st(DIM),
+        ),
         sp(" │ ", st(FAINT)),
         sp(truncate_chars(cwd, 30), st(DIM)),
     ];
@@ -660,7 +667,14 @@ pub fn status_line_responsive(
             sp(format!("{pct}% "), stb(ctx_color)),
             sp(format!("{used_s}/{lim_s}"), st(CYAN_MOON)),
             sp(" │ ", st(FAINT)),
-            sp(format!("{step_current}/{step_max}"), st(DIM)),
+            sp(
+                if step_max > 0 {
+                    format!("{step_current}/{step_max}")
+                } else {
+                    format!("{step_current}")
+                },
+                st(DIM),
+            ),
         ];
         if busy {
             spans.push(sp(" ✦", stb(GOLD)));
@@ -689,7 +703,14 @@ pub fn status_line_responsive(
             st(DIM),
         ),
         sp(" │ ", st(FAINT)),
-        sp(format!("langkah {step_current}/{step_max}"), st(DIM)),
+        sp(
+            if step_max > 0 {
+                format!("langkah {step_current}/{step_max}")
+            } else {
+                format!("langkah {step_current}")
+            },
+            st(DIM),
+        ),
     ];
     if width >= 105 {
         spans.push(sp(" │ ", st(FAINT)));

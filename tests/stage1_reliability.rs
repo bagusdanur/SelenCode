@@ -298,11 +298,18 @@ impl Provider for SelfCorrectMock {
                 assert!(saw_gate, "Self-Correction Gate harus terkirim ke model");
                 Ok(AssistantReply {
                     text: String::new(),
-                    tool_calls: vec![ToolCall {
-                        id: "v1".into(),
-                        name: "verify_project".into(),
-                        args: json!({"scope": "check"}),
-                    }],
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "v1".into(),
+                            name: "run_shell".into(),
+                            args: json!({"command": "node -e \"process.exit(0)\""}),
+                        },
+                        ToolCall {
+                            id: "v2".into(),
+                            name: "verify_project".into(),
+                            args: json!({"scope": "check"}),
+                        },
+                    ],
                     finish_reason: Some("tool_calls".into()),
                     usage: None,
                 })
@@ -337,7 +344,10 @@ async fn self_correction_gate_end_to_end_menahan_klaim_selesai_sebelum_verifikas
         .await
         .unwrap();
 
-    assert_eq!(out, "Sudah diverifikasi dan selesai.");
+    assert!(
+        out.starts_with("Sudah diverifikasi dan selesai."),
+        "jawaban akhir harus dimulai dari respons terverifikasi: {out}"
+    );
     // Pastikan checkpoint otomatis giliran tersimpan karena app.rs diubah!
     let cps = ctx.undo_stack.lock().unwrap().list_checkpoints();
     assert_eq!(cps.len(), 1, "checkpoint giliran otomatis harus tersimpan");

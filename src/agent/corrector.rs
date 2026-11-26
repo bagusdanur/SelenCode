@@ -487,6 +487,197 @@ pub fn is_verification_shell_cmd(args: &Value) -> bool {
     false
 }
 
+/// Apakah jalur berkas tampak sebagai berkas tes lintas bahasa (Perbaikan 4 v0.5.15)?
+/// Mencakup pola umum: `test_*.py`, `*_test.*`, `*.test.*`, `*.spec.*`, `*_spec.*`,
+/// direktori `tests/` / `test/` / `__tests__/` / `spec/`, serta `*Test.java`/`*Tests.cs`, dsb.
+pub fn is_test_file_path(path: &str) -> bool {
+    let norm = path.trim().replace('\\', "/").to_ascii_lowercase();
+    if norm.is_empty() {
+        return false;
+    }
+    let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return false;
+    }
+    // Direktori tes umum di jalur induk
+    if segs[..segs.len().saturating_sub(1)]
+        .iter()
+        .any(|d| matches!(*d, "tests" | "test" | "__tests__" | "spec" | "specs"))
+    {
+        return true;
+    }
+    let fname = *segs.last().unwrap_or(&"");
+    fname.starts_with("test_")
+        || fname.contains("_test.")
+        || fname.contains(".test.")
+        || fname.contains(".spec.")
+        || fname.contains("_spec.")
+        || fname.ends_with("test.java")
+        || fname.ends_with("tests.java")
+        || fname.ends_with("test.kt")
+        || fname.ends_with("tests.kt")
+        || fname.ends_with("test.cs")
+        || fname.ends_with("tests.cs")
+        || fname == "tests.py"
+        || fname == "test.py"
+        || fname == "test.js"
+        || fname == "tests.js"
+}
+
+fn normalize_verify_cmd_tokens(cmd: &str) -> Vec<String> {
+    cmd.split_whitespace()
+        .map(|tok| {
+            let clean = tok.trim_matches(|c| c == '"' || c == '\'');
+            let low = clean.to_ascii_lowercase();
+            match low.as_str() {
+                "python3" | "py" => "python".to_string(),
+                "./bin/test" => "bin/test".to_string(),
+                _ => low,
+            }
+        })
+        .collect()
+}
+
+fn verify_runner_family(tokens: &[String]) -> Option<&'static str> {
+    if tokens.is_empty() {
+        return None;
+    }
+    if tokens[0] == "verify_project" {
+        return Some("verify_project");
+    }
+    if tokens[0] == "pytest"
+        || (tokens.len() >= 3 && tokens[0] == "python" && tokens[1] == "-m" && tokens[2] == "pytest")
+    {
+        return Some("pytest");
+    }
+    if tokens[0] == "bin/test" || tokens.iter().any(|t| t.ends_with("/bin/test")) {
+        return Some("bin/test");
+    }
+    if tokens.len() >= 2 && tokens[0] == "cargo" && matches!(tokens[1].as_str(), "test" | "check" | "clippy" | "build") {
+        return Some("cargo");
+    }
+    if tokens.len() >= 3 && tokens[0] == "python" && tokens[1] == "-m" && tokens[2] == "unittest" {
+        return Some("unittest");
+    }
+    if tokens.len() >= 2 && tokens[0] == "go" && tokens[1] == "test" {
+        return Some("go_test");
+    }
+    if tokens.len() >= 2 && matches!(tokens[0].as_str(), "npm" | "pnpm" | "yarn") && tokens.iter().any(|t| t == "test") {
+        return Some("npm_test");
+    }
+    if tokens.len() >= 2 && tokens[0] == "node" && tokens[1] == "--test" {
+        return Some("node_test");
+    }
+    None
+}
+
+fn extract_runner_targets(tokens: &[String]) -> Vec<String> {
+    let mut skip_next = false;
+    let mut start = 1usize;
+    if tokens.len() >= 3 && tokens[0] == "python" && tokens[1] == "-m" {
+        start = 3;
+    } else if tokens.len() >= 2 && matches!(tokens[0].as_str(), "cargo" | "go" | "npm" | "pnpm" | "yarn") {
+        start = 2;
+    } else if tokens.len() >= 2 && tokens[0] == "node" && tokens[1] == "--test" {
+        start = 2;
+    }
+    let mut targets = Vec::new();
+    for tok in tokens.iter().skip(start) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(tok.as_str(), "-k" | "-m" | "--test" | "-p" | "--package" | "-o") {
+            skip_next = true;
+            continue;
+        }
+        if tok.starts_with('-') || tok == "run" {
+            continue;
+        }
+        targets.push(tok.trim_start_matches("./").to_string());
+    }
+    targets
+}
+
+/// Apakah perintah `candidate` merupakan larian ulang dari perintah verifikasi mapan `established`
+/// atau perluasan eksplisitnya (mis. filter lebih luas pada berkas/suite tes yang sama) — Perbaikan 3 v0.5.15?
+/// Probe ad-hoc (mis. `python3 -c ...`), skrip lain, atau berkas tes tak terkait mengembalikan `false`.
+pub fn is_same_or_broader_verify_cmd(established: &str, candidate: &str) -> bool {
+    let est_toks = normalize_verify_cmd_tokens(established);
+    let cand_toks = normalize_verify_cmd_tokens(candidate);
+    if est_toks.is_empty() || cand_toks.is_empty() {
+        return false;
+    }
+    if est_toks == cand_toks {
+        return true;
+    }
+    // Probe ad-hoc (`python -c ...`, `node -e ...`) tidak pernah boleh menimpa perintah mapan lain!
+    if cand_toks.iter().any(|t| t == "-c" || t == "-e") {
+        return false;
+    }
+    let Some(est_fam) = verify_runner_family(&est_toks) else {
+        return false;
+    };
+    let Some(cand_fam) = verify_runner_family(&cand_toks) else {
+        return false;
+    };
+    if est_fam != cand_fam {
+        return false;
+    }
+    let est_targets = extract_runner_targets(&est_toks);
+    let cand_targets = extract_runner_targets(&cand_toks);
+    // Menjalankan seluruh suite runner yang sama tanpa penyempitan -> perluasan sah (mis. `pytest` / `cargo test`).
+    if cand_targets.is_empty() {
+        return true;
+    }
+    if est_targets.is_empty() {
+        // Mapan adalah suite penuh, candidate menyempit ke 1 file lain -> bukan perluasan!
+        return false;
+    }
+    // Setiap target mapan harus tercakup oleh minimal satu target candidate
+    // (identik, berkas yang sama tanpa `::test_fn`, atau direktori induknya).
+    est_targets.iter().all(|et| {
+        let et_file = et.split("::").next().unwrap_or(et);
+        cand_targets.iter().any(|ct| {
+            let ct_clean = ct.trim_end_matches('/');
+            et == ct
+                || et_file == ct_clean
+                || et_file.starts_with(&format!("{ct_clean}/"))
+        })
+    })
+}
+
+fn parse_exit_code(output: &str) -> Option<i32> {
+    let first = output.lines().next()?.trim();
+    let rest = first.strip_prefix("exit code:")?;
+    rest.split_whitespace().next()?.parse::<i32>().ok()
+}
+
+fn extract_verify_key_line(output: &str) -> String {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("exit code:"))
+        .collect();
+    if lines.is_empty() {
+        return "(tanpa keluaran teks)".to_string();
+    }
+    let interesting = lines.iter().rev().find(|l| {
+        let low = l.to_ascii_lowercase();
+        low.contains("passed")
+            || low.contains("failed")
+            || low.contains("error")
+            || low.contains("assert")
+            || low.contains("lulus")
+            || low.contains("gagal")
+            || low.contains("ok")
+            || low.contains("test result:")
+    });
+    let chosen = interesting.copied().unwrap_or_else(|| *lines.last().unwrap());
+    let clean: String = chosen.chars().take(160).collect();
+    clean
+}
+
 /// Apakah nama file terlihat seperti skrip sampah/repro sementara ciptaan sesi?
 fn is_scratch_repro_file(rel: &str) -> bool {
     let fname = Path::new(rel)
@@ -536,15 +727,21 @@ pub struct SelfCorrectState {
     pub edited_files: Vec<String>,
     /// File baru yang dibuat via `write_file` sepanjang giliran ini (untuk daftar periksa sampah/repro SWE-agent).
     pub created_files: Vec<String>,
+    /// Berkas tes yang ikut diubah pada giliran ini (Perbaikan 4 v0.5.15 — visibilitas permanen di ringkasan akhir).
+    pub edited_test_files: Vec<String>,
     pub edited_code_file: bool,
     pub verified_after_last_edit: bool,
     pub last_verify_passed: Option<bool>,
     /// True bila minimal satu perintah verifikasi nyata pernah dijalankan pada giliran ini (v0.5.14).
     pub has_verification_run: bool,
-    /// Perintah verifikasi terakhir yang dijalankan pada giliran ini (`run_shell` / `verify_project`).
+    /// Perintah verifikasi mapan untuk giliran ini (`run_shell` / `verify_project`, Perbaikan 3 v0.5.15).
     pub last_verify_cmd: Option<String>,
-    /// Nomor langkah (1-based) saat perintah verifikasi terakhir dijalankan.
+    /// Nomor langkah (1-based) saat perintah verifikasi mapan terakhir dijalankan.
     pub last_verify_step: Option<usize>,
+    /// Exit code terakhir dari perintah verifikasi mapan (bila dari `run_shell`).
+    pub last_verify_exit_code: Option<i32>,
+    /// Baris hasil kunci dari larian terakhir perintah verifikasi mapan.
+    pub last_verify_key_line: Option<String>,
     /// Keluaran mentah kegagalan verifikasi terakhir untuk umpan balik refleksi ala Aider.
     pub last_verify_output: Option<String>,
     /// Lingkup ketat v0.5.14: gerbang hanya hidup bila ada mutasi berkas DAN ada perintah verifikasi yang dijalankan.
@@ -561,12 +758,15 @@ impl Default for SelfCorrectState {
         Self {
             edited_files: Vec::new(),
             created_files: Vec::new(),
+            edited_test_files: Vec::new(),
             edited_code_file: false,
             verified_after_last_edit: false,
             last_verify_passed: None,
             has_verification_run: false,
             last_verify_cmd: None,
             last_verify_step: None,
+            last_verify_exit_code: None,
+            last_verify_key_line: None,
             last_verify_output: None,
             strict_known_verify_only: false,
             repair_attempts: 0,
@@ -627,6 +827,11 @@ impl SelfCorrectState {
                     if is_code_file(path) {
                         self.edited_code_file = true;
                     }
+                    if is_test_file_path(path)
+                        && !self.edited_test_files.iter().any(|p| p == path)
+                    {
+                        self.edited_test_files.push(path.to_string());
+                    }
                 }
                 // Ada edit baru -> verifikasi lama tidak lagi berlaku sesudah edit terakhir,
                 // namun tetap simpan `last_verify_cmd` / `last_verify_passed` agar gerbang tahu konteks gagalnya.
@@ -652,20 +857,30 @@ impl SelfCorrectState {
                     && (output.contains("verifikasi proyek otomatis dilewati")
                         || output.starts_with("Ditolak user"))
                 {
-                    // Jangan pernah menimpa kegagalan verifikasi `run_shell` yang sudah diketahui merah!
-                    if self.last_verify_passed != Some(false) {
+                    // Perbaikan 3 (v0.5.15): bila sudah ada perintah verifikasi mapan dari `run_shell`,
+                    // `verify_project` yang dilewati TIDAK boleh menimpa keadaannya!
+                    if self.last_verify_cmd.is_none() {
                         self.verified_after_last_edit = true;
                         self.last_verify_passed = Some(true);
                     }
                     return;
                 }
+                // Bila sudah ada perintah verifikasi mapan berbeda (mis. `python uji.py`), jangan timpa!
+                if let Some(ref est) = self.last_verify_cmd {
+                    if !is_same_or_broader_verify_cmd(est, "verify_project") {
+                        return;
+                    }
+                } else {
+                    self.last_verify_cmd = Some("verify_project".to_string());
+                }
                 self.has_verification_run = true;
                 self.verified_after_last_edit = true;
-                self.last_verify_cmd = Some("verify_project".to_string());
                 self.last_verify_step = (step_1based > 0).then_some(step_1based);
                 let no_tests = output.contains("TIDAK ADA TEST") || output.contains("NO_TESTS");
                 let timed_out = output.contains("TIMEOUT");
                 let ok = !is_error && !no_tests && !timed_out && output.contains("LULUS");
+                self.last_verify_exit_code = Some(if ok { 0 } else { 1 });
+                self.last_verify_key_line = Some(extract_verify_key_line(output));
                 self.last_verify_passed = Some(ok);
                 self.last_verify_output = if ok {
                     None
@@ -674,18 +889,32 @@ impl SelfCorrectState {
                 };
             }
             "run_shell" => {
-                if is_verification_shell_cmd(args) {
-                    let cmd = args
-                        .get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("run_shell")
-                        .trim()
-                        .to_string();
+                let cmd = args
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if cmd.is_empty() {
+                    return;
+                }
+                // Perbaikan 3 (v0.5.15): integritas keadaan verifikasi — terikat pada perintah mapan.
+                // Perintah lain (probe `python3 -c ...`, skrip bantu, suite tak terkait) TIDAK menimpa keadaan!
+                let should_update = match self.last_verify_cmd.as_deref() {
+                    None => is_verification_shell_cmd(args),
+                    Some(est) => is_same_or_broader_verify_cmd(est, &cmd),
+                };
+                if should_update {
+                    if self.last_verify_cmd.is_none() {
+                        self.last_verify_cmd = Some(cmd);
+                    }
                     self.has_verification_run = true;
                     self.verified_after_last_edit = true;
-                    self.last_verify_cmd = Some(cmd);
                     self.last_verify_step = (step_1based > 0).then_some(step_1based);
-                    let ok = !is_error && output.starts_with("exit code: 0");
+                    let ec = parse_exit_code(output);
+                    self.last_verify_exit_code = ec;
+                    self.last_verify_key_line = Some(extract_verify_key_line(output));
+                    let ok = !is_error && (ec == Some(0) || output.starts_with("exit code: 0"));
                     self.last_verify_passed = Some(ok);
                     self.last_verify_output = if ok {
                         None
@@ -885,6 +1114,62 @@ impl SelfCorrectState {
             "\n\n[Status Verifikasi Akhir — GAGAL] Perintah `{cmd}` {status_desc} \
              (putaran gerbang verifikasi: {}/{}).{snippet}",
             self.repair_attempts, self.max_attempts
+        ))
+    }
+
+    /// Baris ringkasan verifikasi spesifik yang dikutip langsung dari keadaan tercatat loop
+    /// (Perbaikan 3 #2 v0.5.15: perintah mapan + exit code + baris hasil kunci, atau `belum diverifikasi`).
+    pub fn closing_verification_summary_line(&self, turn_requests_edit: bool) -> Option<String> {
+        let has_mutation = self.edited_code_file || !self.edited_files.is_empty();
+        if !has_mutation {
+            return None;
+        }
+        if self.has_verification_run {
+            let cmd = self
+                .last_verify_cmd
+                .as_deref()
+                .unwrap_or("verifikasi");
+            let ec_str = self
+                .last_verify_exit_code
+                .map(|c| format!("exit code {c}"))
+                .unwrap_or_else(|| "exit code tidak tercatat".to_string());
+            let status = if !self.verified_after_last_edit {
+                match self.last_verify_passed {
+                    Some(false) => "GAGAL / BASI: belum dijalankan ulang sesudah edit terakhir",
+                    Some(true) => "BASI: belum dijalankan ulang sesudah edit terakhir",
+                    None => "BASI",
+                }
+            } else if self.last_verify_passed == Some(true) {
+                "LULUS"
+            } else {
+                "GAGAL"
+            };
+            let key_line = self
+                .last_verify_key_line
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("(tanpa keluaran teks)");
+            return Some(format!(
+                "Verifikasi: `{cmd}` — {ec_str} ({status}) — {key_line}"
+            ));
+        }
+        if turn_requests_edit {
+            return Some(
+                "Verifikasi: belum diverifikasi (tidak ada perintah verifikasi yang dijalankan pada giliran ini)."
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// Baris catatan wajib bila ada berkas tes yang ikut diubah selama giliran (Perbaikan 4 v0.5.15).
+    pub fn closing_test_files_note(&self) -> Option<String> {
+        if self.edited_test_files.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Catatan berkas tes diubah: {}",
+            self.edited_test_files.join(", ")
         ))
     }
 }

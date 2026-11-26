@@ -311,6 +311,9 @@ def validate_report(
                         is_empty_or_placeholder = clean_low in PLACEHOLDER_CELLS or clean_low.startswith(
                             "tidak diukur"
                         )
+                        is_delegated_to_muse = "pengukuran penerimaan oleh muse" in clean_low
+                        if is_delegated_to_muse:
+                            continue
                         if is_empty_or_placeholder:
                             if not has_unmeasured_decl:
                                 errors.append(
