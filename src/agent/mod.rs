@@ -13,5 +13,8 @@ pub use review::{
     is_session_substantive, run_background_review, run_self_improvement_review, BgReviewOutcome,
     ReviewSkipReason,
 };
-pub use run::{run_turn, run_turn_counted, run_turn_mode, run_turn_ui, run_turn_ui_mode};
+pub use run::{
+    classify_required_skill_for_turn, run_turn, run_turn_counted, run_turn_mode, run_turn_ui,
+    run_turn_ui_mode,
+};
 pub use ui::UiEvent;

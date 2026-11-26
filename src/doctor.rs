@@ -146,6 +146,32 @@ pub fn run_doctor(
         },
     });
 
+    // 2b. Validasi kunci config (Perbaikan 3 v0.5.11: kunci tak dikenal & penempatan salah tidak boleh diam)
+    let cfg_warnings = crate::config::collect_active_config_warnings();
+    checks.push(DoctorCheck {
+        name: "Config Keys".into(),
+        status: if cfg_warnings.is_empty() {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warn
+        },
+        detail: if cfg_warnings.is_empty() {
+            "semua kunci config sesuai skema resmi".into()
+        } else {
+            let preview: Vec<String> = cfg_warnings
+                .iter()
+                .take(4)
+                .map(|(_, w)| w.message.clone())
+                .collect();
+            let extra = if cfg_warnings.len() > 4 {
+                format!(" (+{} lainnya)", cfg_warnings.len() - 4)
+            } else {
+                String::new()
+            };
+            format!("{} peringatan: {}{extra}", cfg_warnings.len(), preview.join("; "))
+        },
+    });
+
     // 3. SQLite Store & Memori Persisten (v0.5.9: satu sumber kebenaran di user_memory)
     let cwd_str = cwd.to_string_lossy().to_string();
     let sess_cnt = store.list_sessions(&cwd_str, 50).map(|v| v.len()).unwrap_or(0);

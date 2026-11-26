@@ -214,6 +214,24 @@ pub fn is_rate_limit_error(err: &str) -> bool {
     low.contains("429") || low.contains("rate limit") || low.contains("rate_limit") || low.contains("too many requests")
 }
 
+/// Deteksi error timeout / provider membisu / stream macet (Perbaikan 4 v0.5.11):
+/// error ini LAYAK jatuh ke rute fallback yang BERBEDA, namun TIDAK boleh diulang pada rute
+/// (provider + model) yang SAMA agar pembatalan provider diam tidak membayar 2× response timeout.
+pub fn is_timeout_error(err: &str) -> bool {
+    let low = err.to_ascii_lowercase();
+    contains_any(
+        &low,
+        &[
+            "timeout",
+            "timed out",
+            "tidak merespons",
+            "ketidakaktifan",
+            "stream provider macet",
+            "tidak ada data selama",
+        ],
+    )
+}
+
 /// Klasifikasi ketat error yang LAYAK memicu fallback ke model/provider cadangan (v0.5.6 Bagian 1):
 /// - HANYA: HTTP 429 (kuota/rate limit), HTTP 5xx provider, timeout/koneksi putus,
 ///   penolakan kredensial/kuota upstream (401/403), dan model tidak ditemukan/mati (404).
@@ -1001,8 +1019,13 @@ impl Provider for DynamicRouterProvider {
                             primary_fail_short = Some(short_fallback_reason(&msg));
                         }
                         let retryable = is_retryable_error(&msg);
+                        let is_timeout = is_timeout_error(&msg);
                         let fallback_eligible = is_fallback_eligible_error(&msg);
-                        let will_retry = retryable && !emitted_any && attempt + 1 < max_attempts;
+                        // Perbaikan 4 (v0.5.11): bila rute ini baru saja timeout/membisu, JANGAN ulangi
+                        // rute yang sama (menghindari 2× response timeout); langsung pindah ke rute fallback
+                        // yang BERBEDA atau kembalikan error timeout yang jelas bila tidak ada rute lain.
+                        let will_retry =
+                            retryable && !is_timeout && !emitted_any && attempt + 1 < max_attempts;
                         if let Ok(mut tel) = self.telemetry.lock() {
                             tel.record_error(route, task, &msg, will_retry);
                         }

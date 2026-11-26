@@ -914,6 +914,272 @@ fn same_canonical_path(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
 }
 
+/// Peringatan kunci config tak dikenal / salah tempat (Perbaikan 3 v0.5.11).
+/// Bersifat peringatan (tidak pernah memblokir start), namun selalu terlihat di stderr & `selen doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWarning {
+    pub key_path: String,
+    pub message: String,
+}
+
+fn check_allowed_keys(
+    section_label: &str,
+    tbl: &toml::map::Map<String, toml::Value>,
+    allowed: &[&str],
+    out: &mut Vec<ConfigWarning>,
+) {
+    for key in tbl.keys() {
+        if allowed.contains(&key.as_str()) {
+            continue;
+        }
+        let key_path = if section_label.is_empty() {
+            key.clone()
+        } else {
+            format!("{section_label}.{key}")
+        };
+        let message = if section_label.starts_with("providers.") && key == "timeouts" {
+            format!(
+                "`{key_path}`: `timeouts` seharusnya top-level (`[timeouts]`), bukan di bawah provider — diabaikan"
+            )
+        } else if section_label.starts_with("providers.")
+            && matches!(
+                key.as_str(),
+                "turn_timeout_secs" | "stall_notice_secs" | "poll_watchdog_secs"
+            )
+        {
+            format!(
+                "`{key_path}`: seharusnya berada di bawah `[telegram]`, bukan di bawah provider — diabaikan"
+            )
+        } else if section_label.is_empty()
+            && matches!(
+                key.as_str(),
+                "connect_secs" | "response_secs" | "stream_idle_secs" | "total_secs"
+            )
+        {
+            format!(
+                "`{key_path}`: seharusnya berada di bawah seksi `[timeouts]`, bukan langsung di top-level — diabaikan"
+            )
+        } else if section_label.is_empty()
+            && matches!(
+                key.as_str(),
+                "turn_timeout_secs" | "stall_notice_secs" | "poll_watchdog_secs"
+            )
+        {
+            format!(
+                "`{key_path}`: seharusnya berada di bawah seksi `[telegram]`, bukan langsung di top-level — diabaikan"
+            )
+        } else {
+            format!("`{key_path}`: kunci config tidak dikenal — diabaikan")
+        };
+        out.push(ConfigWarning { key_path, message });
+    }
+}
+
+/// Periksa seluruh kunci pada `toml::Value` config terhadap skema resmi SelenCode (Perbaikan 3 v0.5.11).
+pub fn validate_toml_keys(val: &toml::Value) -> Vec<ConfigWarning> {
+    let mut warnings = Vec::new();
+    let Some(root) = val.as_table() else {
+        return warnings;
+    };
+
+    const TOP_KEYS: &[&str] = &[
+        "default_provider",
+        "providers",
+        "agent",
+        "shell",
+        "mcp_servers",
+        "telegram",
+        "routing",
+        "sandbox",
+        "hooks",
+        "guard",
+        "aux",
+        "review",
+        "tool_budget",
+        "skills",
+        "fallback",
+        "ask",
+        "memory",
+        "context",
+        "display",
+        "timeouts",
+    ];
+    check_allowed_keys("", root, TOP_KEYS, &mut warnings);
+
+    if let Some(provs) = root.get("providers").and_then(|v| v.as_table()) {
+        const PROV_KEYS: &[&str] = &[
+            "kind",
+            "base_url",
+            "model",
+            "models",
+            "api_key_env",
+            "api_key",
+            "price_in",
+            "price_out",
+            "context_limit",
+            "fallback",
+        ];
+        for (pname, pval) in provs {
+            if let Some(ptbl) = pval.as_table() {
+                check_allowed_keys(&format!("providers.{pname}"), ptbl, PROV_KEYS, &mut warnings);
+            }
+        }
+    }
+
+    let sections: &[(&str, &[&str])] = &[
+        (
+            "timeouts",
+            &["connect_secs", "response_secs", "stream_idle_secs", "total_secs"],
+        ),
+        (
+            "telegram",
+            &[
+                "bot_token_env",
+                "bot_token",
+                "allowed_users",
+                "approval",
+                "approval_timeout_mins",
+                "turn_timeout_secs",
+                "stall_notice_secs",
+                "poll_watchdog_secs",
+            ],
+        ),
+        (
+            "agent",
+            &[
+                "max_steps",
+                "max_output_tokens",
+                "approval",
+                "context_limit_tokens",
+                "max_parallel_subagents",
+                "auto_skills",
+                "self_correct",
+            ],
+        ),
+        ("shell", &["allowlist", "timeout_secs"]),
+        (
+            "routing",
+            &["auto", "fallbacks", "max_retries", "task_routes", "max_cost_usd"],
+        ),
+        (
+            "sandbox",
+            &["mode", "os_isolate", "scrub_env", "allow_network", "audit_log"],
+        ),
+        ("guard", &["enabled", "max_self_correct_rounds"]),
+        ("aux", &["compression_model", "review_model"]),
+        (
+            "review",
+            &[
+                "enabled",
+                "max_tokens",
+                "cooldown_mins",
+                "turns_interval",
+                "min_tool_calls",
+            ],
+        ),
+        (
+            "tool_budget",
+            &[
+                "shell_cap_chars",
+                "spillover_chars",
+                "turn_budget_chars",
+                "dynamic_inject_max_tokens",
+            ],
+        ),
+        ("skills", &["index_max_tokens", "auto_load"]),
+        ("fallback", &["models", "max_attempts"]),
+        ("ask", &["timeout_secs"]),
+        ("memory", &["max_memory_chars", "max_profile_chars"]),
+        ("context", &["folder_map", "folder_map_max_tokens"]),
+        ("display", &["tool_preview_length"]),
+    ];
+    for (sec, keys) in sections {
+        if let Some(tbl) = root.get(*sec).and_then(|v| v.as_table()) {
+            check_allowed_keys(sec, tbl, keys, &mut warnings);
+        }
+    }
+
+    if let Some(arr) = root.get("mcp_servers").and_then(|v| v.as_array()) {
+        const MCP_KEYS: &[&str] = &[
+            "name",
+            "command",
+            "args",
+            "env",
+            "url",
+            "headers",
+            "trust",
+            "timeout_secs",
+        ];
+        for (idx, item) in arr.iter().enumerate() {
+            if let Some(tbl) = item.as_table() {
+                check_allowed_keys(&format!("mcp_servers[{idx}]"), tbl, MCP_KEYS, &mut warnings);
+            }
+        }
+    }
+    if let Some(arr) = root.get("hooks").and_then(|v| v.as_array()) {
+        const HOOK_KEYS: &[&str] = &[
+            "event",
+            "matcher",
+            "command",
+            "timeout_secs",
+            "block_on_error",
+        ];
+        for (idx, item) in arr.iter().enumerate() {
+            if let Some(tbl) = item.as_table() {
+                check_allowed_keys(&format!("hooks[{idx}]"), tbl, HOOK_KEYS, &mut warnings);
+            }
+        }
+    }
+
+    warnings.sort_by(|a, b| a.key_path.cmp(&b.key_path));
+    warnings
+}
+
+/// Validasi kunci TOML dari string mentah config (dipakai juga oleh unit test & `selen doctor`).
+pub fn validate_config_str(text: &str) -> Vec<ConfigWarning> {
+    toml::from_str::<toml::Value>(text)
+        .map(|v| validate_toml_keys(&v))
+        .unwrap_or_default()
+}
+
+/// Cetak peringatan kunci config ke stderr TEPAT 1x per kunci per proses (anti-spam saat config dimuat ulang di loop).
+fn emit_config_warnings_once(source_label: &str, warnings: &[ConfigWarning]) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut guard) = seen.lock() else {
+        return;
+    };
+    for w in warnings {
+        let dedup_key = format!("{source_label}::{}", w.key_path);
+        if guard.insert(dedup_key) {
+            eprintln!("[config peringatan] ({source_label}) {}", w.message);
+        }
+    }
+}
+
+/// Kumpulkan seluruh peringatan kunci tak dikenal/salah tempat dari file config aktif (`./selencode.toml` & global).
+pub fn collect_active_config_warnings() -> Vec<(PathBuf, ConfigWarning)> {
+    let mut out = Vec::new();
+    let mut visited: Vec<PathBuf> = Vec::new();
+    for p in candidate_paths() {
+        if !p.exists() {
+            continue;
+        }
+        if visited.iter().any(|v| same_canonical_path(v, &p)) {
+            continue;
+        }
+        visited.push(p.clone());
+        if let Ok(txt) = std::fs::read_to_string(&p) {
+            for w in validate_config_str(&txt) {
+                out.push((p.clone(), w));
+            }
+        }
+    }
+    out
+}
+
 fn load_merged_config() -> Result<Option<Config>> {
     let local_p = local_config_path();
     let global_p = global_config_path();
@@ -934,6 +1200,8 @@ fn load_merged_config() -> Result<Option<Config>> {
                 .with_context(|| format!("config {} tidak valid", gp.display()))?;
             let l_val: toml::Value = toml::from_str(&l_txt)
                 .with_context(|| format!("config {} tidak valid", local_p.display()))?;
+            emit_config_warnings_once(&gp.display().to_string(), &validate_toml_keys(&g_val));
+            emit_config_warnings_once(&local_p.display().to_string(), &validate_toml_keys(&l_val));
             let merged = merge_toml_values(g_val, l_val);
             let cfg: Config = merged.try_into().with_context(|| {
                 format!(
@@ -978,8 +1246,12 @@ pub fn load_or_empty() -> Result<(Config, bool)> {
 pub fn load_from(path: &std::path::Path) -> Result<Config> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("gagal membaca config {}", path.display()))?;
-    let cfg: Config =
+    let val: toml::Value =
         toml::from_str(&text).with_context(|| format!("config {} tidak valid", path.display()))?;
+    emit_config_warnings_once(&path.display().to_string(), &validate_toml_keys(&val));
+    let cfg: Config = val
+        .try_into()
+        .with_context(|| format!("config {} tidak valid", path.display()))?;
     Ok(cfg)
 }
 

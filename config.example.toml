@@ -46,6 +46,25 @@ max_parallel_subagents = 3                       # batas subagent delegate berja
 allowlist = ["ls", "git status", "git diff", "cargo test"]
 timeout_secs = 120
 
+# Tenggat waktu panggilan HTTP/streaming ke provider AI (v0.5.10).
+# PENTING: `[timeouts]` adalah seksi TOP-LEVEL — BUKAN sub-tabel di bawah `[providers.<nama>]`!
+# Menaruhnya di bawah `[providers.<nama>.timeouts]` akan diabaikan dan memicu peringatan saat start.
+[timeouts]
+connect_secs = 20                                # batas sambung TCP/TLS (detik)
+response_secs = 60                               # batas menunggu header respons awal provider (detik)
+stream_idle_secs = 90                            # batas diam antar-potongan streaming (detik)
+total_secs = 300                                 # batas keras total 1 panggilan provider (detik)
+
+# Telegram Bot Gateway (`selen telegram`) — opsional.
+# [telegram]
+# bot_token_env = "SELENCODE_TELEGRAM_TOKEN"
+# allowed_users = [123456789]                    # User ID / Chat ID yang diizinkan (cek lewat `/id`)
+# approval = "ask"                               # ask | edits | auto
+# approval_timeout_mins = 10                     # batas tunggu tombol persetujuan (menit; 0 = tanpa batas)
+# turn_timeout_secs = 900                        # batas waktu keras 1 giliran agent (detik; default 900 = 15 menit)
+# stall_notice_secs = 180                        # kirim 1 peringatan macet bila giliran diam tanpa progres (detik; default 180)
+# poll_watchdog_secs = 300                       # watchdog OS-thread: keluar non-nol (restart systemd) bila polling macet (detik; default 300)
+
 # Server MCP eksternal (Fase 7) — opsional, boleh banyak. Tool-nya muncul
 # sebagai mcp__<name>__<tool> di registry mode eksekusi. Default: panggilan
 # tool MCP selalu minta approval; trust = true mematikan approval untuk

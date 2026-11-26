@@ -8,10 +8,11 @@ use tokio::sync::mpsc;
 
 use super::context::{
     analyze_token_breakdown, auto_outline, build_folder_map, build_resume_snapshot,
-    build_system_prompt, cap_dynamic_injection, compact_messages_hermes, estimate_tokens,
-    expand_at_mentions, head_tail_truncate, needs_compaction,
-    prune_old_skill_results_with_archive, prune_old_tool_results_with_archive,
-    session_archive_dir, spillover_if_needed, spillover_with_preview,
+    build_resume_system_prompt, build_system_prompt, cap_dynamic_injection,
+    compact_messages_hermes, estimate_tokens, expand_at_mentions, head_tail_truncate,
+    needs_compaction, prune_old_skill_results_with_archive,
+    prune_old_tool_results_with_archive, session_archive_dir, spillover_if_needed,
+    spillover_with_preview,
 };
 use crate::tool_display::{
     build_template_closing_summary, format_tool_event_from_preview, prepare_tool_preview,
@@ -147,6 +148,183 @@ pub async fn run_turn_counted(
     .await
 }
 
+/// Klasifikasi jenis tugas deterministik di level harness (Perbaikan 2 v0.5.11):
+/// menentukan apakah giliran ini memerlukan penegakan pemuatan skill sebelum aksi pengubah berkas
+/// (`systematic-debugging` untuk bug/perbaikan/kegagalan; `test-driven-development` untuk fitur+tes/TDD).
+/// - Berdasarkan jenis tugas, BUKAN redaksi prompt tertentu (berlaku baik untuk redaksi terbuka maupun kanonik).
+/// - Tugas trivial, tanya-jawab, dan pembuatan skrip sederhana (mis. `rekap.py`, `calc.js` dengan
+///   spesifikasi `"cetak error ke stderr"`) mengembalikan `None` (zero spam skill).
+pub fn classify_required_skill_for_turn(
+    prompt: &str,
+    installed_skills: &[crate::skills::SkillInfo],
+) -> Option<String> {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() || installed_skills.is_empty() {
+        return None;
+    }
+    let has_skill = |target: &str| -> bool {
+        installed_skills
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case(target))
+    };
+    let low = trimmed.to_ascii_lowercase();
+
+    // 1. Fitur baru lengkap dengan tes / TDD -> `test-driven-development`
+    if has_skill("test-driven-development") {
+        let explicit_tdd = [
+            "tdd",
+            "test-driven",
+            "test driven",
+            "tes dulu",
+            "test first",
+        ]
+        .iter()
+        .any(|kw| low.contains(kw));
+        let has_feature_verb = [
+            "fitur",
+            "feature",
+            "implement",
+            "tulis ",
+            "buat fungsi",
+            "buat modul",
+            "buat kelas",
+            "buat class",
+            "tambah fungsi",
+            "tambah fitur",
+            "tambahkan ",
+        ]
+        .iter()
+        .any(|kw| low.contains(kw));
+        let has_test_req = [
+            "lengkap dengan tes",
+            "lengkap dengan test",
+            "beserta tes",
+            "beserta test",
+            "dengan tesnya",
+            "dengan testnya",
+            "dengan tes",
+            "dengan test",
+            "unit test",
+            "integration test",
+            "tes otomatis",
+            "test otomatis",
+            "tulis tes",
+            "tulis test",
+            "buat tes",
+            "buat test",
+            "tesnya",
+            "testnya",
+        ]
+        .iter()
+        .any(|kw| low.contains(kw));
+        if explicit_tdd || (has_feature_verb && has_test_req) {
+            return Some("test-driven-development".to_string());
+        }
+    }
+
+    // 2. Bug / perbaikan / error / diagnosis+jawaban benar -> `systematic-debugging`
+    if has_skill("systematic-debugging") {
+        // Saring frasa spesifikasi error-handling pada tugas pembuatan fitur baru (mis. "div 0 cetak error ke stderr")
+        // agar proyek greenfield biasa tidak salah dikira laporan bug.
+        let mut sanitized = low.clone();
+        for benign in [
+            "cetak error",
+            "pesan error",
+            "tampilkan error",
+            "kembalikan error",
+            "lempar error",
+            "throw error",
+            "return error",
+            "error handling",
+            "handle error",
+            "handling error",
+            "error message",
+            "on error",
+            "kalau error",
+            "jika error",
+            "bila error",
+        ] {
+            sanitized = sanitized.replace(benign, " ");
+        }
+
+        let is_trivial_qa = [
+            "jelaskan ",
+            "apa itu ",
+            "ringkas ",
+            "balas ",
+            "tulis satu kalimat",
+            "sapa ",
+            "sebutkan kata sandi",
+            "apa kode rahasia",
+        ]
+        .iter()
+        .any(|p| low.starts_with(p));
+        let is_pure_status_query = [
+            "cek status",
+            "cek lagi status",
+            "udah belum",
+            "sudah belum",
+            "sampai mana",
+        ]
+        .iter()
+        .any(|p| low.starts_with(p))
+            && !["perbaiki", "benerin", "retry", "ulang", "fix ", "bug"]
+                .iter()
+                .any(|kw| low.contains(kw));
+        if is_pure_status_query {
+            return None;
+        }
+
+        let direct_debug = [
+            "bug",
+            "debug",
+            "diagnos",
+            "akar masalah",
+            "akar penyebab",
+            "perbaiki",
+            "benerin",
+            "fix ",
+            "fixing",
+            "traceback",
+            "stack trace",
+            "panic",
+            "crash",
+            "gagal",
+            "failed",
+            "salah hitung",
+            "hasilnya salah",
+            "keliru",
+            "tidak sesuai",
+            "broken",
+            "wrong output",
+            "wrong result",
+            "error",
+        ]
+        .iter()
+        .any(|kw| sanitized.contains(kw));
+
+        let mismatch_diagnosis = ["seharusnya", "harusnya", "expected", "bukannya", "malah"]
+            .iter()
+            .any(|kw| low.contains(kw))
+            && [
+                ".js", ".py", ".rs", ".ts", ".go", "hitung", "fungsi", "skrip", "script", "kode",
+                "output", "hasil", "koreksi", "ubah",
+            ]
+            .iter()
+            .any(|kw| low.contains(kw));
+
+        if (!is_trivial_qa && direct_debug) || mismatch_diagnosis {
+            return Some("systematic-debugging".to_string());
+        }
+    }
+
+    None
+}
+
+fn is_file_mutating_tool(name: &str) -> bool {
+    matches!(name, "edit_file" | "write_file" | "lsp_rename")
+}
+
 /// Loop (Blueprint Bagian 2): provider → tool_call? → jalankan → ToolResult →
 /// ulangi, sampai tidak ada tool_call atau max_steps tercapai.
 /// Error tool menjadi ToolResult is_error=true — tidak pernah crash.
@@ -166,8 +344,23 @@ async fn run_turn_inner(
     let has_mcp = registry.names().iter().any(|n| n.starts_with("mcp__"));
     let installed_skills = crate::skills::list_skills(&ctx.cwd);
     let lean_resume = ctx.is_resumed_session && !messages.is_empty();
+    // Perbaikan 2 (v0.5.11): klasifikasi jenis tugas di level harness untuk gerbang skill.
+    let required_skill = if mode == TurnMode::Execute && ctx.guard.enabled {
+        classify_required_skill_for_turn(user_prompt, &installed_skills)
+    } else {
+        None
+    };
     let mut active_toolsets = if lean_resume {
-        crate::tools::toolsets::select_resume_initial_toolsets(user_prompt, &ctx.cwd, has_mcp, mode)
+        let mut s = crate::tools::toolsets::select_resume_initial_toolsets(
+            user_prompt,
+            &ctx.cwd,
+            has_mcp,
+            mode,
+        );
+        if required_skill.is_some() {
+            s.insert("skills_view".to_string());
+        }
+        s
     } else {
         let mut s =
             crate::tools::toolsets::select_initial_toolsets(user_prompt, &ctx.cwd, has_mcp, mode);
@@ -185,13 +378,21 @@ async fn run_turn_inner(
         lean_resume,
     );
 
-    // Helper lokal untuk menyusun System Prompt + Konteks Sesi (Snapshot Awal) yang identik untuk sesi baru
-    // maupun penyegaran snapshot resume ramping.
+    // Helper lokal untuk menyusun System Prompt + Konteks Sesi (Snapshot Awal).
+    // Pada sesi baru (`is_resume_call == false`): perilaku identik 100% dengan v0.5.10.
+    // Pada giliran RESUME (`is_resume_call == true`, Perbaikan 1 v0.5.11): pakai prompt resume padat
+    // (`build_resume_system_prompt`) dan hanya kirim katalog 14 skill penuh bila toolset skill aktif
+    // (menghemat ~1.000+ token di SETIAP panggilan giliran resume tanpa mengurangi kemampuan apa pun!).
     let build_fresh_system_prompt = |cur_tools: &[crate::providers::ToolSpec],
                                      cur_active: &std::collections::HashSet<String>,
-                                     include_folder_map: bool|
+                                     include_folder_map: bool,
+                                     is_resume_call: bool|
      -> String {
-        let mut sys = build_system_prompt(&ctx.cwd, cur_tools);
+        let mut sys = if is_resume_call {
+            build_resume_system_prompt(&ctx.cwd, cur_tools)
+        } else {
+            build_system_prompt(&ctx.cwd, cur_tools)
+        };
         let mut dynamic_snapshot = String::new();
         let hint = crate::tools::toolsets::inactive_toolsets_hint(registry, cur_active);
         if !hint.is_empty() {
@@ -211,10 +412,20 @@ async fn run_turn_inner(
                 dynamic_snapshot.push('\n');
             }
         }
-        let skills_idx = crate::skills::format_skills_index_budgeted(&installed_skills, dyn_cap);
-        if !skills_idx.is_empty() {
-            dynamic_snapshot.push_str(&skills_idx);
-            dynamic_snapshot.push('\n');
+        let include_full_skills_idx = !is_resume_call
+            || cur_active.contains("skills_view")
+            || cur_active.contains("skills_mem");
+        if include_full_skills_idx {
+            let skills_idx = crate::skills::format_skills_index_budgeted(&installed_skills, dyn_cap);
+            if !skills_idx.is_empty() {
+                dynamic_snapshot.push_str(&skills_idx);
+                dynamic_snapshot.push('\n');
+            }
+        } else if !installed_skills.is_empty() {
+            dynamic_snapshot.push_str(&format!(
+                "Skills terpasang ({}): aktifkan `skills_view`/`skills_mem` bila butuh.\n",
+                installed_skills.len()
+            ));
         }
         if let Some(mcp_idx) = crate::tools::toolsets::build_mcp_compact_index(registry) {
             dynamic_snapshot.push_str(&mcp_idx);
@@ -241,7 +452,7 @@ async fn run_turn_inner(
     // diikuti snapshot blok dinamis (toolsets + peta folder kerja + indeks skills + indeks MCP + memori beku).
     let mut auto_loaded_skill_msgs: Vec<Message> = Vec::new();
     if messages.is_empty() {
-        let sys = build_fresh_system_prompt(&tools, &active_toolsets, true);
+        let sys = build_fresh_system_prompt(&tools, &active_toolsets, true, false);
         let sys_msg = Message::text(Role::System, sys);
         persist_message(ctx, &sys_msg);
         messages.push(sys_msg);
@@ -364,14 +575,21 @@ async fn run_turn_inner(
     let mut anti_spin_reminded = false;
     let mut turn_actions: Vec<ToolActionEvent> = Vec::new();
     let mut forced_stop_reason: Option<String> = None;
+    let mut loaded_skills_in_turn: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut skill_gate_fired = false;
 
     for step in 0..max_steps {
         // Perbaikan 1 (v0.5.9) — Prune lebih dini hasil `skill_view` lama (di luar 2 pesan terakhir =
         // tepat sesudah model memakainya di 1 giliran berikutnya) ke stub ringkas + arsip byte-exact
         // agar isi skill tidak terbawa penuh di sisa sesi.
         let pruned_skills = prune_old_skill_results_with_archive(messages, &prune_dir, 2);
-        // Tahap 1 — Prune hasil tool lama (>200 char di luar 20 pesan terakhir) + arsip ke file (TANPA LLM).
-        let pruned_now = pruned_skills + prune_old_tool_results_with_archive(messages, &prune_dir, 20);
+        // Tahap 1 & Perbaikan 1 (v0.5.11): pada giliran resume step lanjutan (`lean_resume && step >= 2`),
+        // pangkas hasil tool besar (>200 char) di luar 2 pesan terakhir ke stub arsip agar tidak menempel
+        // antar-panggilan; sesi biasa mempertahankan jendela 20 pesan terakhir.
+        let tool_keep_tail = if lean_resume && step >= 2 { 2 } else { 20 };
+        let pruned_now =
+            pruned_skills + prune_old_tool_results_with_archive(messages, &prune_dir, tool_keep_tail);
         // Kompresi dua tahap: hanya ringkas jika MASIH > 50% sesudah Tahap 1 prune!
         if needs_compaction(messages, ctx.context_limit_tokens) {
             match &ui {
@@ -384,10 +602,10 @@ async fn run_turn_inner(
             }
             *messages = compact_messages_hermes(messages);
         }
-        // Perbaikan 1 (v0.5.7): untuk sesi RESUME, bangun snapshot ramping (system prompt segar tanpa
-        // folder_map ulang + ringkas riwayat tool giliran sebelumnya) tanpa mengubah riwayat mentah di DB!
+        // Perbaikan 1 (v0.5.7 & v0.5.11): untuk sesi RESUME, bangun snapshot ramping (system prompt
+        // resume padat tanpa folder_map/katalog skill penuh + ringkas riwayat pra-resume) tanpa mengubah DB!
         let mut snapshot = if lean_resume {
-            let fresh_sys = build_fresh_system_prompt(&tools, &active_toolsets, false);
+            let fresh_sys = build_fresh_system_prompt(&tools, &active_toolsets, false, true);
             build_resume_snapshot(messages, Some(&fresh_sys))
         } else {
             messages.clone()
@@ -516,6 +734,104 @@ async fn run_turn_inner(
             have_usage = true;
         }
         last_text = reply.text.clone();
+
+        // Perbaikan 2 (v0.5.11) — Gerbang Skill di level loop harness (bukan sekadar kalimat prompt!):
+        // Bila tugas tergolong debugging/TDD dan model mencoba menjalankan aksi pengubah berkas
+        // (`edit_file`/`write_file`/`lsp_rename`) SEBELUM memuat skill yang cocok, tahan aksi pengubah
+        // (disk belum tersentuh), jalankan `skill_view` salinan kerja ringkas di harness, rekam pasangan
+        // `ToolUse`/`ToolResult` yang sah ke riwayat + DB, lalu lanjutkan langkah berikutnya.
+        if let Some(req_sk) = required_skill.as_deref() {
+            let attempts_mutation = reply
+                .tool_calls
+                .iter()
+                .any(|c| is_file_mutating_tool(&c.name));
+            let loads_req_in_batch = reply.tool_calls.iter().any(|c| {
+                c.name == "skill_view"
+                    && c.args
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|n| n.eq_ignore_ascii_case(req_sk))
+                        .unwrap_or(false)
+            });
+            if attempts_mutation
+                && !loads_req_in_batch
+                && !loaded_skills_in_turn.contains(req_sk)
+                && !skill_gate_fired
+            {
+                if let Some(sv_tool) = registry.get("skill_view") {
+                    skill_gate_fired = true;
+                    let gate_call_id = format!("gate_skill_{}", step + 1);
+                    let gate_args = serde_json::json!({ "name": req_sk });
+                    let preview_arg = prepare_tool_preview(
+                        "skill_view",
+                        &gate_args,
+                        ctx.tool_preview_length,
+                    );
+                    match &ui {
+                        Some(tx) => {
+                            let _ = tx
+                                .send(UiEvent::ToolStart {
+                                    name: "skill_view".into(),
+                                    args: preview_arg.clone(),
+                                })
+                                .await;
+                        }
+                        None => eprintln!(
+                            "[tool] {}",
+                            format_tool_event_from_preview("skill_view", &preview_arg)
+                        ),
+                    }
+                    let (mut sv_out, sv_err) = match sv_tool.run(gate_args.clone(), ctx).await {
+                        Ok(out) => (redact_secrets(&out), false),
+                        Err(e) => (redact_secrets(&format!("ERROR: {e}")), true),
+                    };
+                    if !sv_err {
+                        loaded_skills_in_turn.insert(req_sk.to_string());
+                        sv_out.push_str(
+                            "\n\n[Gerbang Skill Harness] Aksi ubah berkas ditahan sebelum skill ini dimuat. \
+                             Ikuti prosedur investigasi/tes di atas terlebih dahulu, lalu lanjutkan perubahan berkas.",
+                        );
+                    }
+                    let gate_asst = Message {
+                        role: Role::Assistant,
+                        content: vec![Block::ToolUse {
+                            id: gate_call_id.clone(),
+                            name: "skill_view".into(),
+                            args: gate_args,
+                        }],
+                    };
+                    persist_message(ctx, &gate_asst);
+                    messages.push(gate_asst);
+                    let gate_tool = Message {
+                        role: Role::Tool,
+                        content: vec![Block::ToolResult {
+                            id: gate_call_id,
+                            content: sv_out.clone(),
+                            is_error: sv_err,
+                        }],
+                    };
+                    persist_message(ctx, &gate_tool);
+                    messages.push(gate_tool);
+                    turn_actions.push(ToolActionEvent {
+                        name: "skill_view".into(),
+                        preview: preview_arg,
+                        is_error: sv_err,
+                        error_reason: sv_err.then(|| short_error_reason(&sv_out)),
+                    });
+                    tool_calls_executed += 1;
+                    if let Some(tx) = &ui {
+                        let _ = tx
+                            .send(UiEvent::ToolDone {
+                                name: "skill_view".into(),
+                                summary: summarize(&sv_out, 200),
+                                is_error: sv_err,
+                            })
+                            .await;
+                    }
+                    continue;
+                }
+            }
+        }
 
         // Rekonstruksi pesan assistant (teks + tool_use).
         let mut blocks: Vec<Block> = Vec::new();
@@ -889,6 +1205,11 @@ async fn run_turn_inner(
             // update_plan (Fase 6): checklist ditampilkan ke user setiap
             // berhasil diperbarui — polos dicetak, TUI jadi blok khusus.
             tool_calls_executed += 1;
+            if call.name == "skill_view" && !is_error {
+                if let Some(sk) = call.args.get("name").and_then(|v| v.as_str()) {
+                    loaded_skills_in_turn.insert(sk.trim().to_ascii_lowercase());
+                }
+            }
             if matches!(call.name.as_str(), "skill_create" | "skill_edit")
                 && !is_error
                 && !content.starts_with("Ditolak user")
@@ -965,6 +1286,88 @@ async fn run_turn_inner(
         };
         persist_message(ctx, &tool_msg);
         messages.push(tool_msg);
+
+        // Perbaikan 2 (v0.5.11) — Suntikan nol-pemborosan pasca-langkah-pertama:
+        // Bila pada langkah 0 model hanya membaca/memeriksa berkas tanpa memanggil `skill_view`
+        // pada tugas debugging/TDD, muat salinan kerja skill sekarang juga di harness sebelum
+        // langkah 1 dikirim ke LLM (0 panggilan LLM terbuang, 100% tercatat sebelum edit pertama!).
+        if step == 0 && !skill_gate_fired {
+            if let Some(req_sk) = required_skill.as_deref() {
+                if !loaded_skills_in_turn.contains(req_sk) {
+                    if let Some(sv_tool) = registry.get("skill_view") {
+                        skill_gate_fired = true;
+                        let gate_call_id = "gate_skill_step0".to_string();
+                        let gate_args = serde_json::json!({ "name": req_sk });
+                        let preview_arg = prepare_tool_preview(
+                            "skill_view",
+                            &gate_args,
+                            ctx.tool_preview_length,
+                        );
+                        match &ui {
+                            Some(tx) => {
+                                let _ = tx
+                                    .send(UiEvent::ToolStart {
+                                        name: "skill_view".into(),
+                                        args: preview_arg.clone(),
+                                    })
+                                    .await;
+                            }
+                            None => eprintln!(
+                                "[tool] {}",
+                                format_tool_event_from_preview("skill_view", &preview_arg)
+                            ),
+                        }
+                        let (mut sv_out, sv_err) = match sv_tool.run(gate_args.clone(), ctx).await {
+                            Ok(out) => (redact_secrets(&out), false),
+                            Err(e) => (redact_secrets(&format!("ERROR: {e}")), true),
+                        };
+                        if !sv_err {
+                            loaded_skills_in_turn.insert(req_sk.to_string());
+                            sv_out.push_str(
+                                "\n\n[Gerbang Skill Harness] Skill dimuat otomatis sebelum langkah edit. \
+                                 Ikuti prosedur investigasi/verifikasi di atas.",
+                            );
+                        }
+                        let gate_asst = Message {
+                            role: Role::Assistant,
+                            content: vec![Block::ToolUse {
+                                id: gate_call_id.clone(),
+                                name: "skill_view".into(),
+                                args: gate_args,
+                            }],
+                        };
+                        persist_message(ctx, &gate_asst);
+                        messages.push(gate_asst);
+                        let gate_tool = Message {
+                            role: Role::Tool,
+                            content: vec![Block::ToolResult {
+                                id: gate_call_id,
+                                content: sv_out.clone(),
+                                is_error: sv_err,
+                            }],
+                        };
+                        persist_message(ctx, &gate_tool);
+                        messages.push(gate_tool);
+                        turn_actions.push(ToolActionEvent {
+                            name: "skill_view".into(),
+                            preview: preview_arg,
+                            is_error: sv_err,
+                            error_reason: sv_err.then(|| short_error_reason(&sv_out)),
+                        });
+                        tool_calls_executed += 1;
+                        if let Some(tx) = &ui {
+                            let _ = tx
+                                .send(UiEvent::ToolDone {
+                                    name: "skill_view".into(),
+                                    summary: summarize(&sv_out, 200),
+                                    is_error: sv_err,
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
 
         // Tahap 2: deteksi stagnasi sebagai pemicu berhenti (bukan sekadar log) bila guard aktif.
         if ctx.guard.enabled && loop_guard.is_stagnated() {

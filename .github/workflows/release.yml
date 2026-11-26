@@ -17,6 +17,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Gerbang Laporan Rilis (v0.5.11 Perbaikan 3)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          python3 - << 'PY'
+          import glob, os, re, sys
+          tag = os.environ.get("GITHUB_REF_NAME", "").strip()
+          digits = re.sub(r"[^0-9]", "", tag)
+          pattern = f"docs/reports/HASIL-V{digits}-*.md"
+          matches = sorted(glob.glob(pattern))
+          if not matches:
+              print(f"::error::Gerbang rilis GAGAL: laporan rilis wajib ada di repo sebelum tag dibuat (pola diharapkan: {pattern})")
+              sys.exit(1)
+          path = matches[-1]
+          txt = open(path, encoding="utf-8").read()
+          low = txt.lower()
+          checks = [
+              (tag.lower() in low, f"laporan harus menyebut versi {tag}"),
+              ("perbaikan 1" in low and ("lulus" in low or "pass" in low), "laporan harus memuat vonis/hasil per perbaikan"),
+              ("usage" in low and "proyek a" in low and "proyek b" in low and "resume" in low, "laporan harus memuat angka regresi A/B/E dari tabel usage"),
+              ("tidak diubah" in low, "laporan harus memuat daftar bagian yang sengaja tidak diubah"),
+          ]
+          missing = [msg for ok, msg in checks if not ok]
+          if missing:
+              for m in missing:
+                  print(f"::error::Gerbang rilis GAGAL ({path}): {m}")
+              sys.exit(1)
+          print(f"Gerbang laporan rilis LULUS: {path} ({len(txt)} byte)")
+          PY
       - uses: dtolnay/rust-toolchain@stable
       - name: Jalankan cargo test
         run: cargo test

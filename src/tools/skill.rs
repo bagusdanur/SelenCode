@@ -204,14 +204,14 @@ pub fn build_skill_working_copy(skill_name: &str, raw_content: &str) -> String {
         out.push('\n');
     }
     out.push_str(&format!(
-        "(Salinan kerja ringkas dari {} char — panggil `skill_view(name=\"{skill_name}\", full=true)` untuk isi penuh.)",
+        "(Salinan kerja ringkas dari {} char — muat ulang `skill_view(name=\"{skill_name}\")` juga mengembalikan salinan kerja ini; tambah `full=true` hanya bila benar-benar butuh teks penuh.)",
         raw_content.chars().count()
     ));
     out
 }
 
-/// Tingkat 2 & 3: muat isi `SKILL.md` (`path` kosong; salinan kerja ringkas untuk skill > 4.500 char kecuali `full=true`)
-/// ATAU 1 file referensi di dalam folder skill (`path` diisi).
+/// Tingkat 2 & 3: muat isi `SKILL.md` (`path` kosong; salinan kerja ringkas untuk skill > 4.500 char baik pada
+/// muatan pertama maupun muat-ulang kecuali `full=true`) ATAU 1 file referensi di dalam folder skill (`path` diisi).
 pub struct SkillView;
 
 #[async_trait]
@@ -219,7 +219,7 @@ impl Tool for SkillView {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "skill_view".into(),
-            description: "Muat SKILL.md suatu skill (salinan kerja ringkas bila panjang; set `full=true` untuk isi penuh, atau `path` untuk 1 file referensi).".into(),
+            description: "Muat salinan kerja ringkas SKILL.md (termasuk saat muat ulang); set `full=true` hanya jika benar-benar butuh teks penuh, atau `path` untuk 1 file referensi.".into(),
             parameters: schema(
                 json!({
                     "name": { "type": "string" },

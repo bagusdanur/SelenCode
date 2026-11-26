@@ -1985,12 +1985,20 @@ impl Session {
     }
 
     pub(crate) fn handle_use_skill(&mut self, arg: Option<&str>) -> Result<String> {
-        let name = arg
+        let raw = arg
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!("sebutkan nama skill. Contoh: /skill tinjau-rust"))?;
+        let mut parts = raw.split_whitespace();
+        let name = parts.next().unwrap_or(raw);
+        let want_full = parts.any(|p| p == "--full" || p.eq_ignore_ascii_case("full"));
         let (info, content, refs) = selencode::skills::load_skill_with_refs(&self.ctx.cwd, name)?;
-        let mut msg_body = format!("[Skill dimuat manual via /skill: {}]\n{content}", info.name);
+        let body = if want_full {
+            content
+        } else {
+            selencode::tools::skill::build_skill_working_copy(&info.name, &content)
+        };
+        let mut msg_body = format!("[Skill dimuat manual via /skill: {}]\n{body}", info.name);
         if !refs.is_empty() {
             msg_body.push_str("\n---\nReferensi tersedia (muat dengan `skill_view(name, path)`):\n");
             for r in &refs {
