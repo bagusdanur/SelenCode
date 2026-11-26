@@ -148,13 +148,150 @@ pub async fn run_turn_counted(
     .await
 }
 
-/// Klasifikasi jenis tugas deterministik di level harness (Perbaikan 2 v0.5.11):
+/// Catatan terlihat yang direkam di transkrip & log sesi saat pengguna menonaktifkan gerbang skill
+/// secara eksplisit pada giliran berjalan (Perbaikan 1 v0.5.13).
+pub const SKILL_GATE_SKIPPED_NOTE: &str = "[gerbang-skill] dilewati: instruksi pengguna";
+
+fn normalize_ws_ascii_lower(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn contains_word_phrase(haystack: &str, phrase: &str) -> bool {
+    let mut start = 0usize;
+    while let Some(pos) = haystack[start..].find(phrase) {
+        let abs = start + pos;
+        let end = abs + phrase.len();
+        let before_ok = abs == 0
+            || !haystack[..abs]
+                .chars()
+                .next_back()
+                .map(|c| c.is_alphanumeric() || c == '_')
+                .unwrap_or(false);
+        let after_ok = end >= haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .map(|c| c.is_alphanumeric() || c == '_')
+                .unwrap_or(false);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + phrase.len();
+    }
+    false
+}
+
+/// Deteksi apakah pengguna secara eksplisit melarang pemuatan/pemakaian skill pada giliran berjalan.
+pub fn prompt_explicitly_forbids_skill(prompt: &str) -> bool {
+    let norm = normalize_ws_ascii_lower(prompt);
+    if norm.is_empty() {
+        return false;
+    }
+    const EXPLICIT_SKILL_OPTOUTS: &[&str] = &[
+        "jangan muat skill",
+        "jangan memuat skill",
+        "jangan load skill",
+        "jangan pakai skill",
+        "jangan memakai skill",
+        "jangan gunakan skill",
+        "jangan menggunakan skill",
+        "jangan panggil skill",
+        "jangan buka skill",
+        "jangan aktifkan skill",
+        "jangan jalankan skill",
+        "jangan pakai gerbang skill",
+        "tidak usah muat skill",
+        "tak usah muat skill",
+        "gak usah muat skill",
+        "ga usah muat skill",
+        "nggak usah muat skill",
+        "tidak usah pakai skill",
+        "tak usah pakai skill",
+        "gak usah pakai skill",
+        "ga usah pakai skill",
+        "nggak usah pakai skill",
+        "tidak perlu muat skill",
+        "tidak perlu memuat skill",
+        "tak perlu muat skill",
+        "tak perlu memuat skill",
+        "tidak perlu pakai skill",
+        "tidak perlu skill",
+        "tak perlu skill",
+        "tanpa muat skill",
+        "tanpa memuat skill",
+        "tanpa pakai skill",
+        "tanpa memakai skill",
+        "tanpa menggunakan skill",
+        "tanpa skill",
+        "tanpa gerbang skill",
+        "lewati skill",
+        "abaikan skill",
+        "matikan gerbang skill",
+        "don't load skill",
+        "dont load skill",
+        "do not load skill",
+        "don't load any skill",
+        "do not load any skill",
+        "don't use skill",
+        "dont use skill",
+        "do not use skill",
+        "don't use any skill",
+        "do not use any skill",
+        "without skill",
+        "without any skill",
+        "without loading skill",
+        "without loading any skill",
+        "skip skill",
+        "skip skills",
+        "disable skill gate",
+        "bypass skill gate",
+    ];
+    if EXPLICIT_SKILL_OPTOUTS.iter().any(|p| norm.contains(p)) {
+        return true;
+    }
+    contains_word_phrase(&norm, "no skill") || contains_word_phrase(&norm, "no skills")
+}
+
+/// Deteksi apakah instruksi pengguna pada giliran berjalan meminta melewati gerbang skill
+/// (baik penolakan eksplisit skill maupun instruksi langsung eksekusi seperti "langsung saja kerjakan").
+pub fn prompt_opts_out_of_skill_gate(prompt: &str) -> bool {
+    if prompt_explicitly_forbids_skill(prompt) {
+        return true;
+    }
+    let norm = normalize_ws_ascii_lower(prompt);
+    const DIRECT_EXEC_OPTOUTS: &[&str] = &[
+        "langsung saja kerjakan",
+        "kerjakan langsung saja",
+        "langsung kerjakan saja",
+        "langsung saja perbaiki",
+        "langsung perbaiki saja",
+        "langsung eksekusi saja",
+    ];
+    DIRECT_EXEC_OPTOUTS.iter().any(|p| norm.contains(p))
+}
+
+/// Klasifikasi jenis tugas deterministik di level harness (Perbaikan 2 v0.5.11 + Perbaikan 1 v0.5.13):
 /// menentukan apakah giliran ini memerlukan penegakan pemuatan skill sebelum aksi pengubah berkas
 /// (`systematic-debugging` untuk bug/perbaikan/kegagalan; `test-driven-development` untuk fitur+tes/TDD).
 /// - Berdasarkan jenis tugas, BUKAN redaksi prompt tertentu (berlaku baik untuk redaksi terbuka maupun kanonik).
 /// - Tugas trivial, tanya-jawab, dan pembuatan skrip sederhana (mis. `rekap.py`, `calc.js` dengan
 ///   spesifikasi `"cetak error ke stderr"`) mengembalikan `None` (zero spam skill).
+/// - Instruksi penolakan eksplisit dari pengguna (`prompt_opts_out_of_skill_gate`) selalu menang
+///   dan mengembalikan `None`.
 pub fn classify_required_skill_for_turn(
+    prompt: &str,
+    installed_skills: &[crate::skills::SkillInfo],
+) -> Option<String> {
+    if prompt_opts_out_of_skill_gate(prompt) {
+        return None;
+    }
+    classify_required_skill_for_turn_raw(prompt, installed_skills)
+}
+
+fn classify_required_skill_for_turn_raw(
     prompt: &str,
     installed_skills: &[crate::skills::SkillInfo],
 ) -> Option<String> {
@@ -344,11 +481,23 @@ async fn run_turn_inner(
     let has_mcp = registry.names().iter().any(|n| n.starts_with("mcp__"));
     let installed_skills = crate::skills::list_skills(&ctx.cwd);
     let lean_resume = ctx.is_resumed_session && !messages.is_empty();
-    // Perbaikan 2 (v0.5.11): klasifikasi jenis tugas di level harness untuk gerbang skill.
-    let required_skill = if mode == TurnMode::Execute && ctx.guard.enabled {
-        classify_required_skill_for_turn(user_prompt, &installed_skills)
+    // Perbaikan 2 (v0.5.11) + Perbaikan 1 (v0.5.13): klasifikasi jenis tugas di level harness
+    // untuk gerbang skill; instruksi eksplisit pengguna pada giliran berjalan selalu menang.
+    let raw_required_skill = if mode == TurnMode::Execute && ctx.guard.enabled {
+        classify_required_skill_for_turn_raw(user_prompt, &installed_skills)
     } else {
         None
+    };
+    let skill_gate_opted_out = if mode == TurnMode::Execute && ctx.guard.enabled {
+        prompt_explicitly_forbids_skill(user_prompt)
+            || (raw_required_skill.is_some() && prompt_opts_out_of_skill_gate(user_prompt))
+    } else {
+        false
+    };
+    let required_skill = if skill_gate_opted_out {
+        None
+    } else {
+        raw_required_skill
     };
     let mut active_toolsets = if lean_resume {
         let mut s = crate::tools::toolsets::select_resume_initial_toolsets(
@@ -360,12 +509,18 @@ async fn run_turn_inner(
         if required_skill.is_some() {
             s.insert("skills_view".to_string());
         }
+        if skill_gate_opted_out {
+            s.remove("skills_view");
+        }
         s
     } else {
         let mut s =
             crate::tools::toolsets::select_initial_toolsets(user_prompt, &ctx.cwd, has_mcp, mode);
-        if !installed_skills.is_empty() {
+        if !installed_skills.is_empty() && !skill_gate_opted_out {
             s.insert("skills_view".to_string());
+        }
+        if skill_gate_opted_out {
+            s.remove("skills_view");
         }
         s
     };
@@ -528,6 +683,18 @@ async fn run_turn_inner(
             }
             None => eprintln!("[selen] {note}"),
         }
+    }
+    if skill_gate_opted_out {
+        match &ui {
+            Some(tx) => {
+                let _ = tx
+                    .send(UiEvent::Info(SKILL_GATE_SKIPPED_NOTE.to_string()))
+                    .await;
+            }
+            None => eprintln!("{SKILL_GATE_SKIPPED_NOTE}"),
+        }
+        user_text.push_str("\n\n");
+        user_text.push_str(SKILL_GATE_SKIPPED_NOTE);
     }
     let mut user_blocks = vec![Block::Text(user_text)];
     user_blocks.extend(image_blocks);

@@ -14,7 +14,8 @@ pub use review::{
     ReviewSkipReason,
 };
 pub use run::{
-    classify_required_skill_for_turn, run_turn, run_turn_counted, run_turn_mode, run_turn_ui,
-    run_turn_ui_mode,
+    classify_required_skill_for_turn, prompt_explicitly_forbids_skill,
+    prompt_opts_out_of_skill_gate, run_turn, run_turn_counted, run_turn_mode, run_turn_ui,
+    run_turn_ui_mode, SKILL_GATE_SKIPPED_NOTE,
 };
 pub use ui::UiEvent;

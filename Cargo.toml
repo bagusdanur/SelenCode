@@ -1,6 +1,6 @@
 [package]
 name = "selencode"
-version = "0.5.12"
+version = "0.5.13"
 edition = "2021"
 description = "SelenCode — terminal AI coding agent (seperti Claude Code), persona Selena, full Rust, jalan di Termux Android"
 license = "MIT"
