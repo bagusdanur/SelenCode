@@ -263,7 +263,7 @@ fn perbaikan2_builtin_skill_prompt_habit_and_sharp_descriptions() {
     .unwrap();
     seed_builtin_skills_to(&skills_root);
 
-    let scan = scan_skills_in_dirs(None, Some(&skills_root));
+    let scan = scan_skills_in_dirs(&dir.join("__no_proj__"), Some(&skills_root));
     assert_eq!(scan.skills.len(), 14);
     for target in [
         "systematic-debugging",
@@ -671,7 +671,7 @@ async fn perbaikan8_skills_install_validation_scripts_collision_and_remove() {
     assert_eq!(rep.scripts_count, 1);
     assert!(rep.provenance_path.is_file());
 
-    let scan = scan_skills_in_dirs(None, Some(&user_skills));
+    let scan = scan_skills_in_dirs(&dir.join("__no_proj__"), Some(&user_skills));
     assert!(scan.skills.iter().any(|s| s.name == "cek-paket-demo"));
 
     // 3. Bentrok nama ditolak (tidak menimpa diam-diam), sukses dengan `--rename`
@@ -693,7 +693,7 @@ async fn perbaikan8_skills_install_validation_scripts_collision_and_remove() {
     let rm_msg = remove_installed_skill("cek-paket-demo", &user_skills, &dir).unwrap();
     assert!(rm_msg.contains("berhasil dicopot"));
     // Skill hasil rename tetap bisa dimuat!
-    let scan2 = scan_skills_in_dirs(None, Some(&user_skills));
+    let scan2 = scan_skills_in_dirs(&dir.join("__no_proj__"), Some(&user_skills));
     assert!(scan2.skills.iter().any(|s| s.name == "cek-paket-v2"));
     let _ = load_skill(&dir, "lokal-proyek").unwrap();
 

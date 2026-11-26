@@ -396,7 +396,7 @@ pub fn finalize_staged_skill_install(
             target_name
         ));
     }
-    let existing = scan_skills_in_dirs(None, Some(user_root));
+    let existing = scan_skills_in_dirs(Path::new("__selencode_no_project_skills__"), Some(user_root));
     if existing.skills.iter().any(|s| s.name == target_name) {
         return Err(anyhow!(
             "bentrok nama: skill '{}' sudah terpasang di direktori pengguna. Tidak menimpa diam-diam — gunakan `--rename <nama-baru>` atau copot dulu dengan `selen skills remove {}`.",
@@ -480,8 +480,8 @@ pub fn remove_installed_skill(name: &str, user_root: &Path, cwd: &Path) -> Resul
         ));
     }
     let proj_dir = project_skills_dir(cwd);
-    let proj_scan = scan_skills_in_dirs(Some(&proj_dir), None);
-    let user_scan = scan_skills_in_dirs(None, Some(user_root));
+    let proj_scan = scan_skills_in_dirs(&proj_dir, None);
+    let user_scan = scan_skills_in_dirs(Path::new("__selencode_no_project_skills__"), Some(user_root));
     let Some(target) = user_scan.skills.into_iter().find(|s| s.name == clean) else {
         if proj_scan.skills.iter().any(|s| s.name == clean) {
             return Err(anyhow!(
