@@ -254,6 +254,143 @@ pub const TELEGRAM_BOT_COMMANDS: &[(&str, &str)] = &[
     ("id", "Tampilkan User ID & Chat ID Telegram"),
 ];
 
+/// Batas baris blok kode di chat Telegram sebelum otomatis diekstrak menjadi lampiran berkas (`sendDocument`).
+pub const TELEGRAM_LONG_CODE_MAX_LINES: usize = 25;
+/// Batas karakter blok kode di chat Telegram sebelum otomatis diekstrak menjadi lampiran berkas (`sendDocument`).
+pub const TELEGRAM_LONG_CODE_MAX_CHARS: usize = 1500;
+
+/// Blok kode panjang yang diekstrak dari jawaban Markdown untuk dikirim sebagai berkas lampiran Telegram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedCodeBlock {
+    pub index: usize,
+    pub lang: String,
+    pub filename: String,
+    pub lines: usize,
+    pub content: String,
+}
+
+fn code_ext_for_lang(lang: &str) -> &'static str {
+    match lang.trim().to_ascii_lowercase().as_str() {
+        "rs" | "rust" => "rs",
+        "py" | "python" => "py",
+        "js" | "javascript" | "mjs" | "cjs" => "js",
+        "ts" | "typescript" => "ts",
+        "tsx" => "tsx",
+        "jsx" => "jsx",
+        "json" => "json",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "sh" | "bash" | "zsh" | "shell" => "sh",
+        "ps1" | "powershell" => "ps1",
+        "sql" => "sql",
+        "html" | "htm" => "html",
+        "css" => "css",
+        "go" => "go",
+        "c" => "c",
+        "cpp" | "cc" | "cxx" => "cpp",
+        "java" => "java",
+        "md" | "markdown" => "md",
+        "diff" | "patch" => "diff",
+        "log" => "log",
+        _ => "txt",
+    }
+}
+
+/// Ekstrak blok kode pagar panjang (`>= 25` baris ATAU `>= 1.500` karakter) dari Markdown
+/// agar dikirim sebagai berkas lampiran Telegram (`sendDocument`) + 1 baris ringkasan di chat,
+/// sementara blok kode pendek tetap dirender rapi sebagai `<pre><code>`.
+pub fn extract_long_code_blocks_for_telegram(md: &str) -> (String, Vec<ExtractedCodeBlock>) {
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut extracted: Vec<ExtractedCodeBlock> = Vec::new();
+    let mut in_code = false;
+    let mut code_lang = String::new();
+    let mut fence_open_line = String::new();
+    let mut code_lines: Vec<String> = Vec::new();
+
+    for raw_line in md.lines() {
+        let trimmed = raw_line.trim();
+        if let Some(rest) = trimmed.strip_prefix("```") {
+            if in_code {
+                let body = code_lines.join("\n");
+                let line_cnt = code_lines.len();
+                let char_cnt = body.chars().count();
+                if line_cnt >= TELEGRAM_LONG_CODE_MAX_LINES || char_cnt >= TELEGRAM_LONG_CODE_MAX_CHARS
+                {
+                    let idx = extracted.len() + 1;
+                    let ext = code_ext_for_lang(&code_lang);
+                    let filename = format!("kode_{idx}.{ext}");
+                    let lang_note = if code_lang.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {code_lang}")
+                    };
+                    out_lines.push(format!(
+                        "Lampiran berkas `{filename}` ({line_cnt} baris{lang_note}) — dikirim sebagai dokumen di bawah."
+                    ));
+                    extracted.push(ExtractedCodeBlock {
+                        index: idx,
+                        lang: code_lang.clone(),
+                        filename,
+                        lines: line_cnt,
+                        content: body,
+                    });
+                } else {
+                    out_lines.push(fence_open_line.clone());
+                    out_lines.extend(code_lines.iter().cloned());
+                    out_lines.push("```".to_string());
+                }
+                code_lines.clear();
+                code_lang.clear();
+                fence_open_line.clear();
+                in_code = false;
+            } else {
+                code_lang = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '+')
+                    .collect();
+                fence_open_line = raw_line.to_string();
+                in_code = true;
+            }
+            continue;
+        }
+        if in_code {
+            code_lines.push(raw_line.to_string());
+        } else {
+            out_lines.push(raw_line.to_string());
+        }
+    }
+
+    if in_code {
+        let body = code_lines.join("\n");
+        let line_cnt = code_lines.len();
+        let char_cnt = body.chars().count();
+        if line_cnt >= TELEGRAM_LONG_CODE_MAX_LINES || char_cnt >= TELEGRAM_LONG_CODE_MAX_CHARS {
+            let idx = extracted.len() + 1;
+            let ext = code_ext_for_lang(&code_lang);
+            let filename = format!("kode_{idx}.{ext}");
+            out_lines.push(format!(
+                "Lampiran berkas `{filename}` ({line_cnt} baris) — dikirim sebagai dokumen di bawah."
+            ));
+            extracted.push(ExtractedCodeBlock {
+                index: idx,
+                lang: code_lang,
+                filename,
+                lines: line_cnt,
+                content: body,
+            });
+        } else {
+            out_lines.push(fence_open_line);
+            out_lines.extend(code_lines);
+            out_lines.push("```".to_string());
+        }
+    }
+
+    (out_lines.join("\n"), extracted)
+}
+
 /// Escape karakter khusus HTML untuk Telegram `parse_mode: "HTML"`.
 pub fn escape_telegram_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -268,55 +405,120 @@ pub fn escape_telegram_html(s: &str) -> String {
     out
 }
 
-/// Format inline Markdown (code span, link, bold, strikethrough, italic) ke Telegram HTML aman.
+fn is_url_token(s: &str) -> bool {
+    let t = s.trim();
+    (t.starts_with("http://") || t.starts_with("https://")) && !t.contains(char::is_whitespace)
+}
+
+fn is_plain_status_word(s: &str) -> bool {
+    let up = s.trim().to_ascii_uppercase();
+    matches!(
+        up.as_str(),
+        "SELESAI"
+            | "GAGAL"
+            | "BERJALAN"
+            | "AKTIF"
+            | "SUKSES"
+            | "LULUS"
+            | "TERTUNDA"
+            | "DIJEDA"
+            | "DIBATALKAN"
+            | "KEDALUWARSA"
+            | "PENDING"
+            | "QUEUED"
+            | "RUNNING"
+            | "PROCESSING"
+            | "COMPLETED"
+            | "COMPLETE"
+            | "FAILED"
+            | "FAIL"
+            | "DONE"
+            | "ERROR"
+            | "OK"
+            | "PASS"
+            | "SUCCESS"
+            | "IN_PROGRESS"
+    )
+}
+
+/// Klasifikasi isi backtick sebaris untuk Telegram HP:
+/// - URL TIDAK PERNAH dibungkus `<code>` (dibiarkan polos agar langsung bisa disentuh/diklik di HP).
+/// - Kata status biasa (mis. `SELESAI`, `FAILED`, `PROCESSING`) tidak dibungkus monospace kaku.
+/// - Kalimat prosa panjang (>64 char dengan spasi & tanpa penanda teknis) juga tidak dibungkus `<code>`.
+/// - Istilah teknis pendek (nama berkas, perintah, id, simbol kode) dibungkus `<code>`.
+fn render_inline_backtick_html(code_str: &str) -> String {
+    let t = code_str.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if is_url_token(t) {
+        return escape_telegram_html(t);
+    }
+    if is_plain_status_word(t) {
+        return escape_telegram_html(t);
+    }
+    let has_tech_hint = t.contains('/')
+        || t.contains('\\')
+        || t.contains('_')
+        || t.contains('.')
+        || t.contains("--")
+        || t.contains("::")
+        || t.contains('(')
+        || t.contains('=')
+        || t.starts_with('#')
+        || t.starts_with('$');
+    if t.chars().count() > 64 && t.contains(' ') && !has_tech_hint {
+        return escape_telegram_html(t);
+    }
+    format!("<code>{}</code>", escape_telegram_html(code_str))
+}
+
+/// Format inline Markdown (code span, link, bold `**`/`__`, strikethrough `~~`, italic `*`) ke Telegram HTML aman.
+/// Memakai placeholder untuk backtick agar `**` / `__` yang membungkus `` `kode` `` tidak pernah bocor sebagai bintang mentah!
 fn format_inline_md_to_html(line: &str) -> String {
-    // 1. Pisahkan inline `code` terlebih dahulu agar simbol `*` / `_` di dalam kode tidak ikut terformat.
-    let mut result = String::with_capacity(line.len() + 16);
+    let mut placeholders: Vec<(String, String)> = Vec::new();
+    let mut stripped = String::with_capacity(line.len() + 16);
     let chars: Vec<char> = line.chars().collect();
     let n = chars.len();
     let mut i = 0usize;
-    let mut plain_buf = String::new();
 
     while i < n {
         if chars[i] == '`' {
-            // Cari penutup backtick pada baris yang sama.
             if let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == '`') {
-                if !plain_buf.is_empty() {
-                    result.push_str(&format_non_code_inline(&plain_buf));
-                    plain_buf.clear();
-                }
                 let code_str: String = chars[i + 1..i + 1 + rel_end].iter().collect();
-                result.push_str("<code>");
-                result.push_str(&escape_telegram_html(&code_str));
-                result.push_str("</code>");
+                let token = format!("\x00TGCS{}\x00", placeholders.len());
+                let rendered = render_inline_backtick_html(&code_str);
+                placeholders.push((token.clone(), rendered));
+                stripped.push_str(&token);
                 i = i + 2 + rel_end;
                 continue;
             }
         }
-        plain_buf.push(chars[i]);
+        stripped.push(chars[i]);
         i += 1;
     }
-    if !plain_buf.is_empty() {
-        result.push_str(&format_non_code_inline(&plain_buf));
+
+    let mut formatted = format_non_code_inline(&stripped);
+    for (token, rendered) in placeholders {
+        formatted = formatted.replace(&token, &rendered);
     }
-    result
+    formatted
 }
 
 fn format_non_code_inline(s: &str) -> String {
     let escaped = escape_telegram_html(s);
-    // Link Markdown: [label](https://...)
     let mut out = String::with_capacity(escaped.len() + 16);
     let bytes = escaped.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
-        // [label](url)
+        // Link Markdown: [label](https://...)
         if bytes[i] == b'[' {
             if let Some(close_br) = escaped[i + 1..].find("](") {
                 let label_start = i + 1;
                 let label_end = label_start + close_br;
                 let url_start = label_end + 2;
                 if let Some(close_par) = escaped[url_start..].find(')') {
-                    let url = &escaped[url_start..url_start + close_par];
+                    let url = escaped[url_start..url_start + close_par].trim();
                     if url.starts_with("http://") || url.starts_with("https://") {
                         let label = &escaped[label_start..label_end];
                         let safe_url = url.replace('"', "&quot;");
@@ -333,10 +535,40 @@ fn format_non_code_inline(s: &str) -> String {
                 if end > 0 {
                     let inner = &escaped[i + 2..i + 2 + end];
                     out.push_str("<b>");
-                    out.push_str(inner);
+                    out.push_str(&format_non_code_inline_already_escaped(inner));
                     out.push_str("</b>");
                     i = i + 4 + end;
                     continue;
+                }
+            }
+        }
+        // __bold__ (hanya bila bukan underscore di tengah pengenal seperti foo__bar)
+        if escaped[i..].starts_with("__") {
+            let prev_ok = i == 0
+                || !escaped[..i]
+                    .chars()
+                    .next_back()
+                    .map(|c| c.is_alphanumeric())
+                    .unwrap_or(false);
+            if prev_ok {
+                if let Some(end) = escaped[i + 2..].find("__") {
+                    if end > 0 {
+                        let after_idx = i + 4 + end;
+                        let next_ok = after_idx >= escaped.len()
+                            || !escaped[after_idx..]
+                                .chars()
+                                .next()
+                                .map(|c| c.is_alphanumeric())
+                                .unwrap_or(false);
+                        if next_ok {
+                            let inner = &escaped[i + 2..i + 2 + end];
+                            out.push_str("<b>");
+                            out.push_str(&format_non_code_inline_already_escaped(inner));
+                            out.push_str("</b>");
+                            i = after_idx;
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -377,13 +609,105 @@ fn format_non_code_inline(s: &str) -> String {
     out
 }
 
-/// Konversi jawaban Markdown LLM menjadi Telegram HTML yang rapi, terstruktur, & mudah dibaca di HP.
+/// Format inline ringan untuk teks yang sudah di-escape HTML (menangani link/strike/italic di dalam `<b>`).
+fn format_non_code_inline_already_escaped(escaped: &str) -> String {
+    let mut out = String::with_capacity(escaped.len());
+    let bytes = escaped.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            if let Some(close_br) = escaped[i + 1..].find("](") {
+                let label_start = i + 1;
+                let label_end = label_start + close_br;
+                let url_start = label_end + 2;
+                if let Some(close_par) = escaped[url_start..].find(')') {
+                    let url = escaped[url_start..url_start + close_par].trim();
+                    if url.starts_with("http://") || url.starts_with("https://") {
+                        let label = &escaped[label_start..label_end];
+                        let safe_url = url.replace('"', "&quot;");
+                        out.push_str(&format!("<a href=\"{safe_url}\">{label}</a>"));
+                        i = url_start + close_par + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        if escaped[i..].starts_with("~~") {
+            if let Some(end) = escaped[i + 2..].find("~~") {
+                if end > 0 {
+                    out.push_str("<s>");
+                    out.push_str(&escaped[i + 2..i + 2 + end]);
+                    out.push_str("</s>");
+                    i = i + 4 + end;
+                    continue;
+                }
+            }
+        }
+        if bytes[i] == b'*' && !escaped[i..].starts_with("**") {
+            if let Some(next_ch) = escaped[i + 1..].chars().next() {
+                if !next_ch.is_whitespace() {
+                    if let Some(end) = escaped[i + 1..].find('*') {
+                        let inner = &escaped[i + 1..i + 1 + end];
+                        if !inner.is_empty() && !inner.ends_with(char::is_whitespace) {
+                            out.push_str("<i>");
+                            out.push_str(inner);
+                            out.push_str("</i>");
+                            i = i + 2 + end;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        let ch = escaped[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn split_md_table_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let inner = t.strip_prefix('|').unwrap_or(t);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    inner
+        .split('|')
+        .map(|c| c.trim().to_string())
+        .collect()
+}
+
+fn is_md_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    if !t.contains('-') || !t.contains('|') {
+        return false;
+    }
+    let cells = split_md_table_row(t);
+    !cells.is_empty()
+        && cells.iter().all(|c| {
+            let s = c.trim();
+            !s.is_empty() && s.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ') && s.contains('-')
+        })
+}
+
+fn is_md_table_row_candidate(line: &str) -> bool {
+    let t = line.trim();
+    t.contains('|') && split_md_table_row(t).len() >= 2
+}
+
+/// Konversi jawaban Markdown LLM menjadi Telegram HTML yang rapi, terstruktur, & mudah dibaca di HP:
+/// - `**tebal**` / `__tebal__` → `<b>`; `*miring*` → `<i>`; `~~coret~~` → `<s>`
+/// - Backtick sebaris → `<code>` hanya untuk istilah teknis pendek; URL tidak pernah dibungkus `<code>`
+/// - Header `#`/`##`/`###` → baris `<b>` dengan jarak baris kosong sebelum/sesudahnya
+/// - Tabel markdown → baris kunci-nilai bertumpuk (`• Kunci: nilai`) agar rapi di layar HP
+/// - Blok kode → `<pre><code>` dengan escape HTML penuh
 pub fn markdown_to_telegram_html(md: &str) -> String {
+    let lines: Vec<&str> = md.lines().collect();
     let mut out: Vec<String> = Vec::new();
     let mut in_code = false;
     let mut code_lang = String::new();
     let mut code_lines: Vec<String> = Vec::new();
     let mut quote_lines: Vec<String> = Vec::new();
+    let mut need_blank_after_heading = false;
 
     let flush_quote = |quotes: &mut Vec<String>, dst: &mut Vec<String>| {
         if !quotes.is_empty() {
@@ -392,10 +716,19 @@ pub fn markdown_to_telegram_html(md: &str) -> String {
         }
     };
 
-    for raw_line in md.lines() {
+    let push_blank_if_needed = |dst: &mut Vec<String>| {
+        if dst.last().map(|s| !s.is_empty()).unwrap_or(false) {
+            dst.push(String::new());
+        }
+    };
+
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let raw_line = lines[idx];
         let trimmed = raw_line.trim();
         if let Some(fence_rest) = trimmed.strip_prefix("```") {
             flush_quote(&mut quote_lines, &mut out);
+            need_blank_after_heading = false;
             if in_code {
                 let body = escape_telegram_html(&code_lines.join("\n"));
                 if code_lang.is_empty() {
@@ -417,20 +750,67 @@ pub fn markdown_to_telegram_html(md: &str) -> String {
                     .collect();
                 in_code = true;
             }
+            idx += 1;
             continue;
         }
 
         if in_code {
             code_lines.push(raw_line.to_string());
+            idx += 1;
+            continue;
+        }
+
+        // Tabel Markdown (`| Kol1 | Kol2 |` diikuti baris pemisah `| --- | --- |`) -> tumpukan kunci-nilai rapi di HP.
+        if is_md_table_row_candidate(raw_line)
+            && idx + 1 < lines.len()
+            && is_md_table_separator(lines[idx + 1])
+        {
+            flush_quote(&mut quote_lines, &mut out);
+            need_blank_after_heading = false;
+            let headers = split_md_table_row(raw_line);
+            idx += 2; // lewati header & garis pemisah
+            let mut row_idx = 0usize;
+            while idx < lines.len() && is_md_table_row_candidate(lines[idx]) && !lines[idx].trim().is_empty() {
+                let cells = split_md_table_row(lines[idx]);
+                if row_idx > 0 {
+                    push_blank_if_needed(&mut out);
+                }
+                for (ci, cell) in cells.iter().enumerate() {
+                    let val = cell.trim();
+                    if val.is_empty() {
+                        continue;
+                    }
+                    let hdr = headers.get(ci).map(|s| s.as_str()).unwrap_or("");
+                    let prefix = if ci == 0 { "• " } else { "  – " };
+                    if hdr.is_empty() {
+                        out.push(format!("{prefix}{}", format_inline_md_to_html(val)));
+                    } else {
+                        out.push(format!(
+                            "{prefix}<b>{}:</b> {}",
+                            escape_telegram_html(hdr),
+                            format_inline_md_to_html(val)
+                        ));
+                    }
+                }
+                row_idx += 1;
+                idx += 1;
+            }
+            push_blank_if_needed(&mut out);
             continue;
         }
 
         // Blockquote `> ...`
         if let Some(q) = trimmed.strip_prefix("> ") {
+            if need_blank_after_heading {
+                push_blank_if_needed(&mut out);
+                need_blank_after_heading = false;
+            }
             quote_lines.push(format_inline_md_to_html(q));
+            idx += 1;
             continue;
         } else if trimmed == ">" {
             quote_lines.push(String::new());
+            idx += 1;
             continue;
         } else {
             flush_quote(&mut quote_lines, &mut out);
@@ -442,47 +822,58 @@ pub fn markdown_to_telegram_html(md: &str) -> String {
                 || trimmed.chars().all(|c| c == '*')
                 || trimmed.chars().all(|c| c == '_'))
         {
+            need_blank_after_heading = false;
             out.push("──────────────".to_string());
+            idx += 1;
             continue;
         }
 
-        // Heading Markdown (`#`, `##`, `###`, `####`) -> judul tebal rapi tanpa emoji dekoratif.
+        // Heading Markdown (`#`..`######`) -> baris `<b>` dengan jarak baris kosong sebelum/sesudahnya.
         if trimmed.starts_with('#') {
             let hashes = trimmed.chars().take_while(|&c| c == '#').count();
             if hashes <= 6 {
                 let rest = trimmed[hashes..].trim();
                 if !rest.is_empty() {
-                    if hashes == 1 {
-                        out.push(format!("<b>{}</b>", format_inline_md_to_html(rest)));
-                    } else {
-                        out.push(format!("▸ <b>{}</b>", format_inline_md_to_html(rest)));
-                    }
+                    push_blank_if_needed(&mut out);
+                    let heading_html = format_inline_md_to_html(rest);
+                    // Hindari pembungkusan `<b><b>...</b></b>` bila judul sudah mengandung `**`.
+                    let clean_heading = heading_html.replace("<b>", "").replace("</b>", "");
+                    out.push(format!("<b>{clean_heading}</b>"));
+                    need_blank_after_heading = true;
+                    idx += 1;
                     continue;
                 }
             }
         }
 
-        // Daftar bullet (`- ...` atau `* ...`, termasuk nested)
+        if trimmed.is_empty() {
+            need_blank_after_heading = false;
+            push_blank_if_needed(&mut out);
+            idx += 1;
+            continue;
+        }
+
+        if need_blank_after_heading {
+            push_blank_if_needed(&mut out);
+            need_blank_after_heading = false;
+        }
+
+        // Daftar bullet (`- ...`, `* ...`, `+ ...`, termasuk nested)
         let indent = raw_line.chars().take_while(|&c| c == ' ').count();
         let after_indent = &raw_line[indent..];
         if let Some(item) = after_indent
             .strip_prefix("- ")
             .or_else(|| after_indent.strip_prefix("* "))
+            .or_else(|| after_indent.strip_prefix("+ "))
         {
             let bullet = if indent >= 2 { "  ◦ " } else { "• " };
             out.push(format!("{bullet}{}", format_inline_md_to_html(item)));
-            continue;
-        }
-
-        if trimmed.is_empty() {
-            // Cegah baris kosong bertumpuk berlebihan.
-            if out.last().map(|s| !s.is_empty()).unwrap_or(false) {
-                out.push(String::new());
-            }
+            idx += 1;
             continue;
         }
 
         out.push(format_inline_md_to_html(raw_line));
+        idx += 1;
     }
 
     flush_quote(&mut quote_lines, &mut out);
@@ -492,6 +883,47 @@ pub fn markdown_to_telegram_html(md: &str) -> String {
     }
 
     out.join("\n").trim().to_string()
+}
+
+/// Bersihkan Markdown mentah menjadi TEKS POLOS rapi (tanpa bintang `**`, tanpa backtick mentah,
+/// tanpa pipa tabel, mempertahankan struktur baris) — dipakai sebagai fallback anti-gagal-parse Telegram!
+pub fn markdown_to_clean_plain_text(md: &str) -> String {
+    strip_telegram_html_tags(&markdown_to_telegram_html(md))
+}
+
+/// Buang tag HTML Telegram & unescape entitas HTML menjadi teks polos bersih (mempertahankan baris).
+pub fn strip_telegram_html_tags(html: &str) -> String {
+    let mut no_tags = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut tag_buf = String::new();
+    for ch in html.chars() {
+        match ch {
+            '<' if !in_tag => {
+                in_tag = true;
+                tag_buf.clear();
+            }
+            '>' if in_tag => {
+                in_tag = false;
+                // Untuk `<a href="URL">`, tidak perlu apa-apa di sini; teks label tetap keluar di luar tag.
+                tag_buf.clear();
+            }
+            _ if in_tag => {
+                tag_buf.push(ch);
+            }
+            _ => no_tags.push(ch),
+        }
+    }
+    if in_tag {
+        no_tags.push('<');
+        no_tags.push_str(&tag_buf);
+    }
+    no_tags
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .trim()
+        .to_string()
 }
 
 /// Konversi kartu menu SelenCode (`# Judul`, `* a | b | c`, `> a | b | c`, `---`, `! catatan`)
@@ -718,10 +1150,12 @@ pub fn format_telegram_progress_html(
         } else {
             format!("<b>Mengetik...</b> <i>({step_tag})</i>")
         };
-        return format!(
-            "{header}\n\n<blockquote>{}</blockquote>",
-            escape_telegram_html(&snippet)
-        );
+        let rendered_snippet = snippet
+            .lines()
+            .map(format_inline_md_to_html)
+            .collect::<Vec<_>>()
+            .join("\n");
+        return format!("{header}\n\n<blockquote>{rendered_snippet}</blockquote>");
     }
     let mut parts: Vec<String> = Vec::new();
     if !step_tag.is_empty() {
@@ -994,7 +1428,8 @@ impl TelegramClient {
         Ok(msg.message_id)
     }
 
-    /// Kirim pesan berformat Telegram HTML dengan fallback otomatis ke teks polos bila HTML ditolak.
+    /// Kirim pesan berformat Telegram HTML dengan fallback anti-gagal-parse ke TEKS POLOS BERSIH
+    /// (markdown mentah dibuang, struktur baris dipertahankan, dan kejadian fallback dicatat di log).
     pub async fn send_html_message(
         &self,
         chat_id: i64,
@@ -1014,26 +1449,69 @@ impl TelegramClient {
             .await;
         match res {
             Ok(msg) => Ok(msg.message_id),
-            Err(_) => self.send_message(chat_id, plain_fallback).await,
+            Err(e) => {
+                eprintln!(
+                    "[telegram][render-fallback] HTML ditolak Telegram ({e}) — mengirim ulang sebagai teks polos bersih."
+                );
+                let clean_plain = if plain_fallback.trim().is_empty() {
+                    strip_telegram_html_tags(html)
+                } else {
+                    markdown_to_clean_plain_text(plain_fallback)
+                };
+                self.send_message(chat_id, &clean_plain).await
+            }
         }
     }
 
-    /// Kirim teks Markdown panjang secara rapi sebagai Telegram HTML (terpecah aman per chunk + fallback).
+    /// Kirim teks Markdown panjang secara rapi sebagai Telegram HTML (terpecah aman per chunk + fallback teks polos bersih).
     pub async fn send_long_markdown(&self, chat_id: i64, markdown: &str) -> Result<()> {
         // Sisakan margin karena tag HTML (`<b>`, `<code>`, `&amp;`) memperpanjang teks sedikit.
         for chunk in split_markdown_for_telegram(markdown, 3200) {
             let html = markdown_to_telegram_html(&chunk);
+            let clean_plain = markdown_to_clean_plain_text(&chunk);
             if html.chars().count() <= 4050 {
-                self.send_html_message(chat_id, &html, &chunk).await?;
+                self.send_html_message(chat_id, &html, &clean_plain).await?;
             } else {
                 for sub in split_telegram_chunks(&chunk, TELEGRAM_MAX_CHARS) {
                     let sub_html = markdown_to_telegram_html(&sub);
+                    let sub_plain = markdown_to_clean_plain_text(&sub);
                     if sub_html.chars().count() <= 4050 {
-                        self.send_html_message(chat_id, &sub_html, &sub).await?;
+                        self.send_html_message(chat_id, &sub_html, &sub_plain).await?;
                     } else {
-                        self.send_message(chat_id, &sub).await?;
+                        self.send_message(chat_id, &sub_plain).await?;
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Kirim teks Markdown ke Telegram, sekaligus mengekstrak blok kode panjang (`>= 25` baris
+    /// atau `>= 1.500` char) agar dikirim sebagai lampiran dokumen (`sendDocument`) daripada membanjiri chat.
+    pub async fn send_long_markdown_with_code_files(
+        &self,
+        chat_id: i64,
+        markdown: &str,
+    ) -> Result<()> {
+        let (body_md, blocks) = extract_long_code_blocks_for_telegram(markdown);
+        self.send_long_markdown(chat_id, &body_md).await?;
+        for blk in blocks {
+            let cap = format!("{} ({} baris)", blk.filename, blk.lines);
+            if let Err(e) = self
+                .send_document_bytes(
+                    chat_id,
+                    &blk.filename,
+                    blk.content.as_bytes().to_vec(),
+                    Some(&cap),
+                )
+                .await
+            {
+                eprintln!(
+                    "[telegram][code-file] gagal mengunggah {} ({e}) — jatuh ke pengiriman teks kode terpotong.",
+                    blk.filename
+                );
+                let fallback_md = format!("```{}\n{}\n```", blk.lang, blk.content);
+                let _ = self.send_long_markdown(chat_id, &fallback_md).await;
             }
         }
         Ok(())
@@ -1123,8 +1601,16 @@ impl TelegramClient {
             .await;
         match res {
             Ok(msg) => Ok(msg.message_id),
-            Err(_) => {
-                self.send_message_with_keyboard(chat_id, plain_fallback, rows)
+            Err(e) => {
+                eprintln!(
+                    "[telegram][render-fallback] HTML keyboard ditolak Telegram ({e}) — mengirim ulang sebagai teks polos bersih."
+                );
+                let clean_plain = if plain_fallback.trim().is_empty() {
+                    strip_telegram_html_tags(html)
+                } else {
+                    markdown_to_clean_plain_text(plain_fallback)
+                };
+                self.send_message_with_keyboard(chat_id, &clean_plain, rows)
                     .await
             }
         }
@@ -1145,7 +1631,7 @@ impl TelegramClient {
     }
 
     /// Edit pesan berformat Telegram HTML in-place (mengabaikan "message is not modified",
-    /// dan fallback otomatis ke teks polos bila tag HTML ditolak).
+    /// dan fallback otomatis ke teks polos bersih bila tag HTML ditolak + dicatat di log).
     pub async fn edit_html_message(
         &self,
         chat_id: i64,
@@ -1168,11 +1654,24 @@ impl TelegramClient {
         match res {
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("message is not modified") => Ok(()),
-            Err(_) => match self.edit_message_text(chat_id, message_id, plain_fallback).await {
-                Ok(()) => Ok(()),
-                Err(e2) if e2.to_string().contains("message is not modified") => Ok(()),
-                Err(e2) => Err(e2),
-            },
+            Err(e) => {
+                eprintln!(
+                    "[telegram][render-fallback] editMessageText HTML ditolak ({e}) — fallback teks polos bersih."
+                );
+                let clean_plain = if plain_fallback.trim().is_empty() {
+                    strip_telegram_html_tags(html)
+                } else {
+                    markdown_to_clean_plain_text(plain_fallback)
+                };
+                match self
+                    .edit_message_text(chat_id, message_id, &clean_plain)
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(e2) if e2.to_string().contains("message is not modified") => Ok(()),
+                    Err(e2) => Err(e2),
+                }
+            }
         }
     }
 
@@ -1221,6 +1720,53 @@ impl TelegramClient {
     ) -> Result<TgMessage> {
         self.send_multipart_media("sendDocument", "document", chat_id, file_path, caption)
             .await
+    }
+
+    /// Unggah byte memori langsung sebagai dokumen lampiran Telegram (`sendDocument`) —
+    /// dipakai oleh pengiriman otomatis blok kode panjang agar tidak membanjiri chat.
+    pub async fn send_document_bytes(
+        &self,
+        chat_id: i64,
+        filename: &str,
+        bytes: Vec<u8>,
+        caption: Option<&str>,
+    ) -> Result<TgMessage> {
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(filename.to_string());
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("document".to_string(), part);
+        if let Some(cap) = caption.map(str::trim).filter(|s| !s.is_empty()) {
+            let short_cap: String = cap.chars().take(1000).collect();
+            form = form.text("caption", short_cap);
+        }
+        let url = format!("{}/sendDocument", self.base_url);
+        let upload_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(120))
+            .http1_only()
+            .build()
+            .context("gagal membuat HTTP upload client Telegram")?;
+        let resp = upload_http.post(&url).multipart(form).send().await.map_err(|e| {
+            let clean = redact_tg_token(&e.without_url().to_string(), &self.token);
+            anyhow!("gagal mengirim sendDocument ke Telegram: {clean}")
+        })?;
+        let status = resp.status();
+        let parsed: ApiResponse<TgMessage> = resp.json().await.map_err(|e| {
+            let clean = redact_tg_token(&e.to_string(), &self.token);
+            anyhow!("respons Telegram sendDocument tidak valid (HTTP {status}): {clean}")
+        })?;
+        if !parsed.ok {
+            let desc = parsed
+                .description
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            return Err(anyhow!(
+                "Telegram API sendDocument menolak permintaan: {}",
+                redact_tg_token(&desc, &self.token)
+            ));
+        }
+        parsed
+            .result
+            .ok_or_else(|| anyhow!("respons Telegram sendDocument tidak memuat result"))
     }
 
     /// Unggah foto (`sendPhoto`, maks 10 MB Bot API) sebagai pesan tersendiri (Perbaikan 4 v0.5.7).
@@ -1646,6 +2192,7 @@ impl TgAskHub {
     }
 
     /// Format kartu pertanyaan klarifikasi (gaya v0.5.0: polos, 0 emoji dekoratif, jelas bukan approval).
+    /// Teks pertanyaan & konteks melewati konverter Markdown -> Telegram HTML yang sama.
     pub fn format_ask_card_html(
         question: &str,
         choices: &[String],
@@ -1654,11 +2201,11 @@ impl TgAskHub {
         let mut html = String::from("<b>Pertanyaan Klarifikasi</b>\n");
         let mut plain = String::from("Pertanyaan Klarifikasi\n");
         if let Some(ctx) = context.map(str::trim).filter(|s| !s.is_empty()) {
-            html.push_str(&format!("<i>{}</i>\n\n", escape_telegram_html(ctx)));
-            plain.push_str(&format!("{ctx}\n\n"));
+            html.push_str(&format!("<i>{}</i>\n\n", markdown_to_telegram_html(ctx)));
+            plain.push_str(&format!("{}\n\n", markdown_to_clean_plain_text(ctx)));
         }
-        html.push_str(&escape_telegram_html(question));
-        plain.push_str(question);
+        html.push_str(&markdown_to_telegram_html(question));
+        plain.push_str(&markdown_to_clean_plain_text(question));
         if choices.is_empty() {
             html.push_str("\n\n<i>Balas pesan ini dengan jawabanmu.</i>");
             plain.push_str("\n\nBalas pesan ini dengan jawabanmu.");

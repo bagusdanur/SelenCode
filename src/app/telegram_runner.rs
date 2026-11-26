@@ -161,7 +161,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     if let Some(msg) = &tr.notification {
                         if target_chat != 0 {
                             sent_ok = watch_tg
-                                .send_long_message(target_chat, msg)
+                                .send_long_markdown(target_chat, msg)
                                 .await
                                 .is_ok();
                         }
@@ -261,7 +261,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                             ok,
                             &summary,
                         );
-                        let _ = cron_tg.send_long_message(target_chat, &report).await;
+                        let _ = cron_tg.send_long_markdown(target_chat, &report).await;
                     }
                 }
             }
@@ -646,7 +646,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                         eprintln!("[telegram] error ({chat_id}): {e}");
                         let _ = tokio::time::timeout(
                             Duration::from_secs(15),
-                            tg_clone.send_long_message(chat_id, &format!("Error: {e}")),
+                            tg_clone.send_long_markdown(chat_id, &format!("Error: {e}")),
                         )
                         .await;
                     }
@@ -1542,9 +1542,12 @@ async fn handle_telegram_chat_message(
         selencode::tool_display::DEFAULT_ACTION_BLOCK_MAX_LINES,
     );
 
-    // Perbaikan 1 (#1, #4, #5) & Perbaikan 3 v0.5.8:
+    // Perbaikan 1 (#1, #4, #5) & Perbaikan 3 v0.5.8 + Rendering Telegram HP:
     // Jawaban akhir SELALU dikirim sebagai PESAN BARU (`sendMessage`) dengan blok `Aksi Tool (N)`
-    // yang menampilkan pratinjau argumen teredaksi, penggabungan pengulangan, & semua baris gagal.
+    // yang menampilkan pratinjau argumen teredaksi, serta blok kode panjang (>=25 baris / >=1.500 char)
+    // diekstrak otomatis menjadi lampiran dokumen (`sendDocument`) agar tidak membanjiri chat.
+    let (answer_body_md, long_code_blocks) =
+        selencode::telegram::extract_long_code_blocks_for_telegram(&answer_md);
     if total_tools > 0 {
         let shown: Vec<String> = summary_lines
             .into_iter()
@@ -1554,25 +1557,46 @@ async fn handle_telegram_chat_message(
             "<blockquote expandable><b>Aksi Tool ({total_tools})</b>\n{}</blockquote>",
             shown.join("\n")
         );
-        let body_html = markdown_to_telegram_html(&answer_md);
+        let body_html = markdown_to_telegram_html(&answer_body_md);
         let combined = if body_html.is_empty() {
             tool_block.clone()
         } else {
             format!("{tool_block}\n\n{body_html}")
         };
         if combined.chars().count() <= 4050 {
-            tg.send_html_message(chat_id, &combined, &answer_md).await?;
+            tg.send_html_message(chat_id, &combined, &answer_body_md)
+                .await?;
         } else {
             tg.send_html_message(chat_id, &tool_block, "Aksi tool selesai.")
                 .await?;
-            tg.send_long_markdown(chat_id, &answer_md).await?;
+            tg.send_long_markdown(chat_id, &answer_body_md).await?;
         }
     } else {
-        let final_html = markdown_to_telegram_html(&answer_md);
+        let final_html = markdown_to_telegram_html(&answer_body_md);
         if !final_html.is_empty() && final_html.chars().count() <= 4050 {
-            tg.send_html_message(chat_id, &final_html, &answer_md).await?;
+            tg.send_html_message(chat_id, &final_html, &answer_body_md)
+                .await?;
         } else {
-            tg.send_long_markdown(chat_id, &answer_md).await?;
+            tg.send_long_markdown(chat_id, &answer_body_md).await?;
+        }
+    }
+    for blk in long_code_blocks {
+        let cap = format!("{} ({} baris)", blk.filename, blk.lines);
+        if let Err(e) = tg
+            .send_document_bytes(
+                chat_id,
+                &blk.filename,
+                blk.content.as_bytes().to_vec(),
+                Some(&cap),
+            )
+            .await
+        {
+            eprintln!(
+                "[telegram][code-file] gagal mengunggah {} ({e}) — jatuh ke pengiriman teks kode.",
+                blk.filename
+            );
+            let fallback_md = format!("```{}\n{}\n```", blk.lang, blk.content);
+            let _ = tg.send_long_markdown(chat_id, &fallback_md).await;
         }
     }
 

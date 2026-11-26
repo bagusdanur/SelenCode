@@ -393,6 +393,12 @@ async fn run_turn_inner(
         } else {
             build_system_prompt(&ctx.cwd, cur_tools)
         };
+        // Sentuhan prompt ringan khusus konteks Telegram (CLI/TUI/plain tidak tersentuh sama sekali!).
+        if ctx.telegram_chat_id.is_some() {
+            sys.push_str(
+                "Format Telegram: jawaban dirender ke HTML Telegram untuk layar HP — tulis ringkas, hindari tabel lebar, dan blok kode panjang otomatis dikirim sebagai berkas.\n",
+            );
+        }
         let mut dynamic_snapshot = String::new();
         let hint = crate::tools::toolsets::inactive_toolsets_hint(registry, cur_active);
         if !hint.is_empty() {
