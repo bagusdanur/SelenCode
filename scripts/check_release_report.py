@@ -32,11 +32,11 @@ from typing import Dict, List, Optional, Tuple
 
 VERDICT_RE = re.compile(
     r"^\s*(?:[-*]\s+)?(?:\*\*)?Butir\s+(\d+)(?:\*\*)?\s*[—–-]\s*"
-    r"(?:\*\*)?(LULUS|SEBAGIAN|GAGAL)(?:\*\*)?\s*:\s*(.+?)\s*$"
+    r"(?:\*\*)?(LULUS|SEBAGIAN|GAGAL)(?:\*\*)?\s*:\s*(?:\*\*)?\s*(.+?)\s*$"
 )
 
 ITEM_COUNT_RE = re.compile(
-    r"(?i)jumlah\s+butir(?:\s+prompt(?:\s+ini)?)?\s*\*?\*?\s*:\s*\*?\*?(\d+)\*?\*?"
+    r"(?i)jumlah\s+butir(?:\s+prompt(?:\s+ini)?)?\s*\*?\*?\s*:\s*\*?\*?\s*(\d+)\*?\*?"
 )
 
 UNMEASURED_RE = re.compile(
