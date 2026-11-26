@@ -43,6 +43,17 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+fn tool_result_text(m: &Message) -> String {
+    m.content
+        .iter()
+        .filter_map(|b| match b {
+            Block::ToolResult { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // =========================================================================
 // PERBAIKAN 1: Lantai resume ramping di semua panggilan giliran resume
 // =========================================================================
@@ -120,7 +131,7 @@ async fn p1_resume_followup_calls_stay_lean_and_lazy_toolsets_work() {
                 // Pada step 3 (setelah 2 tool call), isi `big.log` dari step 0 WAJIB sudah ter-prune!
                 let pruned = msgs.iter().any(|m| {
                     m.role == Role::Tool
-                        && m.plain_text().contains("diringkas — arsip:")
+                        && tool_result_text(m).contains("diringkas — arsip:")
                 });
                 *self.seen_big_log_pruned_on_step3.lock().unwrap() = pruned;
             }
@@ -194,8 +205,10 @@ async fn p1_resume_followup_calls_stay_lean_and_lazy_toolsets_work() {
         Message::text(Role::Assistant, "Sudah dibaca: BULAN-511."),
     ];
 
-    // Verifikasi `build_resume_snapshot` memadatkan pesan pra-resume panjang
-    let snap_check = build_resume_snapshot(&msgs, Some(&res_sys));
+    // Verifikasi `build_resume_snapshot` memadatkan pesan pra-resume panjang (8 pesan sebelum pesan user aktif)
+    let mut snap_input = msgs.clone();
+    snap_input.push(Message::text(Role::User, "Pertanyaan resume baru"));
+    let snap_check = build_resume_snapshot(&snap_input, Some(&res_sys));
     assert!(
         snap_check
             .iter()
@@ -352,9 +365,11 @@ async fn p2_loop_skill_gate_enforces_bug_and_tdd_and_consistent_reload() {
             }
             if n == 1 {
                 let has_sv = msgs.iter().any(|m| {
-                    m.role == Role::Tool
-                        && m.plain_text().contains("Systematic Debugging")
-                        && m.plain_text().contains("Gerbang Skill Harness")
+                    if m.role != Role::Tool {
+                        return false;
+                    }
+                    let txt = tool_result_text(m);
+                    txt.contains("Systematic Debugging") && txt.contains("Gerbang Skill Harness")
                 });
                 *self.saw_skill_before_second_try.lock().unwrap() = has_sv;
                 return Ok(AssistantReply {
