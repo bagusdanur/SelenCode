@@ -154,8 +154,11 @@ async fn telegram_html_parse_error_400_falls_back_to_clean_plain_text_and_upload
                         }
                     }
                     if is_chunked {
-                        if raw.windows(5).any(|w| w == b"0\r\n\r\n") {
-                            break;
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let body_bytes = &raw[pos + 4..];
+                            if body_bytes == b"0\r\n\r\n" || body_bytes.ends_with(b"\r\n0\r\n\r\n") {
+                                break;
+                            }
                         }
                     } else if let Some(tot) = expected_total {
                         if raw.len() >= tot {
@@ -165,7 +168,11 @@ async fn telegram_html_parse_error_400_falls_back_to_clean_plain_text_and_upload
                 }
                 let text = String::from_utf8_lossy(&raw).to_string();
                 let first_line = text.lines().next().unwrap_or("").to_string();
-                let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                let body = text
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b)
+                    .unwrap_or("")
+                    .to_string();
                 rec.lock().unwrap().push((first_line.clone(), body.clone()));
 
                 let (status, resp_json) = if first_line.contains("/sendMessage")
