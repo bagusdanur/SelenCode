@@ -1,6 +1,6 @@
 ---
 name: systematic-debugging
-description: Debug 4 fase: temukan akar masalah dulu
+description: WAJIB untuk bug/error/salah hitung: debug 4 fase
 version: 1.0.0
 tags: [debugging, root-cause, diagnostics, testing]
 ---

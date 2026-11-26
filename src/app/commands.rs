@@ -1163,13 +1163,49 @@ impl Session {
     }
 
     pub(crate) fn handle_memory(&self, arg: Option<&str>) -> Result<String> {
+        use selencode::user_memory::{
+            add_entry_in, load_frozen_snapshot, remove_entry_in, replace_entry_in,
+            user_memory_dir, MemoryStoreKind,
+        };
         let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
+        let mem_dir = user_memory_dir();
         let Some(arg) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
-            let list = self.store.list_memories(&cwd_str, 40)?;
-            let mut out = String::from("# Memori Proyek & Global Selena\n");
-            if list.is_empty() {
-                out.push_str("! Belum ada memori tersimpan.\n");
+            let live = load_frozen_snapshot(
+                self.cfg.memory.max_memory_chars,
+                self.cfg.memory.max_profile_chars,
+            );
+            let snap = self.ctx.frozen_user_memory.as_ref().unwrap_or(&live);
+            let mem_txt = snap.memory_text();
+            let prof_txt = snap.profile_text();
+            let mut out = format!(
+                "# Memori Persisten & Profil Pemilik (Snapshot Sesi)\n\
+                 * profil | {}/{} char | termuat beku di prompt\n",
+                prof_txt.chars().count(),
+                self.cfg.memory.max_profile_chars,
+            );
+            if snap.profile_entries.is_empty() {
+                out.push_str("! (profil pemilik masih kosong)\n");
             } else {
+                for (i, e) in snap.profile_entries.iter().enumerate() {
+                    out.push_str(&format!("> P#{} | profile | {e}\n", i + 1));
+                }
+            }
+            out.push_str(&format!(
+                "* memory | {}/{} char | termuat beku di prompt\n",
+                mem_txt.chars().count(),
+                self.cfg.memory.max_memory_chars,
+            ));
+            if snap.memory_entries.is_empty() {
+                out.push_str("! (wadah memory masih kosong)\n");
+            } else {
+                for (i, e) in snap.memory_entries.iter().enumerate() {
+                    out.push_str(&format!("> M#{} | memory | {e}\n", i + 1));
+                }
+            }
+            let list = self.store.list_memories(&cwd_str, 40)?;
+            if !list.is_empty() {
+                out.push_str("---\n* memori proyek (SQLite) | ");
+                out.push_str(&format!("{} item | aktif di folder ini\n", list.len()));
                 for m in list {
                     let scope = if m.scope == "global" { "global" } else { "project" };
                     out.push_str(&format!(
@@ -1179,13 +1215,122 @@ impl Session {
                 }
             }
             out.push_str("---\n");
-            out.push_str("! Kategori: arch, commands, conventions, decisions, issues, tasks, general\n");
-            out.push_str("! Simpan project: /memory add [kategori] <catatan>\n");
-            out.push_str("! Perbarui:       /memory update <id> [kategori] <catatan>\n");
-            out.push_str("! Simpan global:  /memory global [kategori] <catatan>\n");
-            out.push_str("! Hapus memori:   /memory rm <id>  (rahasia/token/password selalu ditolak)");
+            out.push_str("! Wadah persisten: /memory profile add <teks> · /memory user add <teks> · /memory profile rm <no|teks>\n");
+            out.push_str("! Memori proyek:   /memory add [kategori] <catatan> · /memory update <id> <teks> · /memory rm <id>");
             return Ok(out);
         };
+        // Perintah langsung pemilik untuk wadah `profile` / `memory` (Perbaikan 5 v0.5.7).
+        if let Some(rest) = arg
+            .strip_prefix("profile ")
+            .or_else(|| arg.strip_prefix("profil "))
+        {
+            let rest = rest.trim();
+            if let Some(t) = rest.strip_prefix("add ") {
+                let (idx, chars) = add_entry_in(
+                    &mem_dir,
+                    MemoryStoreKind::Profile,
+                    t,
+                    self.cfg.memory.max_profile_chars,
+                )?;
+                return Ok(format!(
+                    "# Profil Pemilik Disimpan\n* P#{idx} | {chars}/{} char | {}",
+                    self.cfg.memory.max_profile_chars,
+                    t.trim()
+                ));
+            }
+            if let Some(t) = rest
+                .strip_prefix("rm ")
+                .or_else(|| rest.strip_prefix("del "))
+                .or_else(|| rest.strip_prefix("remove "))
+            {
+                let (removed, chars) = remove_entry_in(
+                    &mem_dir,
+                    MemoryStoreKind::Profile,
+                    t,
+                    self.cfg.memory.max_profile_chars,
+                )?;
+                return Ok(format!(
+                    "# Profil Pemilik Dihapus\n> dihapus | {chars}/{} char | {removed}",
+                    self.cfg.memory.max_profile_chars
+                ));
+            }
+            if let Some(t) = rest.strip_prefix("replace ") {
+                let Some((sel, new_val)) = t.split_once("=>") else {
+                    anyhow::bail!("format: `/memory profile replace <no_atau_teks_lama> => <teks_baru>`");
+                };
+                let (idx, chars) = replace_entry_in(
+                    &mem_dir,
+                    MemoryStoreKind::Profile,
+                    sel,
+                    new_val,
+                    self.cfg.memory.max_profile_chars,
+                )?;
+                return Ok(format!(
+                    "# Profil Pemilik Diperbarui\n* P#{idx} | {chars}/{} char | {}",
+                    self.cfg.memory.max_profile_chars,
+                    new_val.trim()
+                ));
+            }
+            let (idx, chars) = add_entry_in(
+                &mem_dir,
+                MemoryStoreKind::Profile,
+                rest,
+                self.cfg.memory.max_profile_chars,
+            )?;
+            return Ok(format!(
+                "# Profil Pemilik Disimpan\n* P#{idx} | {chars}/{} char | {rest}",
+                self.cfg.memory.max_profile_chars
+            ));
+        }
+        if let Some(rest) = arg.strip_prefix("user ") {
+            let rest = rest.trim();
+            if let Some(t) = rest.strip_prefix("add ") {
+                let (idx, chars) = add_entry_in(
+                    &mem_dir,
+                    MemoryStoreKind::Memory,
+                    t,
+                    self.cfg.memory.max_memory_chars,
+                )?;
+                return Ok(format!(
+                    "# Memori Persisten Disimpan\n* M#{idx} | {chars}/{} char | {}",
+                    self.cfg.memory.max_memory_chars,
+                    t.trim()
+                ));
+            }
+            if let Some(t) = rest
+                .strip_prefix("rm ")
+                .or_else(|| rest.strip_prefix("del "))
+                .or_else(|| rest.strip_prefix("remove "))
+            {
+                let (removed, chars) = remove_entry_in(
+                    &mem_dir,
+                    MemoryStoreKind::Memory,
+                    t,
+                    self.cfg.memory.max_memory_chars,
+                )?;
+                return Ok(format!(
+                    "# Memori Persisten Dihapus\n> dihapus | {chars}/{} char | {removed}",
+                    self.cfg.memory.max_memory_chars
+                ));
+            }
+            if let Some(t) = rest.strip_prefix("replace ") {
+                let Some((sel, new_val)) = t.split_once("=>") else {
+                    anyhow::bail!("format: `/memory user replace <no_atau_teks_lama> => <teks_baru>`");
+                };
+                let (idx, chars) = replace_entry_in(
+                    &mem_dir,
+                    MemoryStoreKind::Memory,
+                    sel,
+                    new_val,
+                    self.cfg.memory.max_memory_chars,
+                )?;
+                return Ok(format!(
+                    "# Memori Persisten Diperbarui\n* M#{idx} | {chars}/{} char | {}",
+                    self.cfg.memory.max_memory_chars,
+                    new_val.trim()
+                ));
+            }
+        }
         if let Some(rest) = arg.strip_prefix("add ") {
             let (cat, text) = split_optional_category(rest.trim());
             if text.is_empty() {
@@ -1340,6 +1485,51 @@ impl Session {
                 out.push('\n');
             }
             Ok(out)
+        } else if let Some(rest) = arg.strip_prefix("install ") {
+            let toks: Vec<&str> = rest.split_whitespace().collect();
+            let Some(url) = toks.first().copied() else {
+                anyhow::bail!("format: `/skills install <url-git|url-SKILL.md> [--rename <nama>]`");
+            };
+            let mut rename: Option<&str> = None;
+            for i in 1..toks.len() {
+                if toks[i] == "--rename" && i + 1 < toks.len() {
+                    rename = Some(toks[i + 1]);
+                }
+            }
+            let staged = selencode::skill_installer::stage_skill_from_source(url).await?;
+            let summary = selencode::skill_installer::format_install_approval_summary(&staged, rename);
+            if !self
+                .ctx
+                .approver
+                .ask(&format!("skills install {}", rename.unwrap_or(&staged.frontmatter.name)), &summary)
+                .await
+            {
+                return Ok("# Pemasangan Skill Dibatalkan\n! Ditolak user — tidak ada berkas yang ditulis.".to_string());
+            }
+            let user_root = selencode::skills::user_skills_dir()
+                .ok_or_else(|| anyhow::anyhow!("direktori skill pengguna tidak tersedia"))?;
+            let rep = selencode::skill_installer::finalize_staged_skill_install(&staged, &user_root, rename)?;
+            Ok(format!(
+                "# Skill '{}' Berhasil Dipasang\n\
+                 * lokasi | {} | {} berkas ({} skrip, tidak dijalankan otomatis)\n\
+                 > sumber | {} | dicatat di .selen-source.json\n\
+                 ! Siap dipakai via `skill_view` atau `/skill {}` pada sesi berikutnya.",
+                rep.name,
+                rep.target_dir.display(),
+                rep.files_copied,
+                rep.scripts_count,
+                staged.source_url,
+                rep.name
+            ))
+        } else if let Some(name) = arg.strip_prefix("remove ") {
+            let user_root = selencode::skills::user_skills_dir()
+                .ok_or_else(|| anyhow::anyhow!("direktori skill pengguna tidak tersedia"))?;
+            let msg = selencode::skill_installer::remove_installed_skill(
+                name.trim(),
+                &user_root,
+                &self.ctx.cwd,
+            )?;
+            Ok(format!("# Skill Dicopot\n> {} | {msg}", name.trim()))
         } else if let Some(name) = arg.strip_prefix("rm ").or_else(|| arg.strip_prefix("del ")) {
             let name = name.trim();
             if remove_skill(&self.ctx.cwd, name)? {
@@ -1508,6 +1698,120 @@ impl Session {
         }
         out.push_str("---\n! Lanjutkan sesi: /resume <id_sesi>   ·   Cakupan: teks tersimpan di DB sesi lokal");
         Ok(out)
+    }
+
+    /// Tangani `/watch [list | cancel <id>]` — kelola pemantauan tugas asinkron (Perbaikan 3 v0.5.7).
+    pub(crate) fn handle_watch(&self, arg: Option<&str>, chat_id: Option<i64>) -> Result<String> {
+        let raw = arg.map(|s| s.trim()).filter(|s| !s.is_empty());
+        if let Some(cmd) = raw {
+            let lower = cmd.to_ascii_lowercase();
+            if let Some(rest) = lower
+                .strip_prefix("cancel ")
+                .or_else(|| lower.strip_prefix("stop "))
+                .or_else(|| lower.strip_prefix("rm "))
+            {
+                let id: i64 = rest
+                    .trim()
+                    .trim_start_matches('#')
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("ID pantauan tidak valid: '{rest}'. Contoh: /watch cancel 1"))?;
+                if self.store.cancel_job_watch(id, chat_id)? {
+                    return Ok(format!(
+                        "# Pemantauan #{id} Dibatalkan\n> #{id} | dihentikan | tidak akan mengirim laporan lagi"
+                    ));
+                }
+                anyhow::bail!("pemantauan aktif #{id} tidak ditemukan");
+            }
+        }
+        let watches = self.store.list_job_watches(chat_id, false)?;
+        let active_n = watches.iter().filter(|w| w.status == "active").count();
+        if watches.is_empty() {
+            return Ok(
+                "# Pemantauan Tugas Asinkron (0)\n\
+                 ! Belum ada tugas asinkron yang dipantau.\n\
+                 ! Saat agent memasukkan job ke antrean, pantauan didaftarkan otomatis via `watch_job`."
+                    .to_string(),
+            );
+        }
+        let mut out = format!(
+            "# Pemantauan Tugas Asinkron ({active_n} aktif / {} total)\n",
+            watches.len()
+        );
+        for w in watches.iter().take(12) {
+            let mark = if w.status == "active" { "*" } else { ">" };
+            let stage = if w.last_stage.is_empty() {
+                "menunggu cek".to_string()
+            } else if w.last_progress.is_empty() {
+                w.last_stage.clone()
+            } else {
+                format!("{} ({})", w.last_stage, w.last_progress)
+            };
+            out.push_str(&format!(
+                "{mark} #{} {} | {} · {} | tiap {} dtk ({})\n",
+                w.id, w.label, w.status, stage, w.interval_secs, w.check_kind
+            ));
+        }
+        out.push_str("---\n! Batalkan pantauan aktif: /watch cancel <id>   ·   Maks 5 pantauan aktif per chat (0 token LLM).");
+        Ok(out)
+    }
+
+    /// Tangani `/usage` — laporan pemakaian token sesi & hari ini langsung dari SQLite `usage`
+    /// (Perbaikan 7 v0.5.7 — 0 panggilan provider, format bersih maks 1 emoji).
+    pub(crate) fn handle_usage(&self) -> Result<String> {
+        let today_utc = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let rep = self.store.usage_report(&self.session_id, &today_utc)?;
+
+        let sum_rows = |rows: &[selencode::store::UsageBreakdownRow]| -> (u64, u64, u64) {
+            rows.iter().fold((0, 0, 0), |(c, i, o), r| {
+                (c + r.calls, i + r.input_tokens, o + r.output_tokens)
+            })
+        };
+        let (sc, si, so) = sum_rows(&rep.session_rows);
+        let (tc, ti, to) = sum_rows(&rep.today_rows);
+
+        let mut models_seen: Vec<String> = Vec::new();
+        for r in rep.session_rows.iter().chain(rep.today_rows.iter()) {
+            if !models_seen.contains(&r.model) {
+                models_seen.push(r.model.clone());
+            }
+        }
+        let models_line = if models_seen.is_empty() {
+            self.pcfg.model.clone()
+        } else {
+            models_seen.join(", ")
+        };
+
+        let mut out = format!(
+            "# 📊 Laporan Pemakaian Token (/usage)\n\
+             * sesi aktif | {sc} panggilan | {si} in / {so} out\n\
+             * hari ini ({}) | {tc} panggilan | {ti} in / {to} out\n\
+             > model terpakai | {models_line} | langsung dari tabel `usage` (0 panggilan API)\n",
+            rep.today_date
+        );
+
+        let push_kind_breakdown = |out: &mut String, title: &str, rows: &[selencode::store::UsageBreakdownRow]| {
+            if rows.is_empty() {
+                return;
+            }
+            out.push_str(&format!("---\n! Rincian {title}:\n"));
+            for r in rows {
+                let lbl = match r.kind.as_str() {
+                    "main" => "utama",
+                    "fallback" => "fallback",
+                    "review" => "review latar",
+                    "cron" => "cron terjadwal",
+                    "delegate_work" => "delegate work",
+                    other => other,
+                };
+                out.push_str(&format!(
+                    "> {lbl} | {} | {} call · {} in / {} out\n",
+                    r.model, r.calls, r.input_tokens, r.output_tokens
+                ));
+            }
+        };
+        push_kind_breakdown(&mut out, "sesi ini", &rep.session_rows);
+        push_kind_breakdown(&mut out, "hari ini", &rep.today_rows);
+        Ok(out.trim_end().to_string())
     }
 
     /// Tangani `/cron [add|list|remove|pause|resume]` (v0.5.6 Bagian 3).

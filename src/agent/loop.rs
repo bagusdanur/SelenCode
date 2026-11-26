@@ -7,10 +7,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::context::{
-    analyze_token_breakdown, auto_outline, build_system_prompt, cap_dynamic_injection,
-    compact_messages_hermes, estimate_tokens, expand_at_mentions, format_memories_section,
-    head_tail_truncate, needs_compaction, prune_old_tool_results_with_archive,
-    session_archive_dir, spillover_if_needed, spillover_with_preview,
+    analyze_token_breakdown, auto_outline, build_resume_snapshot, build_system_prompt,
+    cap_dynamic_injection, compact_messages_hermes, estimate_tokens, expand_at_mentions,
+    format_memories_section, head_tail_truncate, needs_compaction,
+    prune_old_tool_results_with_archive, session_archive_dir, spillover_if_needed,
+    spillover_with_preview,
 };
 use super::corrector::{LoopGuard, SelfCorrectState, ToolDedupCache};
 use super::plan::{is_read_only, TurnMode, PLAN_NOTE};
@@ -155,30 +156,39 @@ async fn run_turn_inner(
     ui: Option<mpsc::Sender<UiEvent>>,
     mode: TurnMode,
 ) -> Result<(String, Option<Usage>)> {
-    // Progressive Disclosure (tiered toolsets + MCP >15 on-demand index + Skills System v0.4.0):
-    // Hanya kirim Core Toolset + toolset yang cocok dengan intent/workspace, bukan seluruh 29+ schema!
+    // Progressive Disclosure (tiered toolsets + MCP >15 on-demand index + Skills System + Lean Resume v0.5.7):
+    // Pada sesi RESUME (`ctx.is_resumed_session && !messages.is_empty()`), pakai toolset awal super-ramping
+    // agar lantai token resume turun drastis sementara seluruh tool tetap dapat diaktifkan di giliran yang sama.
     let has_mcp = registry.names().iter().any(|n| n.starts_with("mcp__"));
     let installed_skills = crate::skills::list_skills(&ctx.cwd);
-    let mut active_toolsets =
-        crate::tools::toolsets::select_initial_toolsets(user_prompt, &ctx.cwd, has_mcp, mode);
-    if !installed_skills.is_empty() {
-        active_toolsets.insert("skills_view".to_string());
-    }
+    let lean_resume = ctx.is_resumed_session && !messages.is_empty();
+    let mut active_toolsets = if lean_resume {
+        crate::tools::toolsets::select_resume_initial_toolsets(user_prompt, &ctx.cwd, has_mcp, mode)
+    } else {
+        let mut s =
+            crate::tools::toolsets::select_initial_toolsets(user_prompt, &ctx.cwd, has_mcp, mode);
+        if !installed_skills.is_empty() {
+            s.insert("skills_view".to_string());
+        }
+        s
+    };
     let mut loaded_mcp_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut tools = crate::tools::toolsets::active_tool_specs_with_mcp(
+    let mut tools = crate::tools::toolsets::active_tool_specs_for_turn(
         registry,
         &active_toolsets,
         &loaded_mcp_tools,
         mode,
+        lean_resume,
     );
-    // Tahap 3 & Tahap 6 & Skills Tahap 2: Bekukan System Prompt statis di awal sesi (byte-identik),
-    // diikuti snapshot blok dinamis (toolsets + indeks skills maks 60 char/item + indeks MCP + memori)
-    // yang berbagi anggaran cap injeksi dinamis (default 1.500 token; override lewat `[skills] index_max_tokens`).
-    let mut auto_loaded_skill_msgs: Vec<Message> = Vec::new();
-    if messages.is_empty() {
-        let mut sys = build_system_prompt(&ctx.cwd, &tools);
+
+    // Helper lokal untuk menyusun System Prompt + Konteks Sesi (Snapshot Awal) yang identik untuk sesi baru
+    // maupun penyegaran snapshot resume ramping.
+    let build_fresh_system_prompt = |cur_tools: &[crate::providers::ToolSpec],
+                                     cur_active: &std::collections::HashSet<String>|
+     -> String {
+        let mut sys = build_system_prompt(&ctx.cwd, cur_tools);
         let mut dynamic_snapshot = String::new();
-        let hint = crate::tools::toolsets::inactive_toolsets_hint(registry, &active_toolsets);
+        let hint = crate::tools::toolsets::inactive_toolsets_hint(registry, cur_active);
         if !hint.is_empty() {
             dynamic_snapshot.push_str(&hint);
             dynamic_snapshot.push('\n');
@@ -187,7 +197,6 @@ async fn run_turn_inner(
             .skills
             .index_max_tokens
             .unwrap_or(ctx.tool_budget.dynamic_inject_max_tokens);
-        // Bagian 5 (#6): indeks gabungan dipangkas dengan prioritas bawaan -> user -> proyek bila melewati pagu.
         let skills_idx = crate::skills::format_skills_index_budgeted(&installed_skills, dyn_cap);
         if !skills_idx.is_empty() {
             dynamic_snapshot.push_str(&skills_idx);
@@ -196,6 +205,13 @@ async fn run_turn_inner(
         if let Some(mcp_idx) = crate::tools::toolsets::build_mcp_compact_index(registry) {
             dynamic_snapshot.push_str(&mcp_idx);
             dynamic_snapshot.push('\n');
+        }
+        // Perbaikan 5 (v0.5.7): snapshot beku wadah `memory` + `profile` yang dimuat 1x di awal sesi.
+        if let Some(frozen) = &ctx.frozen_user_memory {
+            let frozen_block = frozen.format_for_prompt();
+            if !frozen_block.is_empty() {
+                dynamic_snapshot.push_str(&frozen_block);
+            }
         }
         if let Some(store) = &ctx.store {
             let cwd_str = ctx.cwd.to_string_lossy().to_string();
@@ -212,6 +228,14 @@ async fn run_turn_inner(
             sys.push_str(&capped);
             sys.push('\n');
         }
+        sys
+    };
+
+    // Tahap 3 & Tahap 6 & Skills Tahap 2: Bekukan System Prompt statis di awal sesi (byte-identik),
+    // diikuti snapshot blok dinamis (toolsets + indeks skills maks 60 char/item + indeks MCP + memori beku).
+    let mut auto_loaded_skill_msgs: Vec<Message> = Vec::new();
+    if messages.is_empty() {
+        let sys = build_fresh_system_prompt(&tools, &active_toolsets);
         let sys_msg = Message::text(Role::System, sys);
         persist_message(ctx, &sys_msg);
         messages.push(sys_msg);
@@ -348,8 +372,27 @@ async fn run_turn_inner(
             }
             *messages = compact_messages_hermes(messages);
         }
-        // Tahap 0 — Instrumentasi rincian estimasi token per komponen sebelum panggilan API.
-        let breakdown = analyze_token_breakdown(messages, &tools, registry.names().len());
+        // Perbaikan 1 (v0.5.7): untuk sesi RESUME, bangun snapshot ramping (system prompt segar +
+        // ringkas riwayat tool giliran sebelumnya) tanpa mengubah riwayat mentah di DB!
+        let mut snapshot = if lean_resume {
+            let fresh_sys = build_fresh_system_prompt(&tools, &active_toolsets);
+            build_resume_snapshot(messages, Some(&fresh_sys))
+        } else {
+            messages.clone()
+        };
+        // PLAN_NOTE hanya disisipkan sementara pada snapshot giliran Plan (tidak
+        // disimpan ke riwayat/DB) agar giliran Execute berikutnya tidak ikut
+        // terlarang menulis.
+        if mode == TurnMode::Plan {
+            let pos = if snapshot.first().map(|m| m.role == Role::System).unwrap_or(false) {
+                1
+            } else {
+                0
+            };
+            snapshot.insert(pos, Message::text(Role::System, PLAN_NOTE));
+        }
+        // Tahap 0 — Instrumentasi rincian estimasi token per komponen dari snapshot AKTUAL yang dikirim!
+        let breakdown = analyze_token_breakdown(&snapshot, &tools, registry.names().len());
         if let Some(tx) = &ui {
             let est = breakdown.total_tokens();
             let pct = calc_context_pct(est, ctx.context_limit_tokens);
@@ -370,18 +413,6 @@ async fn run_turn_inner(
         // Provider dipindah ke task agar StreamEvent bisa dikonsumsi sambil jalan.
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(128);
         let p = provider.clone();
-        let mut snapshot = messages.clone();
-        // PLAN_NOTE hanya disisipkan sementara pada snapshot giliran Plan (tidak
-        // disimpan ke riwayat/DB) agar giliran Execute berikutnya tidak ikut
-        // terlarang menulis.
-        if mode == TurnMode::Plan {
-            let pos = if snapshot.first().map(|m| m.role == Role::System).unwrap_or(false) {
-                1
-            } else {
-                0
-            };
-            snapshot.insert(pos, Message::text(Role::System, PLAN_NOTE));
-        }
         let tools_c = tools.clone();
         let handle = tokio::spawn(async move { p.stream_chat(&snapshot, &tools_c, tx).await });
         let mut printed = false;
@@ -591,11 +622,12 @@ async fn run_turn_inner(
                             activated.push(ts);
                         }
                     }
-                    tools = crate::tools::toolsets::active_tool_specs_with_mcp(
+                    tools = crate::tools::toolsets::active_tool_specs_for_turn(
                         registry,
                         &active_toolsets,
                         &loaded_mcp_tools,
                         mode,
+                        lean_resume,
                     );
                     let active_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
                     (
@@ -625,11 +657,12 @@ async fn run_turn_inner(
                             loaded.push(nm);
                         }
                     }
-                    tools = crate::tools::toolsets::active_tool_specs_with_mcp(
+                    tools = crate::tools::toolsets::active_tool_specs_for_turn(
                         registry,
                         &active_toolsets,
                         &loaded_mcp_tools,
                         mode,
+                        lean_resume,
                     );
                     (
                         format!(

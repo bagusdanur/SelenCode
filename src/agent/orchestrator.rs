@@ -228,6 +228,11 @@ fn child_ctx_for_role(parent_ctx: &Ctx) -> Ctx {
         asker: Arc::new(crate::tools::ask::UserAsker::non_interactive()),
         ask_timeout_secs: parent_ctx.ask_timeout_secs,
         router_telemetry: None,
+        memory_cfg: parent_ctx.memory_cfg.clone(),
+        frozen_user_memory: parent_ctx.frozen_user_memory.clone(),
+        is_resumed_session: false,
+        telegram_chat_id: None,
+        tg_file_sender: None,
     }
 }
 

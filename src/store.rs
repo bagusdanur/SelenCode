@@ -382,6 +382,21 @@ CREATE TABLE IF NOT EXISTS cron_jobs (id INTEGER PRIMARY KEY, name TEXT UNIQUE N
                     last_status TEXT NOT NULL DEFAULT '',
                     last_summary TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS job_watches (id INTEGER PRIMARY KEY, label TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL DEFAULT 0, cwd TEXT NOT NULL,
+                    check_kind TEXT NOT NULL, check_target TEXT NOT NULL,
+                    done_marker TEXT NOT NULL DEFAULT '',
+                    fail_marker TEXT NOT NULL DEFAULT '',
+                    interval_secs INTEGER NOT NULL DEFAULT 60,
+                    max_age_secs INTEGER NOT NULL DEFAULT 21600,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    last_stage TEXT NOT NULL DEFAULT '',
+                    last_progress TEXT NOT NULL DEFAULT '',
+                    consecutive_errors INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+                    last_checked_at TEXT NOT NULL DEFAULT '',
+                    final_report TEXT NOT NULL DEFAULT '',
+                    delivered INTEGER NOT NULL DEFAULT 0);
 ";
 
 fn now() -> String {
@@ -1901,6 +1916,294 @@ impl Store {
         }
         Ok(out)
     }
+
+    // ---------- Perbaikan 3 (v0.5.7): Job Watches (pemantau tugas asinkron persisten) ----------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_job_watch(
+        &self,
+        label: &str,
+        chat_id: i64,
+        cwd: &str,
+        check_kind: &str,
+        check_target: &str,
+        done_marker: &str,
+        fail_marker: &str,
+        interval_secs: u64,
+        max_age_secs: u64,
+        expires_at: &str,
+    ) -> Result<crate::watch::JobWatchRecord> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let ts = now();
+        conn.execute(
+            "INSERT INTO job_watches \
+             (label, chat_id, cwd, check_kind, check_target, done_marker, fail_marker, \
+              interval_secs, max_age_secs, status, last_stage, last_progress, consecutive_errors, \
+              created_at, expires_at, last_checked_at, final_report, delivered) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', '', '', 0, ?10, ?11, '', '', 0)",
+            rusqlite::params![
+                label,
+                chat_id,
+                cwd,
+                check_kind,
+                check_target,
+                done_marker,
+                fail_marker,
+                interval_secs as i64,
+                max_age_secs as i64,
+                ts,
+                expires_at,
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(crate::watch::JobWatchRecord {
+            id,
+            label: label.to_string(),
+            chat_id,
+            cwd: cwd.to_string(),
+            check_kind: check_kind.to_string(),
+            check_target: check_target.to_string(),
+            done_marker: done_marker.to_string(),
+            fail_marker: fail_marker.to_string(),
+            interval_secs,
+            max_age_secs,
+            status: "active".to_string(),
+            last_stage: String::new(),
+            last_progress: String::new(),
+            consecutive_errors: 0,
+            created_at: ts,
+            expires_at: expires_at.to_string(),
+            last_checked_at: String::new(),
+            final_report: String::new(),
+            delivered: false,
+        })
+    }
+
+    pub fn count_active_job_watches(&self, chat_id: i64) -> Result<usize> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM job_watches WHERE status = 'active' AND chat_id = ?1",
+            rusqlite::params![chat_id],
+            |row| row.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
+    pub fn list_job_watches(&self, chat_id_filter: Option<i64>, active_only: bool) -> Result<Vec<crate::watch::JobWatchRecord>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut out = Vec::new();
+        let sql = match (chat_id_filter, active_only) {
+            (Some(_), true) => {
+                "SELECT id, label, chat_id, cwd, check_kind, check_target, done_marker, fail_marker, \
+                 interval_secs, max_age_secs, status, last_stage, last_progress, consecutive_errors, \
+                 created_at, expires_at, last_checked_at, final_report, delivered \
+                 FROM job_watches WHERE chat_id = ?1 AND status = 'active' ORDER BY id ASC"
+            }
+            (Some(_), false) => {
+                "SELECT id, label, chat_id, cwd, check_kind, check_target, done_marker, fail_marker, \
+                 interval_secs, max_age_secs, status, last_stage, last_progress, consecutive_errors, \
+                 created_at, expires_at, last_checked_at, final_report, delivered \
+                 FROM job_watches WHERE chat_id = ?1 ORDER BY id DESC LIMIT 20"
+            }
+            (None, true) => {
+                "SELECT id, label, chat_id, cwd, check_kind, check_target, done_marker, fail_marker, \
+                 interval_secs, max_age_secs, status, last_stage, last_progress, consecutive_errors, \
+                 created_at, expires_at, last_checked_at, final_report, delivered \
+                 FROM job_watches WHERE status = 'active' ORDER BY id ASC"
+            }
+            (None, false) => {
+                "SELECT id, label, chat_id, cwd, check_kind, check_target, done_marker, fail_marker, \
+                 interval_secs, max_age_secs, status, last_stage, last_progress, consecutive_errors, \
+                 created_at, expires_at, last_checked_at, final_report, delivered \
+                 FROM job_watches ORDER BY id DESC LIMIT 20"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        if let Some(cid) = chat_id_filter {
+            let rows = stmt.query_map(rusqlite::params![cid], row_to_job_watch)?;
+            for r in rows {
+                out.push(r?);
+            }
+        } else {
+            let rows = stmt.query_map([], row_to_job_watch)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn update_job_watch_poll(
+        &self,
+        id: i64,
+        status: &str,
+        stage: &str,
+        progress: &str,
+        consecutive_errors: u32,
+        checked_at: &str,
+        final_report: Option<&str>,
+        delivered: bool,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "UPDATE job_watches \
+             SET status = ?1, last_stage = ?2, last_progress = ?3, consecutive_errors = ?4, \
+                 last_checked_at = ?5, final_report = COALESCE(?6, final_report), \
+                 delivered = CASE WHEN ?7 = 1 THEN 1 ELSE delivered END \
+             WHERE id = ?8",
+            rusqlite::params![
+                status,
+                stage,
+                progress,
+                consecutive_errors as i64,
+                checked_at,
+                final_report,
+                if delivered { 1i64 } else { 0i64 },
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn cancel_job_watch(&self, id: i64, chat_id_filter: Option<i64>) -> Result<bool> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let n = match chat_id_filter {
+            Some(cid) => conn.execute(
+                "UPDATE job_watches SET status = 'cancelled' WHERE id = ?1 AND chat_id = ?2 AND status = 'active'",
+                rusqlite::params![id, cid],
+            )?,
+            None => conn.execute(
+                "UPDATE job_watches SET status = 'cancelled' WHERE id = ?1 AND status = 'active'",
+                rusqlite::params![id],
+            )?,
+        };
+        Ok(n > 0)
+    }
+
+    /// Ambil laporan watch terminal yang selesai saat sesi CLI tidak aktif, lalu tandai terkirim.
+    pub fn take_undelivered_watch_reports(&self) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, label, final_report FROM job_watches \
+             WHERE chat_id = 0 AND status IN ('done', 'failed', 'expired') AND delivered = 0 AND final_report != '' \
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        for (id, _, _) in &out {
+            let _ = conn.execute(
+                "UPDATE job_watches SET delivered = 1 WHERE id = ?1",
+                rusqlite::params![id],
+            );
+        }
+        Ok(out)
+    }
+
+    // ---------- Perbaikan 7 (v0.5.7): Laporan `/usage` langsung dari tabel `usage` ----------
+
+    pub fn usage_report(&self, session_id: &str, today_utc_prefix: &str) -> Result<UsageReportSummary> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let review_sid = format!("review:{session_id}");
+        let mut session_rows = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT model, kind, COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) \
+                 FROM usage WHERE session_id = ?1 OR session_id = ?2 \
+                 GROUP BY model, kind ORDER BY kind ASC, model ASC",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![session_id, review_sid], |row| {
+                Ok(UsageBreakdownRow {
+                    model: row.get(0)?,
+                    kind: row.get(1)?,
+                    calls: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                    input_tokens: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
+                    output_tokens: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+                })
+            })?;
+            for r in rows {
+                session_rows.push(r?);
+            }
+        }
+        let like_prefix = format!("{today_utc_prefix}%");
+        let mut today_rows = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT model, kind, COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) \
+                 FROM usage WHERE ts LIKE ?1 \
+                 GROUP BY model, kind ORDER BY kind ASC, model ASC",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![like_prefix], |row| {
+                Ok(UsageBreakdownRow {
+                    model: row.get(0)?,
+                    kind: row.get(1)?,
+                    calls: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                    input_tokens: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
+                    output_tokens: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+                })
+            })?;
+            for r in rows {
+                today_rows.push(r?);
+            }
+        }
+        Ok(UsageReportSummary {
+            session_id: session_id.to_string(),
+            today_date: today_utc_prefix.to_string(),
+            session_rows,
+            today_rows,
+        })
+    }
+}
+
+/// Rincian 1 kelompok baris `usage` berdasarkan `(model, kind)` untuk `/usage` (Perbaikan 7 v0.5.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageBreakdownRow {
+    pub model: String,
+    pub kind: String,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Ringkasan lengkap `/usage` (sesi berjalan + total hari ini) langsung dari SQLite `usage`.
+#[derive(Debug, Clone)]
+pub struct UsageReportSummary {
+    pub session_id: String,
+    pub today_date: String,
+    pub session_rows: Vec<UsageBreakdownRow>,
+    pub today_rows: Vec<UsageBreakdownRow>,
+}
+
+fn row_to_job_watch(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::watch::JobWatchRecord> {
+    Ok(crate::watch::JobWatchRecord {
+        id: row.get(0)?,
+        label: row.get(1)?,
+        chat_id: row.get(2)?,
+        cwd: row.get(3)?,
+        check_kind: row.get(4)?,
+        check_target: row.get(5)?,
+        done_marker: row.get(6)?,
+        fail_marker: row.get(7)?,
+        interval_secs: row.get::<_, i64>(8).unwrap_or(60).max(30) as u64,
+        max_age_secs: row.get::<_, i64>(9).unwrap_or(21600).max(60) as u64,
+        status: row.get(10)?,
+        last_stage: row.get(11)?,
+        last_progress: row.get(12)?,
+        consecutive_errors: row.get::<_, i64>(13).unwrap_or(0).max(0) as u32,
+        created_at: row.get(14)?,
+        expires_at: row.get(15)?,
+        last_checked_at: row.get(16)?,
+        final_report: row.get(17)?,
+        delivered: row.get::<_, i64>(18).unwrap_or(0) != 0,
+    })
 }
 
 fn default_long_task_steps(goal: &str) -> Vec<LongTaskStep> {

@@ -66,8 +66,42 @@ pub enum Commands {
         /// Kata kunci atau frasa yang dicari
         query: Vec<String>,
     },
+    /// Kelola pemantauan tugas asinkron (`selen watch list|cancel <id>`)
+    Watch {
+        #[command(subcommand)]
+        action: WatchCliAction,
+    },
+    /// Pasang/copot/lihat skill pengguna (`selen skills install <url>|remove <nama>|list`)
+    Skills {
+        #[command(subcommand)]
+        action: SkillsCliAction,
+    },
     /// Perbarui selen ke rilis terbaru dari GitHub Releases
     Update,
+}
+
+#[derive(Subcommand)]
+pub enum WatchCliAction {
+    /// Tampilkan daftar pemantauan tugas asinkron
+    List,
+    /// Batalkan pemantauan aktif berdasarkan ID
+    Cancel { id: i64 },
+}
+
+#[derive(Subcommand)]
+pub enum SkillsCliAction {
+    /// Pasang skill dari URL Git atau URL SKILL.md langsung (lewat staging, validasi, & persetujuan)
+    Install {
+        /// URL repositori Git (opsional `#subpath` atau `/tree/...`) atau URL `SKILL.md` langsung
+        url: String,
+        /// Ganti nama skill (kebab-case) bila terjadi bentrok nama
+        #[arg(long)]
+        rename: Option<String>,
+    },
+    /// Copot skill hasil `skills install` (tidak berlaku untuk bawaan atau skill proyek)
+    Remove { name: String },
+    /// Tampilkan daftar skill terpasang
+    List,
 }
 
 #[derive(Subcommand)]

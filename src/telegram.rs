@@ -235,6 +235,8 @@ pub const TELEGRAM_BOT_COMMANDS: &[(&str, &str)] = &[
     ("task", "Kelola tugas panjang lintas sesi"),
     ("review", "Lihat & putuskan usulan background review"),
     ("cron", "Kelola tugas terjadwal (add/list/remove/pause/resume)"),
+    ("watch", "Pantau tugas asinkron (list/cancel)"),
+    ("usage", "Ringkasan pemakaian token sesi & hari ini"),
     ("search", "Cari percakapan lintas sesi tersimpan (FTS5)"),
     ("jobs", "Pantau proses latar belakang"),
     ("route", "Info & budget Dynamic Model Routing"),
@@ -1195,6 +1197,82 @@ impl TelegramClient {
                 json!({ "chat_id": chat_id, "action": "typing" }),
             )
             .await;
+    }
+
+    /// Unggah berkas lampiran (`sendDocument`, maks 50 MB Bot API) sebagai pesan tersendiri (Perbaikan 4 v0.5.7).
+    pub async fn send_document(
+        &self,
+        chat_id: i64,
+        file_path: &std::path::Path,
+        caption: Option<&str>,
+    ) -> Result<TgMessage> {
+        self.send_multipart_media("sendDocument", "document", chat_id, file_path, caption)
+            .await
+    }
+
+    /// Unggah foto (`sendPhoto`, maks 10 MB Bot API) sebagai pesan tersendiri (Perbaikan 4 v0.5.7).
+    pub async fn send_photo(
+        &self,
+        chat_id: i64,
+        file_path: &std::path::Path,
+        caption: Option<&str>,
+    ) -> Result<TgMessage> {
+        self.send_multipart_media("sendPhoto", "photo", chat_id, file_path, caption)
+            .await
+    }
+
+    async fn send_multipart_media(
+        &self,
+        method: &str,
+        field_name: &str,
+        chat_id: i64,
+        file_path: &std::path::Path,
+        caption: Option<&str>,
+    ) -> Result<TgMessage> {
+        let bytes = tokio::fs::read(file_path)
+            .await
+            .with_context(|| format!("gagal membaca berkas {}", file_path.display()))?;
+        let fname = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("berkas")
+            .to_string();
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(fname);
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part(field_name.to_string(), part);
+        if let Some(cap) = caption.map(str::trim).filter(|s| !s.is_empty()) {
+            let short_cap: String = cap.chars().take(1000).collect();
+            form = form.text("caption", short_cap);
+        }
+        let url = format!("{}/{method}", self.base_url);
+        let upload_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(120))
+            .http1_only()
+            .build()
+            .context("gagal membuat HTTP upload client Telegram")?;
+        let resp = upload_http.post(&url).multipart(form).send().await.map_err(|e| {
+            let clean = redact_tg_token(&e.without_url().to_string(), &self.token);
+            anyhow!("gagal mengirim {method} ke Telegram: {clean}")
+        })?;
+        let status = resp.status();
+        let parsed: ApiResponse<TgMessage> = resp.json().await.map_err(|e| {
+            let clean = redact_tg_token(&e.to_string(), &self.token);
+            anyhow!("respons Telegram {method} tidak valid (HTTP {status}): {clean}")
+        })?;
+        if !parsed.ok {
+            let desc = parsed
+                .description
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            return Err(anyhow!(
+                "Telegram API {method} menolak permintaan: {}",
+                redact_tg_token(&desc, &self.token)
+            ));
+        }
+        parsed
+            .result
+            .ok_or_else(|| anyhow!("respons Telegram {method} tidak memuat result"))
     }
 }
 

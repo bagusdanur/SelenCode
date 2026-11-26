@@ -115,6 +115,82 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
         let cron_tg = tg.clone();
         let cron_prov_override = cli.provider.clone();
         let cron_store_arc = Arc::new(cron_store);
+        // Perbaikan 3 (v0.5.7): Loop pemantau tugas asinkron (`job_watches`) persisten di gateway.
+        // Otomatis melanjutkan semua pantauan aktif sesudah gateway restart — 0 panggilan LLM!
+        let watch_tg = tg.clone();
+        let watch_store = cron_store_arc.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let Ok(watches) = watch_store.list_job_watches(None, true) else {
+                    continue;
+                };
+                if watches.is_empty() {
+                    continue;
+                }
+                let sandbox = match config::load() {
+                    Ok(c) => selencode::sandbox::SandboxController::from_config(
+                        &c.sandbox,
+                        selencode::sandbox::default_audit_log_path(),
+                    ),
+                    Err(_) => selencode::sandbox::SandboxController::default(),
+                };
+                let fallback_chat = config::load()
+                    .ok()
+                    .and_then(|c| c.telegram.allowed_users.first().copied())
+                    .unwrap_or(0);
+                let now_utc = chrono::Utc::now();
+                for w in watches {
+                    if !selencode::watch::is_watch_due(&w, now_utc) {
+                        continue;
+                    }
+                    let poll_out = selencode::watch::poll_watch_once(&w, &sandbox).await;
+                    let poll_res = match &poll_out {
+                        Ok(s) => Ok(s.as_str()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let tr = selencode::watch::evaluate_watch_poll(
+                        &w,
+                        match &poll_res {
+                            Ok(s) => Ok(*s),
+                            Err(e) => Err(e.as_str()),
+                        },
+                        chrono::Utc::now(),
+                    );
+                    let checked_at = chrono::Utc::now()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    let target_chat = if w.chat_id != 0 {
+                        w.chat_id
+                    } else {
+                        fallback_chat
+                    };
+                    let mut sent_ok = false;
+                    if let Some(msg) = &tr.notification {
+                        if target_chat != 0 {
+                            sent_ok = watch_tg
+                                .send_long_message(target_chat, msg)
+                                .await
+                                .is_ok();
+                        }
+                    }
+                    let final_rep = if tr.terminal {
+                        tr.notification.as_deref()
+                    } else {
+                        None
+                    };
+                    let _ = watch_store.update_job_watch_poll(
+                        w.id,
+                        &tr.new_status,
+                        &tr.new_stage,
+                        &tr.new_progress,
+                        tr.new_consecutive_errors,
+                        &checked_at,
+                        final_rep,
+                        tr.terminal && sent_ok,
+                    );
+                }
+            }
+        });
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(15)).await;
@@ -628,6 +704,7 @@ async fn handle_telegram_chat_message(
             let ask_timeout = s.cfg.ask.timeout_secs;
             s.ctx.asker = Arc::new(selencode::tools::ask::UserAsker::channel(ask_tx));
             s.ctx.ask_timeout_secs = ask_timeout;
+            s.ctx = s.ctx.with_telegram_context(chat_id, tg.clone());
             let tg_ask = tg.clone();
             let ask_hub_bg = ask_hub.clone();
             tokio::spawn(async move {
@@ -847,6 +924,16 @@ async fn handle_telegram_chat_message(
         }
         SlashCommand::Cron(arg) => {
             let reply = s.handle_cron(arg.as_deref(), Some(chat_id))?;
+            tg.send_menu_markup(chat_id, &reply).await?;
+            return Ok(());
+        }
+        SlashCommand::Watch(arg) => {
+            let reply = s.handle_watch(arg.as_deref(), Some(chat_id))?;
+            tg.send_menu_markup(chat_id, &reply).await?;
+            return Ok(());
+        }
+        SlashCommand::Usage => {
+            let reply = s.handle_usage()?;
             tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }

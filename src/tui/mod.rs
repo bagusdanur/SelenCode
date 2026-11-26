@@ -102,6 +102,8 @@ pub enum TuiCommand {
     Skills(Option<String>),
     Review(Option<String>),
     Cron(Option<String>),
+    Watch(Option<String>),
+    Usage,
     Search(Option<String>),
     UseSkill(Option<String>),
     LearnSkill(Option<String>),
@@ -1998,6 +2000,12 @@ fn submit(
         }
         SlashCommand::Cron(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Cron(arg));
+        }
+        SlashCommand::Watch(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Watch(arg));
+        }
+        SlashCommand::Usage => {
+            send_cmd(app, cmd_tx, TuiCommand::Usage);
         }
         SlashCommand::Search(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Search(arg));

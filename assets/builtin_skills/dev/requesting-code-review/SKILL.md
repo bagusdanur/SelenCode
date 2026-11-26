@@ -1,6 +1,6 @@
 ---
 name: requesting-code-review
-description: Review diff berbasis spesifikasi sebelum merge
+description: Untuk tinjau/review diff kode sebelum merge/commit
 version: 1.0.0
 tags: [code-review, diff, quality, git]
 ---

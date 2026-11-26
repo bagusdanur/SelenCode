@@ -47,8 +47,8 @@ impl Tool for ListFiles {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "list_files".into(),
-            description: "Daftar file di folder project (hormati .gitignore, maks 500).".into(),
-            parameters: schema(json!({"path": {"type": "string", "description": "folder relatif, default ."}}), &[]),
+            description: "Daftar file workspace (maks 500).".into(),
+            parameters: schema(json!({"path": {"type": "string"}}), &[]),
         }
     }
     async fn run(&self, args: Value, ctx: &Ctx) -> Result<String> {
@@ -79,7 +79,7 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description: "Baca isi file teks (maks 2000 baris / 100KB). start/end = nomor baris 1-based opsional.".into(),
+            description: "Baca file teks (opsional baris start..end, 1-based).".into(),
             parameters: schema(
                 json!({"path": {"type": "string"},
                        "start": {"type": "integer"},
@@ -145,7 +145,7 @@ impl Tool for WriteFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_file".into(),
-            description: "Tulis file baru / timpa file (butuh persetujuan, diff ditampilkan).".into(),
+            description: "Tulis/timpa file (persetujuan + diff).".into(),
             parameters: schema(
                 json!({"path": {"type": "string"}, "content": {"type": "string"}}),
                 &["path", "content"],
@@ -196,7 +196,7 @@ impl Tool for EditFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit_file".into(),
-            description: "Ganti potongan teks persis dalam file. 'old' WAJIB muncul tepat 1 kali. Butuh persetujuan.".into(),
+            description: "Ganti teks persis `old` (unik 1x) -> `new`.".into(),
             parameters: schema(
                 json!({"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}),
                 &["path", "old", "new"],

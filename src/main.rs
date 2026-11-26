@@ -11,7 +11,7 @@
 mod app;
 
 use anyhow::Result;
-use app::cli::{Cli, Commands, CronCliAction};
+use app::cli::{Cli, Commands, CronCliAction, SkillsCliAction, WatchCliAction};
 use app::plain_runner::interactive_plain;
 use app::session::Session;
 use app::telegram_runner::run_telegram_gateway;
@@ -198,6 +198,83 @@ async fn main() -> Result<()> {
             let arg = (!q.trim().is_empty()).then_some(q.as_str());
             let card = s.handle_search(arg)?;
             println!("{}", selencode::repl::strip_menu_markup(&card));
+            Ok(())
+        }
+        Some(Commands::Watch { action }) => {
+            let s =
+                Session::build(cli.provider.as_deref(), cli.yes, false, None, None, true).await?;
+            let arg = match action {
+                WatchCliAction::List => Some("list".to_string()),
+                WatchCliAction::Cancel { id } => Some(format!("cancel {id}")),
+            };
+            let card = s.handle_watch(arg.as_deref(), None)?;
+            println!("{}", selencode::repl::strip_menu_markup(&card));
+            Ok(())
+        }
+        Some(Commands::Skills { action }) => {
+            match action {
+                SkillsCliAction::Install { url, rename } => {
+                    let staged = selencode::skill_installer::stage_skill_from_source(&url).await?;
+                    let summary = selencode::skill_installer::format_install_approval_summary(
+                        &staged,
+                        rename.as_deref(),
+                    );
+                    println!("{summary}");
+                    let approved = if cli.yes {
+                        true
+                    } else {
+                        use std::io::Write;
+                        print!("Pasang skill ini ke direktori pengguna? [y/N]: ");
+                        std::io::stdout().flush()?;
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line)?;
+                        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "ya" | "yes")
+                    };
+                    if !approved {
+                        println!("Pemasangan dibatalkan — tidak ada berkas yang ditulis.");
+                        return Ok(());
+                    }
+                    let user_root = selencode::skills::user_skills_dir()
+                        .ok_or_else(|| anyhow::anyhow!("direktori skill pengguna tidak tersedia"))?;
+                    let rep = selencode::skill_installer::finalize_staged_skill_install(
+                        &staged,
+                        &user_root,
+                        rename.as_deref(),
+                    )?;
+                    println!(
+                        "Skill '{}' berhasil dipasang ke {} ({} berkas, {} skrip; sumber dicatat di {}).",
+                        rep.name,
+                        rep.target_dir.display(),
+                        rep.files_copied,
+                        rep.scripts_count,
+                        rep.provenance_path.display()
+                    );
+                }
+                SkillsCliAction::Remove { name } => {
+                    let user_root = selencode::skills::user_skills_dir()
+                        .ok_or_else(|| anyhow::anyhow!("direktori skill pengguna tidak tersedia"))?;
+                    let cwd = std::env::current_dir()?;
+                    let msg = selencode::skill_installer::remove_installed_skill(
+                        &name,
+                        &user_root,
+                        &cwd,
+                    )?;
+                    println!("{msg}");
+                }
+                SkillsCliAction::List => {
+                    let mut s = Session::build(
+                        cli.provider.as_deref(),
+                        cli.yes,
+                        false,
+                        None,
+                        None,
+                        true,
+                    )
+                    .await?;
+                    let card = s.handle_skills(None).await?;
+                    println!("{}", selencode::repl::strip_menu_markup(&card));
+                }
+            }
             Ok(())
         }
         Some(Commands::Update) => selencode::update::run().await,

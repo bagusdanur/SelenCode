@@ -10,6 +10,7 @@ pub mod outline;
 pub mod plan;
 pub mod retrieve;
 pub mod search;
+pub mod send_file;
 pub mod session_search;
 pub mod shell;
 pub mod skill;
@@ -17,6 +18,7 @@ pub mod task;
 pub mod toolsets;
 pub mod undo;
 pub mod verify;
+pub mod watch;
 pub mod web;
 
 use crate::config::ShellCfg;
@@ -80,6 +82,16 @@ pub struct Ctx {
     pub ask_timeout_secs: u64,
     /// Telemetri bersama router fallback agar loop mencatat model aktual & notifikasi sekali (v0.5.6 Bagian 1).
     pub router_telemetry: Option<Arc<std::sync::Mutex<crate::providers::router::RouterTelemetry>>>,
+    /// Konfigurasi pagu memori persisten & profil pemilik (`[memory]`, Perbaikan 5 v0.5.7).
+    pub memory_cfg: crate::config::MemoryCfg,
+    /// Snapshot beku wadah `memory` + `profile` yang dimuat 1x di awal sesi (Perbaikan 5 v0.5.7).
+    pub frozen_user_memory: Option<crate::user_memory::FrozenUserMemory>,
+    /// True bila sesi ini dilanjutkan dari DB (`/resume` atau `selen resume`, Perbaikan 1 v0.5.7).
+    pub is_resumed_session: bool,
+    /// ID chat Telegram aktif untuk `watch_job` (None/0 di sesi CLI, Perbaikan 3 v0.5.7).
+    pub telegram_chat_id: Option<i64>,
+    /// Pengirim lampiran berkas Telegram untuk tool `send_file` (None di CLI, Perbaikan 4 v0.5.7).
+    pub tg_file_sender: Option<Arc<send_file::TgFileSender>>,
 }
 
 impl Ctx {
@@ -109,7 +121,33 @@ impl Ctx {
             asker: Arc::new(ask::UserAsker::non_interactive()),
             ask_timeout_secs: 600,
             router_telemetry: None,
+            memory_cfg: crate::config::MemoryCfg::default(),
+            frozen_user_memory: None,
+            is_resumed_session: false,
+            telegram_chat_id: None,
+            tg_file_sender: None,
         }
+    }
+    pub fn with_memory_cfg(mut self, cfg: crate::config::MemoryCfg) -> Self {
+        self.memory_cfg = cfg;
+        self
+    }
+    pub fn with_frozen_user_memory(mut self, snap: crate::user_memory::FrozenUserMemory) -> Self {
+        self.frozen_user_memory = Some(snap);
+        self
+    }
+    pub fn with_resumed_session(mut self, resumed: bool) -> Self {
+        self.is_resumed_session = resumed;
+        self
+    }
+    pub fn with_telegram_context(
+        mut self,
+        chat_id: i64,
+        client: crate::telegram::TelegramClient,
+    ) -> Self {
+        self.telegram_chat_id = Some(chat_id);
+        self.tg_file_sender = Some(Arc::new(send_file::TgFileSender { client, chat_id }));
+        self
     }
     pub fn with_asker(mut self, asker: Arc<ask::UserAsker>, timeout_secs: u64) -> Self {
         self.asker = asker;
@@ -303,10 +341,31 @@ pub fn default_registry_with_shell(shell_cfg: &ShellCfg) -> Registry {
         .register(Arc::new(skill::SkillEdit))
         .register(Arc::new(skill::ManageSkill))
         .register(Arc::new(memory::ManageMemory))
+        .register(Arc::new(memory::UserMemoryTool))
         .register(Arc::new(task::ManageTask))
         .register(Arc::new(verify::VerifyProject::new(shell_cfg.timeout_secs)))
         .register(Arc::new(ask::AskUser))
         .register(Arc::new(session_search::SessionSearch))
+        .register(Arc::new(watch::WatchJob))
+        .register(Arc::new(send_file::SendFile))
+}
+
+/// Registry PEKERJA TERISOLASI untuk `delegate` `mode: "work"` (Perbaikan 6 v0.5.7):
+/// boleh baca/tulis/edit/shell/git-status di dalam Git worktree miliknya sendiri,
+/// TANPA `delegate`/`orchestrate`/`watch_job`/`send_file` (rekursi mustahil secara konstruksi).
+pub fn worker_registry(shell_cfg: &ShellCfg) -> Registry {
+    Registry::new()
+        .register(Arc::new(file::ListFiles))
+        .register(Arc::new(file::ReadFile))
+        .register(Arc::new(file::WriteFile))
+        .register(Arc::new(file::EditFile))
+        .register(Arc::new(search::SearchText))
+        .register(Arc::new(shell::RunShell::new(
+            shell_cfg.allowlist.clone(),
+            shell_cfg.timeout_secs,
+        )))
+        .register(Arc::new(git::GitStatus))
+        .register(Arc::new(git::GitDiff))
 }
 
 /// Registry BACA-SAJA (Fase 6): persis daftar agent::plan::READ_ONLY_TOOLS.

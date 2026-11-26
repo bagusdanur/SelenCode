@@ -426,6 +426,7 @@ fn config_save_load_and_direct_api_key_fallback() {
         skills: Default::default(),
         fallback: Default::default(),
         ask: Default::default(),
+        memory: Default::default(),
     };
     save_to(&cfg, &path).unwrap();
     let loaded = load_from(&path).unwrap();

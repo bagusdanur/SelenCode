@@ -31,15 +31,28 @@ pub const CORE_TOOLS: &[&str] = &[
     "run_shell",
 ];
 
+/// Tool inti super-ramping untuk giliran RESUME (Perbaikan 1 v0.5.7):
+/// menghemat ~2–4 skema tool pada panggilan pertama resume sambil tetap memungkinkan
+/// pemuatan tool apa pun (`list_files`, `skill_view`, `session_search`, `watch_job`, dll.)
+/// di giliran yang sama lewat `activate_toolset`.
+pub const RESUME_CORE_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "search_text",
+    "run_shell",
+];
+
 /// Daftar paket toolset tambahan yang dapat diaktifkan secara dinamis.
 pub const EXTENDED_TOOLSETS: &[(&str, &str, &[&str])] = &[
-    ("git_read", "status & diff repositori git", &["git_status", "git_diff"]),
-    ("verify", "verifikasi build/test/lint proyek", &["verify_project"]),
-    ("git_write", "commit perubahan git", &["git_commit"]),
-    ("code_nav", "outline AST & Smart Context Index", &["outline", "retrieve_context"]),
+    ("fs_list", "daftar file workspace", &["list_files"]),
+    ("git_read", "status/diff git", &["git_status", "git_diff"]),
+    ("verify", "build/test/lint proyek", &["verify_project"]),
+    ("git_write", "commit git", &["git_commit"]),
+    ("code_nav", "outline AST & indeks repo", &["outline", "retrieve_context"]),
     (
         "lsp",
-        "diagnostik, definisi, referensi, hover, & rename simbol LSP",
+        "diagnostik/definisi/refs/rename LSP",
         &[
             "lsp_diagnostics",
             "lsp_definition",
@@ -50,23 +63,15 @@ pub const EXTENDED_TOOLSETS: &[(&str, &str, &[&str])] = &[
     ),
     (
         "bg",
-        "proses latar belakang (dev server/watcher)",
+        "proses latar (server/watcher)",
         &["bg_start", "bg_output", "bg_status", "bg_stop"],
     ),
-    ("web", "ambil isi halaman URL", &["fetch_url"]),
-    (
-        "plan",
-        "checklist rencana & tugas panjang lintas sesi",
-        &["update_plan", "manage_task"],
-    ),
-    (
-        "skills_view",
-        "muat isi skill & file referensi on-demand",
-        &["skill_view"],
-    ),
+    ("web", "ambil URL", &["fetch_url"]),
+    ("plan", "rencana & task panjang", &["update_plan", "manage_task"]),
+    ("skills_view", "muat isi skill", &["skill_view"]),
     (
         "skills_mem",
-        "daftar, buat, edit skill & memori proyek persisten",
+        "skill & memori persisten/profil",
         &[
             "skills_list",
             "skill_view",
@@ -74,36 +79,30 @@ pub const EXTENDED_TOOLSETS: &[(&str, &str, &[&str])] = &[
             "skill_edit",
             "manage_skill",
             "manage_memory",
+            "memory",
         ],
     ),
     (
         "multi_agent",
-        "subagent paralel & orkestrasi multi-peran",
+        "subagent paralel baca/worktree",
         &["delegate", "orchestrate"],
     ),
-    (
-        "clarify",
-        "tanya klarifikasi berpilihan ke pengguna saat ambigu atau kandidat mirip",
-        &["ask_user"],
-    ),
-    (
-        "history",
-        "cari percakapan/frasa lintas sesi tersimpan (FTS5)",
-        &["session_search"],
-    ),
+    ("clarify", "tanya klarifikasi user", &["ask_user"]),
+    ("history", "cari riwayat sesi FTS5", &["session_search"]),
+    ("watch", "pantau job asinkron hingga selesai", &["watch_job"]),
+    ("tg_files", "kirim berkas lampiran ke Telegram", &["send_file"]),
 ];
 
-/// Spesifikasi meta-tool `activate_toolset` yang sangat ramping (~75 token).
+/// Spesifikasi meta-tool `activate_toolset` yang sangat ramping.
 pub fn activate_toolset_spec() -> ToolSpec {
     ToolSpec {
         name: ACTIVATE_TOOLSET_NAME.to_string(),
-        description: "Aktifkan toolset tambahan secara on-demand: git_read, verify, git_write, code_nav, lsp, bg, web, plan, skills_mem, multi_agent, clarify, history, mcp.".to_string(),
+        description: "Aktifkan toolset opsional: fs_list, git_read, verify, git_write, code_nav, lsp, bg, web, plan, skills_view, skills_mem, multi_agent, clarify, history, watch, tg_files, mcp.".to_string(),
         parameters: schema(
             json!({
                 "toolsets": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Daftar nama toolset yang ingin diaktifkan untuk giliran ini."
+                    "items": { "type": "string" }
                 }
             }),
             &["toolsets"],
@@ -283,6 +282,7 @@ pub fn select_initial_toolsets(
     if [
         "sesi lalu",
         "sesi sebelumnya",
+        "sesi lain",
         "cari sesi",
         "session_search",
         "riwayat sesi",
@@ -296,6 +296,59 @@ pub fn select_initial_toolsets(
         set.insert("history".to_string());
     }
 
+    if [
+        "pantau",
+        "watch",
+        "antrean",
+        "queue",
+        "comic-auto",
+        "thunder",
+        "kerjain",
+        "job_queue",
+        "status file",
+        "asinkron",
+        "proses panjang",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+    {
+        set.insert("watch".to_string());
+    }
+
+    if [
+        "kirim berkas",
+        "kirim file",
+        "kirim zip",
+        "kirim laporan",
+        "kirim gambar",
+        "kirim ke chat",
+        "kirim ke telegram",
+        "lampirkan",
+        "send_file",
+        "send file",
+        "attach",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+    {
+        set.insert("tg_files".to_string());
+    }
+
+    if [
+        "preferensi",
+        "ingat ",
+        "simpan ke memori",
+        "simpan memori",
+        "profil",
+        "profile",
+        "selalu simpan",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+    {
+        set.insert("skills_mem".to_string());
+    }
+
     if has_mcp
         && (lower.contains("mcp")
             || lower.contains("resource")
@@ -307,9 +360,82 @@ pub fn select_initial_toolsets(
     set
 }
 
-/// Cek apakah nama tool termasuk dalam paket aktif saat ini.
+/// Pilih toolset awal super-ramping khusus untuk giliran RESUME (Perbaikan 1 v0.5.7):
+/// - Tidak menyalakan `git_read` / `verify` / `skills_view` hanya karena penanda folder `.git` atau adanya skill;
+///   hanya menyalakan toolset yang benar-benar diminta prompt saat ini!
+/// - Semua tool lain tetap dapat diaktifkan di giliran yang sama lewat `activate_toolset`.
+pub fn select_resume_initial_toolsets(
+    prompt: &str,
+    cwd: &Path,
+    has_mcp: bool,
+    mode: TurnMode,
+) -> HashSet<String> {
+    let mut set = select_initial_toolsets(prompt, cwd, has_mcp, mode);
+    let lower = prompt.to_ascii_lowercase();
+    // Pada sesi resume, jangan otomatis membawa `git_read` hanya karena `.git` ada di folder
+    // kecuali prompt benar-benar menyebut git/diff/commit/branch!
+    if !["git ", "git_", "commit", "diff", "branch", "staged"]
+        .iter()
+        .any(|kw| lower.contains(kw))
+    {
+        set.remove("git_read");
+    }
+    // `verify` tidak perlu di pertanyaan singkat resume kecuali prompt menyentuh build/test/fix.
+    if lower.chars().count() < 60
+        && !["test", "tes", "build", "compile", "cargo", "npm", "pytest", "verify", "verifikasi", "fix", "bug"]
+            .iter()
+            .any(|kw| lower.contains(kw))
+    {
+        set.remove("verify");
+    }
+    // Muat `skills_view` di resume bila prompt menyangkut debugging/TDD/review/desain/inspeksi/skill.
+    if [
+        "bug",
+        "error",
+        "salah",
+        "debug",
+        "perbaiki",
+        "fix",
+        "tdd",
+        "review",
+        "tinjau",
+        "desain",
+        "rencana",
+        "inspeksi",
+        "skill",
+        "docker",
+        "sitasi",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+    {
+        set.insert("skills_view".to_string());
+    }
+    if ["daftar file", "list_files", "isi folder", "file apa saja"]
+        .iter()
+        .any(|kw| lower.contains(kw))
+    {
+        set.insert("fs_list".to_string());
+    }
+    set
+}
+
+/// Cek apakah nama tool termasuk dalam paket aktif saat ini (mode normal).
 pub fn is_tool_active(tool_name: &str, active_toolsets: &HashSet<String>) -> bool {
-    if CORE_TOOLS.contains(&tool_name) {
+    is_tool_active_for_turn(tool_name, active_toolsets, false)
+}
+
+/// Cek apakah nama tool termasuk dalam paket aktif saat ini (`lean_resume = true` memakai `RESUME_CORE_TOOLS`).
+pub fn is_tool_active_for_turn(
+    tool_name: &str,
+    active_toolsets: &HashSet<String>,
+    lean_resume: bool,
+) -> bool {
+    if lean_resume {
+        if RESUME_CORE_TOOLS.contains(&tool_name) {
+            return true;
+        }
+    } else if CORE_TOOLS.contains(&tool_name) {
         return true;
     }
     if tool_name.starts_with("mcp__") {
@@ -367,13 +493,14 @@ pub fn build_mcp_compact_index(registry: &Registry) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
-/// Susun daftar `ToolSpec` ramping yang benar-benar dikirim ke provider berdasarkan `active_toolsets`
-/// dan daftar `loaded_mcp_tools` (untuk mode indeks MCP >15 tool).
-pub fn active_tool_specs_with_mcp(
+/// Susun daftar `ToolSpec` ramping yang benar-benar dikirim ke provider berdasarkan `active_toolsets`,
+/// daftar `loaded_mcp_tools` (untuk mode indeks MCP >15 tool), dan mode `lean_resume` (Perbaikan 1 v0.5.7).
+pub fn active_tool_specs_for_turn(
     registry: &Registry,
     active_toolsets: &HashSet<String>,
     loaded_mcp_tools: &HashSet<String>,
     mode: TurnMode,
+    lean_resume: bool,
 ) -> Vec<ToolSpec> {
     let mcp_count = registry
         .names()
@@ -383,12 +510,14 @@ pub fn active_tool_specs_with_mcp(
     let mcp_indexed_mode = mcp_count > MCP_ON_DEMAND_THRESHOLD;
 
     let mut specs = match mode {
-        TurnMode::Plan => registry.specs_where(|n| is_read_only(n) && is_tool_active(n, active_toolsets)),
+        TurnMode::Plan => registry.specs_where(|n| {
+            is_read_only(n) && is_tool_active_for_turn(n, active_toolsets, lean_resume)
+        }),
         TurnMode::Execute => registry.specs_where(|n| {
             if n.starts_with("mcp__") && mcp_indexed_mode {
                 loaded_mcp_tools.contains(n)
             } else {
-                is_tool_active(n, active_toolsets)
+                is_tool_active_for_turn(n, active_toolsets, lean_resume)
             }
         }),
     };
@@ -410,6 +539,17 @@ pub fn active_tool_specs_with_mcp(
     specs
 }
 
+/// Susun daftar `ToolSpec` ramping yang benar-benar dikirim ke provider berdasarkan `active_toolsets`
+/// dan daftar `loaded_mcp_tools` (untuk mode indeks MCP >15 tool).
+pub fn active_tool_specs_with_mcp(
+    registry: &Registry,
+    active_toolsets: &HashSet<String>,
+    loaded_mcp_tools: &HashSet<String>,
+    mode: TurnMode,
+) -> Vec<ToolSpec> {
+    active_tool_specs_for_turn(registry, active_toolsets, loaded_mcp_tools, mode, false)
+}
+
 /// Susun daftar `ToolSpec` ramping yang benar-benar dikirim ke provider berdasarkan `active_toolsets`.
 pub fn active_tool_specs(
     registry: &Registry,
@@ -419,26 +559,26 @@ pub fn active_tool_specs(
     active_tool_specs_with_mcp(registry, active_toolsets, &HashSet::new(), mode)
 }
 
-/// Ringkasan 1 baris toolset yang tersedia untuk disisipkan murah ke system prompt (~50 token).
+/// Ringkasan 1 baris ultra-padat toolset opsional (~60 token; hemat ~190 token/call dibanding deskripsi panjang).
 pub fn inactive_toolsets_hint(registry: &Registry, active_toolsets: &HashSet<String>) -> String {
     let reg_names = registry.names();
     let mut avail = Vec::new();
-    for (name, desc, members) in EXTENDED_TOOLSETS {
+    for (name, _, members) in EXTENDED_TOOLSETS {
         if !active_toolsets.contains(*name)
             && members.iter().any(|m| reg_names.iter().any(|r| r == m))
         {
-            avail.push(format!("{name} ({desc})"));
+            avail.push((*name).to_string());
         }
     }
     if !active_toolsets.contains("mcp") && reg_names.iter().any(|n| n.starts_with("mcp__")) {
-        avail.push("mcp (tool server MCP eksternal)".to_string());
+        avail.push("mcp".to_string());
     }
     if avail.is_empty() {
         String::new()
     } else {
         format!(
-            "Toolset opsional (aktifkan via `{ACTIVATE_TOOLSET_NAME}` hanya bila perlu): {}.",
-            avail.join("; ")
+            "Toolset opsional (`{ACTIVATE_TOOLSET_NAME}`): {}.",
+            avail.join(", ")
         )
     }
 }

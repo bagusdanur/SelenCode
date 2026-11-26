@@ -235,6 +235,11 @@ impl Session {
         ));
         selencode::skills::seed_default_user_skills();
         let hooks = Arc::new(selencode::hooks::HookEngine::from_config(&cfg.hooks));
+        let frozen_user_mem = selencode::user_memory::load_frozen_snapshot(
+            cfg.memory.max_memory_chars,
+            cfg.memory.max_profile_chars,
+        );
+        let is_resumed = resumed_note.is_some();
         let ctx = Ctx::new(cwd, mode == ApprovalMode::AutoAll)
             .with_approver(approver)
             .with_context_limit(init_ctx_limit)
@@ -247,16 +252,22 @@ impl Session {
             .with_skills(cfg.skills.clone())
             .with_router_telemetry(router_telemetry.clone())
             .with_ask_timeout_only(cfg.ask.timeout_secs)
+            .with_memory_cfg(cfg.memory.clone())
+            .with_frozen_user_memory(frozen_user_mem)
+            .with_resumed_session(is_resumed)
             .with_store(store.clone(), session_id.clone());
         // P2.2: subagent `delegate` & `orchestrate` berbagi handle `shared_provider`
         // sehingga ganti provider/model lewat `/model` otomatis memperbarui subagent juga!
         let shared_provider = Arc::new(std::sync::RwLock::new(provider.clone()));
         let mut registry = default_registry_with_shell(&cfg.shell)
-            .register(Arc::new(Delegate::new_shared(
-                shared_provider.clone(),
-                Arc::new(read_only_registry()),
-                cfg.agent.max_parallel_subagents,
-            )))
+            .register(Arc::new(
+                Delegate::new_shared(
+                    shared_provider.clone(),
+                    Arc::new(read_only_registry()),
+                    cfg.agent.max_parallel_subagents,
+                )
+                .with_shell_cfg(cfg.shell.clone()),
+            ))
             .register(Arc::new(Orchestrate::new_shared(
                 shared_provider.clone(),
                 cfg.shell.clone(),
@@ -886,6 +897,11 @@ impl Session {
         );
         self.session_id = new_id.clone();
         self.ctx.session_id = Some(new_id.clone());
+        self.ctx.is_resumed_session = false;
+        self.ctx.frozen_user_memory = Some(selencode::user_memory::load_frozen_snapshot(
+            self.cfg.memory.max_memory_chars,
+            self.cfg.memory.max_profile_chars,
+        ));
         self.messages.clear();
         self.turns_since_review = 0;
         if let Ok(mut plan) = self.ctx.plan_state.lock() {
@@ -940,6 +956,7 @@ impl Session {
 
         self.session_id = info.id.clone();
         self.ctx.session_id = Some(info.id.clone());
+        self.ctx.is_resumed_session = true;
         self.messages = msgs;
         if let Ok(mut plan) = self.ctx.plan_state.lock() {
             plan.clear();

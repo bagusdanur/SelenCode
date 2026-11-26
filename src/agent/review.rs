@@ -975,6 +975,14 @@ pub async fn run_background_review(
                 } else {
                     cwd_str.as_str()
                 };
+                // Perbaikan 5 (v0.5.7): tulis juga ke wadah memori persisten `memory.md`
+                // (satu sumber kebenaran dengan tool `memory` & snapshot beku sesi).
+                let _ = crate::user_memory::add_entry_in(
+                    &crate::user_memory::user_memory_dir(),
+                    crate::user_memory::MemoryStoreKind::Memory,
+                    &safe_content,
+                    cfg.memory.max_memory_chars,
+                );
                 if let Ok(mid) = store.add_memory_categorized(scope_key, &category, &safe_content) {
                     applied.push(AppliedReviewChange {
                         kind: "add_memory".to_string(),

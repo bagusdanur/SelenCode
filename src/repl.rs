@@ -53,6 +53,10 @@ pub enum SlashCommand {
     Review(Option<String>),
     /// /cron [add | list | remove | pause | resume] — tugas terjadwal di gateway Telegram (v0.5.6).
     Cron(Option<String>),
+    /// /watch [list | cancel <id>] — kelola pemantauan tugas asinkron (v0.5.7).
+    Watch(Option<String>),
+    /// /usage — laporan pemakaian token sesi & hari ini langsung dari tabel `usage` (v0.5.7).
+    Usage,
     /// /search <kata kunci> — pencarian lintas sesi tersimpan (FTS5, v0.5.6).
     Search(Option<String>),
     /// /skill <nama> — aktifkan instruksi skill ke sesi ini.
@@ -309,6 +313,18 @@ pub const COMMANDS: &[CommandDef] = &[
         takes_args: false,
     },
     CommandDef {
+        cmd: "/usage",
+        args: "",
+        desc: "ringkasan pemakaian token sesi & hari ini (tanpa panggilan API)",
+        takes_args: false,
+    },
+    CommandDef {
+        cmd: "/watch",
+        args: "[list / cancel <id>]",
+        desc: "kelola pemantauan tugas asinkron hingga selesai",
+        takes_args: true,
+    },
+    CommandDef {
         cmd: "/resume",
         args: "[nomor / rm / info]",
         desc: "tampilkan 10 sesi terakhir bernomor & lanjutkan/hapus sesi",
@@ -383,6 +399,8 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/skills" => SlashCommand::Skills(rest),
         "/review" => SlashCommand::Review(rest),
         "/cron" => SlashCommand::Cron(rest),
+        "/watch" => SlashCommand::Watch(rest),
+        "/usage" => SlashCommand::Usage,
         "/search" => SlashCommand::Search(rest),
         "/skill" => SlashCommand::Skill(rest),
         "/learn" => SlashCommand::Learn(rest),

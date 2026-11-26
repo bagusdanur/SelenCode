@@ -47,6 +47,43 @@ pub struct Config {
     /// Konfigurasi tool bertanya `ask_user` (`[ask]`, v0.5.6 Bagian 2).
     #[serde(default, skip_serializing_if = "AskCfg::is_default")]
     pub ask: AskCfg,
+    /// Konfigurasi pagu memori persisten & profil pemilik (`[memory]`, v0.5.7 Perbaikan 5).
+    #[serde(default, skip_serializing_if = "MemoryCfg::is_default")]
+    pub memory: MemoryCfg,
+}
+
+/// Konfigurasi memori pengguna persisten (`[memory]`, v0.5.7 Perbaikan 5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryCfg {
+    /// Pagu karakter keras wadah `memory` (default: 2.200).
+    #[serde(default = "default_max_memory_chars")]
+    pub max_memory_chars: usize,
+    /// Pagu karakter keras wadah `profile` (default: 1.375).
+    #[serde(default = "default_max_profile_chars")]
+    pub max_profile_chars: usize,
+}
+
+fn default_max_memory_chars() -> usize {
+    crate::user_memory::DEFAULT_MAX_MEMORY_CHARS
+}
+
+fn default_max_profile_chars() -> usize {
+    crate::user_memory::DEFAULT_MAX_PROFILE_CHARS
+}
+
+impl Default for MemoryCfg {
+    fn default() -> Self {
+        Self {
+            max_memory_chars: default_max_memory_chars(),
+            max_profile_chars: default_max_profile_chars(),
+        }
+    }
+}
+
+impl MemoryCfg {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Konfigurasi fallback model/provider global (`[fallback]`, v0.5.6 Bagian 1).
@@ -889,6 +926,7 @@ impl Config {
             skills: SkillsCfg::default(),
             fallback: FallbackCfg::default(),
             ask: AskCfg::default(),
+            memory: MemoryCfg::default(),
         }
     }
 

@@ -284,7 +284,32 @@ pub fn preview_diff(cwd: &Path, id: &str) -> Result<WorktreeDiffPreview> {
         }
     }
 
-    let (_, raw_diff) = run_git(&wt.path, &["diff", base_ref])?;
+    let (_, mut raw_diff) = run_git(&wt.path, &["diff", base_ref])?;
+    // Sertakan isi berkas baru (untracked) sebagai unified diff agar preview menampilkan perubahan lengkap!
+    for rel in &changed_files {
+        let marker_a = format!("+++ b/{rel}");
+        if raw_diff.contains(&marker_a) {
+            continue;
+        }
+        if let Ok(src) = resolve_in_sandbox(&wt.path, Path::new(rel)) {
+            if src.is_file() && !is_secret_file(&src) {
+                if let Ok(bytes) = std::fs::read(&src) {
+                    if !bytes.contains(&0) {
+                        let txt = String::from_utf8_lossy(&bytes);
+                        if !raw_diff.is_empty() && !raw_diff.ends_with('\n') {
+                            raw_diff.push('\n');
+                        }
+                        raw_diff.push_str(&format!("--- /dev/null\n+++ b/{rel}\n"));
+                        for line in txt.lines().take(200) {
+                            raw_diff.push('+');
+                            raw_diff.push_str(line);
+                            raw_diff.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut diff_text = redact_secrets(&raw_diff);
     if diff_text.len() > MAX_DIFF_PREVIEW_BYTES {
         let mut cut = MAX_DIFF_PREVIEW_BYTES;

@@ -86,6 +86,12 @@ pub(crate) async fn interactive_plain(
         true,
     )
     .await?;
+    // Perbaikan 3 (v0.5.7): laporkan pantauan CLI yang selesai saat tidak ada sesi terbuka.
+    if let Ok(done_watches) = s.store.take_undelivered_watch_reports() {
+        for (_wid, _lbl, rep) in done_watches {
+            println!("{rep}");
+        }
+    }
     // Mode CLI polos interaktif (TTY): `ask_user` membaca pilihan bernomor/teks bebas dari stdin;
     // bila dijalankan lewat pipe (non-TTY), tetap non-interaktif agar tidak menggantung.
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -249,6 +255,14 @@ pub(crate) async fn interactive_plain(
                 Err(e) => eprintln!("[error] {e}"),
             },
             SlashCommand::Cron(arg) => match s.handle_cron(arg.as_deref(), None) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Watch(arg) => match s.handle_watch(arg.as_deref(), None) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
+            SlashCommand::Usage => match s.handle_usage() {
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },

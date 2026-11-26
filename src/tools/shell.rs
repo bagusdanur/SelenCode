@@ -78,9 +78,9 @@ impl Tool for RunShell {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_shell".into(),
-            description: "Jalankan perintah shell di folder project. Perintah di luar allowlist butuh persetujuan; output besar diarsipkan otomatis.".into(),
+            description: "Jalankan perintah shell di workspace.".into(),
             parameters: schema(
-                json!({"command": {"type": "string", "description": "perintah shell lengkap"}}),
+                json!({"command": {"type": "string"}}),
                 &["command"],
             ),
         }

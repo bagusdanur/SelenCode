@@ -1,6 +1,6 @@
 [package]
 name = "selencode"
-version = "0.5.6"
+version = "0.5.7"
 edition = "2021"
 description = "SelenCode — terminal AI coding agent (seperti Claude Code), persona Selena, full Rust, jalan di Termux Android"
 license = "MIT"
@@ -19,7 +19,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
 futures = "0.3"
 anyhow = "1"
 thiserror = "2"

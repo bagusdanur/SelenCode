@@ -1,6 +1,6 @@
 ---
 name: test-driven-development
-description: TDD ketat: tes gagal, kode minimal, refactor
+description: Untuk fitur baru+tes/TDD: tes gagal dulu, lalu kode
 version: 1.0.0
 tags: [tdd, testing, quality, workflow]
 ---

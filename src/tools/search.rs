@@ -16,9 +16,9 @@ impl Tool for SearchText {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "search_text".into(),
-            description: "Cari teks/regex di file project. Hasil format path:baris: teks, maks 100.".into(),
+            description: "Cari teks/regex di file workspace (maks 100).".into(),
             parameters: schema(
-                json!({"query": {"type": "string"}, "path": {"type": "string", "description": "folder awal, default ."}}),
+                json!({"query": {"type": "string"}, "path": {"type": "string"}}),
                 &["query"],
             ),
         }

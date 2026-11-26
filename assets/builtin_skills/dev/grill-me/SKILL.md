@@ -1,6 +1,6 @@
 ---
 name: grill-me
-description: Wawancara kritis desain untuk tutup celah
+description: Untuk wawancara rencana/desain kritis sebelum koding
 version: 1.0.0
 tags: [design, architecture, planning, interview]
 ---

@@ -79,17 +79,11 @@ impl Tool for SkillView {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "skill_view".into(),
-            description: "Muat isi penuh SKILL.md suatu skill, atau 1 file referensi (references/templates/scripts) jika `path` diisi.".into(),
+            description: "Muat SKILL.md suatu skill (atau 1 file referensi jika `path` diisi).".into(),
             parameters: schema(
                 json!({
-                    "name": {
-                        "type": "string",
-                        "description": "Nama skill (kebab-case) dari indeks skills"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Opsional: path relatif 1 file referensi di dalam folder skill (mis. references/checklist-rust.md)"
-                    }
+                    "name": { "type": "string" },
+                    "path": { "type": "string" }
                 }),
                 &["name"],
             ),

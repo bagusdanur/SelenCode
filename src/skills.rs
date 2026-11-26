@@ -807,7 +807,8 @@ pub const BUILTIN_TINJAU_RUST_REF: &str = "\
 ";
 
 /// Semai 14 skill bawaan resmi SelenCode (2 asli + 12 hasil adaptasi MIT) + file `NOTICE`
-/// ke direktori target `root`. Tidak pernah menimpa file yang sudah dimodifikasi user.
+/// ke direktori target `root`. Tidak pernah menimpa file yang sudah dimodifikasi user;
+/// hanya menyegarkan deskripsi bawaan lama yang masih persis teks default v0.5.6.
 pub fn seed_builtin_skills_to(root: &Path) {
     let dev = root.join("dev");
     let rilis_dir = dev.join("rilis-github");
@@ -837,6 +838,44 @@ pub fn seed_builtin_skills_to(root: &Path) {
             }
         }
         let _ = std::fs::write(&dst, content);
+    }
+    // Perbaikan 2 (v0.5.7): segarkan 4 deskripsi indeks bawaan jika masih persis versi default v0.5.6
+    // (tidak menyentuh skill yang telah diedit manual oleh pengguna).
+    let stamp_path = root.join(".builtin_version");
+    let cur_ver = env!("CARGO_PKG_VERSION");
+    let stamped = std::fs::read_to_string(&stamp_path).unwrap_or_default();
+    if stamped.trim() != cur_ver {
+        let upgrades: &[(&str, &str, &str)] = &[
+            (
+                "dev/systematic-debugging/SKILL.md",
+                "description: Debug 4 fase: temukan akar masalah dulu",
+                "description: WAJIB untuk bug/error/salah hitung: debug 4 fase",
+            ),
+            (
+                "dev/test-driven-development/SKILL.md",
+                "description: TDD ketat: tes gagal, kode minimal, refactor",
+                "description: Untuk fitur baru+tes/TDD: tes gagal dulu, lalu kode",
+            ),
+            (
+                "dev/requesting-code-review/SKILL.md",
+                "description: Review diff berbasis spesifikasi sebelum merge",
+                "description: Untuk tinjau/review diff kode sebelum merge/commit",
+            ),
+            (
+                "dev/grill-me/SKILL.md",
+                "description: Wawancara kritis desain untuk tutup celah",
+                "description: Untuk wawancara rencana/desain kritis sebelum koding",
+            ),
+        ];
+        for (rel, old_desc, new_desc) in upgrades {
+            let p = root.join(rel);
+            if let Ok(raw) = std::fs::read_to_string(&p) {
+                if raw.contains(old_desc) {
+                    let _ = std::fs::write(&p, raw.replacen(old_desc, new_desc, 1));
+                }
+            }
+        }
+        let _ = std::fs::write(&stamp_path, format!("{cur_ver}\n"));
     }
 }
 
