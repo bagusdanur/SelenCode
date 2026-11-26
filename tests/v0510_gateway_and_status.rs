@@ -179,11 +179,13 @@ async fn p1_silent_provider_aborts_on_response_timeout_and_falls_back() {
 
 #[tokio::test]
 async fn p1_mid_stream_stalled_provider_aborts_on_stream_idle_and_falls_back() {
-    // Server HTTP mock yang mengirim header 200 + 1 chunk SSE lalu membisu tanpa EOF.
+    // Server HTTP mock:
+    // - Koneksi 1: kirim 200 OK + 1 chunk token teks lalu macet (uji stream_idle abort + error terlihat).
+    // - Koneksi 2: kirim 200 OK + chunk role kosong (0 token teks keluar) lalu macet (uji fallback otomatis router!).
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        for _ in 0..2 {
+        for req_idx in 0..2 {
             let Ok((mut sock, _)) = listener.accept().await else {
                 break;
             };
@@ -191,7 +193,11 @@ async fn p1_mid_stream_stalled_provider_aborts_on_stream_idle_and_falls_back() {
                 let mut buf = [0u8; 2048];
                 let _ = sock.read(&mut buf).await;
                 let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n";
-                let first_chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"sebagian \"}}]}\n\n";
+                let first_chunk = if req_idx == 0 {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"sebagian \"}}]}\n\n"
+                } else {
+                    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"
+                };
                 let _ = sock.write_all(head.as_bytes()).await;
                 let _ = sock.write_all(first_chunk.as_bytes()).await;
                 let _ = sock.flush().await;
@@ -215,6 +221,7 @@ async fn p1_mid_stream_stalled_provider_aborts_on_stream_idle_and_falls_back() {
         short_timeouts,
     ));
 
+    // Kasus 1: sudah mengirim sebagian token lalu macet -> harus batal dalam ~1s dengan error jelas
     let t0 = Instant::now();
     let (tx, mut rx) = mpsc::channel(16);
     let err = stalled_primary
@@ -237,7 +244,7 @@ async fn p1_mid_stream_stalled_provider_aborts_on_stream_idle_and_falls_back() {
         "error macet tengah stream wajib memicu rantai fallback: {msg}"
     );
 
-    // Uji fallback otomatis sesudah stream macet
+    // Kasus 2: 200 OK SSE + header/role lalu macet (belum ada token keluar) -> otomatis jatuh ke fallback!
     let fb_calls = Arc::new(AtomicUsize::new(0));
     let fallback: Arc<dyn Provider> = Arc::new(HealthyMockProvider {
         label: "fallback-stream".into(),
