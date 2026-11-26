@@ -15,8 +15,8 @@ use super::context::{
     spillover_with_preview,
 };
 use crate::tool_display::{
-    build_template_closing_summary, format_tool_event_from_preview, prepare_tool_preview,
-    short_error_reason, ToolActionEvent,
+    build_template_closing_summary_with_status, format_tool_event_from_preview,
+    prepare_tool_preview, short_error_reason, ToolActionEvent,
 };
 use super::corrector::{LoopGuard, SelfCorrectState, ToolDedupCache};
 use super::plan::{is_read_only, TurnMode, PLAN_NOTE};
@@ -462,6 +462,82 @@ fn is_file_mutating_tool(name: &str) -> bool {
     matches!(name, "edit_file" | "write_file" | "lsp_rename")
 }
 
+/// Deteksi apakah giliran pengguna meminta perubahan kode/berkas (untuk pemicu konvergensi
+/// belum-ada-edit & pelabelan jujur akhir pagu nol-edit, Perbaikan 1 #2-#3 v0.5.14).
+pub fn prompt_requests_file_change(prompt: &str) -> bool {
+    let norm = normalize_ws_ascii_lower(prompt);
+    if norm.is_empty() {
+        return false;
+    }
+    let read_only_prefixes = [
+        "jelaskan ",
+        "apa itu ",
+        "ringkas ",
+        "balas ",
+        "tulis satu kalimat",
+        "sapa ",
+        "cek status",
+        "cek lagi status",
+        "udah belum",
+        "sudah belum",
+        "sampai mana",
+        "sebutkan ",
+        "daftar file",
+    ];
+    let explicitly_readonly = [
+        "jangan ubah",
+        "tanpa mengubah",
+        "read-only",
+        "read only",
+        "baca saja",
+        "hanya baca",
+    ]
+    .iter()
+    .any(|kw| norm.contains(kw));
+    if explicitly_readonly {
+        return false;
+    }
+    let has_change_signal = [
+        "perbaiki",
+        "benerin",
+        "ubah ",
+        "edit ",
+        "tulis ",
+        "buat ",
+        "buatkan ",
+        "tambah ",
+        "tambahkan ",
+        "hapus ",
+        "refactor",
+        "implement",
+        "fix",
+        "patch",
+        "resolve",
+        "koreksi",
+        "bug",
+        "error",
+        "crash",
+        "traceback",
+        "stack trace",
+        "fail",
+        "gagal",
+        "salah hitung",
+        "seharusnya",
+        "expected",
+        "should ",
+        "broken",
+        "issue",
+        "problem",
+        "regression",
+    ]
+    .iter()
+    .any(|kw| norm.contains(kw));
+    if read_only_prefixes.iter().any(|p| norm.starts_with(p)) && !has_change_signal {
+        return false;
+    }
+    has_change_signal
+}
+
 /// Loop (Blueprint Bagian 2): provider → tool_call? → jalankan → ToolResult →
 /// ulangi, sampai tidak ada tool_call atau max_steps tercapai.
 /// Error tool menjadi ToolResult is_error=true — tidak pernah crash.
@@ -731,7 +807,9 @@ async fn run_turn_inner(
     } else {
         super::corrector::MAX_REPAIR_ATTEMPTS
     };
-    let mut corrector = SelfCorrectState::new(turn_checkpoint_id).with_max_attempts(sc_max);
+    let mut corrector = SelfCorrectState::new(turn_checkpoint_id)
+        .with_max_attempts(sc_max)
+        .with_strict_known_verify_only(true);
     let sid_for_archive = ctx
         .session_id
         .clone()
@@ -751,6 +829,19 @@ async fn run_turn_inner(
     let mut loaded_skills_in_turn: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut skill_gate_fired = false;
+    // Perbaikan 1 (v0.5.14): kesadaran anggaran langkah (checkpoint Hermes + konvergensi nol-edit).
+    let budget_ratio = ctx.guard.budget_warning_ratio.clamp(0.1, 0.95);
+    let max_before_last = max_steps.saturating_sub(1).max(1);
+    let checkpoint_step = ((max_steps as f64) * budget_ratio)
+        .round()
+        .clamp(1.0, max_before_last as f64) as usize;
+    let convergence_step = max_steps
+        .saturating_sub(5)
+        .min(((max_steps as f64) * 0.85).ceil() as usize)
+        .max((checkpoint_step + 1).min(max_before_last));
+    let mut budget_checkpoint_injected = false;
+    let mut convergence_notice_injected = false;
+    let turn_requests_edit = mode == TurnMode::Execute && prompt_requests_file_change(user_prompt);
 
     for step in 0..max_steps {
         // Perbaikan 1 (v0.5.9) — Prune lebih dini hasil `skill_view` lama (di luar 2 pesan terakhir =
@@ -1050,6 +1141,21 @@ async fn run_turn_inner(
                     messages.push(Message::text(Role::User, gate_msg));
                     continue;
                 }
+                // Perbaikan 2 #3 (v0.5.14): sesudah batas putaran gerbang verifikasi (<=3) tercapai,
+                // penutupan diterima, tetapi wajib menyatakan status verifikasi terakhir apa adanya
+                // bila masih merah atau belum diverifikasi ulang sesudah edit terakhir.
+                if let Some(honest_note) = corrector.honest_unverified_closing_note(&last_text) {
+                    last_text.push_str(&honest_note);
+                    let note_msg = Message::text(Role::Assistant, honest_note.trim().to_string());
+                    persist_message(ctx, &note_msg);
+                    messages.push(note_msg);
+                    match &ui {
+                        Some(tx) => {
+                            let _ = tx.send(UiEvent::Token(honest_note)).await;
+                        }
+                        None => println!("{}", honest_note.trim()),
+                    }
+                }
             }
             if let Some(cp_id) = turn_checkpoint_id {
                 if corrector.edited_files.is_empty() {
@@ -1337,8 +1443,11 @@ async fn run_turn_inner(
                         }
                     }
                 };
-            corrector.observe_tool(&call.name, &call.args, &content, is_error);
-            if let Some(warn) = loop_guard.record(&call.name, &call.args, is_error).hint_message() {
+            corrector.observe_tool_at_step(&call.name, &call.args, &content, is_error, step + 1);
+            if let Some(warn) = loop_guard
+                .record_with_result(&call.name, &call.args, &content, is_error)
+                .hint_message()
+            {
                 content.push_str("\n\n");
                 content.push_str(&warn);
                 let note = format!("✦ Loop/stagnasi terdeteksi pada `{}` — meminta strategi baru…", call.name);
@@ -1450,6 +1559,62 @@ async fn run_turn_inner(
                         "\n\n[GUARD ANTI-BERPUTAR] Kamu sudah melakukan 5 giliran pencarian/eksplorasi tanpa kandidat terkonfirmasi. \
                          DILARANG melanjutkan pencarian buta — berhenti sekarang dan panggil `ask_user` dengan kandidat terbaik yang sudah ditemukan sebagai pilihan (maks 4).",
                     );
+                }
+            }
+        }
+        // Perbaikan 1 #1 & #2 (v0.5.14): kesadaran anggaran langkah (checkpoint 1x ala Hermes)
+        // + pemicu konvergensi belum-ada-edit saat sisa langkah menipis.
+        let used_steps = step + 1;
+        let remaining_steps = max_steps.saturating_sub(used_steps);
+        if ctx.guard.enabled
+            && ctx.guard.budget_warning_enabled
+            && max_steps >= 3
+            && remaining_steps > 0
+        {
+            if !budget_checkpoint_injected && used_steps >= checkpoint_step {
+                budget_checkpoint_injected = true;
+                let cp_notice = format!(
+                    "[PEMBERITAHUAN ANGGARAN LANGKAH — checkpoint] Kamu sudah memakai {used_steps} dari {max_steps} langkah (sisa {remaining_steps} langkah). \
+                     Amankan kemajuan nyata sekarang lalu lanjutkan tugas hingga tuntas; jangan berhenti hanya karena pemberitahuan ini."
+                );
+                if let Some(Block::ToolResult { content, .. }) = results.last_mut() {
+                    content.push_str("\n\n");
+                    content.push_str(&cp_notice);
+                }
+                let log_line = format!(
+                    "[anggaran-langkah] checkpoint: {used_steps}/{max_steps} langkah terpakai (sisa {remaining_steps})"
+                );
+                match &ui {
+                    Some(tx) => {
+                        let _ = tx.send(UiEvent::Info(log_line)).await;
+                    }
+                    None => eprintln!("{log_line}"),
+                }
+            }
+            if !convergence_notice_injected
+                && turn_requests_edit
+                && corrector.edited_files.is_empty()
+                && max_steps >= 4
+                && used_steps >= convergence_step
+            {
+                convergence_notice_injected = true;
+                let conv_notice = format!(
+                    "[PERINTAH KONVERGENSI — BELUM ADA EDIT] Kamu sudah memakai {used_steps} dari {max_steps} langkah (sisa {remaining_steps} langkah) \
+                     dan BELUM melakukan perubahan berkas apa pun. HENTIKAN eksplorasi sekarang! Langsung terapkan perbaikan terbaik yang sudah kamu identifikasi \
+                     ke berkas target pada langkah berikutnya, atau nyatakan secara eksplisit bahwa masalah tidak dapat diselesaikan beserta alasannya."
+                );
+                if let Some(Block::ToolResult { content, .. }) = results.last_mut() {
+                    content.push_str("\n\n");
+                    content.push_str(&conv_notice);
+                }
+                let log_line = format!(
+                    "[anggaran-langkah] konvergensi: {used_steps}/{max_steps} langkah tanpa edit — memaksa eksekusi perbaikan"
+                );
+                match &ui {
+                    Some(tx) => {
+                        let _ = tx.send(UiEvent::Info(log_line)).await;
+                    }
+                    None => eprintln!("{log_line}"),
                 }
             }
         }
@@ -1570,17 +1735,30 @@ async fn run_turn_inner(
         }
     }
 
-    // Perbaikan 2 (v0.5.8): Giliran terpotong (max_steps / stagnasi) TIDAK BOLEH berakhir pada
-    // pesan ToolResult kosong tanpa ringkasan penutup untuk pengguna!
+    // Perbaikan 2 (v0.5.8) + Perbaikan 1 #3 (v0.5.14): Giliran terpotong (max_steps / stagnasi)
+    // memakai struktur wajib ala opencode `MAX_STEPS_PROMPT` + pelabelan jujur ala Hermes.
+    // Bila pagu habis dengan NOL mutasi berkas pada tugas perubahan, WAJIB dibuka sebagai kegagalan eksplisit!
     if let Some(stop_reason) = forced_stop_reason {
+        let zero_edit_failure = turn_requests_edit && corrector.edited_files.is_empty();
+        let failure_header = "Gagal: pagu langkah habis sebelum ada perubahan apa pun dibuat.";
+        let extra_zero_edit_rule = if zero_edit_failure {
+            format!(
+                " WAJIB awali jawabanmu dengan kalimat persis: \"{failure_header}\" \
+                 Jangan menyamarkan hasil kosong sebagai rencana atau kemajuan."
+            )
+        } else {
+            String::new()
+        };
         let mut summary_msgs = messages.clone();
         summary_msgs.push(Message::text(
             Role::User,
             format!(
-                "[Ringkasan Penutup Wajib — {stop_reason}] Giliran berhenti di tengah jalan. \
-                 Tulis ringkasan penutup singkat untuk pengguna: (1) yang sudah dikerjakan & hasilnya, \
-                 (2) yang sedang berjalan termasuk ID job/proses bila ada, (3) langkah berikutnya atau kendalanya. \
-                 Jangan memanggil tool."
+                "[BATAS LANGKAH TERCAPAI — {stop_reason}] Tool dimatikan hingga input pengguna berikutnya. \
+                 Jawab dengan teks saja (DILARANG memanggil tool). Jawaban WAJIB memuat: \
+                 (1) pernyataan eksplisit bahwa batas langkah tercapai, \
+                 (2) ringkasan yang sudah dikerjakan, \
+                 (3) daftar yang belum selesai, \
+                 (4) rekomendasi langkah berikutnya.{extra_zero_edit_rule}"
             ),
         ));
         let (stx, _srx) = mpsc::channel::<StreamEvent>(64);
@@ -1590,7 +1768,7 @@ async fn run_turn_inner(
             p_close.stream_chat(&summary_msgs, &[], stx),
         )
         .await;
-        let closing_text = match closing_res {
+        let mut closing_text = match closing_res {
             Ok(Ok(rep)) if !rep.text.trim().is_empty() => {
                 if let Some(u) = rep.usage {
                     persist_usage_kind(ctx, provider.model_name(), Some(u), "main");
@@ -1600,8 +1778,15 @@ async fn run_turn_inner(
                 }
                 rep.text.trim().to_string()
             }
-            _ => build_template_closing_summary(&turn_actions, &stop_reason),
+            _ => build_template_closing_summary_with_status(
+                &turn_actions,
+                &stop_reason,
+                zero_edit_failure,
+            ),
         };
+        if zero_edit_failure && !closing_text.to_ascii_lowercase().starts_with("gagal:") {
+            closing_text = format!("{failure_header}\n\n{closing_text}");
+        }
         let closing_msg = Message::text(Role::Assistant, closing_text.clone());
         persist_message(ctx, &closing_msg);
         messages.push(closing_msg);

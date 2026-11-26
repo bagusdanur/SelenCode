@@ -325,16 +325,29 @@ pub fn build_action_summary_lines(
 }
 
 /// Susun ringkasan penutup templat ketika giliran berhenti mendadak & model tidak dapat dipanggil lagi
-/// (Perbaikan 2 v0.5.8 — menjamin giliran TIDAK pernah berakhir tanpa kesimpulan untuk pengguna).
+/// (Perbaikan 2 v0.5.8 + Perbaikan 1 v0.5.14 — selaras `MAX_STEPS_PROMPT` opencode & pelabelan jujur Hermes).
 pub fn build_template_closing_summary(events: &[ToolActionEvent], stop_reason: &str) -> String {
+    build_template_closing_summary_with_status(events, stop_reason, false)
+}
+
+/// Varian ringkasan penutup templat dengan penanda eksplisit kegagalan nol-edit di akhir pagu (Perbaikan 1 #3 v0.5.14).
+pub fn build_template_closing_summary_with_status(
+    events: &[ToolActionEvent],
+    stop_reason: &str,
+    zero_edit_failure: bool,
+) -> String {
     let total = events.len();
     let ok_count = events.iter().filter(|e| !e.is_error).count();
     let fail_count = total.saturating_sub(ok_count);
 
-    let mut out = format!(
+    let mut out = String::new();
+    if zero_edit_failure {
+        out.push_str("Gagal: pagu langkah habis sebelum ada perubahan apa pun dibuat.\n\n");
+    }
+    out.push_str(&format!(
         "Ringkasan penutup ({stop_reason}):\n\
          - Sudah dikerjakan: {total} aksi tool ({ok_count} berhasil, {fail_count} gagal).\n"
-    );
+    ));
     let (_, lines) = build_action_summary_lines(events, 6);
     if !lines.is_empty() {
         out.push_str("- Aksi utama:\n");
@@ -342,14 +355,20 @@ pub fn build_template_closing_summary(events: &[ToolActionEvent], stop_reason: &
             out.push_str(&format!("  • {l}\n"));
         }
     }
-    if fail_count > 0 {
+    if zero_edit_failure {
+        out.push_str(
+            "- Belum selesai: belum ada satu pun berkas yang diubah atau diverifikasi sebelum pagu langkah habis.\n",
+        );
+    } else if fail_count > 0 {
         if let Some(last_err) = events.iter().rev().find(|e| e.is_error) {
             out.push_str(&format!(
-                "- Kendala terakhir: {} ({})\n",
+                "- Belum selesai / kendala terakhir: {} ({})\n",
                 format_tool_event_from_preview(&last_err.name, &last_err.preview),
                 last_err.error_reason.as_deref().unwrap_or("error")
             ));
         }
+    } else {
+        out.push_str("- Belum selesai: tugas terpotong sebelum penutupan normal selesai.\n");
     }
     out.push_str(
         "- Langkah berikutnya: lanjutkan sesi ini dengan instruksi spesifik atau naikkan batas langkah bila tugas belum selesai.",

@@ -181,6 +181,9 @@ pub enum LoopWarning {
     None,
     /// Tool yang sama dipanggil berulang kali dengan argumen identik.
     RepeatedCall { name: String, count: usize },
+    /// Pola Hermes `tool_guardrails.py` (v0.5.14 Perbaikan 1 #4): panggilan `(tool, args, result)`
+    /// identik berturut-turut sebanyak `>= 3` kali — langkah terbakar tanpa kemajuan.
+    ConsecutiveIdenticalResult { name: String, count: usize },
     /// Terlalu banyak error beruntun tanpa ada perubahan kode yang berhasil.
     Stagnation { consecutive_errors: usize },
 }
@@ -193,6 +196,10 @@ impl LoopWarning {
                 "[Self-Correction / Deteksi Loop] Kamu sudah memanggil tool `{name}` dengan argumen identik sebanyak {count} kali. \
                  HENTIKAN pengulangan ini! Evaluasi ulang akar masalah, ganti pendekatan, atau jelaskan secara jujur ke user jika masalah tidak bisa diselesaikan."
             )),
+            Self::ConsecutiveIdenticalResult { name, count } => Some(format!(
+                "[PERINGATAN PENGULANGAN IDENTIK — {count}x beruntun] Panggilan `{name}` dengan argumen sama menghasilkan keluaran identik {count} kali berturut-turut. \
+                 Kamu sedang berputar dan membakar sisa langkah tanpa kemajuan! Hentikan pengulangan ini, ganti pendekatan, atau langsung terapkan perbaikan sekarang."
+            )),
             Self::Stagnation { consecutive_errors } => Some(format!(
                 "[Self-Correction / Deteksi Stagnasi] Terjadi {consecutive_errors} kegagalan tool beruntun tanpa kemajuan. \
                  Jangan terus mencoba hal yang sama: baca ulang error secara teliti, periksa asumsi atau file terkait, atau laporkan kendala sebenarnya ke user."
@@ -201,7 +208,33 @@ impl LoopWarning {
     }
 }
 
-/// Pendeteksi pengulangan panggilan tool, kegagalan berulang, & stagnasi error dalam satu giliran agent.
+/// Apakah tool ini merupakan poller/penunggu latar yang sah diulang (pengecualian poller ala Hermes)?
+pub fn is_polling_tool(tool_name: &str, args: &Value) -> bool {
+    match tool_name {
+        "watch_job" => {
+            let act = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("status")
+                .to_ascii_lowercase();
+            matches!(act.as_str(), "status" | "check" | "list" | "wait" | "poll")
+        }
+        "background_status" | "process_status" => true,
+        _ => false,
+    }
+}
+
+fn fnv1a_hash_str(seed: u64, s: &str) -> u64 {
+    let mut hash = seed;
+    for b in s.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Pendeteksi pengulangan panggilan tool, pengulangan hasil identik 3x beruntun (Hermes),
+/// kegagalan berulang, & stagnasi error dalam satu giliran agent.
 #[derive(Debug, Default)]
 pub struct LoopGuard {
     call_counts: HashMap<u64, usize>,
@@ -211,6 +244,12 @@ pub struct LoopGuard {
     stagnated: bool,
     /// Batas kegagalan tool yang sama sebelum peringatan (aktif di runtime Tahap 2 = `Some(3)`).
     tool_fail_limit: Option<usize>,
+    /// Fingerprint `(tool, args)` terakhir untuk mendeteksi rentetan identik berturut-turut.
+    last_call_fp: Option<u64>,
+    /// Fingerprint `(tool, args, result)` terakhir (pola Hermes `tool_guardrails.py`).
+    last_result_fp: Option<u64>,
+    /// Jumlah panggilan identik berturut-turut dengan hasil yang sama (ambang = 3).
+    consecutive_identical_streak: usize,
 }
 
 impl LoopGuard {
@@ -230,12 +269,69 @@ impl LoopGuard {
         self.stagnated
     }
 
-    /// Catat satu eksekusi tool dan periksa apakah terjadi loop / kegagalan berulang / stagnasi.
+    /// Catat satu eksekusi tool (API lama tetap utuh untuk kompatibilitas tes).
     pub fn record(&mut self, tool_name: &str, args: &Value, is_error: bool) -> LoopWarning {
+        self.record_internal(tool_name, args, None, is_error)
+    }
+
+    /// Catat satu eksekusi tool beserta keluarannya (v0.5.14 Perbaikan 1 #4, pola Hermes `tool_guardrails.py`):
+    /// menempelkan peringatan tepat pada pengulangan `(tool, args, result)` identik ke-3 berturut-turut,
+    /// sambil mengecualikan tool polling/penunggu yang sah (`watch_job`).
+    pub fn record_with_result(
+        &mut self,
+        tool_name: &str,
+        args: &Value,
+        output: &str,
+        is_error: bool,
+    ) -> LoopWarning {
+        self.record_internal(tool_name, args, Some(output), is_error)
+    }
+
+    fn record_internal(
+        &mut self,
+        tool_name: &str,
+        args: &Value,
+        output: Option<&str>,
+        is_error: bool,
+    ) -> LoopWarning {
+        if is_polling_tool(tool_name, args) {
+            // Tool polling sah (mis. `watch_job` status/wait) tidak boleh memicu peringatan berputar.
+            if !is_error {
+                self.consecutive_errors = 0;
+            }
+            return LoopWarning::None;
+        }
+
         let fp = canonical_tool_fingerprint(tool_name, args);
         let count = self.call_counts.entry(fp).or_insert(0);
         *count += 1;
         let current_count = *count;
+
+        // Lacak rentetan `(tool, args, result)` identik berturut-turut (ambang Hermes/opencode = 3).
+        if let Some(out) = output {
+            let trimmed = out.trim();
+            let is_dedup_stub = trimmed.starts_with("[Dedup:");
+            let res_fp = fnv1a_hash_str(fp, trimmed);
+            let same_as_prev = if is_dedup_stub {
+                // Stub dedup membuktikan `(tool, args)` sama dengan hasil dasar yang belum berubah.
+                self.last_call_fp == Some(fp)
+            } else {
+                self.last_call_fp == Some(fp) && self.last_result_fp == Some(res_fp)
+            };
+            if same_as_prev {
+                self.consecutive_identical_streak += 1;
+            } else {
+                self.last_call_fp = Some(fp);
+                if !is_dedup_stub {
+                    self.last_result_fp = Some(res_fp);
+                }
+                self.consecutive_identical_streak = 1;
+            }
+        } else {
+            self.last_call_fp = Some(fp);
+            self.last_result_fp = None;
+            self.consecutive_identical_streak = 1;
+        }
 
         if is_error {
             self.consecutive_errors += 1;
@@ -251,6 +347,12 @@ impl LoopGuard {
                 self.stagnated = true;
                 return LoopWarning::Stagnation {
                     consecutive_errors: self.consecutive_errors,
+                };
+            }
+            if output.is_some() && self.consecutive_identical_streak >= MAX_IDENTICAL_CALLS {
+                return LoopWarning::ConsecutiveIdenticalResult {
+                    name: tool_name.to_string(),
+                    count: self.consecutive_identical_streak,
                 };
             }
             // Tahap 2: peringatan pada 2x kegagalan identik, atau 3x kegagalan tool sama bila guard aktif.
@@ -269,6 +371,13 @@ impl LoopGuard {
             self.consecutive_errors = 0;
         }
 
+        if output.is_some() && self.consecutive_identical_streak >= MAX_IDENTICAL_CALLS {
+            return LoopWarning::ConsecutiveIdenticalResult {
+                name: tool_name.to_string(),
+                count: self.consecutive_identical_streak,
+            };
+        }
+
         if current_count >= MAX_IDENTICAL_CALLS {
             return LoopWarning::RepeatedCall {
                 name: tool_name.to_string(),
@@ -279,13 +388,35 @@ impl LoopGuard {
     }
 }
 
-/// Apakah perintah shell ini merupakan aksi verifikasi (test / build / check / lint / repro skrip)?
-fn is_verification_shell_cmd(args: &Value) -> bool {
+/// Apakah perintah shell ini merupakan aksi verifikasi (test / build / check / lint / skrip repro)?
+pub fn is_verification_shell_cmd(args: &Value) -> bool {
     let Some(cmd) = args.get("command").and_then(|v| v.as_str()) else {
         return false;
     };
-    let lower = cmd.to_ascii_lowercase();
-    [
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    // Abaikan cek versi/bantuan/instalasi paket semata.
+    if [
+        "--version",
+        " -v",
+        " -V",
+        "--help",
+        "pip install",
+        "pip list",
+        "npm install",
+        "git status",
+        "git diff",
+        "git log",
+    ]
+    .iter()
+    .any(|excl| lower.ends_with(excl) || lower.starts_with(excl))
+    {
+        return false;
+    }
+    let runner_hit = [
         "cargo test",
         "cargo check",
         "cargo clippy",
@@ -306,15 +437,54 @@ fn is_verification_shell_cmd(args: &Value) -> bool {
         "make check",
         "unittest",
         "ruff check",
+        "flake8",
+        "mypy",
+        "pylint",
+        "bin/test",
+        "runtests.py",
+        "manage.py test",
+        "tox",
+        "nox",
         "node --test",
         "node --check",
         "python -m unittest",
         "python3 -m unittest",
         "python -m pytest",
         "python3 -m pytest",
+        "rspec",
+        "phpunit",
+        "mvn test",
+        "gradle test",
+        "dotnet test",
     ]
     .iter()
-    .any(|kw| lower.contains(kw))
+    .any(|kw| lower.contains(kw));
+    if runner_hit {
+        return true;
+    }
+    // Skrip repro / eksekusi tes langsung (`python repro.py`, `python -c "assert ..."`, `node hitung_total.js`, dll.)
+    let starts_runtime = lower.starts_with("python ")
+        || lower.starts_with("python3 ")
+        || lower.starts_with("node ")
+        || lower.contains(" && python ")
+        || lower.contains(" && python3 ")
+        || lower.contains(" && node ")
+        || lower.contains("; python ")
+        || lower.contains("; python3 ")
+        || lower.contains("; node ");
+    if starts_runtime {
+        let runs_script_or_eval = lower.contains(".py")
+            || lower.contains(".js")
+            || lower.contains(".mjs")
+            || lower.contains(".cjs")
+            || lower.contains(".ts")
+            || lower.contains(" -c ")
+            || lower.contains(" -e ");
+        if runs_script_or_eval {
+            return true;
+        }
+    }
+    false
 }
 
 /// Apakah nama file terlihat seperti skrip sampah/repro sementara ciptaan sesi?
@@ -343,7 +513,24 @@ fn is_code_file(rel: &str) -> bool {
     .any(|ext| lower.ends_with(ext))
 }
 
-/// State pelacakan self-correction dalam satu giliran eksekusi agent.
+fn cap_raw_verify_output(output: &str, max_chars: usize) -> String {
+    let trimmed = output.trim();
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        return trimmed.to_string();
+    }
+    let head_len = max_chars / 3;
+    let tail_len = max_chars.saturating_sub(head_len);
+    let head: String = trimmed.chars().take(head_len).collect();
+    let tail: String = trimmed
+        .chars()
+        .skip(count.saturating_sub(tail_len))
+        .collect();
+    format!("{head}\n… [dipotong tengah agar fokus ke error akhir] …\n{tail}")
+}
+
+/// State pelacakan self-correction & gerbang verifikasi dalam satu giliran eksekusi agent
+/// (Tahap 1 + Perbaikan 2 v0.5.8 + Perbaikan 2 v0.5.14: SWE-agent `review_on_submit` + Aider reflection).
 #[derive(Debug)]
 pub struct SelfCorrectState {
     pub edited_files: Vec<String>,
@@ -352,6 +539,16 @@ pub struct SelfCorrectState {
     pub edited_code_file: bool,
     pub verified_after_last_edit: bool,
     pub last_verify_passed: Option<bool>,
+    /// True bila minimal satu perintah verifikasi nyata pernah dijalankan pada giliran ini (v0.5.14).
+    pub has_verification_run: bool,
+    /// Perintah verifikasi terakhir yang dijalankan pada giliran ini (`run_shell` / `verify_project`).
+    pub last_verify_cmd: Option<String>,
+    /// Nomor langkah (1-based) saat perintah verifikasi terakhir dijalankan.
+    pub last_verify_step: Option<usize>,
+    /// Keluaran mentah kegagalan verifikasi terakhir untuk umpan balik refleksi ala Aider.
+    pub last_verify_output: Option<String>,
+    /// Lingkup ketat v0.5.14: gerbang hanya hidup bila ada mutasi berkas DAN ada perintah verifikasi yang dijalankan.
+    pub strict_known_verify_only: bool,
     pub repair_attempts: usize,
     pub max_attempts: usize,
     pub checkpoint_id: Option<usize>,
@@ -367,6 +564,11 @@ impl Default for SelfCorrectState {
             edited_code_file: false,
             verified_after_last_edit: false,
             last_verify_passed: None,
+            has_verification_run: false,
+            last_verify_cmd: None,
+            last_verify_step: None,
+            last_verify_output: None,
+            strict_known_verify_only: false,
             repair_attempts: 0,
             max_attempts: MAX_REPAIR_ATTEMPTS,
             checkpoint_id: None,
@@ -388,8 +590,27 @@ impl SelfCorrectState {
         self
     }
 
-    /// Perbarui state berdasarkan hasil eksekusi 1 tool.
+    /// Aktifkan lingkup ketat v0.5.14 (Perbaikan 2 #4): gerbang hanya menegakkan kasus verifikasi
+    /// yang benar-benar pernah dijalankan pada giliran ini (diam total pada tugas tanpa tes).
+    pub fn with_strict_known_verify_only(mut self, strict: bool) -> Self {
+        self.strict_known_verify_only = strict;
+        self
+    }
+
+    /// Perbarui state berdasarkan hasil eksekusi 1 tool (kompatibel API lama).
     pub fn observe_tool(&mut self, name: &str, args: &Value, output: &str, is_error: bool) {
+        self.observe_tool_at_step(name, args, output, is_error, 0);
+    }
+
+    /// Perbarui state berdasarkan hasil eksekusi 1 tool beserta nomor langkah 1-based (v0.5.14).
+    pub fn observe_tool_at_step(
+        &mut self,
+        name: &str,
+        args: &Value,
+        output: &str,
+        is_error: bool,
+        step_1based: usize,
+    ) {
         match name {
             "write_file" | "edit_file" => {
                 // Abaikan jika gagal atau ditolak user.
@@ -407,9 +628,9 @@ impl SelfCorrectState {
                         self.edited_code_file = true;
                     }
                 }
-                // Ada edit baru -> verifikasi lama tidak lagi berlaku.
+                // Ada edit baru -> verifikasi lama tidak lagi berlaku sesudah edit terakhir,
+                // namun tetap simpan `last_verify_cmd` / `last_verify_passed` agar gerbang tahu konteks gagalnya.
                 self.verified_after_last_edit = false;
-                self.last_verify_passed = None;
             }
             "lsp_rename" => {
                 let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -425,53 +646,99 @@ impl SelfCorrectState {
                     self.edited_files.push("(lsp_rename)".to_string());
                 }
                 self.verified_after_last_edit = false;
-                self.last_verify_passed = None;
             }
             "verify_project" => {
-                self.verified_after_last_edit = true;
                 if !is_error
                     && (output.contains("verifikasi proyek otomatis dilewati")
                         || output.starts_with("Ditolak user"))
                 {
-                    self.last_verify_passed = Some(true);
+                    // Jangan pernah menimpa kegagalan verifikasi `run_shell` yang sudah diketahui merah!
+                    if self.last_verify_passed != Some(false) {
+                        self.verified_after_last_edit = true;
+                        self.last_verify_passed = Some(true);
+                    }
                     return;
                 }
+                self.has_verification_run = true;
+                self.verified_after_last_edit = true;
+                self.last_verify_cmd = Some("verify_project".to_string());
+                self.last_verify_step = (step_1based > 0).then_some(step_1based);
                 let no_tests = output.contains("TIDAK ADA TEST") || output.contains("NO_TESTS");
                 let timed_out = output.contains("TIMEOUT");
                 let ok = !is_error && !no_tests && !timed_out && output.contains("LULUS");
                 self.last_verify_passed = Some(ok);
+                self.last_verify_output = if ok {
+                    None
+                } else {
+                    Some(cap_raw_verify_output(output, 4_000))
+                };
             }
             "run_shell" => {
                 if is_verification_shell_cmd(args) {
+                    let cmd = args
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("run_shell")
+                        .trim()
+                        .to_string();
+                    self.has_verification_run = true;
                     self.verified_after_last_edit = true;
+                    self.last_verify_cmd = Some(cmd);
+                    self.last_verify_step = (step_1based > 0).then_some(step_1based);
                     let ok = !is_error && output.starts_with("exit code: 0");
                     self.last_verify_passed = Some(ok);
+                    self.last_verify_output = if ok {
+                        None
+                    } else {
+                        Some(cap_raw_verify_output(output, 4_000))
+                    };
                 }
             }
             _ => {}
         }
     }
 
-    /// Evaluasi sebelum agent menyelesaikan giliran:
-    /// - Bila file kode sudah diubah tapi BELUM diverifikasi sesudah edit terakhir,
-    ///   atau verifikasi terakhir GAGAL, kembalikan instruksi perbaikan internal
-    ///   (maks `MAX_REPAIR_ATTEMPTS` siklus).
-    /// - Kembalikan `None` bila sudah terverifikasi, tidak ada file kode diubah,
-    ///   atau batas percobaan perbaikan sudah tercapai (agar agent melaporkan kondisi
-    ///   secara jujur, bukan looping selamanya).
+    /// Evaluasi sebelum agent menyelesaikan giliran (pola SWE-agent `review_on_submit` + refleksi Aider):
+    /// - Pada mode ketat (`strict_known_verify_only`), gerbang hanya hidup bila ada mutasi berkas
+    ///   DAN ada perintah verifikasi yang benar-benar dijalankan pada giliran ini.
+    /// - Bila verifikasi terakhir lulus sesudah edit terakhir -> `None` (0 suntikan).
+    /// - Bila ada edit sesudah verifikasi terakhir ATAU verifikasi terakhir GAGAL -> tahan penutupan
+    ///   hingga `max_attempts` (bawaan 3), menyertakan perintah tercatat dan keluaran gagal mentah.
     pub fn completion_gate(&mut self, remaining_steps: usize) -> Option<String> {
         let cap = self.max_attempts;
-        if !self.edited_code_file || remaining_steps < 2 || self.repair_attempts >= cap {
+        let has_mutation = self.edited_code_file || !self.edited_files.is_empty();
+        if !has_mutation || remaining_steps < 2 || self.repair_attempts >= cap {
             return None;
         }
-        // Tahap 2: jika verifikasi sudah LULUS setelah edit terakhir, JANGAN ulangi!
+        if self.strict_known_verify_only && !self.has_verification_run {
+            return None;
+        }
+        // Jika verifikasi sudah LULUS setelah edit terakhir, JANGAN ulangi!
         if self.verified_after_last_edit && self.last_verify_passed == Some(true) {
             return None;
         }
         let files = self.edited_files.join(", ");
+        let step_note = self
+            .last_verify_step
+            .map(|s| format!(" pada langkah {s}"))
+            .unwrap_or_default();
+
         if !self.verified_after_last_edit {
             self.repair_attempts += 1;
             let attempt = self.repair_attempts;
+            if let Some(cmd) = self.last_verify_cmd.as_deref() {
+                let prev_status = match self.last_verify_passed {
+                    Some(false) => "GAGAL",
+                    Some(true) => "LULUS",
+                    None => "belum terkonfirmasi",
+                };
+                return Some(format!(
+                    "[Self-Correction Gate {attempt}/{cap} — Penutupan Ditahan] \
+                     Keadaan tercatat: perintah verifikasi terakhir `{cmd}` dijalankan{step_note} (status: {prev_status}), \
+                     dan setelah itu ada perubahan berkas ({files}) yang belum diverifikasi ulang. \
+                     Jalankan ulang `{cmd}` sekarang untuk membuktikan perubahanmu; bila masih gagal, perbaiki hingga lulus, lalu tutup kembali."
+                ));
+            }
             return Some(format!(
                 "[Self-Correction Gate {attempt}/{cap}] Kamu baru saja mengubah file kode ({files}), \
                  tetapi belum menjalankan verifikasi sesudah edit terakhir. \
@@ -481,9 +748,20 @@ impl SelfCorrectState {
         if self.last_verify_passed == Some(false) {
             self.repair_attempts += 1;
             let attempt = self.repair_attempts;
+            let cmd = self
+                .last_verify_cmd
+                .as_deref()
+                .unwrap_or("verifikasi terakhir");
+            let raw_block = self
+                .last_verify_output
+                .as_deref()
+                .map(|raw| format!("\n\nKeluaran kegagalan mentah dari `{cmd}`:\n{raw}"))
+                .unwrap_or_default();
             return Some(format!(
-                "[Self-Correction Gate {attempt}/{cap}] Verifikasi terakhir pada perubahan ({files}) masih GAGAL. \
-                 Analisis error secara teliti, perbaiki dengan perubahan seminimal mungkin, lalu verifikasi ulang sekali."
+                "[Self-Correction Gate {attempt}/{cap} — Penutupan Ditahan] \
+                 Verifikasi terakhir `{cmd}`{step_note} pada perubahan ({files}) masih GAGAL.{raw_block}\n\n\
+                 Analisis keluaran kegagalan mentah di atas, perbaiki penyebabnya dengan perubahan terarah, \
+                 lalu jalankan ulang `{cmd}` untuk membuktikan hasil lulus sebelum menutup."
             ));
         }
         None
@@ -502,6 +780,10 @@ impl SelfCorrectState {
         if let Some(base_gate) = self.completion_gate(remaining_steps) {
             return Some(base_gate);
         }
+        // Pada lingkup ketat v0.5.14, tugas coding tanpa perintah verifikasi diam total (0 suntikan).
+        if self.strict_known_verify_only && !self.has_verification_run {
+            return None;
+        }
         if !self.edited_code_file || self.checklist_checked || remaining_steps < 2 {
             return None;
         }
@@ -516,6 +798,16 @@ impl SelfCorrectState {
             })
             .cloned()
             .collect();
+        // Pada lingkup ketat v0.5.14: bila verifikasi sudah HIJAU setelah edit terakhir dan tidak ada
+        // berkas sampah repro tertinggal, langsung terima penutupan tanpa suntikan tambahan!
+        if self.strict_known_verify_only
+            && self.verified_after_last_edit
+            && self.last_verify_passed == Some(true)
+            && lingering_scratch.is_empty()
+        {
+            self.checklist_checked = true;
+            return None;
+        }
         // Cek apakah jawaban akhir sudah menyebut minimal satu berkas kode yang diubah.
         let mentions_edited = self.edited_files.iter().any(|f| {
             let base = Path::new(f)
@@ -547,6 +839,52 @@ impl SelfCorrectState {
             "[Daftar Periksa Penutup] Sebelum menyatakan selesai: {}. \
              Jangan menjalankan ulang tes yang sudah lulus bila tidak ada edit baru.",
             items.join("; ")
+        ))
+    }
+
+    /// Catatan status jujur (pola Hermes + Perbaikan 2 #3 v0.5.14): bila penutupan diterima
+    /// sesudah batas putaran refleksi tercapai sementara verifikasi terakhir masih GAGAL atau
+    /// belum dijalankan ulang sesudah edit terakhir, kembalikan blok status jujur untuk ditempel
+    /// pada ringkasan penutup agar tidak pernah menyamar sebagai sukses.
+    pub fn honest_unverified_closing_note(&self, final_reply: &str) -> Option<String> {
+        let has_mutation = self.edited_code_file || !self.edited_files.is_empty();
+        if !has_mutation || !self.has_verification_run {
+            return None;
+        }
+        if self.verified_after_last_edit && self.last_verify_passed == Some(true) {
+            return None;
+        }
+        if final_reply.contains("[Status Verifikasi Akhir") {
+            return None;
+        }
+        let cmd = self
+            .last_verify_cmd
+            .as_deref()
+            .unwrap_or("verifikasi terakhir");
+        let status_desc = if !self.verified_after_last_edit {
+            match self.last_verify_passed {
+                Some(false) => "masih GAGAL dan belum dijalankan ulang setelah edit terakhir",
+                _ => "belum dijalankan ulang setelah edit terakhir",
+            }
+        } else {
+            "masih GAGAL"
+        };
+        let snippet = self
+            .last_verify_output
+            .as_deref()
+            .and_then(|out| {
+                out.lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .map(|l| l.chars().take(160).collect::<String>())
+            })
+            .map(|s| format!(" Ringkasan error terakhir: {s}"))
+            .unwrap_or_default();
+        Some(format!(
+            "\n\n[Status Verifikasi Akhir — GAGAL] Perintah `{cmd}` {status_desc} \
+             (putaran gerbang verifikasi: {}/{}).{snippet}",
+            self.repair_attempts, self.max_attempts
         ))
     }
 }

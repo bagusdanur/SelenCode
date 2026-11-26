@@ -286,19 +286,30 @@ impl SkillsCfg {
     }
 }
 
-/// Konfigurasi dedup panggilan tool, loop guard, & batas putaran Self-correction (`[guard]`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Konfigurasi dedup panggilan tool, loop guard, checkpoint anggaran langkah,
+/// & batas putaran gerbang verifikasi/Self-correction (`[guard]`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GuardCfg {
-    /// Aktifkan dedup + loop guard + rem Self-correction (set `false` untuk debug).
+    /// Aktifkan dedup + loop guard + checkpoint langkah + gerbang verifikasi (set `false` untuk debug).
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Batas maksimum putaran Self-correction otomatis per giliran (default: 1).
+    /// Batas maksimum putaran gerbang verifikasi/refleksi per giliran (default: 3, pola Aider `max_reflections`).
     #[serde(default = "default_max_self_correct_rounds")]
     pub max_self_correct_rounds: usize,
+    /// Aktifkan checkpoint kesadaran anggaran langkah & pemicu konvergensi belum-ada-edit (default: true, v0.5.14).
+    #[serde(default = "default_true")]
+    pub budget_warning_enabled: bool,
+    /// Rasio pemakaian `max_steps` saat checkpoint satu-kali disuntikkan ke model (default: 0.7, rentang 0.1..=0.95).
+    #[serde(default = "default_budget_warning_ratio")]
+    pub budget_warning_ratio: f64,
 }
 
 fn default_max_self_correct_rounds() -> usize {
-    1
+    3
+}
+
+fn default_budget_warning_ratio() -> f64 {
+    0.7
 }
 
 impl Default for GuardCfg {
@@ -306,6 +317,8 @@ impl Default for GuardCfg {
         Self {
             enabled: true,
             max_self_correct_rounds: default_max_self_correct_rounds(),
+            budget_warning_enabled: true,
+            budget_warning_ratio: default_budget_warning_ratio(),
         }
     }
 }
@@ -1065,7 +1078,15 @@ pub fn validate_toml_keys(val: &toml::Value) -> Vec<ConfigWarning> {
             "sandbox",
             &["mode", "os_isolate", "scrub_env", "allow_network", "audit_log"],
         ),
-        ("guard", &["enabled", "max_self_correct_rounds"]),
+        (
+            "guard",
+            &[
+                "enabled",
+                "max_self_correct_rounds",
+                "budget_warning_enabled",
+                "budget_warning_ratio",
+            ],
+        ),
         ("aux", &["compression_model", "review_model"]),
         (
             "review",

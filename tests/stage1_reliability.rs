@@ -265,11 +265,18 @@ impl Provider for SelfCorrectMock {
         match n {
             0 => Ok(AssistantReply {
                 text: String::new(),
-                tool_calls: vec![ToolCall {
-                    id: "e1".into(),
-                    name: "write_file".into(),
-                    args: json!({"path": "app.rs", "content": "fn main() {}\n"}),
-                }],
+                tool_calls: vec![
+                    ToolCall {
+                        id: "pre_v".into(),
+                        name: "run_shell".into(),
+                        args: json!({"command": "node -e \"process.exit(0)\""}),
+                    },
+                    ToolCall {
+                        id: "e1".into(),
+                        name: "write_file".into(),
+                        args: json!({"path": "app.rs", "content": "fn main() {}\n"}),
+                    },
+                ],
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
             }),

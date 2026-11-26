@@ -42,6 +42,13 @@ approval = "ask"                                 # ask | auto
 context_limit_tokens = 100000                    # compaction konteks memicu di 80% batas ini
 max_parallel_subagents = 3                       # batas subagent delegate berjalan paralel (Fase 6)
 
+# Penjaga loop, kesadaran anggaran langkah, & gerbang verifikasi sebelum menutup (v0.5.14).
+[guard]
+enabled = true
+max_self_correct_rounds = 3                      # batas total putaran gerbang verifikasi/refleksi per giliran
+budget_warning_enabled = true                    # aktifkan checkpoint sisa langkah & pemicu konvergensi belum-ada-edit
+budget_warning_ratio = 0.7                       # rasio max_steps saat checkpoint satu-kali disuntikkan ke model
+
 [shell]
 allowlist = ["ls", "git status", "git diff", "cargo test"]
 timeout_secs = 120
