@@ -86,11 +86,10 @@ pub(crate) async fn interactive_plain(
         true,
     )
     .await?;
-    // Perbaikan 3 (v0.5.7): laporkan pantauan CLI yang selesai saat tidak ada sesi terbuka.
-    if let Ok(done_watches) = s.store.take_undelivered_watch_reports() {
-        for (_wid, _lbl, rep) in done_watches {
-            println!("{rep}");
-        }
+    // Perbaikan 2 (v0.5.9): jalankan 1 putaran polling pantauan aktif milik folder ini +
+    // laporkan perubahan/selesai/gagal persis satu kali (0 token LLM; diam bila tak ada perubahan).
+    for rep in s.poll_cli_watches_on_open().await {
+        println!("{rep}");
     }
     // Mode CLI polos interaktif (TTY): `ask_user` membaca pilihan bernomor/teks bebas dari stdin;
     // bila dijalankan lewat pipe (non-TTY), tetap non-interaktif agar tidak menggantung.
@@ -435,7 +434,11 @@ pub(crate) async fn interactive_plain(
             }
         }
     }
-    // Akhir sesi REPL polos (`/exit` atau EOF): jalankan background review bila substantif.
+    // Akhir sesi REPL polos (`/exit` atau EOF): jalankan 1 putaran polling watch bila ada pantauan aktif,
+    // lalu jalankan background review bila substantif.
+    for rep in s.poll_cli_watches_on_close(true).await {
+        println!("{rep}");
+    }
     if let Some(job) = s.prepare_bg_review_job(true) {
         if let Ok(Ok(Some(outcome))) =
             tokio::time::timeout(std::time::Duration::from_secs(15), job.run(true)).await

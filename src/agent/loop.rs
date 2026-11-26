@@ -9,9 +9,9 @@ use tokio::sync::mpsc;
 use super::context::{
     analyze_token_breakdown, auto_outline, build_folder_map, build_resume_snapshot,
     build_system_prompt, cap_dynamic_injection, compact_messages_hermes, estimate_tokens,
-    expand_at_mentions, format_memories_section, head_tail_truncate, needs_compaction,
-    prune_old_tool_results_with_archive, session_archive_dir, spillover_if_needed,
-    spillover_with_preview,
+    expand_at_mentions, head_tail_truncate, needs_compaction,
+    prune_old_skill_results_with_archive, prune_old_tool_results_with_archive,
+    session_archive_dir, spillover_if_needed, spillover_with_preview,
 };
 use crate::tool_display::{
     build_template_closing_summary, format_tool_event_from_preview, prepare_tool_preview,
@@ -220,20 +220,12 @@ async fn run_turn_inner(
             dynamic_snapshot.push_str(&mcp_idx);
             dynamic_snapshot.push('\n');
         }
-        // Perbaikan 5 (v0.5.7): snapshot beku wadah `memory` + `profile` yang dimuat 1x di awal sesi.
+        // Perbaikan 5 (v0.5.7) & Perbaikan 3 (v0.5.9): SATU sumber kebenaran memori persisten —
+        // hanya snapshot beku wadah `memory` + `profile` yang dimuat 1x di awal sesi (tanpa store SQLite ganda).
         if let Some(frozen) = &ctx.frozen_user_memory {
             let frozen_block = frozen.format_for_prompt();
             if !frozen_block.is_empty() {
                 dynamic_snapshot.push_str(&frozen_block);
-            }
-        }
-        if let Some(store) = &ctx.store {
-            let cwd_str = ctx.cwd.to_string_lossy().to_string();
-            if let Ok(mems) = store.list_memories(&cwd_str, 15) {
-                let mem_sec = format_memories_section(&mems);
-                if !mem_sec.is_empty() {
-                    dynamic_snapshot.push_str(&mem_sec);
-                }
             }
         }
         if !dynamic_snapshot.trim().is_empty() {
@@ -374,8 +366,11 @@ async fn run_turn_inner(
     let mut forced_stop_reason: Option<String> = None;
 
     for step in 0..max_steps {
+        // Perbaikan 1 (v0.5.9) — Prune lebih dini hasil `skill_view` lama (di luar 4 pesan terakhir = ~2 langkah tool)
+        // ke stub ringkas + arsip byte-exact agar isi skill tidak terbawa penuh selamanya.
+        let pruned_skills = prune_old_skill_results_with_archive(messages, &prune_dir, 4);
         // Tahap 1 — Prune hasil tool lama (>200 char di luar 20 pesan terakhir) + arsip ke file (TANPA LLM).
-        let pruned_now = prune_old_tool_results_with_archive(messages, &prune_dir, 20);
+        let pruned_now = pruned_skills + prune_old_tool_results_with_archive(messages, &prune_dir, 20);
         // Kompresi dua tahap: hanya ringkas jika MASIH > 50% sesudah Tahap 1 prune!
         if needs_compaction(messages, ctx.context_limit_tokens) {
             match &ui {

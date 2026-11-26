@@ -97,6 +97,45 @@ impl Session {
         selencode::store::summarize_prompt_title(prompt)
     }
 
+    /// Perbaikan 2 (v0.5.9): jalankan 1 putaran polling atas pantauan `watch_job` aktif di ruang kerja ini
+    /// saat sesi CLI/TUI dibuka (+ ambil laporan terminal tertunda), persis 1x per perubahan (0 token).
+    pub(crate) async fn poll_cli_watches_on_open(&self) -> Vec<String> {
+        selencode::watch::poll_active_watches_for_cli(
+            &self.store,
+            &self.ctx.sandbox,
+            &self.ctx.cwd,
+            true,
+            true,
+        )
+        .await
+    }
+
+    /// Perbaikan 2 (v0.5.9): jalankan 1 putaran polling sebelum sesi CLI/TUI ditutup bersih
+    /// hanya bila masih ada pantauan aktif di folder ini.
+    pub(crate) async fn poll_cli_watches_on_close(&self, print_immediately: bool) -> Vec<String> {
+        let target_cwd =
+            selencode::watch::normalize_watch_cwd(&self.ctx.cwd.to_string_lossy());
+        let has_active_here = self
+            .store
+            .list_job_watches(None, true)
+            .map(|ws| {
+                ws.iter()
+                    .any(|w| selencode::watch::normalize_watch_cwd(&w.cwd) == target_cwd)
+            })
+            .unwrap_or(false);
+        if !has_active_here {
+            return Vec::new();
+        }
+        selencode::watch::poll_active_watches_for_cli(
+            &self.store,
+            &self.ctx.sandbox,
+            &self.ctx.cwd,
+            print_immediately,
+            false,
+        )
+        .await
+    }
+
     pub(crate) async fn build(
         provider_name: Option<&str>,
         yes: bool,
@@ -235,6 +274,16 @@ impl Session {
         ));
         selencode::skills::seed_default_user_skills();
         let hooks = Arc::new(selencode::hooks::HookEngine::from_config(&cfg.hooks));
+        // Perbaikan 3 (v0.5.9): migrasi satu kali entri memori lama (SQLite `memories`) ke store persisten `memory.md`
+        // sebelum snapshot beku dimuat, menghormati pagu karakter tanpa memotong diam-diam.
+        if let Ok(mig) = selencode::user_memory::migrate_legacy_sqlite_memories(
+            &store,
+            cfg.memory.max_memory_chars,
+        ) {
+            if let Some(warn) = mig.warning {
+                eprintln!("[selen] {warn}");
+            }
+        }
         let frozen_user_mem = selencode::user_memory::load_frozen_snapshot(
             cfg.memory.max_memory_chars,
             cfg.memory.max_profile_chars,

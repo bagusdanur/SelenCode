@@ -472,3 +472,119 @@ pub fn compute_watch_expires_at(now_utc: DateTime<Utc>, max_age_secs: u64) -> St
     let secs = max_age_secs.max(60) as i64;
     (now_utc + Duration::seconds(secs)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
+
+/// Normalisasi path folder kerja untuk pencocokan `job_watches.cwd` lintas separator/kapitalisasi OS.
+pub fn normalize_watch_cwd(raw: &str) -> String {
+    let canon = std::fs::canonicalize(raw)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| raw.to_string());
+    let mut norm = canon.replace('\\', "/");
+    if let Some(stripped) = norm.strip_prefix("//?/") {
+        norm = stripped.to_string();
+    }
+    while norm.len() > 1 && norm.ends_with('/') {
+        norm.pop();
+    }
+    if cfg!(windows) {
+        norm.to_ascii_lowercase()
+    } else {
+        norm
+    }
+}
+
+/// Satu implementasi polling & evaluasi untuk 1 `JobWatchRecord` — dipakai bersama
+/// oleh loop gateway Telegram (`telegram_runner.rs`) maupun sesi CLI/TUI (`plain_runner.rs`,
+/// `tui_runner.rs`, `main.rs`) agar logika 100% tunggal dan biaya provider = 0 token.
+pub async fn evaluate_and_poll_watch(
+    watch: &JobWatchRecord,
+    sandbox: &SandboxController,
+    now_utc: DateTime<Utc>,
+) -> (WatchTransition, String) {
+    let poll_out = poll_watch_once(watch, sandbox).await;
+    let poll_res = match &poll_out {
+        Ok(s) => Ok(s.as_str()),
+        Err(e) => Err(e.to_string()),
+    };
+    let tr = evaluate_watch_poll(
+        watch,
+        match &poll_res {
+            Ok(s) => Ok(*s),
+            Err(e) => Err(e.as_str()),
+        },
+        now_utc,
+    );
+    let checked_at = now_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    (tr, checked_at)
+}
+
+/// Simpan hasil satu putaran polling `WatchTransition` ke SQLite `job_watches` secara persisten.
+pub fn persist_watch_transition(
+    store: &crate::store::Store,
+    watch_id: i64,
+    tr: &WatchTransition,
+    checked_at: &str,
+    delivered: bool,
+) -> Result<()> {
+    let final_rep = if tr.terminal {
+        tr.notification.as_deref()
+    } else {
+        None
+    };
+    store.update_job_watch_poll(
+        watch_id,
+        &tr.new_status,
+        &tr.new_stage,
+        &tr.new_progress,
+        tr.new_consecutive_errors,
+        checked_at,
+        final_rep,
+        tr.terminal && delivered,
+    )
+}
+
+/// Perbaikan 2 (v0.5.9) — Jalankan 1 putaran polling atas pantauan aktif milik ruang kerja `cwd`
+/// (dan ambil laporan terminal tertunda bila ada) pada pembukaan / penutupan sesi CLI/TUI.
+/// - Memakai fungsi polling yang SAMA persis dengan gateway (`evaluate_and_poll_watch` + `persist_watch_transition`).
+/// - Status "sudah dilaporkan" (`last_stage`/`last_progress` & `delivered=1` untuk terminal) disimpan
+///   persisten ke SQLite sehingga pemakaian bergantian CLI ↔ gateway tidak pernah menghasilkan laporan dobel.
+/// - Bila tidak ada perubahan maupun laporan tertunda, mengembalikan `Vec::new()` (0 baris, 0 token).
+pub async fn poll_active_watches_for_cli(
+    store: &crate::store::Store,
+    sandbox: &SandboxController,
+    cwd: &Path,
+    mark_terminal_delivered: bool,
+    include_undelivered: bool,
+) -> Vec<String> {
+    let target_cwd = normalize_watch_cwd(&cwd.to_string_lossy());
+    let mut reports = Vec::new();
+
+    if let Ok(active_watches) = store.list_job_watches(None, true) {
+        for w in active_watches {
+            if normalize_watch_cwd(&w.cwd) != target_cwd {
+                continue;
+            }
+            let (tr, checked_at) =
+                evaluate_and_poll_watch(&w, sandbox, chrono::Utc::now()).await;
+            let _ = persist_watch_transition(
+                store,
+                w.id,
+                &tr,
+                &checked_at,
+                mark_terminal_delivered,
+            );
+            if let Some(msg) = tr.notification {
+                reports.push(msg);
+            }
+        }
+    }
+
+    if include_undelivered {
+        if let Ok(pending) = store.take_undelivered_watch_reports_for_cwd(&target_cwd) {
+            for (_wid, _lbl, rep) in pending {
+                reports.push(rep);
+            }
+        }
+    }
+
+    reports
+}

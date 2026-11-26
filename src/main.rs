@@ -40,6 +40,10 @@ async fn main() -> Result<()> {
                 false,
             )
             .await?;
+            // Perbaikan 2 (v0.5.9): cek 1 putaran pantauan aktif milik folder ini saat sesi CLI dibuka.
+            for rep in s.poll_cli_watches_on_open().await {
+                println!("{rep}");
+            }
             if cli.plan {
                 // run --plan: 1 giliran plan, lalu berhenti (tanpa eksekusi).
                 run_turn_mode(
@@ -62,6 +66,10 @@ async fn main() -> Result<()> {
                     s.cfg.agent.max_steps,
                 )
                 .await?;
+                // Perbaikan 2 (v0.5.9): 1 putaran polling sebelum sesi CLI ditutup bersih bila ada watch aktif.
+                for rep in s.poll_cli_watches_on_close(true).await {
+                    println!("{rep}");
+                }
                 // Background Self-Improvement Review (v0.5.1): jalankan pasca-sesi selesai
                 // hanya bila `[aux]` review/compression model terpasang & sesi substantif.
                 if let Some(job) = s.prepare_bg_review_job(true) {

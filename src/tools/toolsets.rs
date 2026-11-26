@@ -78,7 +78,6 @@ pub const EXTENDED_TOOLSETS: &[(&str, &str, &[&str])] = &[
             "skill_create",
             "skill_edit",
             "manage_skill",
-            "manage_memory",
             "memory",
         ],
     ),
@@ -342,6 +341,12 @@ pub fn select_initial_toolsets(
         "profil",
         "profile",
         "selalu simpan",
+        "selalu pakai",
+        "selalu gunakan",
+        "mulai sekarang",
+        "biasakan",
+        "jangan lupa",
+        "catat untuk sesi",
     ]
     .iter()
     .any(|kw| lower.contains(kw))

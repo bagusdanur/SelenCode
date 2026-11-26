@@ -71,7 +71,164 @@ impl Tool for SkillsList {
     }
 }
 
-/// Tingkat 2 & 3: muat isi penuh `SKILL.md` (`path` kosong) ATAU 1 file referensi di dalam folder skill (`path` diisi).
+/// Ambang karakter `SKILL.md` di atas mana `skill_view(name)` mengembalikan salinan kerja
+/// prosedural yang padat (Perbaikan 1 v0.5.9) agar konteks tidak meledak 14,6 rb karakter.
+/// Skill kecil (<= 4.500 char) tetap dikembalikan utuh apa adanya; isi penuh selalu bisa
+/// dimuat kapan saja via `skill_view(name, full=true)`.
+pub const SKILL_WORKING_COPY_THRESHOLD: usize = 4_500;
+/// Batas karakter target untuk salinan kerja prosedural `skill_view`.
+pub const SKILL_WORKING_COPY_MAX_CHARS: usize = 2_400;
+
+/// Bangun salinan kerja prosedural ringkas untuk `SKILL.md` berukuran besar (> 4.500 char):
+/// - Mempertahankan aturan inti (Iron Law, fase prosedural, checklist langkah, red flags),
+/// - Membuang contoh kode panjang, tabel rasionalisasi, dan prosa referensi yang bisa dimuat ulang,
+/// - Menyertakan daftar judul bagian lengkap & petunjuk `skill_view(name, full=true)`.
+pub fn build_skill_working_copy(skill_name: &str, raw_content: &str) -> String {
+    if raw_content.chars().count() <= SKILL_WORKING_COPY_THRESHOLD {
+        return raw_content.to_string();
+    }
+    let body = strip_frontmatter(raw_content);
+    let mut all_headings: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if let Some(h) = t.strip_prefix("## ") {
+            let clean = h.trim();
+            if !clean.is_empty() && !all_headings.iter().any(|x| x == clean) {
+                all_headings.push(clean.to_string());
+            }
+        }
+    }
+
+    let mut out = String::new();
+    let mut in_code_block = false;
+    let mut code_lines_buf: Vec<&str> = Vec::new();
+    let mut skip_section = false;
+    let mut section_bullets = 0usize;
+
+    let push_if_fits = |dst: &mut String, text: &str| -> bool {
+        if dst.chars().count() + text.chars().count() + 220 > SKILL_WORKING_COPY_MAX_CHARS {
+            return false;
+        }
+        dst.push_str(text);
+        dst.push('\n');
+        true
+    };
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        // Lewati baris atribusi lisensi / garis pemisah murni
+        if trimmed.starts_with("> Diadaptasi dari") || trimmed == "---" {
+            continue;
+        }
+        // Tangani blok kode: pertahankan hanya blok sangat pendek (<= 2 baris, mis. Iron Law).
+        if trimmed.starts_with("```") {
+            if !in_code_block {
+                in_code_block = true;
+                code_lines_buf.clear();
+            } else {
+                in_code_block = false;
+                if !skip_section && !code_lines_buf.is_empty() && code_lines_buf.len() <= 2 {
+                    for cl in &code_lines_buf {
+                        if !push_if_fits(&mut out, cl) {
+                            break;
+                        }
+                    }
+                }
+                code_lines_buf.clear();
+            }
+            continue;
+        }
+        if in_code_block {
+            if !trimmed.is_empty() {
+                code_lines_buf.push(trimmed);
+            }
+            continue;
+        }
+        // Lewati tabel Markdown panjang (rasionalisasi/quick ref)
+        if trimmed.starts_with('|') {
+            continue;
+        }
+        if let Some(h2) = trimmed.strip_prefix("## ") {
+            let low = h2.to_ascii_lowercase();
+            skip_section = low.contains("rationalization")
+                || low.contains("real-world impact")
+                || low.contains("integration")
+                || low.contains("quick reference")
+                || low.contains("when to use")
+                || low.contains("example");
+            section_bullets = 0;
+            if !skip_section && !push_if_fits(&mut out, trimmed) {
+                break;
+            }
+            continue;
+        }
+        if skip_section {
+            continue;
+        }
+        if trimmed.starts_with("# ") || trimmed.starts_with("### ") {
+            section_bullets = 0;
+            if !push_if_fits(&mut out, trimmed) {
+                break;
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Pertahankan aturan kunci, checklist, & maks 4 butir per sub-bagian agar tetap tajam.
+        let is_bullet = trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed
+                .as_bytes()
+                .first()
+                .map(|b| b.is_ascii_digit())
+                .unwrap_or(false)
+                && trimmed.contains(". ");
+        let is_imperative = trimmed.starts_with("**")
+            || trimmed.contains("MUST")
+            || trimmed.contains("WAJIB")
+            || trimmed.contains("STOP")
+            || trimmed.contains("NEVER")
+            || trimmed.contains("ALWAYS");
+        if is_bullet {
+            if section_bullets < 4 {
+                section_bullets += 1;
+                let short_line: String = if trimmed.chars().count() > 140 {
+                    format!("{}…", trimmed.chars().take(139).collect::<String>())
+                } else {
+                    trimmed.to_string()
+                };
+                if !push_if_fits(&mut out, &short_line) {
+                    break;
+                }
+            }
+        } else if is_imperative && section_bullets < 3 {
+            section_bullets += 1;
+            let short_line: String = if trimmed.chars().count() > 180 {
+                format!("{}…", trimmed.chars().take(179).collect::<String>())
+            } else {
+                trimmed.to_string()
+            };
+            if !push_if_fits(&mut out, &short_line) {
+                break;
+            }
+        }
+    }
+
+    if !all_headings.is_empty() {
+        out.push_str("\nBagian lengkap: ");
+        out.push_str(&all_headings.join(" | "));
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "(Salinan kerja ringkas dari {} char — panggil `skill_view(name=\"{skill_name}\", full=true)` bila butuh detail/contoh lengkap.)",
+        raw_content.chars().count()
+    ));
+    out
+}
+
+/// Tingkat 2 & 3: muat isi `SKILL.md` (`path` kosong; salinan kerja ringkas untuk skill > 4.500 char kecuali `full=true`)
+/// ATAU 1 file referensi di dalam folder skill (`path` diisi).
 pub struct SkillView;
 
 #[async_trait]
@@ -79,11 +236,12 @@ impl Tool for SkillView {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "skill_view".into(),
-            description: "Muat SKILL.md suatu skill (atau 1 file referensi jika `path` diisi).".into(),
+            description: "Muat SKILL.md suatu skill (salinan kerja ringkas bila panjang; set `full=true` untuk isi penuh, atau `path` untuk 1 file referensi).".into(),
             parameters: schema(
                 json!({
                     "name": { "type": "string" },
-                    "path": { "type": "string" }
+                    "path": { "type": "string" },
+                    "full": { "type": "boolean" }
                 }),
                 &["name"],
             ),
@@ -106,9 +264,15 @@ impl Tool for SkillView {
             ));
         }
 
+        let want_full = args.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
         let (info, content, refs) = load_skill_with_refs(&ctx.cwd, name)?;
+        let body = if want_full {
+            content
+        } else {
+            build_skill_working_copy(&info.name, &content)
+        };
         let mut out = format!(
-            "[Skill `{}` ({}, kategori: {}) — {}]\n\n{content}",
+            "[Skill `{}` ({}, kategori: {}) — {}]\n\n{body}",
             info.name,
             info.scope,
             info.category,

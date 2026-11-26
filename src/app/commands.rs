@@ -1167,59 +1167,49 @@ impl Session {
             add_entry_in, load_frozen_snapshot, remove_entry_in, replace_entry_in,
             user_memory_dir, MemoryStoreKind,
         };
-        let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
         let mem_dir = user_memory_dir();
         let Some(arg) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            // Perbaikan 3 (v0.5.9): SATU sumber kebenaran — baca langsung berkas store persisten
+            // (`profile.md` & `memory.md`) agar `/memory` selalu 100% sama dengan isi berkas store.
             let live = load_frozen_snapshot(
                 self.cfg.memory.max_memory_chars,
                 self.cfg.memory.max_profile_chars,
             );
-            let snap = self.ctx.frozen_user_memory.as_ref().unwrap_or(&live);
-            let mem_txt = snap.memory_text();
-            let prof_txt = snap.profile_text();
+            let mem_txt = live.memory_text();
+            let prof_txt = live.profile_text();
             let mut out = format!(
-                "# Memori Persisten & Profil Pemilik (Snapshot Sesi)\n\
-                 * profil | {}/{} char | termuat beku di prompt\n",
+                "# Memori Persisten & Profil Pemilik\n\
+                 * profil | {}/{} char | {}\n",
                 prof_txt.chars().count(),
                 self.cfg.memory.max_profile_chars,
+                mem_dir.join("profile.md").display(),
             );
-            if snap.profile_entries.is_empty() {
+            if live.profile_entries.is_empty() {
                 out.push_str("! (profil pemilik masih kosong)\n");
             } else {
-                for (i, e) in snap.profile_entries.iter().enumerate() {
+                for (i, e) in live.profile_entries.iter().enumerate() {
                     out.push_str(&format!("> P#{} | profile | {e}\n", i + 1));
                 }
             }
             out.push_str(&format!(
-                "* memory | {}/{} char | termuat beku di prompt\n",
+                "* memory | {}/{} char | {}\n",
                 mem_txt.chars().count(),
                 self.cfg.memory.max_memory_chars,
+                mem_dir.join("memory.md").display(),
             ));
-            if snap.memory_entries.is_empty() {
+            if live.memory_entries.is_empty() {
                 out.push_str("! (wadah memory masih kosong)\n");
             } else {
-                for (i, e) in snap.memory_entries.iter().enumerate() {
+                for (i, e) in live.memory_entries.iter().enumerate() {
                     out.push_str(&format!("> M#{} | memory | {e}\n", i + 1));
                 }
             }
-            let list = self.store.list_memories(&cwd_str, 40)?;
-            if !list.is_empty() {
-                out.push_str("---\n* memori proyek (SQLite) | ");
-                out.push_str(&format!("{} item | aktif di folder ini\n", list.len()));
-                for m in list {
-                    let scope = if m.scope == "global" { "global" } else { "project" };
-                    out.push_str(&format!(
-                        "> #{} | {} · {scope} | {}\n",
-                        m.id, m.category, m.content
-                    ));
-                }
-            }
             out.push_str("---\n");
-            out.push_str("! Wadah persisten: /memory profile add <teks> · /memory user add <teks> · /memory profile rm <no|teks>\n");
-            out.push_str("! Memori proyek:   /memory add [kategori] <catatan> · /memory update <id> <teks> · /memory rm <id>");
+            out.push_str("! Kelola memory:  /memory add <teks> · /memory update <no|teks> => <baru> · /memory rm <no|teks>\n");
+            out.push_str("! Kelola profil:  /memory profile add <teks> · /memory profile replace <no|teks> => <baru> · /memory profile rm <no|teks>");
             return Ok(out);
         };
-        // Perintah langsung pemilik untuk wadah `profile` / `memory` (Perbaikan 5 v0.5.7).
+        // Perintah langsung pemilik untuk wadah `profile` / `memory` (Perbaikan 5 v0.5.7 & Perbaikan 3 v0.5.9).
         if let Some(rest) = arg
             .strip_prefix("profile ")
             .or_else(|| arg.strip_prefix("profil "))
@@ -1331,67 +1321,81 @@ impl Session {
                 ));
             }
         }
-        if let Some(rest) = arg.strip_prefix("add ") {
-            let (cat, text) = split_optional_category(rest.trim());
+        if let Some(rest) = arg
+            .strip_prefix("add ")
+            .or_else(|| arg.strip_prefix("global "))
+        {
+            let text = rest.trim();
             if text.is_empty() {
+                anyhow::bail!("isi memori kosong. Contoh: /memory add Jalankan cargo test sebelum rilis");
+            }
+            let (idx, chars) = add_entry_in(
+                &mem_dir,
+                MemoryStoreKind::Memory,
+                text,
+                self.cfg.memory.max_memory_chars,
+            )?;
+            return Ok(format!(
+                "# Memori Persisten Disimpan\n* M#{idx} | {chars}/{} char | {text}",
+                self.cfg.memory.max_memory_chars
+            ));
+        }
+        if let Some(rest) = arg
+            .strip_prefix("update ")
+            .or_else(|| arg.strip_prefix("edit "))
+            .or_else(|| arg.strip_prefix("replace "))
+        {
+            let rest = rest.trim();
+            let (sel, new_val) = if let Some((s, v)) = rest.split_once("=>") {
+                (s.trim(), v.trim())
+            } else {
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                (
+                    parts.next().unwrap_or("").trim(),
+                    parts.next().unwrap_or("").trim(),
+                )
+            };
+            if sel.is_empty() || new_val.is_empty() {
                 anyhow::bail!(
-                    "isi memori kosong. Contoh: /memory add commands Jalankan cargo test sebelum rilis"
+                    "format: `/memory update <no|teks_lama> => <teks_baru>` atau `/memory update <no> <teks_baru>`"
                 );
             }
-            let id = self.store.add_memory_categorized(&cwd_str, cat, text)?;
+            let clean_sel = sel.trim_start_matches(['M', 'm', '#']);
+            let (idx, chars) = replace_entry_in(
+                &mem_dir,
+                MemoryStoreKind::Memory,
+                clean_sel,
+                new_val,
+                self.cfg.memory.max_memory_chars,
+            )?;
             return Ok(format!(
-                "# Memori Proyek Disimpan\n* #{id} | {cat} · project | {text}"
+                "# Memori Persisten Diperbarui\n* M#{idx} | {chars}/{} char | {new_val}",
+                self.cfg.memory.max_memory_chars
             ));
         }
-        if let Some(rest) = arg.strip_prefix("global ") {
-            let (cat, text) = split_optional_category(rest.trim());
-            if text.is_empty() {
-                anyhow::bail!("isi memori global kosong.");
-            }
-            let id = self.store.add_memory_categorized("global", cat, text)?;
+        if let Some(rest) = arg
+            .strip_prefix("rm ")
+            .or_else(|| arg.strip_prefix("del "))
+            .or_else(|| arg.strip_prefix("remove "))
+        {
+            let clean_sel = rest.trim().trim_start_matches(['M', 'm', '#']);
+            let (removed, chars) = remove_entry_in(
+                &mem_dir,
+                MemoryStoreKind::Memory,
+                clean_sel,
+                self.cfg.memory.max_memory_chars,
+            )?;
             return Ok(format!(
-                "# Memori Global Disimpan\n* #{id} | {cat} · global | {text}"
+                "# Memori Persisten Dihapus\n> dihapus | {chars}/{} char | {removed}",
+                self.cfg.memory.max_memory_chars
             ));
-        }
-        if let Some(rest) = arg.strip_prefix("update ").or_else(|| arg.strip_prefix("edit ")) {
-            let mut parts = rest.trim().splitn(2, char::is_whitespace);
-            let id_raw = parts.next().unwrap_or("").trim_start_matches('#');
-            let id: i64 = id_raw
-                .parse()
-                .map_err(|_| anyhow::anyhow!("id memori harus angka (mis. /memory update 1 arch ...)"))?;
-            let tail = parts.next().unwrap_or("").trim();
-            if tail.is_empty() {
-                anyhow::bail!("isi memori baru kosong. Contoh: /memory update {id} [kategori] <catatan baru>");
-            }
-            let (explicit_cat, text) = split_explicit_category_opt(tail);
-            if text.is_empty() {
-                anyhow::bail!("isi memori baru kosong.");
-            }
-            if self.store.update_memory(id, explicit_cat, text)? {
-                let cat_disp = explicit_cat.unwrap_or("(tetap)");
-                return Ok(format!(
-                    "# Memori Diperbarui\n* #{id} | {cat_disp} | {text}"
-                ));
-            }
-            anyhow::bail!("memori #{id} tidak ditemukan");
-        }
-        if let Some(rest) = arg.strip_prefix("rm ").or_else(|| arg.strip_prefix("del ")) {
-            let id: i64 = rest
-                .trim()
-                .trim_start_matches('#')
-                .parse()
-                .map_err(|_| anyhow::anyhow!("id memori harus angka (mis. /memory rm 1)"))?;
-            if self.store.remove_memory(id)? {
-                return Ok(format!("# Memori Dihapus\n> #{id} | dihapus"));
-            }
-            anyhow::bail!("memori #{id} tidak ditemukan");
         }
         Ok("# Cara Pakai /memory\n\
-            ! /memory                              — lihat semua memori aktif\n\
-            ! /memory add [kategori] <catatan>     — simpan memori proyek (arch/commands/conventions/decisions/issues/tasks)\n\
-            ! /memory update <id> [kat] <catatan>  — perbarui memori berdasarkan ID\n\
-            ! /memory global [kategori] <catatan>  — simpan memori global lintas proyek\n\
-            ! /memory rm <id>                      — hapus memori berdasarkan ID"
+            ! /memory                                       — lihat isi memory.md & profile.md\n\
+            ! /memory add <catatan>                         — tambah ke memory.md (pagu 2.200 char)\n\
+            ! /memory update <no|teks> => <catatan baru>    — perbarui entri memory.md\n\
+            ! /memory rm <no|teks>                          — hapus entri memory.md\n\
+            ! /memory profile add|replace|rm ...            — kelola profile.md (pagu 1.375 char)"
             .to_string())
     }
 
@@ -2349,32 +2353,4 @@ impl Session {
         println!("{}", strip_menu_markup(&self.sessions_menu()?));
         Ok(())
     }
-}
-
-/// Pisahkan kategori eksplisit di awal argumen `/memory add [kat] <teks>`.
-/// Bila kata pertama bukan kategori resmi, kategori default `"general"` dan seluruh teks dipertahankan.
-fn split_optional_category(s: &str) -> (&'static str, &str) {
-    let mut parts = s.splitn(2, char::is_whitespace);
-    let first = parts.next().unwrap_or("");
-    if let (Some(cat), Some(rest)) = (selencode::store::parse_explicit_category(first), parts.next()) {
-        let trimmed = rest.trim();
-        if !trimmed.is_empty() {
-            return (cat, trimmed);
-        }
-    }
-    ("general", s.trim())
-}
-
-/// Sama seperti `split_optional_category`, tapi mengembalikan `None` untuk kategori bila tidak disebut
-/// secara eksplisit (dipakai `/memory update <id> [kat] <teks>` agar kategori lama tetap terjaga).
-fn split_explicit_category_opt(s: &str) -> (Option<&'static str>, &str) {
-    let mut parts = s.splitn(2, char::is_whitespace);
-    let first = parts.next().unwrap_or("");
-    if let (Some(cat), Some(rest)) = (selencode::store::parse_explicit_category(first), parts.next()) {
-        let trimmed = rest.trim();
-        if !trimmed.is_empty() {
-            return (Some(cat), trimmed);
-        }
-    }
-    (None, s.trim())
 }

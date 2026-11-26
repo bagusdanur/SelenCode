@@ -27,7 +27,8 @@ pub fn build_system_prompt(cwd: &Path, tools: &[ToolSpec]) -> String {
 4. Skills (WAJIB): cek indeks skill di snapshot SEBELUM aksi tool pertama; jika cocok, panggil `skill_view(name)` dulu (bug/error/job gagal/ulang→`systematic-debugging`, fitur+tes/TDD→`test-driven-development`, review diff→`requesting-code-review`, wawancara desain→`grill-me`, ukur repo→`codebase-inspection`, riset bersitasi→`grounded-citations`; 1 skill cukup). JANGAN muat skill untuk tugas trivial. Jika user EKSPLISIT minta tulis/update skill yang sudah ada: wajib akhiri dengan penulisan nyata (`skill_edit` / `ref_path=\"references/...\"`) + diff ringkas.\n\
 5. Mengulang job gagal: teliti dulu mekanisme resume/retry bawaan (help/README/kode worker/status+metadata job). Bila ada resume/requeue pada job/folder yang sama, WAJIB pakai itu agar tahap selesai tidak diulang; mengulang dari awal = jalan terakhir dengan alasan tertulis. Untuk gagal validasi/kualitas, jelaskan/tangani penyebab sebelum menjalankan ulang.\n\
 6. Klarifikasi (`ask_user`): jika kandidat mirip-tak-identik, tafsir berdampak besar, atau >5 giliran pencarian buntu, aktifkan `clarify` & panggil `ask_user` (maks 4 pilihan; jangan minta rahasia).\n\
-7. Tugas asinkron (`watch_job`): setiap mengantrekan job/proses latar panjang (mis. Comic-auto), WAJIB aktifkan `watch` & daftarkan `watch_job` lalu beri tahu user progres/selesai akan dilaporkan otomatis — DILARANG hanya menyerahkan perintah pantau manual.\n",
+7. Tugas asinkron (`watch_job`): setiap mengantrekan job/proses latar panjang (mis. Comic-auto), WAJIB aktifkan `watch` & daftarkan `watch_job` lalu beri tahu user progres/selesai akan dilaporkan otomatis — DILARANG hanya menyerahkan perintah pantau manual.\n\
+8. Memori lintas-sesi (`memory`): satu-satunya cara mengingat preferensi/profil/fakta pemilik antar-sesi adalah tool `memory` (`target`: `memory` maks 2200 char, `profile` maks 1375 char; aktifkan `skills_mem` bila perlu; tanpa rahasia).\n",
     );
     for name in ["AGENT.md", "AGENTS.md"] {
         let p = cwd.join(name);
@@ -788,20 +789,138 @@ pub fn cap_dynamic_injection(text: &str, max_tokens: usize) -> String {
     format!("{head}\n... [injeksi dinamis dibatasi {max_tokens} token]")
 }
 
-/// Cari nama tool berdasarkan `tool_use_id` dari pesan Assistant sebelumnya.
-fn resolve_tool_name_for_id(messages: &[Message], up_to: usize, tool_id: &str) -> String {
+/// Cari nama tool & nama skill (bila `skill_view`/`manage_skill`) berdasarkan `tool_use_id`.
+fn resolve_tool_call_info(messages: &[Message], up_to: usize, tool_id: &str) -> (String, Option<String>) {
     for m in messages[..up_to].iter().rev() {
         if m.role == Role::Assistant {
             for b in &m.content {
-                if let Block::ToolUse { id, name, .. } = b {
+                if let Block::ToolUse { id, name, args } = b {
                     if id == tool_id {
-                        return name.clone();
+                        let sk = args
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        return (name.clone(), sk);
                     }
                 }
             }
         }
     }
-    "tool".to_string()
+    ("tool".to_string(), None)
+}
+
+/// Cari nama tool berdasarkan `tool_use_id` dari pesan Assistant sebelumnya.
+fn resolve_tool_name_for_id(messages: &[Message], up_to: usize, tool_id: &str) -> String {
+    resolve_tool_call_info(messages, up_to, tool_id).0
+}
+
+/// Ekstrak judul bagian Markdown (`#` / `##`) dari isi skill untuk stub ringkas.
+pub fn extract_markdown_headings(text: &str, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        let heading = t
+            .strip_prefix("## ")
+            .or_else(|| t.strip_prefix("# "));
+        if let Some(h) = heading {
+            let clean = h.trim();
+            if !clean.is_empty() && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(clean)) {
+                out.push(clean.to_string());
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Perbaikan 1 (v0.5.9) — Prune lebih dini khusus hasil `skill_view` (di luar `keep_recent_msgs`
+/// pesan terakhir, default 4 = ~2 giliran tool) agar isi skill besar tidak terbawa penuh di setiap
+/// panggilan LLM berikutnya:
+/// - Isi utuh diarsipkan byte-exact ke `archive_dir`.
+/// - Diganti stub ringkas berisi nama skill, daftar judul bagiannya, & petunjuk `skill_view(name, full=true)`
+///   bila model membutuhkannya lagi.
+/// - 100% idempoten & tidak menyentuh hasil tool lain.
+pub fn prune_old_skill_results_with_archive(
+    messages: &mut [Message],
+    archive_dir: &Path,
+    keep_recent_msgs: usize,
+) -> usize {
+    const MIN_SKILL_PRUNE_CHARS: usize = 400;
+    if messages.len() <= keep_recent_msgs {
+        return 0;
+    }
+    let cutoff = messages.len() - keep_recent_msgs;
+    let mut targets: Vec<(usize, usize, String, String)> = Vec::new();
+    for i in 0..cutoff {
+        if messages[i].role != Role::Tool {
+            continue;
+        }
+        for (bi, b) in messages[i].content.iter().enumerate() {
+            if let Block::ToolResult { id, content, is_error } = b {
+                if *is_error
+                    || content.chars().count() <= MIN_SKILL_PRUNE_CHARS
+                    || content.contains("isi penuh terarsip:")
+                    || content.contains("diringkas — arsip:")
+                {
+                    continue;
+                }
+                let (tname, arg_skill) = resolve_tool_call_info(messages, i, id);
+                if tname == "skill_view" || tname == "manage_skill" {
+                    let skill_name = arg_skill.unwrap_or_else(|| {
+                        content
+                            .strip_prefix("[Skill `")
+                            .and_then(|s| s.split('`').next())
+                            .unwrap_or("skill")
+                            .to_string()
+                    });
+                    targets.push((i, bi, id.clone(), skill_name));
+                }
+            }
+        }
+    }
+    if targets.is_empty() {
+        return 0;
+    }
+    let _ = std::fs::create_dir_all(archive_dir);
+    let mut pruned = 0usize;
+    for (msg_idx, block_idx, call_id, skill_name) in targets {
+        if let Some(Block::ToolResult { content, .. }) = messages[msg_idx].content.get_mut(block_idx) {
+            let safe_id: String = call_id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .take(28)
+                .collect();
+            let safe_sk: String = skill_name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .take(32)
+                .collect();
+            let fname = format!(
+                "{:04}_skill_{}_{}.txt",
+                msg_idx,
+                if safe_sk.is_empty() { "doc" } else { &safe_sk },
+                if safe_id.is_empty() { "res" } else { &safe_id }
+            );
+            let archive_path = archive_dir.join(fname);
+            let _ = std::fs::write(&archive_path, content.as_str());
+            let headings = extract_markdown_headings(content, 8);
+            let headings_line = if headings.is_empty() {
+                String::new()
+            } else {
+                format!("\nBagian: {}", headings.join(" | "))
+            };
+            *content = format!(
+                "[Skill `{skill_name}` aktif — isi penuh terarsip: {}]{headings_line}\n\
+                 (Panduan skill `{skill_name}` tetap berlaku; panggil `skill_view(name=\"{skill_name}\", full=true)` bila butuh membaca ulang isi penuhnya.)",
+                archive_path.display()
+            );
+            pruned += 1;
+        }
+    }
+    pruned
 }
 
 /// Tahap 1 — Prune hasil tool lama TANPA LLM + arsipkan hasil utuh (teredaksi) ke file:
@@ -833,6 +952,7 @@ pub fn prune_old_tool_results_with_archive(
                 if content.chars().count() > MIN_PRUNE_CHARS
                     && !content.starts_with("[Hasil ")
                     && !content.contains("diringkas — arsip:")
+                    && !content.contains("isi penuh terarsip:")
                 {
                     let tname = resolve_tool_name_for_id(messages, i, id);
                     targets.push((i, bi, id.clone(), tname));

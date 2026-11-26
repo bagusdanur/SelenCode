@@ -130,7 +130,7 @@ impl Tool for WatchJob {
 
         Ok(format!(
             "Pemantauan #{} terdaftar untuk '{}' (metode: {}, interval {} dtk, batas {} jam). \
-             Gateway akan melapor otomatis saat tahap berubah, selesai, atau gagal (tanpa biaya token). \
+             Progres/selesai/gagal akan dilaporkan otomatis oleh gateway maupun saat sesi CLI/TUI berikutnya dibuka (tanpa biaya token). \
              Kelola via `/watch list` atau `/watch cancel {}`.",
             rec.id,
             rec.label,

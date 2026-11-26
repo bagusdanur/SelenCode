@@ -354,7 +354,6 @@ pub fn default_registry_with_shell(shell_cfg: &ShellCfg) -> Registry {
         .register(Arc::new(skill::SkillCreate))
         .register(Arc::new(skill::SkillEdit))
         .register(Arc::new(skill::ManageSkill))
-        .register(Arc::new(memory::ManageMemory))
         .register(Arc::new(memory::UserMemoryTool))
         .register(Arc::new(task::ManageTask))
         .register(Arc::new(verify::VerifyProject::new(shell_cfg.timeout_secs)))

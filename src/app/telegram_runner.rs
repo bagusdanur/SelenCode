@@ -144,21 +144,9 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     if !selencode::watch::is_watch_due(&w, now_utc) {
                         continue;
                     }
-                    let poll_out = selencode::watch::poll_watch_once(&w, &sandbox).await;
-                    let poll_res = match &poll_out {
-                        Ok(s) => Ok(s.as_str()),
-                        Err(e) => Err(e.to_string()),
-                    };
-                    let tr = selencode::watch::evaluate_watch_poll(
-                        &w,
-                        match &poll_res {
-                            Ok(s) => Ok(*s),
-                            Err(e) => Err(e.as_str()),
-                        },
-                        chrono::Utc::now(),
-                    );
-                    let checked_at = chrono::Utc::now()
-                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    let (tr, checked_at) =
+                        selencode::watch::evaluate_and_poll_watch(&w, &sandbox, chrono::Utc::now())
+                            .await;
                     let target_chat = if w.chat_id != 0 {
                         w.chat_id
                     } else {
@@ -173,20 +161,12 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                                 .is_ok();
                         }
                     }
-                    let final_rep = if tr.terminal {
-                        tr.notification.as_deref()
-                    } else {
-                        None
-                    };
-                    let _ = watch_store.update_job_watch_poll(
+                    let _ = selencode::watch::persist_watch_transition(
+                        &watch_store,
                         w.id,
-                        &tr.new_status,
-                        &tr.new_stage,
-                        &tr.new_progress,
-                        tr.new_consecutive_errors,
+                        &tr,
                         &checked_at,
-                        final_rep,
-                        tr.terminal && sent_ok,
+                        sent_ok,
                     );
                 }
             }

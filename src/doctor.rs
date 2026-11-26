@@ -146,15 +146,19 @@ pub fn run_doctor(
         },
     });
 
-    // 3. SQLite Store (sesi & memori)
+    // 3. SQLite Store & Memori Persisten (v0.5.9: satu sumber kebenaran di user_memory)
     let cwd_str = cwd.to_string_lossy().to_string();
     let sess_cnt = store.list_sessions(&cwd_str, 50).map(|v| v.len()).unwrap_or(0);
-    let mem_cnt = store.list_memories(&cwd_str, 100).map(|v| v.len()).unwrap_or(0);
+    let umem = crate::user_memory::load_frozen_snapshot(
+        cfg.memory.max_memory_chars,
+        cfg.memory.max_profile_chars,
+    );
+    let mem_cnt = umem.memory_entries.len() + umem.profile_entries.len();
     checks.push(DoctorCheck {
         name: "SQLite Store".into(),
         status: CheckStatus::Ok,
         detail: format!(
-            "{} sesi folder ini · {} memori ({})",
+            "{} sesi folder ini · {} memori persisten ({})",
             sess_cnt,
             mem_cnt,
             crate::store::db_path().display()

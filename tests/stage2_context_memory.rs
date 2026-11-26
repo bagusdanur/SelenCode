@@ -209,8 +209,11 @@ async fn retrieve_context_tool_is_read_only_and_works() {
     assert!(out.contains("parser.rs"));
     assert!(out.contains("parse_invoice_xml"));
 
-    // manage_memory hanya ada di default_registry, BUKAN di read_only_registry!
-    assert!(default_registry().get("manage_memory").is_some());
+    // v0.5.9 Perbaikan 3: hanya SATU tool memori lintas-sesi aktif (`memory`);
+    // `manage_memory` lama dipensiunkan dari registry aktif, dan keduanya tidak ada di read_only_registry!
+    assert!(default_registry().get("memory").is_some());
+    assert!(default_registry().get("manage_memory").is_none());
+    assert!(ro.get("memory").is_none());
     assert!(ro.get("manage_memory").is_none());
 
     std::fs::remove_dir_all(&cwd).ok();
@@ -273,30 +276,44 @@ async fn structured_project_memory_crud_grouping_migration_and_secret_guard() {
     assert!(sec.contains("Perintah Build, Test, & Lint (commands)"));
     assert!(sec.contains("[project] Backend Rust modular di src/"));
 
-    // Uji tool `manage_memory` end-to-end.
+    // Uji tool `memory` (store persisten tunggal v0.5.9) end-to-end dengan SELENCODE_DATA_DIR terisolasi.
+    let mem_data_dir = std::env::temp_dir().join(format!(
+        "selencode-stage2-umem-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&mem_data_dir).unwrap();
+    let prev_data_dir = std::env::var_os("SELENCODE_DATA_DIR");
+    std::env::set_var("SELENCODE_DATA_DIR", &mem_data_dir);
+
     let reg = default_registry();
-    let mem_tool = reg.get("manage_memory").unwrap();
+    let mem_tool = reg.get("memory").expect("tool memory wajib aktif");
     let ctx = Ctx::new(PathBuf::from("/proj/x"), true).with_store(store.clone(), "sess-1".into());
 
     let saved = mem_tool
         .run(
-            json!({"action": "save", "category": "issues", "content": "Hindari pipe literal di COMMANDS.args"}),
+            json!({"action": "add", "target": "memory", "content": "Hindari pipe literal di COMMANDS.args"}),
             &ctx,
         )
         .await
         .unwrap();
-    assert!(saved.contains("issues"));
+    assert!(saved.contains("Tersimpan di wadah 'memory'"));
 
     let rejected = mem_tool
         .run(
-            json!({"action": "save", "category": "general", "content": "ghp_1234567890abcdefghijklmnop"}),
+            json!({"action": "add", "target": "memory", "content": "ghp_1234567890abcdefghijklmnop"}),
             &ctx,
         )
         .await;
     assert!(rejected.is_err());
 
-    let listed = mem_tool.run(json!({"action": "list"}), &ctx).await.unwrap();
+    let listed = mem_tool.run(json!({"action": "view"}), &ctx).await.unwrap();
     assert!(listed.contains("Hindari pipe literal"));
+
+    match prev_data_dir {
+        Some(v) => std::env::set_var("SELENCODE_DATA_DIR", v),
+        None => std::env::remove_var("SELENCODE_DATA_DIR"),
+    }
+    std::fs::remove_dir_all(&mem_data_dir).ok();
 
     assert!(store.remove_memory(id_arch).unwrap());
     std::fs::remove_file(&db).ok();

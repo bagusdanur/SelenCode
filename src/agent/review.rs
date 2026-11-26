@@ -489,12 +489,24 @@ pub fn build_pruned_review_prompt(
     }
 
     let cwd_str = cwd.to_string_lossy().to_string();
-    let memories = store.list_memories(&cwd_str, 30).unwrap_or_default();
+    let mem_dir = crate::user_memory::user_memory_dir();
+    let persistent_mems = crate::user_memory::load_entries_from(
+        &mem_dir,
+        crate::user_memory::MemoryStoreKind::Memory,
+    );
+    let legacy_mems = store.list_memories(&cwd_str, 30).unwrap_or_default();
     let mut mem_section = String::new();
-    if memories.is_empty() {
+    if persistent_mems.is_empty() && legacy_mems.is_empty() {
         mem_section.push_str("(belum ada catatan memory)");
     } else {
-        for m in &memories {
+        for (idx, content) in persistent_mems.iter().enumerate() {
+            let line = redact_secrets(&format!("- #{} [memory] {}\n", idx + 1, content));
+            if mem_section.chars().count() + line.chars().count() > mem_budget {
+                break;
+            }
+            mem_section.push_str(&line);
+        }
+        for m in &legacy_mems {
             let scope = if m.scope == "global" {
                 "global"
             } else {
@@ -954,8 +966,8 @@ pub async fn run_background_review(
                 }
             }
             ReviewAction::AddMemory {
-                category,
-                scope,
+                category: _,
+                scope: _,
                 content,
                 reason,
             } => {
@@ -963,30 +975,28 @@ pub async fn run_background_review(
                 if safe_content.is_empty() || safe_content.chars().count() > 320 {
                     continue;
                 }
-                let existing = store.list_memories(&cwd_str, 50).unwrap_or_default();
+                // Perbaikan 3 (v0.5.9): SATU sumber kebenaran — tulis HANYA ke wadah memori persisten `memory.md`
+                // (menghormati pagu karakter keras; tidak lagi menulis ganda ke tabel SQLite lama).
+                let mem_dir = crate::user_memory::user_memory_dir();
+                let existing = crate::user_memory::load_entries_from(
+                    &mem_dir,
+                    crate::user_memory::MemoryStoreKind::Memory,
+                );
                 if existing
                     .iter()
-                    .any(|m| m.content.eq_ignore_ascii_case(&safe_content))
+                    .any(|m| m.eq_ignore_ascii_case(&safe_content))
                 {
                     continue;
                 }
-                let scope_key = if scope.eq_ignore_ascii_case("global") {
-                    "global"
-                } else {
-                    cwd_str.as_str()
-                };
-                // Perbaikan 5 (v0.5.7): tulis juga ke wadah memori persisten `memory.md`
-                // (satu sumber kebenaran dengan tool `memory` & snapshot beku sesi).
-                let _ = crate::user_memory::add_entry_in(
-                    &crate::user_memory::user_memory_dir(),
+                if let Ok((idx, _)) = crate::user_memory::add_entry_in(
+                    &mem_dir,
                     crate::user_memory::MemoryStoreKind::Memory,
                     &safe_content,
                     cfg.memory.max_memory_chars,
-                );
-                if let Ok(mid) = store.add_memory_categorized(scope_key, &category, &safe_content) {
+                ) {
                     applied.push(AppliedReviewChange {
                         kind: "add_memory".to_string(),
-                        target: format!("#{mid}"),
+                        target: format!("M#{idx}"),
                         reason: short_reason(&reason, &safe_content),
                         diff: None,
                     });

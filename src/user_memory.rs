@@ -289,3 +289,87 @@ fn find_entry_index(entries: &[String], selector: &str) -> Option<usize> {
         .iter()
         .position(|e| e.to_ascii_lowercase().contains(&low))
 }
+
+/// Laporan hasil migrasi satu kali dari tabel SQLite lama (`memories` / `manage_memory`)
+/// ke store persisten tunggal (`memory.md`, Perbaikan 3 v0.5.9).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacyMemoryMigrationReport {
+    pub migrated: usize,
+    pub skipped_duplicates: usize,
+    pub skipped_secrets: usize,
+    pub overflow_remaining: usize,
+    pub warning: Option<String>,
+}
+
+/// Pindahkan seluruh entri lama di tabel SQLite `memories` ke berkas persisten `dir/memory.md`.
+/// - Menghormati pagu keras `max_memory_chars` (default 2.200 char): jika gabungannya meluber,
+///   entri berlebih TIDAK dipotong diam-diam melainkan ditahan utuh dengan peringatan minta rangkum.
+/// - Menolak & membersihkan entri lama yang mengandung kredensial/rahasia.
+/// - Idempoten: entri yang sudah berhasil dipindahkan atau sudah ada di `memory.md` dihapus dari tabel lama.
+pub fn migrate_legacy_sqlite_memories_in(
+    store: &crate::store::Store,
+    dir: &Path,
+    max_memory_chars: usize,
+) -> Result<LegacyMemoryMigrationReport> {
+    let legacy_rows = store.list_all_legacy_memories()?;
+    if legacy_rows.is_empty() {
+        return Ok(LegacyMemoryMigrationReport::default());
+    }
+    let limit = max_memory_chars.max(200);
+    let mut report = LegacyMemoryMigrationReport::default();
+    let mut entries = load_entries_from(dir, MemoryStoreKind::Memory);
+    let mut changed_file = false;
+    let mut migrated_ids: Vec<i64> = Vec::new();
+
+    for row in legacy_rows {
+        let clean: String = row.content.split_whitespace().collect::<Vec<_>>().join(" ");
+        if clean.is_empty() {
+            migrated_ids.push(row.id);
+            continue;
+        }
+        if contains_secret_like(&clean) {
+            report.skipped_secrets += 1;
+            migrated_ids.push(row.id);
+            continue;
+        }
+        if entries.iter().any(|e| e.eq_ignore_ascii_case(&clean)) {
+            report.skipped_duplicates += 1;
+            migrated_ids.push(row.id);
+            continue;
+        }
+        let mut candidate = entries.clone();
+        candidate.push(clean.clone());
+        let next_chars = entry_char_count(&candidate);
+        if next_chars > limit {
+            // Hormati pagu: JANGAN potong diam-diam; tahan di tabel lama agar tidak ada data hilang.
+            report.overflow_remaining += 1;
+            continue;
+        }
+        entries = candidate;
+        changed_file = true;
+        report.migrated += 1;
+        migrated_ids.push(row.id);
+    }
+
+    if changed_file {
+        save_entries_to(dir, MemoryStoreKind::Memory, &entries, limit)?;
+    }
+    for id in migrated_ids {
+        let _ = store.remove_memory(id);
+    }
+    if report.overflow_remaining > 0 {
+        report.warning = Some(format!(
+            "Migrasi memori lama: {} entri dipindahkan ke memory.md; {} entri tertahan karena pagu {limit} karakter penuh — rangkum atau hapus catatan lama lewat `/memory` terlebih dahulu (tidak dipotong diam-diam).",
+            report.migrated, report.overflow_remaining
+        ));
+    }
+    Ok(report)
+}
+
+/// Versi default `migrate_legacy_sqlite_memories_in` yang memakai `user_memory_dir()`.
+pub fn migrate_legacy_sqlite_memories(
+    store: &crate::store::Store,
+    max_memory_chars: usize,
+) -> Result<LegacyMemoryMigrationReport> {
+    migrate_legacy_sqlite_memories_in(store, &user_memory_dir(), max_memory_chars)
+}

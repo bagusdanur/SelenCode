@@ -1174,6 +1174,32 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Ambil seluruh entri memori lama di tabel SQLite `memories` (lintas seluruh scope, urutan kronologis)
+    /// untuk migrasi satu kali ke store memori persisten v0.5.7/v0.5.9 (`memory.md`).
+    pub fn list_all_legacy_memories(&self) -> Result<Vec<MemoryItem>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, scope, category, content, ts, updated_at FROM memories ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let ts: String = row.get(4)?;
+            let upd: String = row.get::<_, String>(5).unwrap_or_default();
+            Ok(MemoryItem {
+                id: row.get(0)?,
+                scope: row.get(1)?,
+                category: row.get::<_, String>(2).unwrap_or_else(|_| "general".to_string()),
+                content: row.get(3)?,
+                created_at: ts.clone(),
+                updated_at: if upd.is_empty() { ts } else { upd },
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     // ---------- Background Self-Improvement Review: Staging & Cooldown (v0.5.1) ----------
 
     pub fn create_review_proposal(
@@ -2098,6 +2124,42 @@ impl Store {
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
+        }
+        for (id, _, _) in &out {
+            let _ = conn.execute(
+                "UPDATE job_watches SET delivered = 1 WHERE id = ?1",
+                rusqlite::params![id],
+            );
+        }
+        Ok(out)
+    }
+
+    /// Ambil laporan watch terminal tertunda khusus untuk folder kerja `normalized_cwd` (v0.5.9 Perbaikan 2),
+    /// lalu tandai `delivered = 1` agar tidak pernah dilaporkan dua kali (baik oleh CLI maupun gateway).
+    pub fn take_undelivered_watch_reports_for_cwd(
+        &self,
+        normalized_cwd: &str,
+    ) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, label, cwd, final_report FROM job_watches \
+             WHERE status IN ('done', 'failed', 'expired') AND delivered = 0 AND final_report != '' \
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, label, row_cwd, rep) = r?;
+            if crate::watch::normalize_watch_cwd(&row_cwd) == normalized_cwd {
+                out.push((id, label, rep));
+            }
         }
         for (id, _, _) in &out {
             let _ = conn.execute(

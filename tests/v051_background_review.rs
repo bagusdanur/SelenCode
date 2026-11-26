@@ -154,6 +154,8 @@ fn aux_model_resolution_and_trivial_control_eligibility() {
 #[tokio::test]
 async fn scenario1_correction_patches_skill_records_separate_usage_and_enforces_cooldown() {
     let dir = temp_dir("sc1");
+    let prev_data_dir = std::env::var_os("SELENCODE_DATA_DIR");
+    std::env::set_var("SELENCODE_DATA_DIR", &dir);
     let skill_md = write_sample_skill(&dir);
     let store = Store::open_at(&dir.join("selen.db")).unwrap();
     let cwd_str = dir.to_string_lossy().to_string();
@@ -230,10 +232,15 @@ async fn scenario1_correction_patches_skill_records_separate_usage_and_enforces_
     assert!(diff.contains("-2. Simpan hasil unduhan ke folder `/tmp/raws`."));
     assert!(diff.contains("+2. Simpan hasil unduhan ke folder kanonik `~/data/raws`."));
 
-    // Memory baru tersimpan!
-    let mems = store.list_memories(&cwd_str, 10).unwrap();
-    assert_eq!(mems.len(), 1);
-    assert!(mems[0].content.contains("~/data/raws"));
+    // Memory baru tersimpan ke store persisten tunggal (`memory.md`, v0.5.9) — bukan tabel SQLite lama!
+    let mem_dir = dir.join("selencode").join("memory");
+    let umems = selencode::user_memory::load_entries_from(
+        &mem_dir,
+        selencode::user_memory::MemoryStoreKind::Memory,
+    );
+    assert_eq!(umems.len(), 1);
+    assert!(umems[0].contains("~/data/raws"));
+    assert!(store.list_memories(&cwd_str, 10).unwrap().is_empty());
 
     // Laporan tepat satu baris bergaya Hermes/SelenCode!
     let report = outcome.report_message.as_deref().unwrap();
@@ -258,6 +265,10 @@ async fn scenario1_correction_patches_skill_records_separate_usage_and_enforces_
     assert!(second.is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
+    match prev_data_dir {
+        Some(v) => std::env::set_var("SELENCODE_DATA_DIR", v),
+        None => std::env::remove_var("SELENCODE_DATA_DIR"),
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

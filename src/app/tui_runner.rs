@@ -702,6 +702,9 @@ async fn tui_worker(
                 }
             },
             TuiCommand::Shutdown => {
+                // Perbaikan 2 (v0.5.9): majukan status pantauan aktif di folder ini saat sesi TUI ditutup bersih
+                // (biarkan laporan terminal `delivered=false` bila baru selesai pas penutupan agar muncul di sesi berikut).
+                let _ = s.poll_cli_watches_on_close(false).await;
                 // Jalankan review latar akhir sesi bila substantif (disimpan agar tampil di sesi berikutnya).
                 if let Some(job) = s.prepare_bg_review_job(true) {
                     let _ = tokio::time::timeout(Duration::from_secs(10), job.run(false)).await;
@@ -762,6 +765,10 @@ pub(crate) async fn interactive_tui(
     app.plan_next = cli.plan;
     if let Some(note) = &s.resumed_note {
         app.info(note.clone());
+    }
+    // Perbaikan 2 (v0.5.9): jalankan 1 putaran polling pantauan aktif di folder ini + tampilkan bila berubah/selesai.
+    for rep in s.poll_cli_watches_on_open().await {
+        app.info(rep);
     }
     if let Ok(pending_reports) = s.store.take_undelivered_review_reports(&cwd_str) {
         for rep in pending_reports {
