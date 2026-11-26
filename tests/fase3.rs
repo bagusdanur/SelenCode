@@ -429,6 +429,7 @@ fn config_save_load_and_direct_api_key_fallback() {
         memory: Default::default(),
         context: Default::default(),
         display: Default::default(),
+        timeouts: Default::default(),
     };
     save_to(&cfg, &path).unwrap();
     let loaded = load_from(&path).unwrap();
