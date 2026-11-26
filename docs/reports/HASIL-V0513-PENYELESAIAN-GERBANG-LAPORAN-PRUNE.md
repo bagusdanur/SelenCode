@@ -48,7 +48,68 @@
      3. `c_edit` → `edit_file` (`const total = 35000 - 10;` → `const total = 35000 * 0.9;`)
    - **Hasil berkas `hitung_total.js`:** `const total = 35000 * 0.9;` (`31500`) — **LULUS** (identik dengan v0.5.11).
 
-*(Catatan: transkrip uji LIVE pada biner rilis `selen-windows-x64.exe` `v0.5.13` ditambahkan setelah biner rilis diterbitkan.)*
+*(Catatan: di bawah ini adalah transkrip uji LIVE pada biner rilis publik `selen-windows-x64.exe` `v0.5.13`.)*
+
+#### B. Uji LIVE Biner Rilis `selen-windows-x64.exe` `v0.5.13` (Skenario B: `hitung_total.js`, `35000` diskon `10%` → `31500`)
+
+1. **Giliran LIVE 1 — Berlarangan eksplisit (`ws_optout`):**
+   - **Prompt:** `"Di hitung_total.js ada bug diskon 10% dari 35000, seharusnya 31500 tapi sekarang 34990. Jangan muat skill apa pun, langsung saja perbaiki."`
+   - **Transkrip terlihat (stderr + stdout):**
+     ```text
+     [gerbang-skill] dilewati: instruksi pengguna
+     [tool] read_file — hitung_total.js
+     [tool] edit_file — hitung_total.js
+     [auto-approve] edit_file hitung_total.js
+     [tool] run_shell — node hitung_total.js
+     [auto-approve] run_shell: node hitung_total.js
+     Sudah diperbaiki di `hitung_total.js`:
+     - Mengubah `harga - diskonPersen` menjadi `harga - (harga * diskonPersen) / 100`.
+     - Verifikasi `node hitung_total.js` menghasilkan `31500`.
+     [selen] ✦ Self-correction (1/1): memeriksa verifikasi & daftar periksa penutup…
+     [tool] activate_toolset — verify
+     [tool] verify_project — check
+     [selen] ✦ Checkpoint #1 tersimpan (1 file diubah · /rollback 1 untuk batalkan)
+     ```
+   - **Urutan tool dari tabel `messages` SQLite DB (`selen.db`, 14 pesan):**
+     1. `call_8715772963657930673` → `read_file` (`{"path": "hitung_total.js"}`)
+     2. `call_17117582652934725564` → `edit_file` (`harga - diskonPersen` → `harga - (harga * diskonPersen) / 100`)
+     3. `call_3235319566621313535` → `run_shell` (`{"command": "node hitung_total.js"}`)
+     4. `call_4934494165580949777` → `activate_toolset` (`{"toolsets": ["verify"]}`)
+     5. `call_9016353662989641754` → `verify_project` (`{"changed_files": ["hitung_total.js"], "scope": "check"}`)
+   - **Catatan `[gerbang-skill]` di tabel `messages` DB:** `["[gerbang-skill] dilewati: instruksi pengguna"]`
+   - **Jumlah `skill_view` / `gate_skill_*` di DB:** **`0`**
+   - **Hasil eksekusi `node hitung_total.js`:** **`31500`**
+   - **Pemakaian token (`usage` DB):** `39.863` input / `875` output (`7` panggilan) — **LULUS**.
+
+2. **Giliran LIVE 2 — Tanpa larangan (`ws_control`, kontrol v0.5.11):**
+   - **Prompt:** `"Di hitung_total.js ada bug diskon 10% dari 35000, seharusnya 31500 tapi sekarang 34990. Perbaiki."`
+   - **Transkrip terlihat (stderr + stdout):**
+     ```text
+     [tool] read_file — hitung_total.js
+     [tool] skill_view — systematic-debugging
+     [tool] edit_file — hitung_total.js
+     [auto-approve] edit_file hitung_total.js
+     [tool] run_shell — node hitung_total.js
+     [auto-approve] run_shell: node hitung_total.js
+     Bug di `hitung_total.js` sudah diperbaiki.
+     - Penyebab: Baris 2 sebelumnya langsung mengurangi `harga - diskonPersen` (`35000 - 10 = 34990`), bukan nilai potongan persennya.
+     - Perbaikan: Diubah menjadi `return harga - (harga * diskonPersen) / 100;`.
+     - Verifikasi: `node hitung_total.js` sekarang menghasilkan `31500`.
+     [selen] ✦ Self-correction (1/1): memeriksa verifikasi & daftar periksa penutup…
+     [tool] activate_toolset — verify
+     [tool] verify_project — targeted
+     [selen] ✦ Checkpoint #1 tersimpan (1 file diubah · /rollback 1 untuk batalkan)
+     ```
+   - **Urutan tool dari tabel `messages` SQLite DB (`selen.db`, 16 pesan):**
+     1. `call_1816110522731405865` → `read_file` (`{"path": "hitung_total.js"}`)
+     2. `gate_skill_step0` → `skill_view` (`{"name": "systematic-debugging"}`)
+     3. `call_16729684823629682962` → `edit_file` (`harga - diskonPersen` → `harga - (harga * diskonPersen) / 100`)
+     4. `call_11650079967939355265` → `run_shell` (`{"command": "node hitung_total.js"}`)
+     5. `call_4963753746405966060` → `activate_toolset` (`{"toolsets": ["verify"]}`)
+     6. `call_7000855085265600366` → `verify_project` (`{"changed_files": ["hitung_total.js"], "scope": "targeted"}`)
+   - **Catatan `[gerbang-skill]` di DB:** `[]` (tidak ditekan; gerbang menembak `gate_skill_step0` persis v0.5.11)
+   - **Hasil eksekusi `node hitung_total.js`:** **`31500`**
+   - **Pemakaian token (`usage` DB):** `43.377` input / `2.309` output (`7` panggilan) — **LULUS**.
 
 ---
 
@@ -110,8 +171,8 @@
 
 | Metrik | Nilai v0.5.13 | Status |
 | --- | --- | --- |
-| Skenario B opt-out (`hitung_total.js`) | 31500 (0 suntikan `skill_view`, 1 catatan `[gerbang-skill] dilewati`) | LULUS |
-| Skenario B kontrol tanpa larangan | 31500 (1 `gate_skill_step0` sebelum `edit_file`) | LULUS |
+| Skenario B opt-out (`hitung_total.js`, LIVE) | 31500 (0 `skill_view` di DB, 1 `[gerbang-skill] dilewati`, 39.863 in / 875 out) | LULUS |
+| Skenario B kontrol tanpa larangan (LIVE) | 31500 (1 `gate_skill_step0` sebelum `edit_file`, 43.377 in / 2.309 out) | LULUS |
 | Kontrak prune `skill_view(full=true)` | 1 panggilan penuh (>10.000 char) → panggilan ke-2 stub (<1.000 char) + arsip byte-exact | LULUS |
 | Pemeriksa laporan mesin (contoh buatan) | 2 ditolak (hilang `Butir 2`, sel kosong) + 1 lolos (lengkap) | LULUS |
 | Proyek A (`usage` penuh) | Tidak diukur | Uji terarah |
@@ -130,3 +191,15 @@
 - Perilaku gerbang skill di luar jalur opt-out Perbaikan 1 (jaminan termuat sebelum aksi pengubah pertama, pengecualian tugas trivial, dan biaya terukur v0.5.11).
 - Mesin prune/stub + arsip (`src/agent/context.rs`) di luar penambahan tes regresi kontrak Perbaikan 3.
 - Seluruh hasil v0.5.7–v0.5.11: timeout & watchdog gateway + batas memori, `watch_job` + status segar, polling watch CLI, store memory tunggal, jalur resume ramping (`6.013`), salinan kerja `skill_view`, peringatan config + `selen doctor`, pembatalan provider ~1×, `send_file`, `delegate_work`, `/usage`, `skills install`, fallback rute berbeda, `ask_user`, `cron`, `session_search`, pelacakan approval, serta 12 skill bawaan + `NOTICE`.
+
+---
+
+## Bukti CI & Rilis Publik `v0.5.13`
+
+- **CI GitHub Actions (Linux + Windows x64):** Run `#45876560857` pada commit `3051d8c` — **LULUS** (Linux & Windows x64 `success`, termasuk seluruh tes `v0513_skill_optout_report_gate_prune`).
+- **Release Workflow & Gerbang Laporan Rilis Baru:** Run `#45877614345` pada tag `v0.5.13` — **LULUS** (`scripts/check_release_report.py --tag v0.5.13` lolos di langkah gerbang rilis; 5/5 job `success`: `Unit & Integration Tests`, `Termux (aarch64-linux-android)`, `Linux x64`, `Windows x64`, `GitHub Release`).
+- **Halaman Rilis Publik:** https://github.com/bagusdanur/SelenCode/releases/tag/v0.5.13 (`draft = false`, 3 aset lengkap):
+  - `selen-linux-x64` (`16.878.288` byte)
+  - `selen-termux-arm64` (`15.196.176` byte)
+  - `selen-windows-x64.exe` (`15.570.432` byte)
+  - Verifikasi biner: `selen --version` → `selen 0.5.13`.
