@@ -372,7 +372,7 @@ impl Provider for AnthropicProvider {
             let rem_total = req_deadline.saturating_duration_since(Instant::now());
             if rem_total.is_zero() {
                 return Err(anyhow!(
-                    "timeout total panggilan Anthropic ({} detik) — panggilan dibatalkan",
+                    "timeout total panggilan Anthropic ({} detik) — koneksi dihentikan",
                     self.timeouts.total.as_secs()
                 ));
             }
@@ -383,12 +383,12 @@ impl Provider for AnthropicProvider {
                 .map_err(|_| {
                     if hit_total {
                         anyhow!(
-                            "timeout total panggilan Anthropic ({} detik) — panggilan dibatalkan",
+                            "timeout total panggilan Anthropic ({} detik) — koneksi dihentikan",
                             self.timeouts.total.as_secs()
                         )
                     } else {
                         anyhow!(
-                            "timeout ketidakaktifan stream Anthropic (tidak ada data selama {} detik) — panggilan dibatalkan",
+                            "timeout ketidakaktifan stream Anthropic (tidak ada data selama {} detik) — koneksi dihentikan",
                             self.timeouts.stream_idle.as_secs()
                         )
                     }
