@@ -332,8 +332,11 @@ impl Provider for AnthropicProvider {
         let mut body = build_request(msgs, tools, &self.model, self.max_output_tokens);
         apply_prompt_caching(&mut body);
         let url = format!("{}/v1/messages", self.base_url);
-        let req_deadline = Instant::now() + self.timeouts.total;
-        let resp_wait = self.timeouts.response.min(self.timeouts.total);
+        let est_tokens = crate::agent::context::estimate_tokens(msgs);
+        let eff_idle = self.timeouts.effective_stream_idle(est_tokens);
+        let eff_total = self.timeouts.effective_total(est_tokens);
+        let req_deadline = Instant::now() + eff_total;
+        let resp_wait = self.timeouts.response.min(eff_total);
         let resp = tokio::time::timeout(
             resp_wait,
             self.client
@@ -373,23 +376,23 @@ impl Provider for AnthropicProvider {
             if rem_total.is_zero() {
                 return Err(anyhow!(
                     "timeout total panggilan Anthropic ({} detik) — koneksi dihentikan",
-                    self.timeouts.total.as_secs()
+                    eff_total.as_secs()
                 ));
             }
-            let wait_for = self.timeouts.stream_idle.min(rem_total);
-            let hit_total = rem_total <= self.timeouts.stream_idle;
+            let wait_for = eff_idle.min(rem_total);
+            let hit_total = rem_total <= eff_idle;
             let next_chunk = tokio::time::timeout(wait_for, stream.next())
                 .await
                 .map_err(|_| {
                     if hit_total {
                         anyhow!(
                             "timeout total panggilan Anthropic ({} detik) — koneksi dihentikan",
-                            self.timeouts.total.as_secs()
+                            eff_total.as_secs()
                         )
                     } else {
                         anyhow!(
                             "timeout ketidakaktifan stream Anthropic (tidak ada data selama {} detik) — koneksi dihentikan",
-                            self.timeouts.stream_idle.as_secs()
+                            eff_idle.as_secs()
                         )
                     }
                 })?;

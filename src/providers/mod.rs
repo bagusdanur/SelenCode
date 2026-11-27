@@ -34,6 +34,43 @@ impl Default for ProviderTimeouts {
     }
 }
 
+impl ProviderTimeouts {
+    /// Skalasi batas diam streaming berbasis estimasi ukuran konteks permintaan
+    /// (diporting dari Hermes Agent `agent/chat_completion_helpers.py`:
+    /// `_scale_stale_timeout_for_context` & `_stream_env_stale_base`).
+    ///
+    /// - Konteks besar (>16k / >50k / >100k token) membuat model/proxy (mis. 9Router)
+    ///   berpikir lebih lama sebelum potongan token pertama atau antar-potongan keluar;
+    ///   menaikkan kesabaran ke 180s / 240s / 300s mencegah stream sehat dipotong prematur.
+    /// - Nilai uji pendek (`stream_idle < 30s`) TIDAK dinaikkan agar tes timeout tetap cepat.
+    pub fn effective_stream_idle(&self, est_context_tokens: usize) -> Duration {
+        let base_secs = self.stream_idle.as_secs();
+        if base_secs < 30 {
+            return self.stream_idle;
+        }
+        let scaled_secs = if est_context_tokens > 100_000 {
+            base_secs.max(300)
+        } else if est_context_tokens > 50_000 {
+            base_secs.max(240)
+        } else if est_context_tokens > 16_000 {
+            base_secs.max(180)
+        } else {
+            base_secs
+        };
+        Duration::from_secs(scaled_secs)
+    }
+
+    /// Pastikan tenggat total operasional memberi ruang cukup bagi `effective_stream_idle`
+    /// yang sudah diskalakan pada konteks besar, tanpa mengubah tenggat uji pendek (`total < 60s`).
+    pub fn effective_total(&self, est_context_tokens: usize) -> Duration {
+        let idle = self.effective_stream_idle(est_context_tokens);
+        if self.total.as_secs() < 60 {
+            return self.total;
+        }
+        self.total.max(idle + Duration::from_secs(60))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {

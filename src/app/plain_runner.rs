@@ -108,6 +108,9 @@ pub(crate) async fn interactive_plain(
     if let Some(note) = &s.resumed_note {
         println!("{note}");
     }
+    for notice in &s.cfg.startup_notices {
+        println!("[selen] {notice}");
+    }
     println!(
         "{}",
         selencode::tui::moonlit::plain_banner(&s.provider_name, &s.pcfg.model)

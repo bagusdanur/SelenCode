@@ -173,6 +173,14 @@ impl ToolDedupCache {
             true
         });
     }
+
+    /// Bersihkan cache deduplikasi bacaan berkas sesudah proactive prune / compaction
+    /// (diporting dari Hermes Agent `agent/turn_preflight.py`: `_reset_read_dedup_caches`).
+    /// Tanpa reset ini, berkas yang isinya sudah di-prune menjadi stub 1 baris akan dijawab
+    /// `"tidak berubah — gunakan isi sebelumnya"` bila model mencoba membacanya kembali!
+    pub fn clear_file_reads(&mut self) {
+        self.records.retain(|_, rec| rec.tool_name != "read_file");
+    }
 }
 
 /// Hasil evaluasi `LoopGuard` setelah satu pemanggilan tool selesai.

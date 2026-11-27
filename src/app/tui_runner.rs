@@ -766,6 +766,9 @@ pub(crate) async fn interactive_tui(
     if let Some(note) = &s.resumed_note {
         app.info(note.clone());
     }
+    for notice in &s.cfg.startup_notices {
+        app.info(notice.clone());
+    }
     // Perbaikan 2 (v0.5.9): jalankan 1 putaran polling pantauan aktif di folder ini + tampilkan bila berubah/selesai.
     for rep in s.poll_cli_watches_on_open().await {
         app.info(rep);

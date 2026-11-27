@@ -10,9 +10,9 @@ use super::context::{
     analyze_token_breakdown, auto_outline, build_folder_map, build_resume_snapshot,
     build_resume_system_prompt, build_system_prompt, cap_dynamic_injection,
     compact_messages_hermes, estimate_tokens, expand_at_mentions, head_tail_truncate,
-    needs_compaction, prune_old_skill_results_with_archive,
-    prune_old_tool_results_with_archive, session_archive_dir, spillover_if_needed,
-    spillover_with_preview,
+    needs_compaction, proactive_prune_context_with_archive,
+    prune_old_skill_results_with_archive, prune_old_tool_results_with_archive, session_archive_dir,
+    spillover_if_needed, spillover_with_preview,
 };
 use crate::tool_display::{
     build_template_closing_summary_with_status, format_tool_event_from_preview,
@@ -715,6 +715,143 @@ pub fn prompt_requests_file_change(prompt: &str) -> bool {
     false
 }
 
+/// Batas rentetan stream macet beruntun lintas langkah sebelum circuit breaker berhenti bersih
+/// (diporting dari Hermes Agent `agent/chat_completion_helpers.py`: `_consecutive_stale_streams` / `stale_giveup`).
+pub const STALE_STREAM_GIVEUP_LIMIT: usize = 3;
+
+/// Klasifikasi kegagalan panggilan API dalam giliran aktif untuk menentukan jalur pemulihan
+/// (diporting dari Hermes Agent `agent/error_classifier.py`: `FailoverReason` & `classify_api_error`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnApiErrorKind {
+    /// Stream berhenti mengalir / terputus di tengah / timeout jaringan — layak dipulihkan dengan
+    /// prune ringan + retry + circuit breaker rentetan macet.
+    StreamStaleOrDrop,
+    /// HTTP 429 rate-limit atau 5xx / server overload sementara — retry dengan jittered backoff.
+    TransientServerOrRateLimit,
+    /// HTTP 413 / konteks melebihi batas provider — kompresi darurat lalu retry di giliran yang sama.
+    ContextOverflow,
+    /// Error deterministik (400 format, 401/403 auth, 404 model mati, batal user, lokal) — hentikan segera.
+    NonRetryable,
+}
+
+/// Klasifikasi deterministik pesan error panggilan model pada giliran berjalan.
+pub fn classify_turn_api_error(err_msg: &str) -> TurnApiErrorKind {
+    let low = err_msg.to_ascii_lowercase();
+    if [
+        "ditolak user",
+        "dibatalkan",
+        "cancelled",
+        "canceled",
+        "belum dikonfigurasi",
+        "batas biaya routing",
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "404",
+        "model_not_found",
+        "model not found",
+        "insufficient_quota",
+        "billing",
+    ]
+    .iter()
+    .any(|kw| low.contains(kw))
+    {
+        return TurnApiErrorKind::NonRetryable;
+    }
+    if [
+        "413",
+        "payload too large",
+        "request entity too large",
+        "request_too_large",
+        "request exceeds the maximum size",
+        "context_length_exceeded",
+        "context length exceeded",
+        "maximum context length",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+    ]
+    .iter()
+    .any(|kw| low.contains(kw))
+    {
+        return TurnApiErrorKind::ContextOverflow;
+    }
+    if [
+        "ketidakaktifan",
+        "tidak ada data selama",
+        "stream provider macet",
+        "stream anthropic macet",
+        "stream gemini macet",
+        "stream terputus",
+        "stream provider terputus",
+        "stream anthropic terputus",
+        "stream gemini terputus",
+        "unexpected eof",
+        "connection reset",
+        "broken pipe",
+        "timeout total panggilan",
+        "menunggu respons awal",
+        "tidak merespons",
+        "timeout",
+        "timed out",
+    ]
+    .iter()
+    .any(|kw| low.contains(kw))
+    {
+        return TurnApiErrorKind::StreamStaleOrDrop;
+    }
+    if [
+        "429",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "500",
+        "502",
+        "503",
+        "504",
+        "overloaded",
+        "temporarily unavailable",
+        "bad gateway",
+        "service unavailable",
+        "connection refused",
+        "error sending request",
+    ]
+    .iter()
+    .any(|kw| low.contains(kw))
+    {
+        return TurnApiErrorKind::TransientServerOrRateLimit;
+    }
+    TurnApiErrorKind::NonRetryable
+}
+
+/// Hitung jeda exponential backoff + uniform jitter `[0, delay/2]` dalam milidetik
+/// (diporting dari Hermes Agent `agent/retry_utils.py`: `jittered_backoff`).
+/// `attempt` bersifat 1-based (`1, 2, 3, ...`).
+pub fn jittered_backoff_ms(attempt: usize, base_ms: u64, max_ms: u64) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if base_ms == 0 || max_ms == 0 {
+        return 0;
+    }
+    static JITTER_TICK: AtomicU64 = AtomicU64::new(0);
+    let tick = JITTER_TICK.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let shift = attempt.saturating_sub(1).min(16) as u32;
+    let delay = base_ms.saturating_mul(1u64 << shift).min(max_ms);
+    let half = delay / 2;
+    if half == 0 {
+        return delay;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let seed = (nanos ^ tick.wrapping_mul(0x9E37_79B9)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let jitter = seed % (half + 1);
+    delay.saturating_add(jitter)
+}
+
 /// Loop (Blueprint Bagian 2): provider → tool_call? → jalankan → ToolResult →
 /// ulangi, sampai tidak ada tool_call atau max_steps tercapai.
 /// Error tool menjadi ToolResult is_error=true — tidak pernah crash.
@@ -993,10 +1130,17 @@ async fn run_turn_inner(
         .unwrap_or_else(|| "ephemeral".to_string());
     let prune_dir = session_archive_dir("pruned", &sid_for_archive);
     let mut turn_tool_chars_used = 0usize;
-    let scaled_turn_budget = (ctx.tool_budget.turn_budget_chars as u128
-        * (ctx.context_limit_tokens.max(20_000) as u128)
-        / 100_000)
-        .clamp(24_000, 180_000) as usize;
+    // v0.5.17 Masalah 2: JANGAN menggelembungkan pagu output tool per giliran hingga 180.000 char
+    // hanya karena model di atas kertas berjendela 1M (mis. Gemini di 9Router). Skala hanya turun
+    // untuk model kecil (<100k), dan patok batas atas pada `turn_budget_chars` (bawaan 60.000 char).
+    let scaled_turn_budget = if ctx.context_limit_tokens < 100_000 {
+        ((ctx.tool_budget.turn_budget_chars as u128)
+            * (ctx.context_limit_tokens.max(20_000) as u128)
+            / 100_000)
+            .clamp(20_000, ctx.tool_budget.turn_budget_chars.max(20_000) as u128) as usize
+    } else {
+        ctx.tool_budget.turn_budget_chars.clamp(24_000, 60_000)
+    };
     let mut last_step_deduped = 0usize;
     let mut last_announced_fallback_model: Option<String> = None;
     let mut unconfirmed_search_calls: usize = 0;
@@ -1006,6 +1150,13 @@ async fn run_turn_inner(
     let mut loaded_skills_in_turn: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut skill_gate_fired = false;
+    // v0.5.17 Masalah 1 (Hermes `agent/chat_completion_helpers.py`): pelacak rentetan stream macet
+    // lintas langkah — direset ke 0 setiap kali panggilan model berhasil.
+    let mut consecutive_stale_streams: usize = 0;
+    // v0.5.17 Masalah 2 (Hermes `agent/usage_anchor.py`): jangkar token aktual terakhir dari provider
+    // agar pemangkasan proaktif menyala berdasarkan ukuran riil, bukan hanya perkiraan kasar.
+    let mut last_provider_prompt_tokens: usize = 0;
+    let mut last_est_tokens_at_call: usize = 0;
     // Perbaikan 1 (v0.5.14 + v0.5.15): kesadaran anggaran langkah.
     // `max_steps == 0` berarti TANPA BATAS ala Hermes (tidak ada pagu tersembunyi);
     // `max_steps > 0` berlaku sebagai pagu keras dengan checkpoint rasio + konvergensi tepat spesifikasi.
@@ -1040,8 +1191,66 @@ async fn run_turn_inner(
         // pangkas hasil tool besar (>200 char) di luar 2 pesan terakhir ke stub arsip agar tidak menempel
         // antar-panggilan; sesi biasa mempertahankan jendela 20 pesan terakhir.
         let tool_keep_tail = if lean_resume && step >= 2 { 2 } else { 20 };
-        let pruned_now =
+        let mut pruned_now =
             pruned_skills + prune_old_tool_results_with_archive(messages, &prune_dir, tool_keep_tail);
+        if pruned_now > 0 {
+            dedup.clear_file_reads();
+        }
+        // v0.5.17 Masalah 2 (diporting dari Hermes `agent/turn_preflight.py` + `agent/context_compressor_prune.py`):
+        // Pemangkasan proaktif 3-pass (dedup hasil tool identik + arsip ToolResult lama + ringkas argumen
+        // ToolUse raksasa seperti `write_file` 16KB) berdasarkan tekanan token riil, TANPA menunggu
+        // `messages.len() > 20` atau 80% jendela 1M!
+        if ctx.tool_budget.proactive_prune_tokens > 0 {
+            let est_pre = analyze_token_breakdown(messages, &tools, registry.names().len()).total_tokens();
+            let anchored_tokens = if last_provider_prompt_tokens > 0 {
+                est_pre.max(
+                    last_provider_prompt_tokens
+                        .saturating_add(est_pre.saturating_sub(last_est_tokens_at_call)),
+                )
+            } else {
+                est_pre
+            };
+            let proactive_trigger = ctx
+                .tool_budget
+                .proactive_prune_tokens
+                .min((ctx.context_limit_tokens * 45 / 100).max(4_000));
+            if anchored_tokens >= proactive_trigger {
+                let mut pres = proactive_prune_context_with_archive(
+                    messages,
+                    &prune_dir,
+                    anchored_tokens,
+                    proactive_trigger,
+                    ctx.tool_budget.proactive_prune_min_reclaim_tokens,
+                    4,
+                    false,
+                );
+                if pres.pruned_count == 0 && anchored_tokens >= proactive_trigger.saturating_mul(3) / 2 {
+                    pres = proactive_prune_context_with_archive(
+                        messages,
+                        &prune_dir,
+                        anchored_tokens,
+                        proactive_trigger,
+                        ctx.tool_budget.proactive_prune_min_reclaim_tokens,
+                        2,
+                        false,
+                    );
+                }
+                if pres.pruned_count > 0 {
+                    pruned_now += pres.pruned_count;
+                    dedup.clear_file_reads();
+                    let note = format!(
+                        "✦ Prune proaktif konteks: {} item diringkas (~{} token dibebaskan, arsip tersimpan)",
+                        pres.pruned_count, pres.reclaimed_tokens
+                    );
+                    match &ui {
+                        Some(tx) => {
+                            let _ = tx.send(UiEvent::Info(note)).await;
+                        }
+                        None => eprintln!("[selen] {note}"),
+                    }
+                }
+            }
+        }
         // Kompresi dua tahap: hanya ringkas jika MASIH > 50% sesudah Tahap 1 prune!
         if needs_compaction(messages, ctx.context_limit_tokens) {
             match &ui {
@@ -1053,44 +1262,7 @@ async fn run_turn_inner(
                 None => eprintln!("[selen] compaction dua tahap dijalankan"),
             }
             *messages = compact_messages_hermes(messages);
-        }
-        // Perbaikan 1 (v0.5.7 & v0.5.11): untuk sesi RESUME, bangun snapshot ramping (system prompt
-        // resume padat tanpa folder_map/katalog skill penuh + ringkas riwayat pra-resume) tanpa mengubah DB!
-        let mut snapshot = if lean_resume {
-            let fresh_sys = build_fresh_system_prompt(&tools, &active_toolsets, false, true);
-            build_resume_snapshot(messages, Some(&fresh_sys))
-        } else {
-            messages.clone()
-        };
-        // PLAN_NOTE hanya disisipkan sementara pada snapshot giliran Plan (tidak
-        // disimpan ke riwayat/DB) agar giliran Execute berikutnya tidak ikut
-        // terlarang menulis.
-        if mode == TurnMode::Plan {
-            let pos = if snapshot.first().map(|m| m.role == Role::System).unwrap_or(false) {
-                1
-            } else {
-                0
-            };
-            snapshot.insert(pos, Message::text(Role::System, PLAN_NOTE));
-        }
-        // Tahap 0 — Instrumentasi rincian estimasi token per komponen dari snapshot AKTUAL yang dikirim!
-        let breakdown = analyze_token_breakdown(&snapshot, &tools, registry.names().len());
-        if let Some(tx) = &ui {
-            let est = breakdown.total_tokens();
-            let pct = calc_context_pct(est, ctx.context_limit_tokens);
-            let _ = tx
-                .send(UiEvent::ContextInfo {
-                    used_tokens: est,
-                    limit_tokens: ctx.context_limit_tokens,
-                })
-                .await;
-            let _ = tx
-                .send(UiEvent::Step {
-                    current: step + 1,
-                    max: max_steps,
-                    context_pct: pct,
-                })
-                .await;
+            dedup.clear_file_reads();
         }
         // Provider dipindah ke task agar StreamEvent bisa dikonsumsi sambil jalan.
         // Bungkus dalam `AbortOnDrop` (v0.5.10 Perbaikan 1) agar saat giliran dibatalkan
@@ -1104,35 +1276,210 @@ async fn run_turn_inner(
                 }
             }
         }
-        let (tx, mut rx) = mpsc::channel::<StreamEvent>(128);
-        let p = provider.clone();
-        let tools_c = tools.clone();
-        let mut handle_guard = AbortOnDrop(Some(tokio::spawn(async move {
-            p.stream_chat(&snapshot, &tools_c, tx).await
-        })));
-        let mut printed = false;
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                StreamEvent::Token(t) => match &ui {
-                    Some(utx) => {
-                        let _ = utx.send(UiEvent::Token(t)).await;
-                    }
-                    None => {
-                        print!("{t}");
-                        let _ = std::io::stdout().flush();
-                        printed = true;
-                    }
-                },
+        // v0.5.17 Masalah 1 (diporting dari Hermes `agent/turn_api_error.py`, `agent/retry_utils.py`,
+        // `agent/chat_completion_helpers.py`): loop pemulihan panggilan API di dalam giliran agar
+        // stream macet (>90s/180s), koneksi putus tengah jalan, 429/5xx sementara, atau 413 overflow
+        // TIDAK langsung membunuh giliran kerja pengguna!
+        let mut api_retry_count: usize = 0;
+        let mut overflow_compactions: usize = 0;
+        let (reply, breakdown) = loop {
+            // Perbaikan 1 (v0.5.7 & v0.5.11): untuk sesi RESUME, bangun snapshot ramping (system prompt
+            // resume padat tanpa folder_map/katalog skill penuh + ringkas riwayat pra-resume) tanpa mengubah DB!
+            let mut snapshot = if lean_resume {
+                let fresh_sys = build_fresh_system_prompt(&tools, &active_toolsets, false, true);
+                build_resume_snapshot(messages, Some(&fresh_sys))
+            } else {
+                messages.clone()
+            };
+            // PLAN_NOTE hanya disisipkan sementara pada snapshot giliran Plan (tidak
+            // disimpan ke riwayat/DB) agar giliran Execute berikutnya tidak ikut
+            // terlarang menulis.
+            if mode == TurnMode::Plan {
+                let pos = if snapshot.first().map(|m| m.role == Role::System).unwrap_or(false) {
+                    1
+                } else {
+                    0
+                };
+                snapshot.insert(pos, Message::text(Role::System, PLAN_NOTE));
             }
-        }
-        let reply = handle_guard
-            .0
-            .take()
-            .expect("handle provider tersedia")
-            .await
-            .map_err(|e| anyhow::anyhow!("task provider panik: {e}"))??;
-        if printed {
-            println!();
+            // Tahap 0 — Instrumentasi rincian estimasi token per komponen dari snapshot AKTUAL yang dikirim!
+            let breakdown = analyze_token_breakdown(&snapshot, &tools, registry.names().len());
+            if api_retry_count == 0 && overflow_compactions == 0 {
+                if let Some(tx) = &ui {
+                    let est = breakdown.total_tokens();
+                    let pct = calc_context_pct(est, ctx.context_limit_tokens);
+                    let _ = tx
+                        .send(UiEvent::ContextInfo {
+                            used_tokens: est,
+                            limit_tokens: ctx.context_limit_tokens,
+                        })
+                        .await;
+                    let _ = tx
+                        .send(UiEvent::Step {
+                            current: step + 1,
+                            max: max_steps,
+                            context_pct: pct,
+                        })
+                        .await;
+                }
+            }
+            let (tx, mut rx) = mpsc::channel::<StreamEvent>(128);
+            let p = provider.clone();
+            let tools_c = tools.clone();
+            let mut handle_guard = AbortOnDrop(Some(tokio::spawn(async move {
+                p.stream_chat(&snapshot, &tools_c, tx).await
+            })));
+            let mut printed = false;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    StreamEvent::Token(t) => match &ui {
+                        Some(utx) => {
+                            let _ = utx.send(UiEvent::Token(t)).await;
+                        }
+                        None => {
+                            print!("{t}");
+                            let _ = std::io::stdout().flush();
+                            printed = true;
+                        }
+                    },
+                }
+            }
+            let call_res = handle_guard
+                .0
+                .take()
+                .expect("handle provider tersedia")
+                .await
+                .map_err(|e| anyhow::anyhow!("task provider panik: {e}"))
+                .and_then(|r| r);
+            if printed {
+                println!();
+            }
+            match call_res {
+                Ok(r) => {
+                    consecutive_stale_streams = 0;
+                    break (r, breakdown);
+                }
+                Err(err) => {
+                    let err_str = err.to_string();
+                    match classify_turn_api_error(&err_str) {
+                        TurnApiErrorKind::NonRetryable => return Err(err),
+                        TurnApiErrorKind::ContextOverflow => {
+                            if overflow_compactions >= 2 {
+                                return Err(err);
+                            }
+                            overflow_compactions += 1;
+                            let em = proactive_prune_context_with_archive(
+                                messages,
+                                &prune_dir,
+                                usize::MAX,
+                                1,
+                                0,
+                                2,
+                                true,
+                            );
+                            pruned_now += em.pruned_count;
+                            if em.pruned_count == 0 {
+                                *messages = compact_messages_hermes(messages);
+                            }
+                            dedup.clear_file_reads();
+                            let note = format!(
+                                "✦ Konteks melebihi batas provider — meringkas {} item & mencoba ulang otomatis ({overflow_compactions}/2)…",
+                                em.pruned_count
+                            );
+                            match &ui {
+                                Some(tx) => {
+                                    let _ = tx.send(UiEvent::Info(note)).await;
+                                }
+                                None => eprintln!("[selen] {note}"),
+                            }
+                            continue;
+                        }
+                        TurnApiErrorKind::StreamStaleOrDrop => {
+                            consecutive_stale_streams += 1;
+                            if consecutive_stale_streams >= STALE_STREAM_GIVEUP_LIMIT {
+                                return Err(anyhow::anyhow!(
+                                    "Provider tidak merespons / stream macet {consecutive_stale_streams}x beruntun — panggilan dihentikan agar tidak macet tanpa akhir (penyebab terakhir: {err_str})"
+                                ));
+                            }
+                            if api_retry_count >= ctx.api_max_retries {
+                                return Err(err);
+                            }
+                            api_retry_count += 1;
+                            // Diet darurat sebelum retry agar payload ulang lebih ringan bagi proxy/9Router!
+                            let em = proactive_prune_context_with_archive(
+                                messages,
+                                &prune_dir,
+                                breakdown.total_tokens(),
+                                1,
+                                0,
+                                2,
+                                true,
+                            );
+                            if em.pruned_count > 0 {
+                                pruned_now += em.pruned_count;
+                                dedup.clear_file_reads();
+                            }
+                            let delay_ms = jittered_backoff_ms(
+                                api_retry_count,
+                                ctx.api_retry_base_delay_ms,
+                                30_000,
+                            );
+                            let prune_suffix = if em.pruned_count > 0 {
+                                format!(", {} item konteks diringkas", em.pruned_count)
+                            } else {
+                                String::new()
+                            };
+                            let note = format!(
+                                "✦ Stream provider macet/terputus — mencoba ulang otomatis ({api_retry_count}/{}{prune_suffix}) dalam {:.1} dtk…",
+                                ctx.api_max_retries,
+                                delay_ms as f64 / 1000.0
+                            );
+                            match &ui {
+                                Some(tx) => {
+                                    let _ = tx.send(UiEvent::Info(note)).await;
+                                }
+                                None => eprintln!("[selen] {note}"),
+                            }
+                            if delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            }
+                            continue;
+                        }
+                        TurnApiErrorKind::TransientServerOrRateLimit => {
+                            if api_retry_count >= ctx.api_max_retries {
+                                return Err(err);
+                            }
+                            api_retry_count += 1;
+                            let delay_ms = jittered_backoff_ms(
+                                api_retry_count,
+                                ctx.api_retry_base_delay_ms,
+                                30_000,
+                            );
+                            let note = format!(
+                                "✦ Provider sibuk/sementara gagal — mencoba ulang otomatis ({api_retry_count}/{}) dalam {:.1} dtk…",
+                                ctx.api_max_retries,
+                                delay_ms as f64 / 1000.0
+                            );
+                            match &ui {
+                                Some(tx) => {
+                                    let _ = tx.send(UiEvent::Info(note)).await;
+                                }
+                                None => eprintln!("[selen] {note}"),
+                            }
+                            if delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
+        if let Some(u) = reply.usage {
+            if u.input_tokens > 0 {
+                last_provider_prompt_tokens = u.input_tokens as usize;
+                last_est_tokens_at_call = breakdown.total_tokens();
+            }
         }
         // BAGIAN 1 (#4 & #5): catat model aktual yang melayani panggilan & beri tahu user 1x per perpindahan fallback.
         let (served_model_opt, was_fallback, fallback_notice) = ctx

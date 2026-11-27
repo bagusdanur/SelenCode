@@ -172,6 +172,43 @@ pub fn run_doctor(
         },
     });
 
+    // 2c. Pagu langkah efektif & sumbernya (v0.5.17 Masalah 3: warisan `max_steps = 25` dibebaskan otomatis)
+    let (steps_status, steps_detail) = match &cfg.max_steps_source {
+        crate::config::MaxStepsSource::DefaultUnbounded => {
+            if cfg.agent.max_steps == 0 {
+                (
+                    CheckStatus::Ok,
+                    "tanpa batas (max_steps = 0) · sumber: bawaan tanpa batas".to_string(),
+                )
+            } else {
+                (
+                    CheckStatus::Ok,
+                    format!(
+                        "{} langkah (pagu keras) · sumber: konfigurasi runtime",
+                        cfg.agent.max_steps
+                    ),
+                )
+            }
+        }
+        crate::config::MaxStepsSource::Legacy25Liberated { config_path } => (
+            CheckStatus::Ok,
+            format!(
+                "tanpa batas (efektif: 0) · sumber: warisan max_steps = {} dari {} dibebaskan otomatis",
+                crate::config::LEGACY_DEFAULT_MAX_STEPS,
+                config_path
+            ),
+        ),
+        crate::config::MaxStepsSource::ExplicitConfig { value, config_path } => (
+            CheckStatus::Ok,
+            format!("{value} langkah (pagu keras) · sumber: eksplisit di {config_path}"),
+        ),
+    };
+    checks.push(DoctorCheck {
+        name: "Batas Langkah".into(),
+        status: steps_status,
+        detail: steps_detail,
+    });
+
     // 3. SQLite Store & Memori Persisten (v0.5.9: satu sumber kebenaran di user_memory)
     let cwd_str = cwd.to_string_lossy().to_string();
     let sess_cnt = store.list_sessions(&cwd_str, 50).map(|v| v.len()).unwrap_or(0);

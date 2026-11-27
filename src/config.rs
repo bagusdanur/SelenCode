@@ -3,6 +3,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Nilai pagu langkah bawaan era lama (pra-v0.5.15) yang otomatis dibebaskan oleh sistem (v0.5.17).
+pub const LEGACY_DEFAULT_MAX_STEPS: usize = 25;
+
+/// Asal usul nilai efektif `[agent] max_steps` untuk pelaporan transparan di startup & `selen doctor`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum MaxStepsSource {
+    /// Tidak diatur di config atau bernilai `0` — bawaan tanpa batas ala Hermes (sejak v0.5.15).
+    #[default]
+    DefaultUnbounded,
+    /// Config lama memuat `max_steps = 25` (pagu warisan pra-v0.5.15) yang dibebaskan otomatis menjadi `0`.
+    Legacy25Liberated { config_path: String },
+    /// Pagu keras yang dipilih secara eksplisit oleh pengguna di config (nilai > 0 selain 25).
+    ExplicitConfig { value: usize, config_path: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub default_provider: String,
@@ -59,6 +74,12 @@ pub struct Config {
     /// Konfigurasi tenggat waktu panggilan provider (`[timeouts]`, v0.5.10 Perbaikan 1).
     #[serde(default, skip_serializing_if = "ProviderTimeoutsCfg::is_default")]
     pub timeouts: ProviderTimeoutsCfg,
+    /// Sumber nilai efektif `agent.max_steps` (tidak diserialisasi ke TOML, v0.5.17).
+    #[serde(skip)]
+    pub max_steps_source: MaxStepsSource,
+    /// Pemberitahuan startup penting dari loader config (mis. pembebasan pagu warisan `max_steps = 25`).
+    #[serde(skip)]
+    pub startup_notices: Vec<String>,
 }
 
 /// Konfigurasi tenggat waktu panggilan HTTP/streaming ke provider (`[timeouts]`, v0.5.10 Perbaikan 1).
@@ -444,6 +465,21 @@ pub struct ToolBudgetCfg {
     /// Batas maksimum estimasi token injeksi dinamis awal sesi (default 1.500).
     #[serde(default = "default_dynamic_inject_max_tokens")]
     pub dynamic_inject_max_tokens: usize,
+    /// Batas karakter praktis per panggilan `read_file` sebelum dipotong di akhir baris utuh + petunjuk `start`/`end`
+    /// (diporting dari Hermes `tools/file_tools.py`, default 16.000 char; 0 = batas 100KB penuh).
+    #[serde(default = "default_file_read_max_chars")]
+    pub file_read_max_chars: usize,
+    /// Batas baris bawaan `read_file` saat model tidak menentukan `start`/`end` (default 250 baris; 0 = 2000).
+    #[serde(default = "default_file_read_default_lines")]
+    pub file_read_default_lines: usize,
+    /// Ambang token pemicu pemangkasan proaktif hasil tool/argumen lama tanpa menunggu 80% jendela 1M
+    /// (diporting dari Hermes `agent/context_compressor.py`, default 18.000 token; 0 = matikan).
+    #[serde(default = "default_proactive_prune_tokens")]
+    pub proactive_prune_tokens: usize,
+    /// Penghematan token minimum agar proactive prune di-commit (mencegah pemecahan prompt cache untuk
+    /// penghematan kecil — diporting dari Hermes `proactive_prune_min_reclaim_tokens`, default 2.000 token).
+    #[serde(default = "default_proactive_prune_min_reclaim_tokens")]
+    pub proactive_prune_min_reclaim_tokens: usize,
 }
 
 fn default_shell_cap_chars() -> usize {
@@ -458,6 +494,18 @@ fn default_turn_budget_chars() -> usize {
 fn default_dynamic_inject_max_tokens() -> usize {
     1_500
 }
+fn default_file_read_max_chars() -> usize {
+    crate::tools::file::DEFAULT_FILE_READ_MAX_CHARS
+}
+fn default_file_read_default_lines() -> usize {
+    crate::tools::file::DEFAULT_FILE_READ_LINES
+}
+fn default_proactive_prune_tokens() -> usize {
+    18_000
+}
+fn default_proactive_prune_min_reclaim_tokens() -> usize {
+    2_000
+}
 
 impl Default for ToolBudgetCfg {
     fn default() -> Self {
@@ -466,6 +514,10 @@ impl Default for ToolBudgetCfg {
             spillover_chars: default_spillover_chars(),
             turn_budget_chars: default_turn_budget_chars(),
             dynamic_inject_max_tokens: default_dynamic_inject_max_tokens(),
+            file_read_max_chars: default_file_read_max_chars(),
+            file_read_default_lines: default_file_read_default_lines(),
+            proactive_prune_tokens: default_proactive_prune_tokens(),
+            proactive_prune_min_reclaim_tokens: default_proactive_prune_min_reclaim_tokens(),
         }
     }
 }
@@ -1116,6 +1168,10 @@ pub fn validate_toml_keys(val: &toml::Value) -> Vec<ConfigWarning> {
                 "spillover_chars",
                 "turn_budget_chars",
                 "dynamic_inject_max_tokens",
+                "file_read_max_chars",
+                "file_read_default_lines",
+                "proactive_prune_tokens",
+                "proactive_prune_min_reclaim_tokens",
             ],
         ),
         ("skills", &["index_max_tokens", "auto_load"]),
@@ -1212,6 +1268,80 @@ pub fn collect_active_config_warnings() -> Vec<(PathBuf, ConfigWarning)> {
     out
 }
 
+/// Ambil nilai eksplisit `[agent] max_steps` dari pohon TOML mentah bila memang tertulis di berkas.
+fn extract_explicit_max_steps(val: &toml::Value) -> Option<usize> {
+    val.as_table()?
+        .get("agent")?
+        .as_table()?
+        .get("max_steps")?
+        .as_integer()
+        .filter(|&n| n >= 0)
+        .map(|n| n as usize)
+}
+
+/// Cetak pemberitahuan pembebasan pagu warisan `max_steps = 25` ke stderr tepat 1x per path per proses.
+fn emit_legacy_max_steps_notice_once(path_label: &str, notice: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut guard) = seen.lock() {
+        if guard.insert(path_label.to_string()) {
+            eprintln!("[selen] {notice}");
+        }
+    }
+}
+
+/// Terapkan kebijakan `max_steps` v0.5.17 (Masalah 3):
+/// - Tidak diset atau `0` -> bawaan tanpa batas (`DefaultUnbounded`).
+/// - Nilai warisan `25` dari config pra-v0.5.15 -> dibebaskan otomatis menjadi tanpa batas (`0`)
+///   dengan pemberitahuan terlihat + dicatat sumbernya (`Legacy25Liberated`).
+/// - Nilai pagu lain (`> 0` selain `25`, mis. `15`, `30`, `40`, `50`) -> dihormati apa adanya
+///   sebagai pilihan eksplisit pengguna (`ExplicitConfig`).
+fn apply_max_steps_policy(
+    cfg: &mut Config,
+    explicit: Option<(usize, String)>,
+    emit_stderr: bool,
+) {
+    match explicit {
+        None | Some((0, _)) => {
+            cfg.agent.max_steps = 0;
+            cfg.max_steps_source = MaxStepsSource::DefaultUnbounded;
+        }
+        Some((LEGACY_DEFAULT_MAX_STEPS, config_path)) => {
+            cfg.agent.max_steps = 0;
+            cfg.max_steps_source = MaxStepsSource::Legacy25Liberated {
+                config_path: config_path.clone(),
+            };
+            let notice = format!(
+                "Pagu langkah warisan max_steps = {LEGACY_DEFAULT_MAX_STEPS} di {config_path} dibebaskan otomatis menjadi tanpa batas (0). \
+                 Set angka lain di [agent] max_steps (mis. 20, 30, atau 40) jika memang menginginkan pagu keras."
+            );
+            cfg.startup_notices.push(notice.clone());
+            if emit_stderr {
+                emit_legacy_max_steps_notice_once(&config_path, &notice);
+            }
+        }
+        Some((value, config_path)) => {
+            cfg.agent.max_steps = value;
+            cfg.max_steps_source = MaxStepsSource::ExplicitConfig { value, config_path };
+        }
+    }
+}
+
+/// Parse string TOML config sekaligus menerapkan kebijakan pembebasan `max_steps = 25` warisan
+/// (dipakai oleh loader & unit test agar dapat diuji deterministik tanpa menyentuh file global).
+pub fn parse_config_str_with_policy(text: &str, source_label: &str) -> Result<Config> {
+    let val: toml::Value =
+        toml::from_str(text).with_context(|| format!("config {source_label} tidak valid"))?;
+    let explicit_steps = extract_explicit_max_steps(&val).map(|v| (v, source_label.to_string()));
+    let mut cfg: Config = val
+        .try_into()
+        .with_context(|| format!("config {source_label} tidak valid"))?;
+    apply_max_steps_policy(&mut cfg, explicit_steps, false);
+    Ok(cfg)
+}
+
 fn load_merged_config() -> Result<Option<Config>> {
     let local_p = local_config_path();
     let global_p = global_config_path();
@@ -1234,14 +1364,20 @@ fn load_merged_config() -> Result<Option<Config>> {
                 .with_context(|| format!("config {} tidak valid", local_p.display()))?;
             emit_config_warnings_once(&gp.display().to_string(), &validate_toml_keys(&g_val));
             emit_config_warnings_once(&local_p.display().to_string(), &validate_toml_keys(&l_val));
+            let explicit_steps = extract_explicit_max_steps(&l_val)
+                .map(|v| (v, local_p.display().to_string()))
+                .or_else(|| {
+                    extract_explicit_max_steps(&g_val).map(|v| (v, gp.display().to_string()))
+                });
             let merged = merge_toml_values(g_val, l_val);
-            let cfg: Config = merged.try_into().with_context(|| {
+            let mut cfg: Config = merged.try_into().with_context(|| {
                 format!(
                     "gagal menggabungkan config {} + {}",
                     gp.display(),
                     local_p.display()
                 )
             })?;
+            apply_max_steps_policy(&mut cfg, explicit_steps, true);
             Ok(Some(cfg))
         }
         (true, false) => Ok(Some(load_from(&global_p.unwrap())?)),
@@ -1280,10 +1416,13 @@ pub fn load_from(path: &std::path::Path) -> Result<Config> {
         .with_context(|| format!("gagal membaca config {}", path.display()))?;
     let val: toml::Value =
         toml::from_str(&text).with_context(|| format!("config {} tidak valid", path.display()))?;
-    emit_config_warnings_once(&path.display().to_string(), &validate_toml_keys(&val));
-    let cfg: Config = val
+    let path_label = path.display().to_string();
+    emit_config_warnings_once(&path_label, &validate_toml_keys(&val));
+    let explicit_steps = extract_explicit_max_steps(&val).map(|v| (v, path_label));
+    let mut cfg: Config = val
         .try_into()
         .with_context(|| format!("config {} tidak valid", path.display()))?;
+    apply_max_steps_policy(&mut cfg, explicit_steps, true);
     Ok(cfg)
 }
 
@@ -1383,6 +1522,8 @@ impl Config {
             context: ContextCfg::default(),
             display: DisplayCfg::default(),
             timeouts: ProviderTimeoutsCfg::default(),
+            max_steps_source: MaxStepsSource::DefaultUnbounded,
+            startup_notices: Vec::new(),
         }
     }
 

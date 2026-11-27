@@ -1089,6 +1089,248 @@ pub fn prune_old_tool_results_with_archive(
     pruned
 }
 
+/// Ringkasan hasil pemangkasan proaktif deterministik (tanpa LLM) ala Hermes Agent
+/// (`agent/context_compressor_prune.py` + `agent/context_compressor.py`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProactivePruneResult {
+    /// Total blok yang diringkas / dideduplikasi pada putaran ini.
+    pub pruned_count: usize,
+    /// Estimasi token yang berhasil dibebaskan.
+    pub reclaimed_tokens: usize,
+    /// Pass 1: hasil tool duplikat identik lama yang diganti back-reference tanpa hilang data.
+    pub deduped_tool_results: usize,
+    /// Pass 2: hasil tool besar di luar ekor terlindungi yang diarsipkan & diringkas jadi stub.
+    pub pruned_tool_results: usize,
+    /// Pass 3: argumen `ToolUse` raksasa (mis. `write_file.content` 16KB) di luar ekor terlindungi yang diringkas.
+    pub pruned_tool_args: usize,
+}
+
+/// Pemangkasan proaktif konteks 3-pass deterministik TANPA LLM dengan gerbang `min_reclaim_tokens`
+/// dan arsip byte-exact (diporting dari Hermes Agent `agent/context_compressor_prune.py`:
+/// `ProactivePruneMixin.prune_tool_results_only` & `agent/context_compressor.py`: `_prune_old_tool_results`).
+///
+/// - Hanya aktif bila `force_emergency` bernilai `true` ATAU `current_tokens >= trigger_tokens`.
+/// - Ekor terlindungi (`keep_tail_msgs`) dimundurkan bila jatuh di tengah pesan `Role::Tool`
+///   agar satu kelompok hasil tool paralel tidak pernah terbelah.
+/// - Pass 1 (lossless dedup): simpan salinan penuh di pesan tool TERBARU, ganti salinan lama identik.
+/// - Pass 2 (`ToolResult` > 600 char di luar ekor): arsipkan penuh ke `archive_dir`, ganti stub 1 baris.
+/// - Pass 3 (argumen `ToolUse` raksasa di luar ekor, mis. `write_file.content` > 2.000 char):
+///   arsipkan JSON argumen penuh ke `archive_dir`, ganti nilai string raksasa jadi stub JSON sah.
+/// - Gerbang minimum reclaim: bila `!force_emergency` dan penghematan `< min_reclaim_tokens`,
+///   TIDAK menulis arsip dan membiarkan `messages` 100% utuh (menghindari pemecahan prompt cache).
+pub fn proactive_prune_context_with_archive(
+    messages: &mut [Message],
+    archive_dir: &Path,
+    current_tokens: usize,
+    trigger_tokens: usize,
+    min_reclaim_tokens: usize,
+    keep_tail_msgs: usize,
+    force_emergency: bool,
+) -> ProactivePruneResult {
+    const MIN_DEDUP_CHARS: usize = 400;
+    const MIN_RESULT_PRUNE_CHARS: usize = 600;
+    const MIN_EMERGENCY_RESULT_PRUNE_CHARS: usize = 200;
+    const MIN_ARG_STRING_PRUNE_CHARS: usize = 2_000;
+    const PREVIEW_CHARS: usize = 120;
+
+    if messages.is_empty() {
+        return ProactivePruneResult::default();
+    }
+    if !force_emergency && (trigger_tokens == 0 || current_tokens < trigger_tokens) {
+        return ProactivePruneResult::default();
+    }
+
+    // Selaraskan batas ekor mundur agar tidak membelah pesan Tool paralel (Hermes `_align_boundary_backward`).
+    let mut boundary = messages.len().saturating_sub(keep_tail_msgs);
+    while boundary > 0 && messages[boundary].role == Role::Tool {
+        boundary -= 1;
+    }
+
+    let before_tokens = estimate_tokens(messages);
+    let mut cand = messages.to_vec();
+    let mut planned_archives: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut deduped = 0usize;
+    let mut pruned_results = 0usize;
+    let mut pruned_args = 0usize;
+
+    // Pass 1: Deduplikasi byte-identik hasil tool (simpan yang paling baru, ringkas yang lama — lossless).
+    let mut seen_bodies: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for i in (0..cand.len()).rev() {
+        if cand[i].role != Role::Tool {
+            continue;
+        }
+        let ids_tools: Vec<(usize, String, bool)> = cand[i]
+            .content
+            .iter()
+            .enumerate()
+            .filter_map(|(bi, b)| match b {
+                Block::ToolResult { id, content, is_error } => {
+                    let eligible = !*is_error
+                        && content.chars().count() > MIN_DEDUP_CHARS
+                        && !content.starts_with("[Hasil ")
+                        && !content.contains("diringkas — arsip:")
+                        && !content.contains("isi penuh terarsip:");
+                    eligible.then(|| (bi, id.clone(), true))
+                }
+                _ => None,
+            })
+            .collect();
+        for (bi, call_id, _) in ids_tools {
+            let tname = resolve_tool_name_for_id(&cand, i, &call_id);
+            if let Some(Block::ToolResult { content, .. }) = cand[i].content.get_mut(bi) {
+                if !seen_bodies.insert(content.clone()) {
+                    let orig_chars = content.chars().count();
+                    *content = format!(
+                        "[Hasil {tname} duplikat identik ({orig_chars} char) — salinan penuh tersedia di pesan lebih baru]"
+                    );
+                    deduped += 1;
+                }
+            }
+        }
+    }
+
+    // Pass 2: Ringkas `ToolResult` besar di luar ekor terlindungi dengan arsip byte-exact.
+    let min_res_chars = if force_emergency {
+        MIN_EMERGENCY_RESULT_PRUNE_CHARS
+    } else {
+        MIN_RESULT_PRUNE_CHARS
+    };
+    let mut res_targets: Vec<(usize, usize, String, String)> = Vec::new();
+    for i in 0..boundary {
+        if cand[i].role != Role::Tool {
+            continue;
+        }
+        for (bi, b) in cand[i].content.iter().enumerate() {
+            if let Block::ToolResult { id, content, .. } = b {
+                if content.chars().count() > min_res_chars
+                    && !content.starts_with("[Hasil ")
+                    && !content.contains("diringkas — arsip:")
+                    && !content.contains("isi penuh terarsip:")
+                {
+                    let tname = resolve_tool_name_for_id(&cand, i, id);
+                    res_targets.push((i, bi, id.clone(), tname));
+                }
+            }
+        }
+    }
+    for (msg_idx, block_idx, call_id, tool_name) in res_targets {
+        if let Some(Block::ToolResult { content, .. }) = cand[msg_idx].content.get_mut(block_idx) {
+            let safe_id: String = call_id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .take(32)
+                .collect();
+            let fname = format!(
+                "{:04}_p_{}_{}.txt",
+                msg_idx,
+                tool_name.replace('/', "_"),
+                if safe_id.is_empty() { "res".to_string() } else { safe_id }
+            );
+            let archive_path = archive_dir.join(fname);
+            let orig = content.clone();
+            let orig_chars = orig.chars().count();
+            let first_line: String = orig
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(PREVIEW_CHARS)
+                .collect();
+            planned_archives.push((archive_path.clone(), orig));
+            *content = format!(
+                "[Hasil {tool_name} diringkas ({orig_chars} char) — arsip: {}] {first_line}",
+                archive_path.display()
+            );
+            pruned_results += 1;
+        }
+    }
+
+    // Pass 3: Ringkas argumen `ToolUse` raksasa di luar ekor terlindungi (mis. `write_file.content` 16KB
+    // atau `edit_file.old/new` jumbo) agar payload penulisan berkas penuh tidak terus dikirim ulang.
+    for msg_idx in 0..boundary {
+        if cand[msg_idx].role != Role::Assistant {
+            continue;
+        }
+        for (bi, b) in cand[msg_idx].content.iter_mut().enumerate() {
+            if let Block::ToolUse { id, name, args } = b {
+                let Some(obj) = args.as_object_mut() else {
+                    continue;
+                };
+                let mut oversized_fields: Vec<(String, usize)> = Vec::new();
+                for (k, v) in obj.iter() {
+                    if let Some(s) = v.as_str() {
+                        let clen = s.chars().count();
+                        if clen > MIN_ARG_STRING_PRUNE_CHARS
+                            && !s.contains("argumen diringkas — arsip:")
+                        {
+                            oversized_fields.push((k.clone(), clen));
+                        }
+                    }
+                }
+                if oversized_fields.is_empty() {
+                    continue;
+                }
+                let safe_id: String = id
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                    .take(28)
+                    .collect();
+                let fname = format!(
+                    "{:04}_args_{}_{}_{}.json",
+                    msg_idx,
+                    bi,
+                    name.replace('/', "_"),
+                    if safe_id.is_empty() { "call".to_string() } else { safe_id }
+                );
+                let archive_path = archive_dir.join(fname);
+                let orig_json = serde_json::Value::Object(obj.clone()).to_string();
+                planned_archives.push((archive_path.clone(), orig_json));
+                for (field, clen) in oversized_fields {
+                    obj.insert(
+                        field.clone(),
+                        serde_json::Value::String(format!(
+                            "[{name}.{field} ({clen} char) argumen diringkas — arsip: {}]",
+                            archive_path.display()
+                        )),
+                    );
+                }
+                pruned_args += 1;
+            }
+        }
+    }
+
+    let total_changes = deduped + pruned_results + pruned_args;
+    if total_changes == 0 {
+        return ProactivePruneResult::default();
+    }
+    let after_tokens = estimate_tokens(&cand);
+    let reclaimed_tokens = before_tokens.saturating_sub(after_tokens);
+    if !force_emergency && reclaimed_tokens < min_reclaim_tokens {
+        return ProactivePruneResult::default();
+    }
+
+    // Tulis seluruh arsip byte-exact sebelum meng-commit ke `messages` (no information loss).
+    if !planned_archives.is_empty() {
+        if std::fs::create_dir_all(archive_dir).is_err() {
+            return ProactivePruneResult::default();
+        }
+        for (path, body) in &planned_archives {
+            if std::fs::write(path, body.as_str()).is_err() {
+                return ProactivePruneResult::default();
+            }
+        }
+    }
+    messages.clone_from_slice(&cand);
+    ProactivePruneResult {
+        pruned_count: total_changes,
+        reclaimed_tokens,
+        deduped_tool_results: deduped,
+        pruned_tool_results: pruned_results,
+        pruned_tool_args: pruned_args,
+    }
+}
+
 /// Diet konteks ringan (kompatibilitas tes lama): padatkan `Block::ToolResult` lama di luar
 /// `keep_recent_tool_msgs` pesan tool terakhir.
 pub fn prune_old_tool_results(messages: &mut [Message], keep_recent_tool_msgs: usize) -> usize {

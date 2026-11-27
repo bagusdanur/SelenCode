@@ -9,6 +9,46 @@ use similar::{ChangeTag, TextDiff};
 pub const MAX_READ_LINES: usize = 2000;
 pub const MAX_READ_BYTES: usize = 100 * 1024;
 pub const MAX_LIST: usize = 500;
+/// Batas karakter per baris sebelum dipotong rapi (diporting dari Hermes `tools/tool_output_limits.py`).
+pub const DEFAULT_MAX_LINE_LENGTH: usize = 2000;
+/// Batas baris bawaan untuk `read_file` tanpa rentang eksplisit `start`/`end` (pola Hermes `file_tools.py`).
+pub const DEFAULT_FILE_READ_LINES: usize = 250;
+/// Batas karakter praktis bawaan per panggilan `read_file` (diporting dari Hermes `tools/file_tools.py`: `_truncate_to_char_budget`).
+pub const DEFAULT_FILE_READ_MAX_CHARS: usize = 16_000;
+
+/// Potong daftar baris `read_file` pada BARIS UTUH terakhir yang muat di dalam `max_chars`
+/// (diporting dari Hermes Agent `tools/file_tools.py`: `_truncate_to_char_budget`).
+/// Mengembalikan `(teks_terjaga, jumlah_baris_terjaga, terpotong)`.
+/// Jika baris pertama sendiri melebihi `max_chars`, baris pertama dipotong aman UTF-8 agar kursor tetap maju.
+pub fn truncate_lines_to_char_budget(lines: &[String], max_chars: usize) -> (String, usize, bool) {
+    if lines.is_empty() || max_chars == 0 {
+        return (String::new(), 0, false);
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut running = 0usize;
+    for line in lines {
+        let line_chars = line.chars().count();
+        let sep = usize::from(!kept.is_empty());
+        if running + sep + line_chars > max_chars {
+            if kept.is_empty() {
+                let clamped: String = line.chars().take(max_chars).collect();
+                return (clamped, 1, true);
+            }
+            return (kept.join("\n"), kept.len(), true);
+        }
+        kept.push(line.as_str());
+        running += sep + line_chars;
+    }
+    (kept.join("\n"), kept.len(), false)
+}
+
+fn clamp_line_length(line: &str, max_line_chars: usize) -> String {
+    if max_line_chars == 0 || line.chars().count() <= max_line_chars {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(max_line_chars).collect();
+    format!("{head} ... [baris dipotong]")
+}
 
 fn path_arg(args: &Value) -> String {
     str_arg(args, "path").unwrap_or(".").to_string()
@@ -123,9 +163,53 @@ impl Tool for ReadFile {
             return Err(anyhow!("start={start} melebihi jumlah baris {}", lines.len()));
         }
         let slice = &lines[(start - 1).min(lines.len())..end];
-        let take = slice.len().min(MAX_READ_LINES);
-        let mut out = slice[..take].join("\n");
-        if out.len() > MAX_READ_BYTES {
+        let default_line_cap = if ctx.tool_budget.file_read_default_lines > 0 {
+            ctx.tool_budget.file_read_default_lines.min(MAX_READ_LINES)
+        } else {
+            MAX_READ_LINES
+        };
+        let line_cap = if has_range {
+            MAX_READ_LINES
+        } else {
+            default_line_cap
+        };
+        let take = slice.len().min(line_cap);
+        let truncated_by_lines = take < slice.len();
+        let clamped_lines: Vec<String> = slice[..take]
+            .iter()
+            .map(|l| clamp_line_length(l, DEFAULT_MAX_LINE_LENGTH))
+            .collect();
+        let char_budget = if ctx.tool_budget.file_read_max_chars > 0 {
+            ctx.tool_budget.file_read_max_chars
+        } else {
+            MAX_READ_BYTES
+        };
+        let (mut out, kept_lines, truncated_by_chars) =
+            truncate_lines_to_char_budget(&clamped_lines, char_budget);
+        if truncated_by_lines || truncated_by_chars {
+            let shown = kept_lines.max(1);
+            let last_shown = (start + shown - 1).min(lines.len());
+            let next_start = last_shown + 1;
+            let next_end = (next_start + default_line_cap.saturating_sub(1)).min(lines.len());
+            let reason = if truncated_by_chars {
+                format!("pagu {char_budget} char")
+            } else {
+                format!("pagu {line_cap} baris")
+            };
+            if next_start <= lines.len() {
+                out.push_str(&format!(
+                    "\n... [dipotong di {reason}: menampilkan baris {start}-{last_shown} dari {}. \
+                     Gunakan read_file(path=\"{rel}\", start={next_start}, end={next_end}) untuk melanjutkan, \
+                     atau search_text untuk mencari simbol spesifik.]",
+                    lines.len()
+                ));
+            } else {
+                out.push_str(&format!(
+                    "\n... [dipotong di {reason}: menampilkan baris {start}-{last_shown} dari {}.]",
+                    lines.len()
+                ));
+            }
+        } else if out.len() > MAX_READ_BYTES {
             let mut cut = MAX_READ_BYTES;
             while cut > 0 && !out.is_char_boundary(cut) {
                 cut -= 1;
