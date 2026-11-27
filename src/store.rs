@@ -956,6 +956,46 @@ impl Store {
         Ok(self.list_sessions(cwd, 1)?.into_iter().next())
     }
 
+    /// Cari sesi persis berdasarkan ID unik (lintas cwd / tanpa batas daftar 10 terakhir).
+    pub fn session_by_id(&self, session_id: &str) -> Result<Option<SessionInfo>> {
+        let clean = session_id.trim();
+        if clean.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, cwd, provider, model, created_at, title FROM sessions WHERE id = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![clean], |row| {
+            Ok(SessionInfo {
+                id: row.get(0)?,
+                cwd: row.get(1)?,
+                provider: row.get(2)?,
+                model: row.get(3)?,
+                created_at: row.get(4)?,
+                title: row.get(5)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => {
+                let mut info = r?;
+                drop(rows);
+                drop(stmt);
+                drop(conn);
+                if is_placeholder_title(&info.title) {
+                    if let Ok(msgs) = self.load_messages(&info.id) {
+                        if let Some(inferred) = infer_session_title(&msgs) {
+                            let _ = self.update_session_title(&info.id, &inferred);
+                            info.title = inferred;
+                        }
+                    }
+                }
+                Ok(Some(info))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn record_usage(
         &self,
         session_id: &str,
@@ -2265,6 +2305,89 @@ impl Store {
         let conn = self.conn.lock().expect("mutex store poisoned");
         conn.execute("DELETE FROM gateway_state WHERE key = ?1", rusqlite::params![key])?;
         Ok(())
+    }
+
+    /// Penanda bahwa user secara eksplisit menjalankan `/new` (atau `--new`) dan belum mengirim pesan,
+    /// sehingga restart sebelum pesan pertama tetap menghormati sesi baru yang bersih.
+    pub const SESSION_POINTER_NEW: &'static str = "__new__";
+
+    fn cli_session_state_key(cwd: &str) -> String {
+        let norm = cwd.trim_end_matches(['/', '\\']);
+        let norm = if norm.is_empty() { cwd } else { norm };
+        format!("cli_last_session:{norm}")
+    }
+
+    fn telegram_session_state_key(chat_id: i64) -> String {
+        format!("tg_chat_session:{chat_id}")
+    }
+
+    /// Ambil pointer sesi aktif terakhir untuk terminal (CLI/TUI) di folder kerja `cwd`.
+    pub fn get_cli_last_session(&self, cwd: &str) -> Result<Option<String>> {
+        Ok(self
+            .get_gateway_state(&Self::cli_session_state_key(cwd))?
+            .map(|(v, _)| v))
+    }
+
+    /// Simpan pointer sesi aktif terakhir untuk terminal (CLI/TUI) di folder kerja `cwd`.
+    pub fn set_cli_last_session(&self, cwd: &str, session_id: &str) -> Result<()> {
+        self.set_gateway_state(&Self::cli_session_state_key(cwd), session_id)
+    }
+
+    /// Ambil pointer sesi aktif terakhir untuk `chat_id` Telegram tertentu (persisten lintas restart/idle).
+    pub fn get_telegram_chat_session(&self, chat_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .get_gateway_state(&Self::telegram_session_state_key(chat_id))?
+            .map(|(v, _)| v))
+    }
+
+    /// Simpan pointer sesi aktif terakhir untuk `chat_id` Telegram tertentu.
+    pub fn set_telegram_chat_session(&self, chat_id: i64, session_id: &str) -> Result<()> {
+        self.set_gateway_state(&Self::telegram_session_state_key(chat_id), session_id)
+    }
+
+    /// Tentukan sesi yang harus dilanjutkan saat terminal (`selen`) dibuka kembali di `cwd`.
+    /// - Jika `explicit_resume == false` (auto-resume saat `selen` biasa) dan pointer == `__new__`,
+    ///   mengembalikan `Ok(None)` agar `/new` / `--new` yang belum berisi pesan tetap dihormati.
+    /// - Jika pointer menunjuk ID sesi yang valid di SQLite, mengembalikan sesi tersebut (termasuk
+    ///   sesi lama yang terakhir dipilih via `/resume`).
+    /// - Jika pointer belum ada atau sesinya sudah dihapus, fallback ke `latest_session(cwd)`.
+    pub fn resolve_cli_resume_session(
+        &self,
+        cwd: &str,
+        explicit_resume: bool,
+    ) -> Result<Option<SessionInfo>> {
+        if let Some(ptr) = self.get_cli_last_session(cwd)? {
+            if ptr == Self::SESSION_POINTER_NEW {
+                if !explicit_resume {
+                    return Ok(None);
+                }
+            } else if let Some(info) = self.session_by_id(&ptr)? {
+                return Ok(Some(info));
+            }
+        }
+        self.latest_session(cwd)
+    }
+
+    /// Tentukan sesi yang harus dilanjutkan untuk `chat_id` Telegram saat gateway restart atau
+    /// sesudah sesi di-evict karena idle.
+    /// - Jika pointer == `__new__`, kembalikan `Ok(None)` (menghormati `/new` terakhir user).
+    /// - Jika pointer menunjuk ID sesi valid di SQLite, kembalikan sesi tersebut.
+    /// - Jika belum ada pointer (mis. baru upgrade dari versi lama) atau sesi terhapus,
+    ///   fallback ke `latest_session(cwd)` agar percakapan terakhir tetap nyambung!
+    pub fn resolve_telegram_resume_session(
+        &self,
+        chat_id: i64,
+        cwd: &str,
+    ) -> Result<Option<SessionInfo>> {
+        if let Some(ptr) = self.get_telegram_chat_session(chat_id)? {
+            if ptr == Self::SESSION_POINTER_NEW {
+                return Ok(None);
+            }
+            if let Some(info) = self.session_by_id(&ptr)? {
+                return Ok(Some(info));
+            }
+        }
+        self.latest_session(cwd)
     }
 
     /// Catat penanda bahwa gateway keluar karena watchdog agar saat bangun kembali

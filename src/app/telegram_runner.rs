@@ -822,13 +822,13 @@ async fn handle_telegram_chat_message(
                 tokio::sync::mpsc::channel::<ApprovalRequest>(16);
             let (ask_tx, mut ask_rx) =
                 tokio::sync::mpsc::channel::<selencode::tools::ask::AskUserRequest>(8);
-            let mut s = match Session::build(
+            let first_prompt_opt = (!is_slash_cmd).then_some(text.as_str());
+            let mut s = match Session::build_for_telegram_chat(
                 provider_override.as_deref(),
                 yes_flag,
-                false,
-                Some(&text),
+                chat_id,
+                first_prompt_opt,
                 Some(approval_tx),
-                false,
             )
             .await
             {
@@ -840,6 +840,9 @@ async fn handle_telegram_chat_message(
                     return Err(e);
                 }
             };
+            if s.resumed_note.is_some() || !is_slash_cmd {
+                let _ = s.store.set_telegram_chat_session(chat_id, &s.session_id);
+            }
             let ask_timeout = s.cfg.ask.timeout_secs;
             s.ctx.asker = Arc::new(selencode::tools::ask::UserAsker::channel(ask_tx));
             s.ctx.ask_timeout_secs = ask_timeout;
@@ -1002,6 +1005,9 @@ async fn handle_telegram_chat_message(
                 spawn_telegram_bg_review(tg.clone(), chat_id, busy_chats.clone(), job);
             }
             let sid = s.reset_session()?;
+            let _ = s
+                .store
+                .set_telegram_chat_session(chat_id, selencode::store::Store::SESSION_POINTER_NEW);
             let short: String = sid.chars().take(10).collect();
             tg.send_html_message(
                 chat_id,
@@ -1187,6 +1193,9 @@ async fn handle_telegram_chat_message(
                     tg.send_menu_markup(chat_id, &card).await?;
                 }
                 super::commands::ResumeOutcome::Switched(data) => {
+                    let _ = s
+                        .store
+                        .set_telegram_chat_session(chat_id, &data.session_id);
                     let short: String = data.session_id.chars().take(10).collect();
                     let mut html = format!(
                         "<b>Melanjutkan Sesi</b>\n\
@@ -1422,6 +1431,7 @@ async fn handle_telegram_chat_message(
         TimedOut(u64),
     }
 
+    let _ = s.store.set_telegram_chat_session(chat_id, &s.session_id);
     let turn_outcome = tokio::select! {
         r = run_turn_ui(
             s.provider.clone(),

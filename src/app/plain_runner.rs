@@ -74,18 +74,28 @@ fn run_plain_setup_wizard(s: &mut Session) -> Result<()> {
 pub(crate) async fn interactive_plain(
     cli: Cli,
     resume: bool,
+    explicit_resume: bool,
     resume_target: Option<String>,
 ) -> Result<()> {
     let mut s = Session::build_with_target(
         cli.provider.as_deref(),
         cli.yes,
         resume,
+        explicit_resume,
         resume_target.as_deref(),
         None,
         None,
         true,
     )
     .await?;
+    let init_cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+    if !resume {
+        let _ = s
+            .store
+            .set_cli_last_session(&init_cwd_str, selencode::store::Store::SESSION_POINTER_NEW);
+    } else if s.resumed_note.is_some() {
+        let _ = s.store.set_cli_last_session(&init_cwd_str, &s.session_id);
+    }
     // Perbaikan 2 (v0.5.9): jalankan 1 putaran polling pantauan aktif milik folder ini +
     // laporkan perubahan/selesai/gagal persis satu kali (0 token LLM; diam bila tak ada perubahan).
     for rep in s.poll_cli_watches_on_open().await {
@@ -227,6 +237,8 @@ pub(crate) async fn interactive_plain(
                 Ok((card, resume_prompt)) => {
                     println!("{}", strip_menu_markup(&card));
                     if let Some(prompt) = resume_prompt {
+                        let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+                        let _ = s.store.set_cli_last_session(&cwd_str, &s.session_id);
                         match run_turn(
                             s.provider.clone(),
                             &s.registry,
@@ -315,7 +327,14 @@ pub(crate) async fn interactive_plain(
                     });
                 }
                 match s.reset_session() {
-                    Ok(sid) => println!("Sesi baru dimulai ({sid})."),
+                    Ok(sid) => {
+                        let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+                        let _ = s.store.set_cli_last_session(
+                            &cwd_str,
+                            selencode::store::Store::SESSION_POINTER_NEW,
+                        );
+                        println!("Sesi baru dimulai ({sid}).");
+                    }
                     Err(e) => eprintln!("[error] {e}"),
                 }
             }
@@ -336,6 +355,8 @@ pub(crate) async fn interactive_plain(
                     println!("{}", strip_menu_markup(&card));
                 }
                 Ok(super::commands::ResumeOutcome::Switched(data)) => {
+                    let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+                    let _ = s.store.set_cli_last_session(&cwd_str, &data.session_id);
                     println!(
                         "Melanjutkan sesi: \"{}\" ({}) — {} pesan dimuat.",
                         data.title,
@@ -362,6 +383,8 @@ pub(crate) async fn interactive_plain(
                 );
             }
             SlashCommand::NotCommand => {
+                let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+                let _ = s.store.set_cli_last_session(&cwd_str, &s.session_id);
                 if plan_next {
                     plan_next = false;
                     match run_turn_mode(

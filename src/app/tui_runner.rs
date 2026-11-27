@@ -61,6 +61,7 @@ async fn tui_worker(
             TuiCommand::Prompt(prompt) | TuiCommand::InterruptPrompt(prompt) => {
                 let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
                 let _ = s.store.record_prompt_history(&cwd_str, &prompt);
+                let _ = s.store.set_cli_last_session(&cwd_str, &s.session_id);
                 active_turn.store(true, Ordering::SeqCst);
                 let mut turn_ok = false;
                 tokio::select! {
@@ -116,6 +117,7 @@ async fn tui_worker(
             TuiCommand::PromptPlan(prompt) => {
                 let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
                 let _ = s.store.record_prompt_history(&cwd_str, &prompt);
+                let _ = s.store.set_cli_last_session(&cwd_str, &s.session_id);
                 tokio::select! {
                     r = run_turn_ui_mode(
                         s.provider.clone(),
@@ -159,6 +161,8 @@ async fn tui_worker(
                 }
             }
             TuiCommand::ExecutePlan(plan) => {
+                let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+                let _ = s.store.set_cli_last_session(&cwd_str, &s.session_id);
                 let prompt = approved_plan_prompt(&plan);
                 tokio::select! {
                     r = run_turn_ui(
@@ -287,6 +291,8 @@ async fn tui_worker(
                 Ok((card, resume_prompt)) => {
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
                     if let Some(prompt) = resume_prompt {
+                        let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+                        let _ = s.store.set_cli_last_session(&cwd_str, &s.session_id);
                         tokio::select! {
                             r = run_turn_ui(
                                 s.provider.clone(),
@@ -652,6 +658,11 @@ async fn tui_worker(
                 }
                 match s.reset_session() {
                     Ok(sid) => {
+                        let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+                        let _ = s.store.set_cli_last_session(
+                            &cwd_str,
+                            selencode::store::Store::SESSION_POINTER_NEW,
+                        );
                         let _ = ui_tx
                             .send(UiEvent::SessionReset {
                                 session_id: sid,
@@ -682,6 +693,8 @@ async fn tui_worker(
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
                 }
                 Ok(ResumeOutcome::Switched(data)) => {
+                    let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+                    let _ = s.store.set_cli_last_session(&cwd_str, &data.session_id);
                     let _ = ui_tx
                         .send(UiEvent::SessionResumed {
                             session_id: data.session_id,
@@ -718,6 +731,7 @@ async fn tui_worker(
 pub(crate) async fn interactive_tui(
     cli: Cli,
     resume: bool,
+    explicit_resume: bool,
     resume_target: Option<String>,
 ) -> Result<()> {
     // Approver berbasis channel: permintaan approval dari tool mengalir ke
@@ -732,12 +746,21 @@ pub(crate) async fn interactive_tui(
         cli.provider.as_deref(),
         cli.yes,
         resume,
+        explicit_resume,
         resume_target.as_deref(),
         None,
         Some(approval_tx),
         true,
     )
     .await?;
+    let init_cwd_str = s.ctx.cwd.to_string_lossy().to_string();
+    if !resume {
+        let _ = s
+            .store
+            .set_cli_last_session(&init_cwd_str, selencode::store::Store::SESSION_POINTER_NEW);
+    } else if s.resumed_note.is_some() {
+        let _ = s.store.set_cli_last_session(&init_cwd_str, &s.session_id);
+    }
     s.ctx.asker = Arc::new(selencode::tools::ask::UserAsker::channel(ask_tx));
     let (init_in, init_out) = s.store.total_usage(&s.session_id).unwrap_or((0, 0));
     let mut app = App::new(

@@ -1283,28 +1283,16 @@ fn extract_explicit_max_steps(val: &toml::Value) -> Option<usize> {
         .map(|n| n as usize)
 }
 
-/// Cetak pemberitahuan pembebasan pagu warisan `max_steps = 25` ke stderr tepat 1x per path per proses.
-fn emit_legacy_max_steps_notice_once(path_label: &str, notice: &str) {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    if let Ok(mut guard) = seen.lock() {
-        if guard.insert(path_label.to_string()) {
-            eprintln!("[selen] {notice}");
-        }
-    }
-}
-
 /// Terapkan kebijakan tanpa `max_steps` terstruktur (Opsi A):
 /// - Giliran utama pengguna SELALU tanpa batas langkah (`0`); tidak ada pagu langkah dari config user.
 /// - Jika config lama masih memuat `max_steps = N` (`N > 0`, mis. `25`, `40`, dll.), nilai itu
-///   diabaikan otomatis dengan 1 pemberitahuan terlihat dan dicatat di `selen doctor`.
+///   diabaikan diam-diam saat startup (tanpa spam teks peringatan di terminal) dan tetap dicatat
+///   di `MaxStepsSource::DeprecatedIgnored` untuk diagnostik `selen doctor`.
 /// - Batas langkah hanya dipertahankan sebagai pengaman internal pada subagent/orchestrator/cron latar.
 fn apply_max_steps_policy(
     cfg: &mut Config,
     explicit: Option<(usize, String)>,
-    emit_stderr: bool,
+    _emit_stderr: bool,
 ) {
     match explicit {
         None | Some((0, _)) => {
@@ -1315,16 +1303,8 @@ fn apply_max_steps_policy(
             cfg.agent.max_steps = 0;
             cfg.max_steps_source = MaxStepsSource::DeprecatedIgnored {
                 legacy_value,
-                config_path: config_path.clone(),
+                config_path,
             };
-            let notice = format!(
-                "Kunci [agent] max_steps = {legacy_value} di {config_path} sudah tidak dipakai dan diabaikan — \
-                 SelenCode selalu berjalan tanpa batas langkah (rem memakai LoopGuard, konvergensi, & timeout)."
-            );
-            cfg.startup_notices.push(notice.clone());
-            if emit_stderr {
-                emit_legacy_max_steps_notice_once(&config_path, &notice);
-            }
         }
     }
 }

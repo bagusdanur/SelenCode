@@ -18,6 +18,9 @@ pub struct Cli {
     /// untuk `selen run --plan` berhenti sesudah rencana (tanpa eksekusi)
     #[arg(long, global = true)]
     pub plan: bool,
+    /// Mulai sesi baru yang bersih tanpa melanjutkan sesi terakhir di folder ini
+    #[arg(long, global = true)]
+    pub new: bool,
 }
 
 #[derive(Subcommand)]

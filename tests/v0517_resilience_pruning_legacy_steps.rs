@@ -588,10 +588,8 @@ max_steps = 25
         }
     ));
     assert!(
-        !legacy_cfg.startup_notices.is_empty()
-            && legacy_cfg.startup_notices[0].contains("25")
-            && legacy_cfg.startup_notices[0].contains("tanpa batas"),
-        "harus ada pemberitahuan terlihat tentang diabaikannya max_steps lama: {:?}",
+        legacy_cfg.startup_notices.is_empty(),
+        "max_steps lama diabaikan diam-diam di terminal tanpa spam startup notice: {:?}",
         legacy_cfg.startup_notices
     );
     let saved_path = cwd.join("saved-clean.toml");
@@ -636,7 +634,7 @@ max_steps = 40
             config_path: "/tmp/custom.toml".into()
         }
     );
-    assert!(!other_cfg.startup_notices.is_empty());
+    assert!(other_cfg.startup_notices.is_empty());
     let rep_other = run_doctor(&other_cfg, &cwd, "router", &pcfg, &store, &sandbox);
     let step_chk_other = rep_other
         .checks

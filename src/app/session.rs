@@ -2,6 +2,7 @@ use super::{make_aux_review_provider, make_routed_provider};
 use anyhow::Result;
 use selencode::agent::context::{
     compact_messages, estimate_tokens, format_context_compact, infer_model_context_limit,
+    sanitize_interrupted_messages,
 };
 use selencode::agent::ui::ModelPickerData;
 use selencode::config::{self, Config, ProviderCfg};
@@ -144,10 +145,12 @@ impl Session {
         approval_tx: Option<tokio::sync::mpsc::Sender<ApprovalRequest>>,
         allow_unconfigured: bool,
     ) -> Result<Session> {
-        Self::build_with_target(
+        Self::build_inner(
             provider_name,
             yes,
             resume,
+            resume,
+            None,
             None,
             first_prompt,
             approval_tx,
@@ -160,7 +163,56 @@ impl Session {
         provider_name: Option<&str>,
         yes: bool,
         resume: bool,
+        explicit_resume: bool,
         resume_target: Option<&str>,
+        first_prompt: Option<&str>,
+        approval_tx: Option<tokio::sync::mpsc::Sender<ApprovalRequest>>,
+        allow_unconfigured: bool,
+    ) -> Result<Session> {
+        Self::build_inner(
+            provider_name,
+            yes,
+            resume,
+            explicit_resume,
+            resume_target,
+            None,
+            first_prompt,
+            approval_tx,
+            allow_unconfigured,
+        )
+        .await
+    }
+
+    /// Bangun atau pulihkan sesi persisten untuk satu `chat_id` Telegram lintas restart / idle eviction.
+    pub(crate) async fn build_for_telegram_chat(
+        provider_name: Option<&str>,
+        yes: bool,
+        chat_id: i64,
+        first_prompt: Option<&str>,
+        approval_tx: Option<tokio::sync::mpsc::Sender<ApprovalRequest>>,
+    ) -> Result<Session> {
+        Self::build_inner(
+            provider_name,
+            yes,
+            true,
+            false,
+            None,
+            Some(chat_id),
+            first_prompt,
+            approval_tx,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_inner(
+        provider_name: Option<&str>,
+        yes: bool,
+        resume: bool,
+        explicit_resume: bool,
+        resume_target: Option<&str>,
+        telegram_chat_id: Option<i64>,
         first_prompt: Option<&str>,
         approval_tx: Option<tokio::sync::mpsc::Sender<ApprovalRequest>>,
         allow_unconfigured: bool,
@@ -217,13 +269,41 @@ impl Session {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
-            let info = store.resolve_session(&cwd_str, target, 10)?;
-            let msgs = store.load_messages(&info.id)?;
+            let info = match store.session_by_id(target)? {
+                Some(found) => found,
+                None => store.resolve_session(&cwd_str, target, 10)?,
+            };
+            let mut msgs = store.load_messages(&info.id)?;
+            if let Some(syn) = sanitize_interrupted_messages(&mut msgs) {
+                let _ = store.save_message(&info.id, &syn);
+            }
             (info.id, msgs, Some((info.title, info.created_at)))
-        } else if resume {
-            match store.latest_session(&cwd_str)? {
+        } else if let Some(chat_id) = telegram_chat_id {
+            match store.resolve_telegram_resume_session(chat_id, &cwd_str)? {
                 Some(info) => {
-                    let msgs = store.load_messages(&info.id)?;
+                    let mut msgs = store.load_messages(&info.id)?;
+                    if let Some(syn) = sanitize_interrupted_messages(&mut msgs) {
+                        let _ = store.save_message(&info.id, &syn);
+                    }
+                    (info.id, msgs, Some((info.title, info.created_at)))
+                }
+                None => {
+                    let title = Self::title_from(first_prompt.unwrap_or(""));
+                    let id = if first_prompt.is_some() {
+                        store.create_session(&cwd_str, &name, &pcfg.model, &title)?
+                    } else {
+                        store.register_lazy_session(&cwd_str, &name, &pcfg.model, &title)
+                    };
+                    (id, Vec::new(), None)
+                }
+            }
+        } else if resume {
+            match store.resolve_cli_resume_session(&cwd_str, explicit_resume)? {
+                Some(info) => {
+                    let mut msgs = store.load_messages(&info.id)?;
+                    if let Some(syn) = sanitize_interrupted_messages(&mut msgs) {
+                        let _ = store.save_message(&info.id, &syn);
+                    }
                     (info.id, msgs, Some((info.title, info.created_at)))
                 }
                 None => {
