@@ -82,3 +82,16 @@ Seluruh fitur, pagar, dan kontrak `v0.5.7`–`v0.5.18` di bawah ini sengaja tida
 - Porting ketahanan stream & fallback `v0.5.17`–`v0.5.18`: fallback chain untuk kelas mati-diam & mid-stream stall, penutupan jujur + pembatalan aman tool call terpotong `max_output_tokens`, dasar `stream_idle = 180s` + skalasi konteks (`> 50k → 240s`, `> 100k → 300s`), retry jittered backoff + diet pra-retry + breaker, batas ganda `read_file`, dan gerbang prune pasca-tool.
 - Pagar hemat sesi kecil & resume: `build_resume_snapshot`, `build_resume_system_prompt`, `prune_old_skill_results_with_archive` (prune dini skill), dan `prune_old_tool_results_with_archive(..., 2)` khusus `lean_resume && step >= 2`.
 - `TypingLoopGuard` Telegram, klasifier nomina permintaan ubah berkas, konverter Markdown→HTML Telegram, watchdog polling gateway, gerbang skill harness + opt-out eksplisit, memori persisten, `ask_user`, `cron`, `session_search`, `watch_job`, dan sandbox/approval.
+
+---
+
+## Bukti Rilis & Artefak CI
+
+- **Commit tag `v0.5.19`:** `ff2d09c`
+- **CI Run (Linux + Windows x64):** `45984429127` (`success` — Linux job `140456286171`, Windows x64 job `140456286775`)
+- **Release Run (Tests + 3 Biner + GitHub Release):** `45985834004` (`success`)
+- **URL Rilis:** https://github.com/bagusdanur/SelenCode/releases/tag/v0.5.19
+- **Aset Biner Terbit (3 berkas):**
+  - `selen-termux-arm64` — 15.319.504 byte
+  - `selen-linux-x64` — 17.049.808 byte
+  - `selen-windows-x64.exe` — 15.735.296 byte
