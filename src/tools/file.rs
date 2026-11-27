@@ -279,7 +279,7 @@ impl Tool for WriteFile {
         // Masalah 3 (v0.5.20): beri dorongan terarah saat model menulis ulang utuh berkas besar
         // yang sudah ada padahal mayoritas barisnya tidak berubah (seharusnya memakai `edit_file`).
         if existed && old.len() >= 4_000 {
-            let similarity = TextDiff::from_lines(&old, content).ratio();
+            let similarity = TextDiff::from_lines(old.as_str(), content).ratio();
             if similarity >= 0.65 {
                 msg.push_str(&format!(
                     "\n[Efisiensi] Berkas ini sudah ada ({} byte, {:.0}% baris sama) — untuk perubahan lokal berikutnya pada berkas besar, gunakan `edit_file` (patch terarah) agar hemat token keluaran & langkah.",
