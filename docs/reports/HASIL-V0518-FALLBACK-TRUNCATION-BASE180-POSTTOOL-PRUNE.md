@@ -72,9 +72,9 @@
 | Rata-rata token tugas A + B (`usage`) | ≤ 5.000 token | pengukuran penerimaan oleh Muse | Menunggu uji live Muse |
 | Token giliran Resume E (`usage`) | ≤ 7.500 token | pengukuran penerimaan oleh Muse | Menunggu uji live Muse |
 | Uji penerimaan delta v0.5.18 (fallback mati-diam, trunc output, dasar 180s, prune pasca-tool) | 4/4 syarat selesai terpenuhi | pengukuran penerimaan oleh Muse | Menunggu uji live Muse |
-| Suite unit & integrasi Linux CI (`cargo test`) | 100% lulus, 0 gagal | Diisi sesudah CI Linux hijau | Menunggu CI |
-| Suite unit & integrasi Windows x64 CI (`cargo test`) | 100% lulus, 0 gagal | Diisi sesudah CI Windows hijau | Menunggu CI |
-| `cargo clippy --all-targets -- -D clippy::correctness` | 0 error | Diisi sesudah CI hijau | Menunggu CI |
+| Suite unit & integrasi Linux CI (`cargo test`) | 100% lulus, 0 gagal | 100% lulus, 0 gagal (CI Run `45949219251`, job `140340899910`) | LULUS |
+| Suite unit & integrasi Windows x64 CI (`cargo test`) | 100% lulus, 0 gagal | 100% lulus, 0 gagal (CI Run `45949219251`, job `140340900312`) | LULUS |
+| `cargo clippy --all-targets -- -D clippy::correctness` | 0 error | 0 error (CI Run `45949219251`) | LULUS |
 
 Tidak diukur — Rata-rata token tugas A + B (`usage`): pengukuran penerimaan oleh Muse (sesuai pembagian tugas, pengujian live tidak dijalankan oleh pengembang).
 Tidak diukur — Token giliran Resume E (`usage`): pengukuran penerimaan oleh Muse (sesuai pembagian tugas, pengujian live tidak dijalankan oleh pengembang).
