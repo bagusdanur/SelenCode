@@ -180,7 +180,7 @@ fn telegram_chat_sessions_persist_independently_across_gateway_restart_and_sanit
                     content: vec![Block::ToolUse {
                         id: "call_crash_1".into(),
                         name: "run_shell".into(),
-                        input: serde_json::json!({"command": "echo hi"}),
+                        args: serde_json::json!({"command": "echo hi"}),
                     }],
                 },
             )
