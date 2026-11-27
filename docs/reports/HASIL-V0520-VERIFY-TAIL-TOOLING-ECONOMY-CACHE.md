@@ -92,3 +92,16 @@ Seluruh fitur, pagar, dan kontrak `v0.5.7`–`v0.5.19` di bawah ini sengaja tida
 - Pagar hemat sesi kecil & resume: `build_resume_snapshot`, `build_resume_system_prompt`, `prune_old_skill_results_with_archive`, dan `prune_old_tool_results_with_archive(..., 2)` khusus `lean_resume && step >= 2`.
 - `TypingLoopGuard` Telegram, klasifier nomina permintaan ubah berkas, konverter Markdown→HTML Telegram, watchdog polling gateway, gerbang skill harness + opt-out eksplisit, memori persisten, `ask_user`, `cron`, `session_search`, `watch_job`, dan sandbox/approval.
 - Verifikasi E2E browser mandiri (dicatat penguji di luar daftar 4 masalah bernomor siklus ini; tidak ditambahkan tanpa perintah pemilik).
+
+---
+
+## Bukti Rilis & Artefak CI
+
+- **Commit tag `v0.5.20`:** `4a0a377`
+- **CI Run (Linux + Windows x64):** `46001001555` (`success` — Linux job `140512310964`, Windows x64 job `140512311417`)
+- **Release Run (Tests + 3 Biner + GitHub Release):** `46002285634` (`success`)
+- **URL Rilis:** https://github.com/bagusdanur/SelenCode/releases/tag/v0.5.20
+- **Aset Biner Terbit (3 berkas):**
+  - `selen-termux-arm64` — 15.344.264 byte
+  - `selen-linux-x64` — 17.072.816 byte
+  - `selen-windows-x64.exe` — 15.762.944 byte
