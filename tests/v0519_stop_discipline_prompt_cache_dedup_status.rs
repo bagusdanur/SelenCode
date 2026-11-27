@@ -4,8 +4,7 @@ use selencode::agent::corrector::{
     is_dedup_passed_verify_output, is_same_or_broader_verify_cmd, is_verification_shell_cmd,
     SelfCorrectState, ToolDedupCache,
 };
-use selencode::agent::run_turn_ui;
-use selencode::agent::UiEvent;
+use selencode::agent::{run_turn_ui, UiEvent};
 use selencode::config::ToolBudgetCfg;
 use selencode::providers::anthropic::AnthropicStreamParser;
 use selencode::providers::gemini::GeminiStreamParser;
@@ -17,7 +16,7 @@ use selencode::providers::{
     AssistantReply, Block, Message, Provider, StreamEvent, ToolCall, ToolSpec, Usage,
 };
 use selencode::store::Store;
-use selencode::tools::{default_registry, Ctx};
+use selencode::tools::{default_registry, Ctx, Registry, Tool};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,38 +33,27 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir.canonicalize().unwrap()
 }
 
-/// Perintah verifikasi lintas platform yang pasti tersedia & lulus dengan exit code 0
-/// (memakai `cargo --version` tidak terdeteksi sebagai verifikasi, jadi pakai `node --check` atau `echo`?
-/// Kita pakai skrip kecil + `python -m unittest` / `node --check` / `cargo check` — agar portable
-/// di Linux + Windows CI tanpa bergantung pada `node`, kita buat mock tool `run_shell`? Tidak:
-/// `cargo` PASTI ada di lingkungan `cargo test` Linux maupun Windows! Tapi `cargo check` lambat.
-/// Solusi 100% instan & portable: pakai `verify_project` atau `run_shell` dengan `cargo --help`?
-/// Tidak — `SelfCorrectState` mengenali `npm test`, `vitest`, `pytest`, `node --check`, dll.
-/// Untuk tes `run_turn_ui` yang benar-benar mengeksekusi `run_shell`, kita bisa bungkus tool
-/// registry kustom dengan `FakeShellTool` bernama `"run_shell"` yang mengembalikan
-/// `"exit code: 0\n15 passed\n"` secara deterministik 1ms di Linux maupun Windows!).
 struct FakeVerifyShellTool {
     exec_count: Arc<AtomicUsize>,
     fail_next: Arc<AtomicUsize>,
 }
 
 #[async_trait]
-impl selencode::tools::Tool for FakeVerifyShellTool {
-    fn name(&self) -> &str {
-        "run_shell"
+impl Tool for FakeVerifyShellTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "run_shell".into(),
+            description: "Mock run_shell untuk uji deterministik v0.5.19".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                },
+                "required": ["command"]
+            }),
+        }
     }
-    fn description(&self) -> &str {
-        "Mock run_shell untuk uji deterministik v0.5.19"
-    }
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": { "type": "string" }
-            },
-            "required": ["command"]
-        })
-    }
+
     async fn run(&self, args: Value, _ctx: &Ctx) -> Result<String> {
         self.exec_count.fetch_add(1, Ordering::SeqCst);
         let cmd = args
@@ -74,23 +62,20 @@ impl selencode::tools::Tool for FakeVerifyShellTool {
             .unwrap_or("");
         if self.fail_next.load(Ordering::SeqCst) > 0 {
             self.fail_next.fetch_sub(1, Ordering::SeqCst);
-            return Ok(format!(
-                "exit code: 1\nFAILED: test_saldo ({cmd})\n"
-            ));
+            return Ok(format!("exit code: 1\nFAILED: test_saldo ({cmd})\n"));
         }
-        Ok(format!(
-            "exit code: 0\n✓ 15 passed ({cmd})\n"
-        ))
+        Ok(format!("exit code: 0\n✓ 15 passed ({cmd})\n"))
     }
 }
 
-fn registry_with_fake_shell(exec_count: Arc<AtomicUsize>, fail_next: Arc<AtomicUsize>) -> selencode::tools::Registry {
-    let mut reg = default_registry();
-    reg.register(Arc::new(FakeVerifyShellTool {
+fn registry_with_fake_shell(
+    exec_count: Arc<AtomicUsize>,
+    fail_next: Arc<AtomicUsize>,
+) -> Registry {
+    default_registry().register(Arc::new(FakeVerifyShellTool {
         exec_count,
         fail_next,
-    }));
-    reg
+    }))
 }
 
 // =========================================================================
@@ -102,16 +87,27 @@ fn m1_compound_svelte_verify_and_incremental_verify_after_small_edit() {
     let full_cmd = "npm run check && npm test && npm run build";
     assert!(is_verification_shell_cmd(&json!({"command": full_cmd})));
     assert!(is_verification_shell_cmd(&json!({"command": "npx svelte-check"})));
-    assert!(is_verification_shell_cmd(&json!({"command": "npx vitest run src/lib/db.test.ts"})));
+    assert!(is_verification_shell_cmd(
+        &json!({"command": "npx vitest run src/lib/db.test.ts"})
+    ));
 
     // Sub-perintah dari perintah majemuk diterima sebagai keluarga yang sah,
     // sementara probe `python -c` / `node -e` TETAP ditolak (menjaga pagar v0.5.15).
     assert!(is_same_or_broader_verify_cmd(full_cmd, "npm run check"));
     assert!(is_same_or_broader_verify_cmd(full_cmd, "npm test"));
-    assert!(is_same_or_broader_verify_cmd(full_cmd, "npx vitest run src/lib/db.test.ts"));
+    assert!(is_same_or_broader_verify_cmd(
+        full_cmd,
+        "npx vitest run src/lib/db.test.ts"
+    ));
     assert!(is_same_or_broader_verify_cmd(full_cmd, "npm run build"));
-    assert!(!is_same_or_broader_verify_cmd(full_cmd, "python -c \"assert 1 == 1\""));
-    assert!(!is_same_or_broader_verify_cmd(full_cmd, "node -e \"console.log('ok')\""));
+    assert!(!is_same_or_broader_verify_cmd(
+        full_cmd,
+        "python -c \"assert 1 == 1\""
+    ));
+    assert!(!is_same_or_broader_verify_cmd(
+        full_cmd,
+        "node -e \"console.log('ok')\""
+    ));
 
     // Alur SelfCorrectState:
     // 1. Tulis aplikasi & jalankan suite penuh -> HIJAU
@@ -161,7 +157,10 @@ fn m1_compound_svelte_verify_and_incremental_verify_after_small_edit() {
         false,
         4,
     );
-    assert!(!sc.verified_after_last_edit, "probe node -e tidak boleh dianggap verifikasi");
+    assert!(
+        !sc.verified_after_last_edit,
+        "probe node -e tidak boleh dianggap verifikasi"
+    );
 
     // 4. Jalankan verifikasi inkremental terarah (`npx vitest run src/lib/format.test.ts`) -> diterima & HIJAU!
     sc.observe_tool_at_step(
@@ -200,9 +199,9 @@ async fn m1_repeated_green_verify_converges_cleanly_without_stagnation_loop() {
                     *self.saw_stop_nudge.lock().unwrap() = true;
                 }
             }
-            // Panggilan penutup tanpa tool (dari konvergensi bersih)
             if tools.is_empty() {
-                let txt = "Aplikasi selesai dibuat pada `app.js` dan seluruh verifikasi sudah lulus.".to_string();
+                let txt = "Aplikasi selesai dibuat pada `app.js` dan seluruh verifikasi sudah lulus."
+                    .to_string();
                 let _ = tx.send(StreamEvent::Token(txt.clone())).await;
                 return Ok(AssistantReply {
                     text: txt,
@@ -225,7 +224,11 @@ async fn m1_repeated_green_verify_converges_cleanly_without_stagnation_loop() {
                         args: json!({"path": "app.js", "content": "export const ok = true;\n"}),
                     }],
                     finish_reason: Some("tool_calls".into()),
-                    usage: Some(Usage { input_tokens: 800, output_tokens: 30, ..Default::default() }),
+                    usage: Some(Usage {
+                        input_tokens: 800,
+                        output_tokens: 30,
+                        ..Default::default()
+                    }),
                 }),
                 // Langkah 1: verifikasi pertama kali -> benar-benar jalan dan LULUS.
                 // Langkah 2, 3, 4: model membandel mengulang perintah verifikasi identik tanpa edit baru!
@@ -237,13 +240,21 @@ async fn m1_repeated_green_verify_converges_cleanly_without_stagnation_loop() {
                         args: json!({"command": "npm run check && npm test && npm run build"}),
                     }],
                     finish_reason: Some("tool_calls".into()),
-                    usage: Some(Usage { input_tokens: 1000, output_tokens: 25, ..Default::default() }),
+                    usage: Some(Usage {
+                        input_tokens: 1000,
+                        output_tokens: 25,
+                        ..Default::default()
+                    }),
                 }),
                 _ => Ok(AssistantReply {
                     text: "Selesai.".into(),
                     tool_calls: vec![],
                     finish_reason: Some("stop".into()),
-                    usage: Some(Usage { input_tokens: 1000, output_tokens: 15, ..Default::default() }),
+                    usage: Some(Usage {
+                        input_tokens: 1000,
+                        output_tokens: 15,
+                        ..Default::default()
+                    }),
                 }),
             }
         }
@@ -252,7 +263,8 @@ async fn m1_repeated_green_verify_converges_cleanly_without_stagnation_loop() {
     let cwd = temp_dir("m1-converge");
     let shell_execs = Arc::new(AtomicUsize::new(0));
     let reg = registry_with_fake_shell(shell_execs.clone(), Arc::new(AtomicUsize::new(0)));
-    let ctx = Ctx::new(cwd);
+    let mut ctx = Ctx::new(cwd, true);
+    ctx.self_correct = true;
     let calls = Arc::new(AtomicUsize::new(0));
     let saw_stop_nudge = Arc::new(Mutex::new(false));
     let provider: Arc<dyn Provider> = Arc::new(StubbornVerifyProvider {
@@ -266,8 +278,8 @@ async fn m1_repeated_green_verify_converges_cleanly_without_stagnation_loop() {
         &reg,
         &ctx,
         &mut messages,
-        "Buat berkas app.js lalu verifikasi dengan check+test+build.",
-        0, // Tanpa batas langkah (Opsi A)
+        "Buat berkas app.js lalu verifikasi proyek.",
+        0,
         ui_tx,
     )
     .await
@@ -280,20 +292,20 @@ async fn m1_repeated_green_verify_converges_cleanly_without_stagnation_loop() {
         }
     }
 
-    // 1. Perintah shell verifikasi hanya dieksekusi TEPAT 1× (3 pengulangan berikutnya dicegat dedup!)
     assert_eq!(
         shell_execs.load(Ordering::SeqCst),
         1,
         "perintah verifikasi identik tanpa edit baru tidak boleh dijalankan lebih dari 1x"
     );
-    // 2. Dorongan [DISIPLIN BERHENTI] terkirim dan sesi konvergen berhenti dalam <= 6 panggilan
-    assert!(*saw_stop_nudge.lock().unwrap(), "harus menyuntikkan [DISIPLIN BERHENTI]");
+    assert!(
+        *saw_stop_nudge.lock().unwrap(),
+        "harus menyuntikkan [DISIPLIN BERHENTI]"
+    );
     assert!(
         calls.load(Ordering::SeqCst) <= 6,
         "giliran harus berhenti cepat, bukan berputar panjang (actual={})",
         calls.load(Ordering::SeqCst)
     );
-    // 3. TIDAK ada alarm palsu stagnasi/loop maupun status verifikasi GAGAL
     assert!(
         !infos.iter().any(|s| s.contains("Loop/stagnasi terdeteksi")),
         "dedup verifikasi hijau tidak boleh memicu alarm stagnasi palsu: {infos:?}"
@@ -355,26 +367,22 @@ fn m2_provider_cache_token_parsing_and_sqlite_persistence() {
 
     // 4. Native AnthropicStreamParser
     let mut ap = AnthropicStreamParser::new();
-    ap.handle_event(
-        "message_start",
-        &json!({
-            "message": {
-                "usage": {
-                    "input_tokens": 14_000,
-                    "output_tokens": 0,
-                    "cache_read_input_tokens": 11_500,
-                    "cache_creation_input_tokens": 900
-                }
+    ap.handle_event(&json!({
+        "type": "message_start",
+        "message": {
+            "usage": {
+                "input_tokens": 14_000,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 11_500,
+                "cache_creation_input_tokens": 900
             }
-        }),
-    );
-    ap.handle_event(
-        "message_delta",
-        &json!({
-            "delta": {"stop_reason": "end_turn"},
-            "usage": {"output_tokens": 250}
-        }),
-    );
+        }
+    }));
+    ap.handle_event(&json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn"},
+        "usage": {"output_tokens": 250}
+    }));
     let a_usage = ap.finish().usage.expect("anthropic usage");
     assert_eq!(a_usage.cache_read_tokens, 11_500);
     assert_eq!(a_usage.cache_write_tokens, 900);
@@ -395,9 +403,14 @@ fn m2_provider_cache_token_parsing_and_sqlite_persistence() {
 
     // 6. SQLite Store: record_usage_full + total_cache_usage + usage_report
     let dir = temp_dir("m2-store");
-    let store = Store::open(&dir.join("selen.db")).unwrap();
+    let store = Store::open_at(&dir.join("selen.db")).unwrap();
     let sid = store
-        .create_session(&dir.to_string_lossy(), "openai", "ag/gemini-4-hydrogen-medium")
+        .create_session(
+            &dir.to_string_lossy(),
+            "openai",
+            "ag/gemini-4-hydrogen-medium",
+            "uji cache",
+        )
         .unwrap();
     store
         .record_usage_full(&sid, "ag/gemini-4-hydrogen-medium", u_oai, "main")
@@ -518,9 +531,11 @@ async fn m2_prefix_stability_across_long_session_and_rearm_hysteresis() {
                         .map(|b| match b {
                             Block::Text(t) => format!("T:{t}"),
                             Block::ToolUse { id, name, args } => format!("U:{id}:{name}:{args}"),
-                            Block::ToolResult { id, content, is_error } => {
-                                format!("R:{id}:{is_error}:{content}")
-                            }
+                            Block::ToolResult {
+                                id,
+                                content,
+                                is_error,
+                            } => format!("R:{id}:{is_error}:{content}"),
                             Block::Image { media_type, .. } => format!("I:{media_type}"),
                         })
                         .collect();
@@ -568,12 +583,17 @@ async fn m2_prefix_stability_across_long_session_and_rearm_hysteresis() {
     }
 
     let cwd = temp_dir("m2-prefix");
-    let store = Arc::new(Store::open(&cwd.join("selen.db")).unwrap());
+    let store = Arc::new(Store::open_at(&cwd.join("selen.db")).unwrap());
     let sid = store
-        .create_session(&cwd.to_string_lossy(), "openai", "ag/gemini-4-hydrogen-medium")
+        .create_session(
+            &cwd.to_string_lossy(),
+            "openai",
+            "ag/gemini-4-hydrogen-medium",
+            "uji prefix",
+        )
         .unwrap();
     let reg = default_registry();
-    let mut ctx = Ctx::new(cwd);
+    let mut ctx = Ctx::new(cwd, true);
     ctx.store = Some(store.clone());
     ctx.session_id = Some(sid.clone());
     ctx.self_correct = false;
@@ -599,8 +619,6 @@ async fn m2_prefix_stability_across_long_session_and_rearm_hysteresis() {
 
     let snaps = snapshots.lock().unwrap();
     assert_eq!(snaps.len(), 14);
-    // Pada panggilan terakhir ada > 26 pesan (melampaui batas lama 20!),
-    // namun SELURUH prefiks [0..prev_len] antar-panggilan WAJIB 100% byte-identik!
     assert!(snaps.last().unwrap().len() > 26);
     for i in 1..snaps.len() {
         let prev = &snaps[i - 1];
@@ -613,9 +631,11 @@ async fn m2_prefix_stability_across_long_session_and_rearm_hysteresis() {
         );
     }
 
-    // Pastikan cache_read_tokens & cache_write_tokens tercatat di SQLite `usage` dan di UiEvent::TurnDone
     let (cr_db, cw_db) = store.total_cache_usage(&sid).unwrap();
-    assert!(cr_db > 50_000, "cache_read_tokens harus tercatat di SQLite usage, dapat: {cr_db}");
+    assert!(
+        cr_db > 50_000,
+        "cache_read_tokens harus tercatat di SQLite usage, dapat: {cr_db}"
+    );
     assert_eq!(cw_db, 4_000, "cache_write_tokens harus tercatat di SQLite usage");
 
     let mut done_usage = None;
@@ -658,7 +678,11 @@ async fn m2_prefix_stability_across_long_session_and_rearm_hysteresis() {
                         }),
                     }],
                     finish_reason: Some("tool_calls".into()),
-                    usage: Some(Usage { input_tokens: actual_in, output_tokens: 30, ..Default::default() }),
+                    usage: Some(Usage {
+                        input_tokens: actual_in,
+                        output_tokens: 30,
+                        ..Default::default()
+                    }),
                 }),
                 3..=6 => Ok(AssistantReply {
                     text: String::new(),
@@ -671,7 +695,11 @@ async fn m2_prefix_stability_across_long_session_and_rearm_hysteresis() {
                         }),
                     }],
                     finish_reason: Some("tool_calls".into()),
-                    usage: Some(Usage { input_tokens: actual_in, output_tokens: 20, ..Default::default() }),
+                    usage: Some(Usage {
+                        input_tokens: actual_in,
+                        output_tokens: 20,
+                        ..Default::default()
+                    }),
                 }),
                 _ => {
                     let _ = tx.send(StreamEvent::Token("Tuntas.".into())).await;
@@ -679,7 +707,11 @@ async fn m2_prefix_stability_across_long_session_and_rearm_hysteresis() {
                         text: "Tuntas.".into(),
                         tool_calls: vec![],
                         finish_reason: Some("stop".into()),
-                        usage: Some(Usage { input_tokens: actual_in, output_tokens: 15, ..Default::default() }),
+                        usage: Some(Usage {
+                            input_tokens: actual_in,
+                            output_tokens: 15,
+                            ..Default::default()
+                        }),
                     })
                 }
             }
@@ -687,7 +719,7 @@ async fn m2_prefix_stability_across_long_session_and_rearm_hysteresis() {
     }
 
     let cwd_h = temp_dir("m2-hyst");
-    let mut ctx_h = Ctx::new(cwd_h);
+    let mut ctx_h = Ctx::new(cwd_h, true);
     ctx_h.self_correct = false;
     ctx_h.tool_budget.proactive_prune_tokens = 6_000;
     ctx_h.tool_budget.proactive_prune_min_reclaim_tokens = 1_000;
@@ -755,12 +787,20 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
     );
     assert!(sc.verified_after_last_edit);
     assert!(sc.completion_gate(10).is_none());
-    assert!(sc.honest_unverified_closing_note("Selesai memperbaiki src/app.ts.").is_none());
+    assert!(sc
+        .honest_unverified_closing_note("Selesai memperbaiki src/app.ts.")
+        .is_none());
     let summary_line = sc
         .closing_verification_summary_line(true)
         .expect("harus ada baris ringkasan verifikasi");
-    assert!(summary_line.contains("LULUS"), "harus LULUS, dapat: {summary_line}");
-    assert!(!summary_line.contains("GAGAL"), "tidak boleh GAGAL, dapat: {summary_line}");
+    assert!(
+        summary_line.contains("LULUS"),
+        "harus LULUS, dapat: {summary_line}"
+    );
+    assert!(
+        !summary_line.contains("GAGAL"),
+        "tidak boleh GAGAL, dapat: {summary_line}"
+    );
 
     // 2. End-to-end `run_turn_ui`: edit -> verify LULUS -> ulang verify (kena dedup) -> tutup.
     //    Harus langsung tutup dengan status LULUS dan 0 putaran self-correction!
@@ -794,7 +834,11 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
                         args: json!({"path": "big.ts", "content": "export const v = 1;\n"}),
                     }],
                     finish_reason: Some("tool_calls".into()),
-                    usage: Some(Usage { input_tokens: 400, output_tokens: 20, ..Default::default() }),
+                    usage: Some(Usage {
+                        input_tokens: 400,
+                        output_tokens: 20,
+                        ..Default::default()
+                    }),
                 }),
                 1 => Ok(AssistantReply {
                     text: String::new(),
@@ -804,7 +848,11 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
                         args: json!({"command": "npm test"}),
                     }],
                     finish_reason: Some("tool_calls".into()),
-                    usage: Some(Usage { input_tokens: 500, output_tokens: 20, ..Default::default() }),
+                    usage: Some(Usage {
+                        input_tokens: 500,
+                        output_tokens: 20,
+                        ..Default::default()
+                    }),
                 }),
                 2 => Ok(AssistantReply {
                     text: String::new(),
@@ -814,7 +862,11 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
                         args: json!({"command": "npm test"}),
                     }],
                     finish_reason: Some("tool_calls".into()),
-                    usage: Some(Usage { input_tokens: 550, output_tokens: 20, ..Default::default() }),
+                    usage: Some(Usage {
+                        input_tokens: 550,
+                        output_tokens: 20,
+                        ..Default::default()
+                    }),
                 }),
                 _ => {
                     let reply = "Perubahan pada `big.ts` sudah diverifikasi dan lulus.".to_string();
@@ -823,7 +875,11 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
                         text: reply,
                         tool_calls: vec![],
                         finish_reason: Some("stop".into()),
-                        usage: Some(Usage { input_tokens: 600, output_tokens: 25, ..Default::default() }),
+                        usage: Some(Usage {
+                            input_tokens: 600,
+                            output_tokens: 25,
+                            ..Default::default()
+                        }),
                     })
                 }
             }
@@ -832,7 +888,8 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
 
     let execs = Arc::new(AtomicUsize::new(0));
     let reg = registry_with_fake_shell(execs.clone(), Arc::new(AtomicUsize::new(0)));
-    let ctx = Ctx::new(cwd.clone());
+    let mut ctx = Ctx::new(cwd.clone(), true);
+    ctx.self_correct = true;
     let saw_gate = Arc::new(Mutex::new(false));
     let (utx, _urx) = mpsc::channel::<UiEvent>(64);
     let mut msgs = Vec::new();
@@ -844,7 +901,7 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
         &reg,
         &ctx,
         &mut msgs,
-        "Ubah big.ts lalu jalankan npm test.",
+        "Perbarui big.ts lalu verifikasi proyek.",
         0,
         utx,
     )
@@ -856,8 +913,14 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
         !*saw_gate.lock().unwrap(),
         "dedup pada verifikasi yang sudah lulus tidak boleh memicu Self-Correction Gate"
     );
-    assert!(out.contains("[Verifikasi — LULUS:"), "output akhir harus LULUS: {out}");
-    assert!(!out.contains("GAGAL"), "output akhir tidak boleh memuat GAGAL: {out}");
+    assert!(
+        out.contains("[Verifikasi — LULUS:"),
+        "output akhir harus LULUS: {out}"
+    );
+    assert!(
+        !out.contains("GAGAL"),
+        "output akhir tidak boleh memuat GAGAL: {out}"
+    );
 
     // 3. Pagar non-regresi: kegagalan verifikasi NYATA tetap ditahan gerbang & dilaporkan GAGAL!
     let mut sc_fail = SelfCorrectState::new(None).with_strict_known_verify_only(true);
@@ -875,5 +938,8 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
         "verifikasi gagal nyata WAJIB tetap ditahan oleh Self-Correction Gate"
     );
     let fail_line = sc_fail.closing_verification_summary_line(true).unwrap();
-    assert!(fail_line.contains("GAGAL"), "kegagalan nyata wajib tetap tertulis GAGAL: {fail_line}");
+    assert!(
+        fail_line.contains("GAGAL"),
+        "kegagalan nyata wajib tetap tertulis GAGAL: {fail_line}"
+    );
 }
