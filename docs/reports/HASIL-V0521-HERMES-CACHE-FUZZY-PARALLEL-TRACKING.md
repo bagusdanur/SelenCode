@@ -55,15 +55,12 @@
 |---|---|---|---|
 | Rata-rata token tugas A + B (`usage`) | ≤ 5.000 token | pengukuran penerimaan oleh Muse | Menunggu uji live Muse |
 | Token giliran Resume E (`usage`) | ≤ 7.500 token | pengukuran penerimaan oleh Muse | Menunggu uji live Muse |
-| Suite unit & integrasi Linux CI (`cargo test`) | 100% lulus, 0 gagal | Menunggu CI Run | Menunggu CI |
-| Suite unit & integrasi Windows x64 CI (`cargo test`) | 100% lulus, 0 gagal | Menunggu CI Run | Menunggu CI |
-| `cargo clippy --all-targets -- -D clippy::correctness` | 0 error | Menunggu CI Run | Menunggu CI |
+| Suite unit & integrasi Linux CI (`cargo test`) | 100% lulus, 0 gagal | 100% lulus, 0 gagal (CI Run `46012397047`, job `140550929984`) | LULUS |
+| Suite unit & integrasi Windows x64 CI (`cargo test`) | 100% lulus, 0 gagal | 100% lulus, 0 gagal (CI Run `46012397047`, job `140550929767`) | LULUS |
+| `cargo clippy --all-targets -- -D clippy::correctness` | 0 error | 0 error (CI Run `46012397047`) | LULUS |
 
 Tidak diukur — Rata-rata token tugas A + B (`usage`): pengukuran penerimaan oleh Muse.
 Tidak diukur — Token giliran Resume E (`usage`): pengukuran penerimaan oleh Muse.
-Tidak diukur — Suite unit & integrasi Linux CI (`cargo test`): akan diisi nomor Run ID CI resmi segera setelah workflow GitHub Actions selesai sebelum tag rilis `v0.5.21`.
-Tidak diukur — Suite unit & integrasi Windows x64 CI (`cargo test`): akan diisi nomor Run ID CI resmi segera setelah workflow GitHub Actions selesai sebelum tag rilis `v0.5.21`.
-Tidak diukur — `cargo clippy --all-targets -- -D clippy::correctness`: akan diisi nomor Run ID CI resmi segera setelah workflow GitHub Actions selesai sebelum tag rilis `v0.5.21`.
 
 ---
 
