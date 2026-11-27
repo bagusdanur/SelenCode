@@ -267,6 +267,7 @@ async fn telegram_prompt_hint_only_appears_in_telegram_context_not_cli() {
                 usage: Some(Usage {
                     input_tokens: 100,
                     output_tokens: 5,
+                    ..Default::default()
                 }),
             })
         }

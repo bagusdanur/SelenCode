@@ -52,6 +52,7 @@ impl Provider for MockReviewProvider {
                 usage: Some(Usage {
                     input_tokens: self.in_tokens,
                     output_tokens: self.out_tokens,
+                    ..Default::default()
                 }),
             }),
             Err(e) => Err(anyhow!("{e}")),

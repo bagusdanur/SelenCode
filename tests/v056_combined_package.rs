@@ -79,6 +79,7 @@ impl Provider for ScriptedProv {
             usage: Some(Usage {
                 input_tokens: 420,
                 output_tokens: 65,
+                ..Default::default()
             }),
         })
     }

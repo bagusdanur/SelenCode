@@ -396,6 +396,7 @@ async fn tahap6_db_token_proof_10_skills_lazy_load_and_single_skill_view() {
                         usage: Some(Usage {
                             input_tokens: 1_200,
                             output_tokens: 25,
+                            ..Default::default()
                         }),
                     })
                 }
@@ -420,6 +421,7 @@ async fn tahap6_db_token_proof_10_skills_lazy_load_and_single_skill_view() {
                         usage: Some(Usage {
                             input_tokens: 2_350,
                             output_tokens: 20,
+                            ..Default::default()
                         }),
                     })
                 }
@@ -493,7 +495,7 @@ async fn tahap6_end_to_end_create_skill_with_approval_then_new_session_follows_i
                             }),
                         }],
                         finish_reason: Some("tool_calls".into()),
-                        usage: Some(Usage { input_tokens: 1100, output_tokens: 40 }),
+                        usage: Some(Usage { input_tokens: 1100, output_tokens: 40, ..Default::default() }),
                     })
                 }
                 _ => {
@@ -502,7 +504,7 @@ async fn tahap6_end_to_end_create_skill_with_approval_then_new_session_follows_i
                         text: "Skill format-laporan-kpi disimpan.".into(),
                         tool_calls: vec![],
                         finish_reason: Some("stop".into()),
-                        usage: Some(Usage { input_tokens: 1200, output_tokens: 15 }),
+                        usage: Some(Usage { input_tokens: 1200, output_tokens: 15, ..Default::default() }),
                     })
                 }
             }
@@ -561,7 +563,7 @@ async fn tahap6_end_to_end_create_skill_with_approval_then_new_session_follows_i
                             args: json!({"name": "format-laporan-kpi"}),
                         }],
                         finish_reason: Some("tool_calls".into()),
-                        usage: Some(Usage { input_tokens: 1050, output_tokens: 20 }),
+                        usage: Some(Usage { input_tokens: 1050, output_tokens: 20, ..Default::default() }),
                     })
                 }
                 1 => {
@@ -579,7 +581,7 @@ async fn tahap6_end_to_end_create_skill_with_approval_then_new_session_follows_i
                             }),
                         }],
                         finish_reason: Some("tool_calls".into()),
-                        usage: Some(Usage { input_tokens: 1300, output_tokens: 35 }),
+                        usage: Some(Usage { input_tokens: 1300, output_tokens: 35, ..Default::default() }),
                     })
                 }
                 _ => {
@@ -588,7 +590,7 @@ async fn tahap6_end_to_end_create_skill_with_approval_then_new_session_follows_i
                         text: "Laporan KPI dibuat sesuai skill.".into(),
                         tool_calls: vec![],
                         finish_reason: Some("stop".into()),
-                        usage: Some(Usage { input_tokens: 1350, output_tokens: 15 }),
+                        usage: Some(Usage { input_tokens: 1350, output_tokens: 15, ..Default::default() }),
                     })
                 }
             }

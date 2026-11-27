@@ -112,6 +112,156 @@ pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>> 
     Ok(items.into_iter().map(|(id, _)| id).collect())
 }
 
+/// Ekstrak `Usage` termasuk `cache_read_tokens` & `cache_write_tokens` dari objek JSON `usage`
+/// respons OpenAI-compatible (diambil dari Hermes `agent/usage_pricing.py`: `_CHAT_USAGE_SHAPE`).
+/// Mendukung:
+/// - OpenAI / 9Router / Gemini-via-OpenAI (`prompt_tokens_details.cached_tokens`)
+/// - Anthropic-style proxy (`cache_read_input_tokens`, `cache_creation_input_tokens`)
+/// - DeepSeek (`prompt_cache_hit_tokens`) & Kimi/Moonshot (`cached_tokens`).
+pub fn parse_openai_usage(u: &Value) -> Usage {
+    let first_nonzero = |paths: &[&[&str]]| -> u64 {
+        for path in paths {
+            let mut cur = u;
+            let mut ok = true;
+            for key in *path {
+                if let Some(next) = cur.get(*key) {
+                    cur = next;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                if let Some(n) = cur.as_u64().filter(|&v| v > 0) {
+                    return n;
+                }
+            }
+        }
+        0
+    };
+    let input_tokens = u["prompt_tokens"]
+        .as_u64()
+        .or_else(|| u["input_tokens"].as_u64())
+        .unwrap_or(0);
+    let output_tokens = u["completion_tokens"]
+        .as_u64()
+        .or_else(|| u["output_tokens"].as_u64())
+        .unwrap_or(0);
+    let cache_read_tokens = first_nonzero(&[
+        &["prompt_tokens_details", "cached_tokens"],
+        &["cache_read_input_tokens"],
+        &["prompt_cache_hit_tokens"],
+        &["cached_tokens"],
+    ]);
+    let cache_write_tokens = first_nonzero(&[
+        &["prompt_tokens_details", "cache_write_tokens"],
+        &["prompt_tokens_details", "cache_creation_input_tokens"],
+        &["cache_creation_input_tokens"],
+        &["cache_write_tokens"],
+    ]);
+    Usage {
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    }
+}
+
+/// Tentukan apakah rute OpenAI-wire ini menerima & diuntungkan oleh penanda `cache_control`
+/// gaya Anthropic pada amplop pesan (diambil dari Hermes `agent/agent_runtime_helpers.py`:
+/// `anthropic_prompt_cache_policy`).
+///
+/// - Claude pada gateway non-OpenAI (OpenRouter, Nous, LiteLLM, 9Router): `true`.
+/// - Kimi/Moonshot & Qwen pada OpenRouter/Nous/Alibaba/DashScope: `true`.
+/// - Gemini (`gemini-*`, `ag/gemini-*`), OpenAI (`gpt-*`/`o1`/`o3`/`o4`), DeepSeek, & server lokal:
+///   `false` (memakai automatic prefix caching berbasis byte prefiks stabil — tidak kirim `cache_control`
+///   agar relay ketat tidak membalas HTTP 400).
+pub fn should_apply_openai_envelope_cache_control(base_url: &str, model: &str) -> bool {
+    let url_low = base_url.trim().to_ascii_lowercase();
+    let model_low = model.trim().to_ascii_lowercase();
+    if url_low.contains("api.openai.com")
+        || url_low.contains("127.0.0.1")
+        || url_low.contains("localhost")
+    {
+        return false;
+    }
+    let is_claude = model_low.contains("claude");
+    let is_kimi = model_low.contains("kimi") || model_low.contains("moonshot");
+    let is_qwen = model_low.contains("qwen");
+    let is_openrouter = url_low.contains("openrouter.ai");
+    let is_nous = url_low.contains("nousresearch.com");
+    let is_alibaba = url_low.contains("dashscope") || url_low.contains("opencode");
+    if is_claude {
+        return true;
+    }
+    if (is_openrouter || is_nous) && (is_kimi || is_qwen) {
+        return true;
+    }
+    if is_alibaba && is_qwen {
+        return true;
+    }
+    false
+}
+
+/// Terapkan penanda `cache_control: {"type": "ephemeral"}` gaya amplop pada array pesan OpenAI-wire
+/// (diambil dari Hermes `agent/prompt_caching.py`: `apply_anthropic_cache_control`, maks 4 breakpoint:
+/// pesan `system` + hingga 3 pesan non-system terbaru yang memiliki konten teks non-kosong).
+pub fn apply_openai_envelope_cache_control(messages: &mut [Value]) {
+    if messages.is_empty() {
+        return;
+    }
+    let mark_msg = |msg: &mut Value| {
+        let Some(obj) = msg.as_object_mut() else {
+            return;
+        };
+        let marker = json!({"type": "ephemeral"});
+        match obj.get_mut("content") {
+            Some(Value::String(s)) if !s.is_empty() => {
+                let text = s.clone();
+                obj.insert(
+                    "content".into(),
+                    json!([{"type": "text", "text": text, "cache_control": marker}]),
+                );
+            }
+            Some(Value::Array(parts)) => {
+                if let Some(last) = parts.last_mut().and_then(|v| v.as_object_mut()) {
+                    last.insert("cache_control".into(), marker);
+                }
+            }
+            _ => {}
+        }
+    };
+    let mut used = 0usize;
+    if messages[0].get("role").and_then(|v| v.as_str()) == Some("system") {
+        mark_msg(&mut messages[0]);
+        used += 1;
+    }
+    let budget = 4usize.saturating_sub(used);
+    if budget == 0 {
+        return;
+    }
+    let cacheable_idxs: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            let role = m.get("role").and_then(|v| v.as_str())?;
+            if role == "system" || role == "tool" {
+                return None;
+            }
+            let has_body = match m.get("content") {
+                Some(Value::String(s)) => !s.is_empty(),
+                Some(Value::Array(a)) => !a.is_empty(),
+                _ => false,
+            };
+            has_body.then_some(i)
+        })
+        .collect();
+    let start = cacheable_idxs.len().saturating_sub(budget);
+    for &idx in &cacheable_idxs[start..] {
+        mark_msg(&mut messages[idx]);
+    }
+}
+
 fn messages_to_openai(msgs: &[Message]) -> Vec<Value> {
     let mut out = Vec::new();
     for m in msgs {
@@ -216,9 +366,13 @@ impl Provider for OpenAiProvider {
         tools: &[ToolSpec],
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<AssistantReply> {
+        let mut wire_msgs = messages_to_openai(msgs);
+        if should_apply_openai_envelope_cache_control(&self.base_url, &self.model) {
+            apply_openai_envelope_cache_control(&mut wire_msgs);
+        }
         let mut body = json!({
             "model": self.model,
-            "messages": messages_to_openai(msgs),
+            "messages": wire_msgs,
             "stream": true,
             "stream_options": {"include_usage": true},
             "max_tokens": self.max_output_tokens,
@@ -324,12 +478,9 @@ impl Provider for OpenAiProvider {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                // Chunk terakhir (include_usage) membawa field usage.
+                // Chunk terakhir (include_usage) membawa field usage (+ detail cache read/write).
                 if v["usage"].is_object() {
-                    usage = Some(Usage {
-                        input_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-                        output_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-                    });
+                    usage = Some(parse_openai_usage(&v["usage"]));
                 }
                 let choice = &v["choices"][0];
                 if let Some(fr) = choice["finish_reason"].as_str() {
@@ -370,10 +521,7 @@ impl Provider for OpenAiProvider {
             if !data.is_empty() && data != "[DONE]" {
                 if let Ok(v) = serde_json::from_str::<Value>(data) {
                     if v["usage"].is_object() {
-                        usage = Some(Usage {
-                            input_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-                            output_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-                        });
+                        usage = Some(parse_openai_usage(&v["usage"]));
                     }
                     let choice = &v["choices"][0];
                     if let Some(fr) = choice["finish_reason"].as_str() {

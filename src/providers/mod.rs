@@ -174,10 +174,17 @@ pub struct ToolCall {
 }
 
 /// Pemakaian token 1 panggilan provider (bila provider melaporkannya).
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+/// Mencakup token cache read/write (Masalah 2 v0.5.19 — pola normalisasi Hermes `agent/usage_pricing.py`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Token input yang dilayani dari prompt cache provider (`cached_tokens` / `cache_read_input_tokens` / `cachedContentTokenCount`).
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Token input yang ditulis ke prompt cache provider (`cache_creation_input_tokens` / `cache_write_tokens`).
+    #[serde(default)]
+    pub cache_write_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default)]

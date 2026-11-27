@@ -330,7 +330,9 @@ CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session_id TEXT,
                        role TEXT, content TEXT, ts TEXT);
 CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, session_id TEXT, model TEXT,
                     input_tokens INT, output_tokens INT, ts TEXT,
-                    kind TEXT NOT NULL DEFAULT 'main');
+                    kind TEXT NOT NULL DEFAULT 'main',
+                    cache_read_tokens INT NOT NULL DEFAULT 0,
+                    cache_write_tokens INT NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, scope TEXT,
                     content TEXT, ts TEXT,
                     category TEXT NOT NULL DEFAULT 'general',
@@ -973,15 +975,60 @@ impl Store {
         output_tokens: u64,
         kind: &str,
     ) -> Result<()> {
+        self.record_usage_full(
+            session_id,
+            model,
+            crate::providers::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            kind,
+        )
+    }
+
+    /// Catat pemakaian token lengkap termasuk `cache_read_tokens` & `cache_write_tokens` (Masalah 2 v0.5.19).
+    pub fn record_usage_full(
+        &self,
+        session_id: &str,
+        model: &str,
+        usage: crate::providers::Usage,
+        kind: &str,
+    ) -> Result<()> {
         let conn = self.conn.lock().expect("mutex store poisoned");
         if matches!(kind, "main" | "fallback") {
             self.materialize_if_pending(&conn, session_id)?;
         }
         conn.execute(
-            "INSERT INTO usage (session_id, model, input_tokens, output_tokens, ts, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![session_id, model, input_tokens as i64, output_tokens as i64, now(), kind],
+            "INSERT INTO usage (session_id, model, input_tokens, output_tokens, ts, kind, cache_read_tokens, cache_write_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                session_id,
+                model,
+                usage.input_tokens as i64,
+                usage.output_tokens as i64,
+                now(),
+                kind,
+                usage.cache_read_tokens as i64,
+                usage.cache_write_tokens as i64,
+            ],
         )?;
         Ok(())
+    }
+
+    /// Total `(cache_read_tokens, cache_write_tokens)` untuk satu sesi (Masalah 2 v0.5.19).
+    pub fn total_cache_usage(&self, session_id: &str) -> Result<(u64, u64)> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let (cr, cw): (Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT SUM(cache_read_tokens), SUM(cache_write_tokens) FROM usage WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((
+            cr.unwrap_or(0).max(0) as u64,
+            cw.unwrap_or(0).max(0) as u64,
+        ))
     }
 
     /// Catat biaya token Background Self-Improvement Review secara TERPISAH dari jalur utama (v0.5.1).
@@ -2273,7 +2320,8 @@ impl Store {
         let mut session_rows = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT model, kind, COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) \
+                "SELECT model, kind, COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
+                        COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0) \
                  FROM usage WHERE session_id = ?1 OR session_id = ?2 \
                  GROUP BY model, kind ORDER BY kind ASC, model ASC",
             )?;
@@ -2284,6 +2332,8 @@ impl Store {
                     calls: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
                     input_tokens: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
                     output_tokens: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+                    cache_read_tokens: row.get::<_, i64>(5).unwrap_or(0).max(0) as u64,
+                    cache_write_tokens: row.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
                 })
             })?;
             for r in rows {
@@ -2294,7 +2344,8 @@ impl Store {
         let mut today_rows = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT model, kind, COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) \
+                "SELECT model, kind, COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
+                        COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0) \
                  FROM usage WHERE ts LIKE ?1 \
                  GROUP BY model, kind ORDER BY kind ASC, model ASC",
             )?;
@@ -2305,6 +2356,8 @@ impl Store {
                     calls: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
                     input_tokens: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
                     output_tokens: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+                    cache_read_tokens: row.get::<_, i64>(5).unwrap_or(0).max(0) as u64,
+                    cache_write_tokens: row.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
                 })
             })?;
             for r in rows {
@@ -2320,7 +2373,7 @@ impl Store {
     }
 }
 
-/// Rincian 1 kelompok baris `usage` berdasarkan `(model, kind)` untuk `/usage` (Perbaikan 7 v0.5.7).
+/// Rincian 1 kelompok baris `usage` berdasarkan `(model, kind)` untuk `/usage` (Perbaikan 7 v0.5.7 + cache v0.5.19).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageBreakdownRow {
     pub model: String,
@@ -2328,6 +2381,8 @@ pub struct UsageBreakdownRow {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 /// Ringkasan lengkap `/usage` (sesi berjalan + total hari ini) langsung dari SQLite `usage`.
@@ -2458,6 +2513,20 @@ fn migrate_usage_schema(conn: &Connection) -> Result<()> {
             [],
         )
         .context("gagal migrasi kolom kind pada tabel usage")?;
+    }
+    if !cols.iter().any(|c| c == "cache_read_tokens") {
+        conn.execute(
+            "ALTER TABLE usage ADD COLUMN cache_read_tokens INT NOT NULL DEFAULT 0",
+            [],
+        )
+        .context("gagal migrasi kolom cache_read_tokens pada tabel usage")?;
+    }
+    if !cols.iter().any(|c| c == "cache_write_tokens") {
+        conn.execute(
+            "ALTER TABLE usage ADD COLUMN cache_write_tokens INT NOT NULL DEFAULT 0",
+            [],
+        )
+        .context("gagal migrasi kolom cache_write_tokens pada tabel usage")?;
     }
     Ok(())
 }

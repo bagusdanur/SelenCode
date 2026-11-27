@@ -141,6 +141,7 @@ async fn m1_mid_turn_stale_stream_recovers_and_circuit_breaker_stops_infinite_ha
                         usage: Some(Usage {
                             input_tokens: 450,
                             output_tokens: 20,
+                            ..Default::default()
                         }),
                     })
                 }
@@ -452,6 +453,7 @@ async fn m2_proactive_prune_controls_context_explosion_archives_and_resets_dedup
                     usage: Some(Usage {
                         input_tokens: 4_500,
                         output_tokens: 60,
+                        ..Default::default()
                     }),
                 }),
                 1 => Ok(AssistantReply {
@@ -465,6 +467,7 @@ async fn m2_proactive_prune_controls_context_explosion_archives_and_resets_dedup
                     usage: Some(Usage {
                         input_tokens: 22_000,
                         output_tokens: 50,
+                        ..Default::default()
                     }),
                 }),
                 2 => Ok(AssistantReply {
@@ -478,6 +481,7 @@ async fn m2_proactive_prune_controls_context_explosion_archives_and_resets_dedup
                     usage: Some(Usage {
                         input_tokens: 24_000,
                         output_tokens: 40,
+                        ..Default::default()
                     }),
                 }),
                 _ => {
@@ -489,6 +493,7 @@ async fn m2_proactive_prune_controls_context_explosion_archives_and_resets_dedup
                         usage: Some(Usage {
                             input_tokens: 8_000,
                             output_tokens: 30,
+                            ..Default::default()
                         }),
                     })
                 }

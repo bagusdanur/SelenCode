@@ -162,6 +162,7 @@ async fn p1_resume_followup_calls_stay_lean_and_lazy_toolsets_work() {
                     usage: Some(Usage {
                         input_tokens: 2800,
                         output_tokens: 30,
+                        ..Default::default()
                     }),
                 })
             } else {
@@ -172,6 +173,7 @@ async fn p1_resume_followup_calls_stay_lean_and_lazy_toolsets_work() {
                     usage: Some(Usage {
                         input_tokens: 2900,
                         output_tokens: 35,
+                        ..Default::default()
                     }),
                 })
             }
@@ -360,6 +362,7 @@ async fn p2_loop_skill_gate_enforces_bug_and_tdd_and_consistent_reload() {
                     usage: Some(Usage {
                         input_tokens: 400,
                         output_tokens: 30,
+                        ..Default::default()
                     }),
                 });
             }
@@ -387,6 +390,7 @@ async fn p2_loop_skill_gate_enforces_bug_and_tdd_and_consistent_reload() {
                     usage: Some(Usage {
                         input_tokens: 550,
                         output_tokens: 30,
+                        ..Default::default()
                     }),
                 });
             }
@@ -397,6 +401,7 @@ async fn p2_loop_skill_gate_enforces_bug_and_tdd_and_consistent_reload() {
                 usage: Some(Usage {
                     input_tokens: 520,
                     output_tokens: 20,
+                    ..Default::default()
                 }),
             })
         }
@@ -654,6 +659,7 @@ async fn p4_silent_provider_skips_same_route_retry_but_keeps_different_fallback(
                 usage: Some(Usage {
                     input_tokens: 90,
                     output_tokens: 10,
+                    ..Default::default()
                 }),
             })
         }

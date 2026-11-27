@@ -75,6 +75,7 @@ impl Provider for HealthyMockProvider {
             usage: Some(Usage {
                 input_tokens: 120,
                 output_tokens: 20,
+                ..Default::default()
             }),
         })
     }
@@ -316,6 +317,7 @@ async fn p1_turn_timeout_drops_and_aborts_provider_task_and_next_turn_works() {
                 usage: Some(Usage {
                     input_tokens: 100,
                     output_tokens: 15,
+                    ..Default::default()
                 }),
             })
         }

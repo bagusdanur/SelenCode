@@ -169,6 +169,8 @@ pub struct AnthropicStreamParser {
     blocks: BTreeMap<u64, PartialBlock>,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
     saw_usage: bool,
     finish_reason: Option<String>,
 }
@@ -185,6 +187,8 @@ impl AnthropicStreamParser {
                 if u.is_object() {
                     self.input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
                     self.output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
+                    self.cache_read_tokens = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                    self.cache_write_tokens = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                     self.saw_usage = true;
                 }
                 None
@@ -240,6 +244,12 @@ impl AnthropicStreamParser {
                     if let Some(i) = u["input_tokens"].as_u64() {
                         self.input_tokens = i;
                     }
+                    if let Some(cr) = u["cache_read_input_tokens"].as_u64() {
+                        self.cache_read_tokens = cr;
+                    }
+                    if let Some(cw) = u["cache_creation_input_tokens"].as_u64() {
+                        self.cache_write_tokens = cw;
+                    }
                 }
                 None
             }
@@ -276,6 +286,8 @@ impl AnthropicStreamParser {
                 Some(Usage {
                     input_tokens: self.input_tokens,
                     output_tokens: self.output_tokens,
+                    cache_read_tokens: self.cache_read_tokens,
+                    cache_write_tokens: self.cache_write_tokens,
                 })
             } else {
                 None

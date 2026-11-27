@@ -109,6 +109,7 @@ impl Provider for RoleMockProvider {
                 usage: Some(Usage {
                     input_tokens: self.tokens_per_call / 2,
                     output_tokens: self.tokens_per_call / 2,
+                    ..Default::default()
                 }),
             });
         }
@@ -132,6 +133,7 @@ impl Provider for RoleMockProvider {
             usage: Some(Usage {
                 input_tokens: self.tokens_per_call / 2,
                 output_tokens: self.tokens_per_call / 2,
+                ..Default::default()
             }),
         })
     }

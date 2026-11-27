@@ -141,6 +141,7 @@ async fn p1_skill_gate_optout_suppresses_gate_logs_visibly_and_normal_turn_still
                     usage: Some(Usage {
                         input_tokens: 1200,
                         output_tokens: 20,
+                        ..Default::default()
                     }),
                 }),
                 1 => Ok(AssistantReply {
@@ -158,6 +159,7 @@ async fn p1_skill_gate_optout_suppresses_gate_logs_visibly_and_normal_turn_still
                     usage: Some(Usage {
                         input_tokens: 1350,
                         output_tokens: 35,
+                        ..Default::default()
                     }),
                 }),
                 _ => Ok(AssistantReply {
@@ -167,6 +169,7 @@ async fn p1_skill_gate_optout_suppresses_gate_logs_visibly_and_normal_turn_still
                     usage: Some(Usage {
                         input_tokens: 1400,
                         output_tokens: 25,
+                        ..Default::default()
                     }),
                 }),
             }
@@ -537,6 +540,7 @@ async fn p3_skill_view_full_true_prune_contract_exact_1_call_then_stub_and_byte_
                     usage: Some(Usage {
                         input_tokens: 1500,
                         output_tokens: 20,
+                        ..Default::default()
                     }),
                 }),
                 1 => {
@@ -554,6 +558,7 @@ async fn p3_skill_view_full_true_prune_contract_exact_1_call_then_stub_and_byte_
                         usage: Some(Usage {
                             input_tokens: 5200,
                             output_tokens: 20,
+                            ..Default::default()
                         }),
                     })
                 }
@@ -568,6 +573,7 @@ async fn p3_skill_view_full_true_prune_contract_exact_1_call_then_stub_and_byte_
                         usage: Some(Usage {
                             input_tokens: 1800,
                             output_tokens: 20,
+                            ..Default::default()
                         }),
                     })
                 }

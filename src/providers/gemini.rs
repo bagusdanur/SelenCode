@@ -174,6 +174,7 @@ pub struct GeminiStreamParser {
     tool_calls: Vec<ToolCall>,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_tokens: u64,
     saw_usage: bool,
     finish_reason: Option<String>,
 }
@@ -189,6 +190,9 @@ impl GeminiStreamParser {
             if u.is_object() {
                 self.input_tokens = u["promptTokenCount"].as_u64().unwrap_or(0);
                 self.output_tokens = u["candidatesTokenCount"].as_u64().unwrap_or(0);
+                if let Some(cr) = u["cachedContentTokenCount"].as_u64() {
+                    self.cache_read_tokens = cr;
+                }
                 self.saw_usage = true;
             }
         }
@@ -234,6 +238,8 @@ impl GeminiStreamParser {
                 Some(Usage {
                     input_tokens: self.input_tokens,
                     output_tokens: self.output_tokens,
+                    cache_read_tokens: self.cache_read_tokens,
+                    cache_write_tokens: 0,
                 })
             } else {
                 None

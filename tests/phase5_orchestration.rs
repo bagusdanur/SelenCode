@@ -32,6 +32,7 @@ impl Provider for EchoModelProvider {
             usage: Some(Usage {
                 input_tokens: self.cost_tokens,
                 output_tokens: self.cost_tokens,
+                ..Default::default()
             }),
         })
     }

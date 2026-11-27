@@ -87,6 +87,7 @@ impl Provider for SequenceProv {
                 usage: Some(Usage {
                     input_tokens: 300,
                     output_tokens: 40,
+                    ..Default::default()
                 }),
             })
         } else {
@@ -194,7 +195,7 @@ async fn perbaikan1_resume_lean_toolset_snapshot_and_on_demand_activation() {
                     args: json!({"toolsets": ["history"]}),
                 }],
                 finish_reason: Some("tool_calls".into()),
-                usage: Some(Usage { input_tokens: 400, output_tokens: 30 }),
+                usage: Some(Usage { input_tokens: 400, output_tokens: 30, ..Default::default() }),
             },
             AssistantReply {
                 text: String::new(),
@@ -204,13 +205,13 @@ async fn perbaikan1_resume_lean_toolset_snapshot_and_on_demand_activation() {
                     args: json!({"query": "KODE-RESUME-991"}),
                 }],
                 finish_reason: Some("tool_calls".into()),
-                usage: Some(Usage { input_tokens: 450, output_tokens: 30 }),
+                usage: Some(Usage { input_tokens: 450, output_tokens: 30, ..Default::default() }),
             },
             AssistantReply {
                 text: "Ditemukan KODE-RESUME-991 pada sesi lama.".into(),
                 tool_calls: Vec::new(),
                 finish_reason: Some("stop".into()),
-                usage: Some(Usage { input_tokens: 480, output_tokens: 40 }),
+                usage: Some(Usage { input_tokens: 480, output_tokens: 40, ..Default::default() }),
             },
         ]),
     });
@@ -526,14 +527,14 @@ impl Provider for WriteFileWorkerProv {
                     args: json!({"path": fname, "content": format!("hasil {fname}\n")}),
                 }],
                 finish_reason: Some("tool_calls".into()),
-                usage: Some(Usage { input_tokens: 210, output_tokens: 35 }),
+                usage: Some(Usage { input_tokens: 210, output_tokens: 35, ..Default::default() }),
             })
         } else {
             Ok(AssistantReply {
                 text: "Fitur selesai ditulis di worktree.".into(),
                 tool_calls: Vec::new(),
                 finish_reason: Some("stop".into()),
-                usage: Some(Usage { input_tokens: 240, output_tokens: 25 }),
+                usage: Some(Usage { input_tokens: 240, output_tokens: 25, ..Default::default() }),
             })
         }
     }

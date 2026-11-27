@@ -387,6 +387,7 @@ async fn regression_fixes_shell_spillover_lean_toolsets_and_review_metrics() {
                 usage: Some(Usage {
                     input_tokens: 1500,
                     output_tokens: 1,
+                    ..Default::default()
                 }),
             })
         }

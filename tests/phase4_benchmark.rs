@@ -51,6 +51,7 @@ impl Provider for BenchMockProvider {
                     usage: Some(Usage {
                         input_tokens: 200,
                         output_tokens: 50,
+                        ..Default::default()
                     }),
                 });
             }
@@ -69,6 +70,7 @@ impl Provider for BenchMockProvider {
                     usage: Some(Usage {
                         input_tokens: 300,
                         output_tokens: 80,
+                        ..Default::default()
                     }),
                 });
             }
@@ -79,6 +81,7 @@ impl Provider for BenchMockProvider {
                 usage: Some(Usage {
                     input_tokens: 250,
                     output_tokens: 40,
+                    ..Default::default()
                 }),
             });
         }
@@ -100,6 +103,7 @@ impl Provider for BenchMockProvider {
                     usage: Some(Usage {
                         input_tokens: 300,
                         output_tokens: 80,
+                        ..Default::default()
                     }),
                 });
             }
@@ -110,6 +114,7 @@ impl Provider for BenchMockProvider {
                 usage: Some(Usage {
                     input_tokens: 200,
                     output_tokens: 30,
+                    ..Default::default()
                 }),
             });
         }

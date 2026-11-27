@@ -230,14 +230,14 @@ async fn p1_long_session_prunes_skill_result_to_stub_archives_byte_exact_and_all
                     text: String::new(),
                     tool_calls: vec![tc],
                     finish_reason: Some("tool_calls".into()),
-                    usage: Some(Usage { input_tokens: 500, output_tokens: 30 }),
+                    usage: Some(Usage { input_tokens: 500, output_tokens: 30, ..Default::default() }),
                 })
             } else {
                 Ok(AssistantReply {
                     text: "Debug selesai dengan skill yang di-stub lalu dimuat ulang.".into(),
                     tool_calls: Vec::new(),
                     finish_reason: Some("stop".into()),
-                    usage: Some(Usage { input_tokens: 600, output_tokens: 40 }),
+                    usage: Some(Usage { input_tokens: 600, output_tokens: 40, ..Default::default() }),
                 })
             }
         }

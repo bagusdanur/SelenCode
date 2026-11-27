@@ -1771,13 +1771,33 @@ impl Session {
         let today_utc = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let rep = self.store.usage_report(&self.session_id, &today_utc)?;
 
-        let sum_rows = |rows: &[selencode::store::UsageBreakdownRow]| -> (u64, u64, u64) {
-            rows.iter().fold((0, 0, 0), |(c, i, o), r| {
-                (c + r.calls, i + r.input_tokens, o + r.output_tokens)
+        let sum_rows = |rows: &[selencode::store::UsageBreakdownRow]| -> (u64, u64, u64, u64, u64) {
+            rows.iter().fold((0, 0, 0, 0, 0), |(c, i, o, cr, cw), r| {
+                (
+                    c + r.calls,
+                    i + r.input_tokens,
+                    o + r.output_tokens,
+                    cr + r.cache_read_tokens,
+                    cw + r.cache_write_tokens,
+                )
             })
         };
-        let (sc, si, so) = sum_rows(&rep.session_rows);
-        let (tc, ti, to) = sum_rows(&rep.today_rows);
+        let (sc, si, so, scr, scw) = sum_rows(&rep.session_rows);
+        let (tc, ti, to, tcr, tcw) = sum_rows(&rep.today_rows);
+        let fmt_cache = |inp: u64, cr: u64, cw: u64| -> String {
+            if cr == 0 && cw == 0 {
+                String::new()
+            } else if cr > 0 && inp > 0 {
+                let pct = (cr as f64 / inp as f64) * 100.0;
+                if cw > 0 {
+                    format!(" · cache read {cr} ({pct:.1}%) / write {cw}")
+                } else {
+                    format!(" · cache read {cr} ({pct:.1}%)")
+                }
+            } else {
+                format!(" · cache read {cr} / write {cw}")
+            }
+        };
 
         let mut models_seen: Vec<String> = Vec::new();
         for r in rep.session_rows.iter().chain(rep.today_rows.iter()) {
@@ -1793,10 +1813,12 @@ impl Session {
 
         let mut out = format!(
             "# 📊 Laporan Pemakaian Token (/usage)\n\
-             * sesi aktif | {sc} panggilan | {si} in / {so} out\n\
-             * hari ini ({}) | {tc} panggilan | {ti} in / {to} out\n\
+             * sesi aktif | {sc} panggilan | {si} in / {so} out{}\n\
+             * hari ini ({}) | {tc} panggilan | {ti} in / {to} out{}\n\
              > model terpakai | {models_line} | langsung dari tabel `usage` (0 panggilan API)\n",
-            rep.today_date
+            fmt_cache(si, scr, scw),
+            rep.today_date,
+            fmt_cache(ti, tcr, tcw),
         );
 
         let push_kind_breakdown = |out: &mut String, title: &str, rows: &[selencode::store::UsageBreakdownRow]| {

@@ -108,7 +108,7 @@ impl ToolDedupCache {
             "run_shell" | "verify_project" => {
                 self.dedup_hits += 1;
                 Some(format!(
-                    "[Dedup: perintah `{name}` identik baru saja LULUS pada giliran ini tanpa perubahan file baru — tidak dijalankan ulang. Hasil sebelumnya: {}]",
+                    "[Dedup: perintah `{name}` identik baru saja LULUS pada giliran ini tanpa perubahan file baru — tidak dijalankan ulang. Hasil sebelumnya: {}. Verifikasi sudah HIJAU; jika seluruh kriteria tugas sudah terpenuhi, langsung tutup jawaban dengan ringkasan hasil tanpa mengulang verifikasi.]",
                     rec.preview
                 ))
             }
@@ -431,11 +431,28 @@ pub fn is_verification_shell_cmd(args: &Value) -> bool {
         "cargo build",
         "npm test",
         "npm run test",
+        "npm run check",
         "npm run build",
         "npm run lint",
         "npm run typecheck",
         "pnpm test",
+        "pnpm run test",
+        "pnpm check",
+        "pnpm run check",
+        "pnpm build",
+        "pnpm run build",
         "yarn test",
+        "yarn check",
+        "yarn build",
+        "bun test",
+        "bun run test",
+        "bun run build",
+        "svelte-check",
+        "vitest",
+        "jest",
+        "playwright",
+        "eslint",
+        "biome",
         "tsc",
         "pytest",
         "go test",
@@ -570,13 +587,52 @@ fn verify_runner_family(tokens: &[String]) -> Option<&'static str> {
     if tokens.len() >= 2 && tokens[0] == "go" && tokens[1] == "test" {
         return Some("go_test");
     }
-    if tokens.len() >= 2 && matches!(tokens[0].as_str(), "npm" | "pnpm" | "yarn") && tokens.iter().any(|t| t == "test") {
+    if tokens.len() >= 2 && matches!(tokens[0].as_str(), "npm" | "pnpm" | "yarn" | "bun") {
+        if tokens.iter().any(|t| t == "test" || t == "vitest") {
+            return Some("npm_test");
+        }
+        if tokens.iter().any(|t| t == "check" || t == "typecheck" || t == "svelte-check") {
+            return Some("npm_check");
+        }
+        if tokens.iter().any(|t| t == "build") {
+            return Some("npm_build");
+        }
+        if tokens.iter().any(|t| t == "lint") {
+            return Some("npm_lint");
+        }
+    }
+    if tokens.first().map(String::as_str) == Some("npx") && tokens.len() >= 2 {
+        match tokens[1].as_str() {
+            "vitest" | "jest" => return Some("npm_test"),
+            "svelte-check" | "tsc" => return Some("npm_check"),
+            _ => {}
+        }
+    }
+    if tokens[0] == "vitest" || tokens[0] == "jest" {
         return Some("npm_test");
+    }
+    if tokens[0] == "svelte-check" || tokens[0] == "tsc" {
+        return Some("npm_check");
     }
     if tokens.len() >= 2 && tokens[0] == "node" && tokens[1] == "--test" {
         return Some("node_test");
     }
     None
+}
+
+/// Pecah perintah majemuk `a && b && c` (atau dipisah `;`) menjadi sub-perintah individual.
+fn split_compound_shell_commands(cmd: &str) -> Vec<&str> {
+    cmd.split("&&")
+        .flat_map(|part| part.split(';'))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Cek apakah output tool merupakan hasil deduplikasi untuk perintah verifikasi yang BARU SAJA LULUS
+/// (Masalah 3 v0.5.19): output dedup seperti ini menandakan verifikasi tetap HIJAU, BUKAN gagal!
+pub fn is_dedup_passed_verify_output(output: &str) -> bool {
+    output.starts_with("[Dedup:") && output.contains("baru saja LULUS")
 }
 
 fn extract_runner_targets(tokens: &[String]) -> Vec<String> {
@@ -622,6 +678,25 @@ pub fn is_same_or_broader_verify_cmd(established: &str, candidate: &str) -> bool
     // Probe ad-hoc (`python -c ...`, `node -e ...`) tidak pernah boleh menimpa perintah mapan lain!
     if cand_toks.iter().any(|t| t == "-c" || t == "-e") {
         return false;
+    }
+    // Perintah majemuk (`npm run check && npm test && npm run build`): terima baik larian ulang
+    // seluruh perintah majemuk maupun sub-perintah verifikasi di dalamnya (verifikasi inkremental
+    // sesudah edit kecil — Masalah 1 v0.5.19).
+    let est_parts = split_compound_shell_commands(established);
+    let cand_parts = split_compound_shell_commands(candidate);
+    if est_parts.len() > 1 || cand_parts.len() > 1 {
+        if cand_parts.len() > 1 {
+            // Candidate majemuk yang mencakup salah satu sub-perintah mapan (atau seluruhnya) -> sah.
+            return est_parts.iter().all(|ep| {
+                cand_parts
+                    .iter()
+                    .any(|cp| is_same_or_broader_verify_cmd(ep, cp))
+            });
+        }
+        // Established majemuk, candidate tunggal: sah bila cocok dengan salah satu sub-perintah verifikasi mapan!
+        return est_parts
+            .iter()
+            .any(|ep| is_same_or_broader_verify_cmd(ep, candidate));
     }
     let Some(est_fam) = verify_runner_family(&est_toks) else {
         return false;
@@ -757,6 +832,11 @@ pub struct SelfCorrectState {
     pub repair_attempts: usize,
     pub max_attempts: usize,
     pub checkpoint_id: Option<usize>,
+    /// True bila minimal satu perintah verifikasi nyata pernah LULUS penuh pada giliran ini (Masalah 1 v0.5.19).
+    pub has_passed_green_verify: bool,
+    /// Jumlah berkas berbeda yang disentuh sejak verifikasi hijau terakhir (untuk mengizinkan
+    /// verifikasi inkremental terbatas pada edit kecil sesudah build+tes hijau — Masalah 1 v0.5.19).
+    pub edits_since_last_green_verify: usize,
     /// True sesudah daftar periksa penutup SWE-agent (`review_on_submit`) dijalankan sekali.
     pub checklist_checked: bool,
 }
@@ -780,6 +860,8 @@ impl Default for SelfCorrectState {
             repair_attempts: 0,
             max_attempts: MAX_REPAIR_ATTEMPTS,
             checkpoint_id: None,
+            has_passed_green_verify: false,
+            edits_since_last_green_verify: 0,
             checklist_checked: false,
         }
     }
@@ -844,6 +926,9 @@ impl SelfCorrectState {
                 // Ada edit baru -> verifikasi lama tidak lagi berlaku sesudah edit terakhir,
                 // namun tetap simpan `last_verify_cmd` / `last_verify_passed` agar gerbang tahu konteks gagalnya.
                 self.verified_after_last_edit = false;
+                if self.has_passed_green_verify {
+                    self.edits_since_last_green_verify += 1;
+                }
             }
             "lsp_rename" => {
                 let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -859,8 +944,22 @@ impl SelfCorrectState {
                     self.edited_files.push("(lsp_rename)".to_string());
                 }
                 self.verified_after_last_edit = false;
+                if self.has_passed_green_verify {
+                    self.edits_since_last_green_verify += 1;
+                }
             }
             "verify_project" => {
+                // Masalah 3 (v0.5.19): dedup perintah verifikasi yang BARU SAJA LULUS bukan kegagalan!
+                if !is_error && is_dedup_passed_verify_output(output) {
+                    self.has_verification_run = true;
+                    self.verified_after_last_edit = true;
+                    self.last_verify_passed = Some(true);
+                    self.has_passed_green_verify = true;
+                    self.edits_since_last_green_verify = 0;
+                    self.last_verify_exit_code = self.last_verify_exit_code.or(Some(0));
+                    self.last_verify_output = None;
+                    return;
+                }
                 if !is_error
                     && (output.contains("verifikasi proyek otomatis dilewati")
                         || output.starts_with("Ditolak user"))
@@ -890,6 +989,10 @@ impl SelfCorrectState {
                 self.last_verify_exit_code = Some(if ok { 0 } else { 1 });
                 self.last_verify_key_line = Some(extract_verify_key_line(output));
                 self.last_verify_passed = Some(ok);
+                if ok {
+                    self.has_passed_green_verify = true;
+                    self.edits_since_last_green_verify = 0;
+                }
                 self.last_verify_output = if ok {
                     None
                 } else {
@@ -906,11 +1009,44 @@ impl SelfCorrectState {
                 if cmd.is_empty() {
                     return;
                 }
-                // Perbaikan 3 (v0.5.15): integritas keadaan verifikasi — terikat pada perintah mapan.
-                // Perintah lain (probe `python3 -c ...`, skrip bantu, suite tak terkait) TIDAK menimpa keadaan!
+                // Masalah 3 (v0.5.19): perintah verifikasi identik yang dihentikan dedup karena
+                // BARU SAJA LULUS tanpa perubahan berkas baru wajib mempertahankan status LULUS
+                // (tidak pernah menimpa `last_verify_passed` menjadi `false`!).
+                if !is_error && is_dedup_passed_verify_output(output) {
+                    if is_verification_shell_cmd(args)
+                        || self
+                            .last_verify_cmd
+                            .as_deref()
+                            .map(|est| is_same_or_broader_verify_cmd(est, &cmd))
+                            .unwrap_or(false)
+                    {
+                        self.has_verification_run = true;
+                        self.verified_after_last_edit = true;
+                        self.last_verify_passed = Some(true);
+                        self.has_passed_green_verify = true;
+                        self.edits_since_last_green_verify = 0;
+                        self.last_verify_exit_code = self.last_verify_exit_code.or(Some(0));
+                        self.last_verify_output = None;
+                    }
+                    return;
+                }
+                // Perbaikan 3 (v0.5.15) + Masalah 1 (v0.5.19):
+                // - Jika belum ada perintah mapan: terima perintah verifikasi proyek mana pun.
+                // - Jika sudah ada perintah mapan: terima perintah yang sama/lebih luas/sub-perintah
+                //   komponennya; ATAU bila proyek SUDAH pernah lulus verifikasi penuh dan baru ada
+                //   edit kecil (<= 2 edit), terima juga perintah verifikasi proyek inkremental yang sah
+                //   (tetap menolak keras probe `python -c` / `node -e` dan skrip tak terkait!).
+                let cand_toks = normalize_verify_cmd_tokens(&cmd);
+                let is_probe = cand_toks.iter().any(|t| t == "-c" || t == "-e");
+                let is_incremental_after_green = !is_probe
+                    && self.has_passed_green_verify
+                    && self.edits_since_last_green_verify <= 2
+                    && verify_runner_family(&cand_toks).is_some();
                 let should_update = match self.last_verify_cmd.as_deref() {
                     None => is_verification_shell_cmd(args),
-                    Some(est) => is_same_or_broader_verify_cmd(est, &cmd),
+                    Some(est) => {
+                        is_same_or_broader_verify_cmd(est, &cmd) || is_incremental_after_green
+                    }
                 };
                 if should_update {
                     if self.last_verify_cmd.is_none() {
@@ -924,6 +1060,10 @@ impl SelfCorrectState {
                     self.last_verify_key_line = Some(extract_verify_key_line(output));
                     let ok = !is_error && (ec == Some(0) || output.starts_with("exit code: 0"));
                     self.last_verify_passed = Some(ok);
+                    if ok {
+                        self.has_passed_green_verify = true;
+                        self.edits_since_last_green_verify = 0;
+                    }
                     self.last_verify_output = if ok {
                         None
                     } else {
@@ -964,6 +1104,13 @@ impl SelfCorrectState {
             self.repair_attempts += 1;
             let attempt = self.repair_attempts;
             if let Some(cmd) = self.last_verify_cmd.as_deref() {
+                if self.last_verify_passed == Some(true) && self.edits_since_last_green_verify <= 2 {
+                    return Some(format!(
+                        "[Self-Correction Gate {attempt}/{cap} — Verifikasi Inkremental] \
+                         Verifikasi sebelumnya (`{cmd}`{step_note}) sudah LULUS, lalu ada edit kecil pada ({files}). \
+                         Jalankan verifikasi inkremental/terbatas pada bagian yang berubah saja 1× (tidak perlu mengulang suite penuh yang tidak terdampak), lalu langsung tutup jawaban jika lulus."
+                    ));
+                }
                 let prev_status = match self.last_verify_passed {
                     Some(false) => "GAGAL",
                     Some(true) => "LULUS",

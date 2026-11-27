@@ -145,6 +145,7 @@ impl Provider for ScriptedProvider {
             usage: Some(Usage {
                 input_tokens: 1_000,
                 output_tokens: 500,
+                ..Default::default()
             }),
         })
     }

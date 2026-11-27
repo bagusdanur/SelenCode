@@ -134,14 +134,14 @@ impl Provider for BatchedReadProv {
                     })
                     .collect(),
                 finish_reason: Some("tool_calls".into()),
-                usage: Some(Usage { input_tokens: 300, output_tokens: 40 }),
+                usage: Some(Usage { input_tokens: 300, output_tokens: 40, ..Default::default() }),
             })
         } else {
             Ok(AssistantReply {
                 text: "Riset ter-batch selesai.".into(),
                 tool_calls: Vec::new(),
                 finish_reason: Some("stop".into()),
-                usage: Some(Usage { input_tokens: 350, output_tokens: 30 }),
+                usage: Some(Usage { input_tokens: 350, output_tokens: 30, ..Default::default() }),
             })
         }
     }
@@ -202,7 +202,7 @@ impl Provider for TruncatingProv {
                     .into(),
                 tool_calls: Vec::new(),
                 finish_reason: Some("stop".into()),
-                usage: Some(Usage { input_tokens: 200, output_tokens: 40 }),
+                usage: Some(Usage { input_tokens: 200, output_tokens: 40, ..Default::default() }),
             });
         }
         Ok(AssistantReply {
@@ -213,7 +213,7 @@ impl Provider for TruncatingProv {
                 args: json!({}),
             }],
             finish_reason: Some("tool_calls".into()),
-            usage: Some(Usage { input_tokens: 220, output_tokens: 25 }),
+            usage: Some(Usage { input_tokens: 220, output_tokens: 25, ..Default::default() }),
         })
     }
 }

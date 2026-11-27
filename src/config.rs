@@ -504,10 +504,10 @@ fn default_file_read_default_lines() -> usize {
     crate::tools::file::DEFAULT_FILE_READ_LINES
 }
 fn default_proactive_prune_tokens() -> usize {
-    18_000
+    28_000
 }
 fn default_proactive_prune_min_reclaim_tokens() -> usize {
-    2_000
+    4_096
 }
 
 impl Default for ToolBudgetCfg {

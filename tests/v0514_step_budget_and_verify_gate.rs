@@ -129,6 +129,7 @@ budget_warning_ratio = 0.7
                     usage: Some(Usage {
                         input_tokens: 900,
                         output_tokens: 20,
+                        ..Default::default()
                     }),
                 }),
                 4 => Ok(AssistantReply {
@@ -146,6 +147,7 @@ budget_warning_ratio = 0.7
                     usage: Some(Usage {
                         input_tokens: 1050,
                         output_tokens: 30,
+                        ..Default::default()
                     }),
                 }),
                 _ => Ok(AssistantReply {
@@ -155,6 +157,7 @@ budget_warning_ratio = 0.7
                     usage: Some(Usage {
                         input_tokens: 1100,
                         output_tokens: 25,
+                        ..Default::default()
                     }),
                 }),
             }

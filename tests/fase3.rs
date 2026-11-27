@@ -350,6 +350,7 @@ impl Provider for UsageMock {
             usage: Some(Usage {
                 input_tokens: 11,
                 output_tokens: 7,
+                ..Default::default()
             }),
         })
     }

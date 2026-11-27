@@ -46,6 +46,7 @@ fn reducer_event_streaming_tool_dan_turn() {
         usage: Some(Usage {
             input_tokens: 100,
             output_tokens: 40,
+            ..Default::default()
         }),
     });
 

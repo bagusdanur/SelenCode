@@ -87,6 +87,7 @@ async fn m1_dead_silent_and_midstream_primary_falls_back_with_notice_and_breaker
                 usage: Some(Usage {
                     input_tokens: 300,
                     output_tokens: 20,
+                    ..Default::default()
                 }),
             })
         }
@@ -262,6 +263,7 @@ async fn m2_max_output_tokens_truncation_is_visible_persisted_and_cancels_partia
                     usage: Some(Usage {
                         input_tokens: 500,
                         output_tokens: 80,
+                        ..Default::default()
                     }),
                 })
             } else {
@@ -276,6 +278,7 @@ async fn m2_max_output_tokens_truncation_is_visible_persisted_and_cancels_partia
                     usage: Some(Usage {
                         input_tokens: 1_200,
                         output_tokens: 8_188,
+                        ..Default::default()
                     }),
                 })
             }
@@ -358,6 +361,7 @@ async fn m2_max_output_tokens_truncation_is_visible_persisted_and_cancels_partia
                 usage: Some(Usage {
                     input_tokens: 8_000,
                     output_tokens: 8_188,
+                    ..Default::default()
                 }),
             })
         }
@@ -466,6 +470,7 @@ async fn m4_post_tool_prune_fires_in_same_ingestion_turn_before_next_call() {
                     usage: Some(Usage {
                         input_tokens: 4_350,
                         output_tokens: 90,
+                        ..Default::default()
                     }),
                 })
             } else {
@@ -478,6 +483,7 @@ async fn m4_post_tool_prune_fires_in_same_ingestion_turn_before_next_call() {
                     usage: Some(Usage {
                         input_tokens: 6_500,
                         output_tokens: 25,
+                        ..Default::default()
                     }),
                 })
             }

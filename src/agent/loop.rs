@@ -19,7 +19,9 @@ use crate::tool_display::{
     build_template_closing_summary_with_status, format_tool_event_from_preview,
     prepare_tool_preview, short_error_reason, ToolActionEvent,
 };
-use super::corrector::{LoopGuard, SelfCorrectState, ToolDedupCache};
+use super::corrector::{
+    is_dedup_passed_verify_output, LoopGuard, SelfCorrectState, ToolDedupCache,
+};
 use super::plan::{is_read_only, TurnMode, PLAN_NOTE};
 use super::ui::UiEvent;
 
@@ -37,7 +39,7 @@ fn persist_message(ctx: &Ctx, msg: &Message) {
 
 fn persist_usage_kind(ctx: &Ctx, model: &str, usage: Option<Usage>, kind: &str) {
     if let (Some(store), Some(sid), Some(u)) = (&ctx.store, &ctx.session_id, usage) {
-        if let Err(e) = store.record_usage_with_kind(sid, model, u.input_tokens, u.output_tokens, kind) {
+        if let Err(e) = store.record_usage_full(sid, model, u, kind) {
             eprintln!("[selen] gagal mencatat usage: {e}");
         }
     }
@@ -1226,6 +1228,13 @@ async fn run_turn_inner(
     // agar pemangkasan proaktif menyala berdasarkan ukuran riil, bukan hanya perkiraan kasar.
     let mut last_provider_prompt_tokens: usize = 0;
     let mut last_est_tokens_at_call: usize = 0;
+    // v0.5.19 Masalah 2 (diambil dari Hermes `agent/context_compressor_prune.py:148-200`,
+    // `_proactive_prune_rearm_tokens`): landasan histeresis agar prune proaktif tidak
+    // memotong prefiks berulang-ulang di setiap panggilan sehingga prompt cache provider tetap menempel.
+    let mut proactive_prune_rearm_tokens: usize = 0;
+    // v0.5.19 Masalah 1: pelacak pengulangan perintah verifikasi yang sudah hijau tanpa edit baru.
+    let mut green_verify_dedup_hits: usize = 0;
+    let mut verified_convergence_stop = false;
     // Perbaikan 1 (v0.5.14 + v0.5.15): kesadaran anggaran langkah.
     // `max_steps == 0` berarti TANPA BATAS ala Hermes (tidak ada pagu tersembunyi);
     // `max_steps > 0` berlaku sebagai pagu keras dengan checkpoint rasio + konvergensi tepat spesifikasi.
@@ -1256,19 +1265,26 @@ async fn run_turn_inner(
         // tepat sesudah model memakainya di 1 giliran berikutnya) ke stub ringkas + arsip byte-exact
         // agar isi skill tidak terbawa penuh di sisa sesi.
         let pruned_skills = prune_old_skill_results_with_archive(messages, &prune_dir, 2);
-        // Tahap 1 & Perbaikan 1 (v0.5.11): pada giliran resume step lanjutan (`lean_resume && step >= 2`),
-        // pangkas hasil tool besar (>200 char) di luar 2 pesan terakhir ke stub arsip agar tidak menempel
-        // antar-panggilan; sesi biasa mempertahankan jendela 20 pesan terakhir.
-        let tool_keep_tail = if lean_resume && step >= 2 { 2 } else { 20 };
-        let mut pruned_now =
-            pruned_skills + prune_old_tool_results_with_archive(messages, &prune_dir, tool_keep_tail);
+        // Tahap 1 & Perbaikan 1 (v0.5.11) + Masalah 2 (v0.5.19):
+        // - Pada giliran resume (`lean_resume && step >= 2`), tetap pangkas hasil tool besar di luar
+        //   2 pesan terakhir agar resume E tetap ramping (<= 7.500 token).
+        // - Pada sesi biasa (non-resume), JANGAN menjalankan prune bergeser per langkah di setiap
+        //   pesan > 20! Mutasi prefiks bergeser setiap langkah mematahkan prompt cache prefiks provider
+        //   (Gemini/OpenAI/Anthropic) pada panggilan #11..#77; pemangkasan konteks sesi biasa kini
+        //   sepenuhnya ditangani prune proaktif bergelombang dengan landasan histeresis (rearm runway).
+        let mut pruned_now = pruned_skills
+            + if lean_resume && step >= 2 {
+                prune_old_tool_results_with_archive(messages, &prune_dir, 2)
+            } else {
+                0
+            };
         if pruned_now > 0 {
             dedup.clear_file_reads();
         }
-        // v0.5.17 Masalah 2 (diporting dari Hermes `agent/turn_preflight.py` + `agent/context_compressor_prune.py`):
-        // Pemangkasan proaktif 3-pass (dedup hasil tool identik + arsip ToolResult lama + ringkas argumen
-        // ToolUse raksasa seperti `write_file` 16KB) berdasarkan tekanan token riil, TANPA menunggu
-        // `messages.len() > 20` atau 80% jendela 1M!
+        // v0.5.17 Masalah 2 + v0.5.19 Masalah 2 (diambil dari Hermes `agent/turn_preflight.py` +
+        // `agent/context_compressor_prune.py` termasuk histeresis `_proactive_prune_rearm_tokens`):
+        // Pemangkasan proaktif 3-pass berdasarkan tekanan token riil, hanya menyala saat melewati
+        // ambang pemicu DAN landasan rearm agar prefiks tetap stabil byte-identik di antara gelombang.
         if ctx.tool_budget.proactive_prune_tokens > 0 {
             let est_pre = analyze_token_breakdown(messages, &tools, registry.names().len()).total_tokens();
             let anchored_tokens = if last_provider_prompt_tokens > 0 {
@@ -1283,7 +1299,9 @@ async fn run_turn_inner(
                 .tool_budget
                 .proactive_prune_tokens
                 .min((ctx.context_limit_tokens * 45 / 100).max(4_000));
-            if anchored_tokens >= proactive_trigger {
+            if anchored_tokens >= proactive_trigger
+                && anchored_tokens >= proactive_prune_rearm_tokens
+            {
                 let mut pres = proactive_prune_context_with_archive(
                     messages,
                     &prune_dir,
@@ -1307,6 +1325,17 @@ async fn run_turn_inner(
                 if pres.pruned_count > 0 {
                     pruned_now += pres.pruned_count;
                     dedup.clear_file_reads();
+                    let after_est =
+                        analyze_token_breakdown(messages, &tools, registry.names().len())
+                            .total_tokens();
+                    let runway = pres
+                        .reclaimed_tokens
+                        .max(proactive_trigger / 2)
+                        .max(ctx.tool_budget.proactive_prune_min_reclaim_tokens);
+                    proactive_prune_rearm_tokens = after_est.saturating_add(runway);
+                    last_provider_prompt_tokens =
+                        last_provider_prompt_tokens.saturating_sub(pres.reclaimed_tokens);
+                    last_est_tokens_at_call = after_est;
                     let note = format!(
                         "✦ Prune proaktif konteks: {} item diringkas (~{} token dibebaskan, arsip tersimpan)",
                         pres.pruned_count, pres.reclaimed_tokens
@@ -1331,6 +1360,9 @@ async fn run_turn_inner(
                 None => eprintln!("[selen] compaction dua tahap dijalankan"),
             }
             *messages = compact_messages_hermes(messages);
+            proactive_prune_rearm_tokens = 0;
+            last_provider_prompt_tokens = 0;
+            last_est_tokens_at_call = 0;
             dedup.clear_file_reads();
         }
         // Provider dipindah ke task agar StreamEvent bisa dikonsumsi sambil jalan.
@@ -1449,6 +1481,7 @@ async fn run_turn_inner(
                             pruned_now += em.pruned_count;
                             if em.pruned_count == 0 {
                                 *messages = compact_messages_hermes(messages);
+                                proactive_prune_rearm_tokens = 0;
                             }
                             dedup.clear_file_reads();
                             let note = format!(
@@ -1599,6 +1632,8 @@ async fn run_turn_inner(
         if let Some(u) = reply.usage {
             turn_usage.input_tokens += u.input_tokens;
             turn_usage.output_tokens += u.output_tokens;
+            turn_usage.cache_read_tokens += u.cache_read_tokens;
+            turn_usage.cache_write_tokens += u.cache_write_tokens;
             have_usage = true;
         }
         last_text = reply.text.clone();
@@ -2065,6 +2100,7 @@ async fn run_turn_inner(
                                     {
                                         let p = call.args.get("path").and_then(|v| v.as_str());
                                         dedup.invalidate_on_edit(p);
+                                        green_verify_dedup_hits = 0;
                                     } else {
                                         dedup.record_success(
                                             &call.name,
@@ -2159,7 +2195,21 @@ async fn run_turn_inner(
                     }
                 }
             }
-            if let Some(warn) = loop_guard
+            // Masalah 1 & 3 (v0.5.19): dedup perintah verifikasi yang BARU SAJA LULUS tanpa edit baru
+            // BUKAN stagnasi gagal; beri dorongan disiplin berhenti lalu konvergen bersih ke penutupan.
+            let is_green_verify_dedup = !is_error && is_dedup_passed_verify_output(&content);
+            if is_green_verify_dedup {
+                green_verify_dedup_hits += 1;
+                if green_verify_dedup_hits >= 2 {
+                    content.push_str(
+                        "\n\n[DISIPLIN BERHENTI] Verifikasi proyek sudah HIJAU dan tidak ada perubahan berkas baru sejak lulus. \
+                         DILARANG mengulang perintah check/test/build yang sama — segera tutup jawaban akhir dengan ringkasan hasil yang telah terverifikasi.",
+                    );
+                }
+                if green_verify_dedup_hits >= 3 && corrector.last_verify_passed == Some(true) {
+                    verified_convergence_stop = true;
+                }
+            } else if let Some(warn) = loop_guard
                 .record_with_result(&call.name, &call.args, &content, is_error)
                 .hint_message()
             {
@@ -2388,7 +2438,9 @@ async fn run_turn_inner(
                 .tool_budget
                 .proactive_prune_tokens
                 .min((ctx.context_limit_tokens * 45 / 100).max(4_000));
-            if anchored_post >= proactive_trigger {
+            if anchored_post >= proactive_trigger
+                && anchored_post >= proactive_prune_rearm_tokens
+            {
                 let old_res = proactive_prune_context_with_archive(
                     messages,
                     &prune_dir,
@@ -2415,6 +2467,16 @@ async fn run_turn_inner(
                 let post_reclaimed = old_res.reclaimed_tokens + batch_res.reclaimed_tokens;
                 if post_pruned > 0 {
                     dedup.clear_file_reads();
+                    let after_est =
+                        analyze_token_breakdown(messages, &tools, registry.names().len())
+                            .total_tokens();
+                    let runway = post_reclaimed
+                        .max(proactive_trigger / 2)
+                        .max(ctx.tool_budget.proactive_prune_min_reclaim_tokens);
+                    proactive_prune_rearm_tokens = after_est.saturating_add(runway);
+                    last_provider_prompt_tokens =
+                        last_provider_prompt_tokens.saturating_sub(post_reclaimed);
+                    last_est_tokens_at_call = after_est;
                     if let (Some(store), Some(sid)) = (&ctx.store, &ctx.session_id) {
                         let _ = store.add_latest_call_pruned_count(sid, post_pruned);
                     }
@@ -2430,6 +2492,16 @@ async fn run_turn_inner(
                     }
                 }
             }
+        }
+        if verified_convergence_stop {
+            let note = "✦ Disiplin berhenti: verifikasi proyek sudah hijau tanpa edit baru — menutup giliran secara bersih…".to_string();
+            match &ui {
+                Some(tx) => {
+                    let _ = tx.send(UiEvent::Info(note)).await;
+                }
+                None => eprintln!("[selen] {note}"),
+            }
+            break;
         }
 
         // Perbaikan 2 (v0.5.11) — Suntikan nol-pemborosan pasca-langkah-pertama:
@@ -2573,6 +2645,8 @@ async fn run_turn_inner(
                     persist_usage_kind(ctx, provider.model_name(), Some(u), "main");
                     turn_usage.input_tokens += u.input_tokens;
                     turn_usage.output_tokens += u.output_tokens;
+                    turn_usage.cache_read_tokens += u.cache_read_tokens;
+                    turn_usage.cache_write_tokens += u.cache_write_tokens;
                     have_usage = true;
                 }
                 rep.text.trim().to_string()
@@ -2584,6 +2658,68 @@ async fn run_turn_inner(
             ),
         };
         let mut closing_text = enforce_zero_edit_failure_header(&raw_closing, zero_edit_failure);
+        if let Some(ver_line) = corrector.closing_verification_summary_line(turn_requests_edit) {
+            if !closing_text.contains(&ver_line) {
+                closing_text.push_str("\n\n");
+                closing_text.push_str(&ver_line);
+            }
+        }
+        if let Some(test_line) = corrector.closing_test_files_note() {
+            if !closing_text.contains(&test_line) {
+                closing_text.push_str("\n");
+                closing_text.push_str(&test_line);
+            }
+        }
+        let closing_msg = Message::text(Role::Assistant, closing_text.clone());
+        persist_message(ctx, &closing_msg);
+        messages.push(closing_msg);
+        match &ui {
+            Some(tx) => {
+                let _ = tx.send(UiEvent::Token(closing_text.clone())).await;
+            }
+            None => println!("{closing_text}"),
+        }
+        last_text = closing_text;
+    } else if verified_convergence_stop {
+        // Masalah 1 (v0.5.19): konvergensi bersih ketika verifikasi proyek sudah HIJAU dan
+        // model mencoba mengulang perintah verifikasi identik berulang kali tanpa edit baru.
+        let mut summary_msgs = messages.clone();
+        summary_msgs.push(Message::text(
+            Role::User,
+            "[KONVERGENSI VERIFIKASI HIJAU] Seluruh verifikasi proyek sudah LULUS tanpa perubahan berkas baru. \
+             Tool dimatikan — tulis ringkasan akhir yang ringkas dan faktual (berkas yang dibuat/diubah serta hasil verifikasi yang lulus)."
+                .to_string(),
+        ));
+        let (stx, _srx) = mpsc::channel::<StreamEvent>(64);
+        let p_close = provider.clone();
+        let closing_res = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            p_close.stream_chat(&summary_msgs, &[], stx),
+        )
+        .await;
+        let mut closing_text = match closing_res {
+            Ok(Ok(rep)) if !rep.text.trim().is_empty() => {
+                if let Some(u) = rep.usage {
+                    persist_usage_kind(ctx, provider.model_name(), Some(u), "main");
+                    turn_usage.input_tokens += u.input_tokens;
+                    turn_usage.output_tokens += u.output_tokens;
+                    turn_usage.cache_read_tokens += u.cache_read_tokens;
+                    turn_usage.cache_write_tokens += u.cache_write_tokens;
+                    have_usage = true;
+                }
+                rep.text.trim().to_string()
+            }
+            _ => {
+                let files = if corrector.edited_files.is_empty() {
+                    "(tidak ada perubahan berkas)".to_string()
+                } else {
+                    corrector.edited_files.join(", ")
+                };
+                format!(
+                    "Tugas selesai dan terverifikasi lulus.\n- Berkas diubah: {files}"
+                )
+            }
+        };
         if let Some(ver_line) = corrector.closing_verification_summary_line(turn_requests_edit) {
             if !closing_text.contains(&ver_line) {
                 closing_text.push_str("\n\n");
