@@ -229,7 +229,7 @@ impl Tool for WriteFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_file".into(),
-            description: "Buat file baru atau tulis penuh file kecil (persetujuan + diff). Untuk perubahan lokal pada file besar yang sudah ada, utamakan edit_file.".into(),
+            description: "Tulis file baru/kecil; untuk ubah lokal file besar pakai edit_file.".into(),
             parameters: schema(
                 json!({"path": {"type": "string"}, "content": {"type": "string"}}),
                 &["path", "content"],
@@ -300,7 +300,7 @@ impl Tool for EditFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit_file".into(),
-            description: "Patch terarah: ganti teks persis `old` (unik 1x) -> `new`. Utamakan ini untuk mengubah berkas yang sudah ada.".into(),
+            description: "Patch terarah: ganti teks persis `old` (unik 1x) -> `new`.".into(),
             parameters: schema(
                 json!({"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}),
                 &["path", "old", "new"],
