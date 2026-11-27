@@ -210,7 +210,7 @@ async fn m2_read_file_dual_cap_pagination_and_per_line_clamp() {
     let reg = default_registry();
     let read_tool = reg.get("read_file").unwrap();
 
-    // 1. Berkas Svelte besar (~850 baris, ~40KB < 100KB): tidak dibuang utuh sekaligus!
+    // 1a. Berkas Svelte besar (~850 baris panjang, ~55KB < 100KB): dipotong rapi oleh pagu karakter 16.000 char!
     let mut svelte = String::new();
     for i in 1..=850 {
         svelte.push_str(&format!(
@@ -230,8 +230,23 @@ async fn m2_read_file_dual_cap_pagination_and_per_line_clamp() {
         out.chars().count()
     );
     assert!(
-        out.contains("baris 1-250 dari 850") && out.contains("start=251"),
-        "harus menyertakan petunjuk pagination start/end yang jelas: {out}"
+        out.contains("pagu 16000 char") && out.contains("dari 850") && out.contains("start="),
+        "harus memotong pada pagu 16000 char + petunjuk pagination start/end: {out}"
+    );
+
+    // 1b. Berkas 850 baris pendek (~10KB): dipotong rapi oleh pagu baris bawaan 250 baris!
+    let mut short_many = String::new();
+    for i in 1..=850 {
+        short_many.push_str(&format!("let v{i} = {i};\n"));
+    }
+    std::fs::write(cwd.join("short_many.svelte"), &short_many).unwrap();
+    let out_lines = read_tool
+        .run(json!({"path": "short_many.svelte"}), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        out_lines.contains("baris 1-250 dari 850") && out_lines.contains("start=251"),
+        "harus memotong pada pagu 250 baris + start=251: {out_lines}"
     );
 
     // 2. Baris super panjang (minified CSS/SVG 5.000 char) dipotong per baris (2.000 char)
