@@ -20,7 +20,8 @@ use crate::tool_display::{
     prepare_tool_preview, short_error_reason, ToolActionEvent,
 };
 use super::corrector::{
-    is_dedup_passed_verify_output, LoopGuard, SelfCorrectState, ToolDedupCache,
+    detect_tooling_config_error_hint, is_dedup_passed_verify_output, is_vendor_or_dependency_path,
+    LoopGuard, SelfCorrectState, ToolDedupCache,
 };
 use super::plan::{is_read_only, TurnMode, PLAN_NOTE};
 use super::ui::UiEvent;
@@ -1235,6 +1236,9 @@ async fn run_turn_inner(
     // v0.5.19 Masalah 1: pelacak pengulangan perintah verifikasi yang sudah hijau tanpa edit baru.
     let mut green_verify_dedup_hits: usize = 0;
     let mut verified_convergence_stop = false;
+    // v0.5.20 Masalah 2: pengaman bacaan berulang di dalam `node_modules/`/vendor & panduan pemulihan config 1x.
+    let mut vendor_reads_in_turn: usize = 0;
+    let mut tooling_hint_injected = false;
     // Perbaikan 1 (v0.5.14 + v0.5.15): kesadaran anggaran langkah.
     // `max_steps == 0` berarti TANPA BATAS ala Hermes (tidak ada pagu tersembunyi);
     // `max_steps > 0` berlaku sebagai pagu keras dengan checkpoint rasio + konvergensi tepat spesifikasi.
@@ -1328,9 +1332,12 @@ async fn run_turn_inner(
                     let after_est =
                         analyze_token_breakdown(messages, &tools, registry.names().len())
                             .total_tokens();
+                    // v0.5.20 Masalah 4 (diambil dari Hermes `agent/context_compressor_prune.py:200`):
+                    // landasan rearm penuh `after + max(reclaimed, proactive_trigger, min_reclaim)` agar
+                    // pemangkasan bersifat episodik dan prefiks prompt cache tidak cepat patah ulang.
                     let runway = pres
                         .reclaimed_tokens
-                        .max(proactive_trigger / 2)
+                        .max(proactive_trigger)
                         .max(ctx.tool_budget.proactive_prune_min_reclaim_tokens);
                     proactive_prune_rearm_tokens = after_est.saturating_add(runway);
                     last_provider_prompt_tokens =
@@ -2058,9 +2065,32 @@ async fn run_turn_inner(
                         true,
                     )
                 } else if ctx.guard.enabled {
+                    let vendor_read_rel = if call.name == "read_file" {
+                        call.args
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .filter(|p| is_vendor_or_dependency_path(p))
+                    } else {
+                        None
+                    };
                     if let Some(dedup_stub) = dedup.check_hit(&call.name, &call.args, &ctx.cwd) {
                         last_step_deduped += 1;
                         (dedup_stub, false)
+                    } else if let Some(vpath) = vendor_read_rel.filter(|_| vendor_reads_in_turn >= 1)
+                    {
+                        // Masalah 2 (v0.5.20): cegah pembacaan berulang di dalam `node_modules/` / vendor
+                        // yang membakar puluhan panggilan & mengotori konteks saat memperbaiki galat config.
+                        vendor_reads_in_turn += 1;
+                        last_step_deduped += 1;
+                        (
+                            format!(
+                                "[PANDUAN PERKAKAS — BACAAN VENDOR DICEGAH] Berkas '{vpath}' berada di direktori dependensi/vendor \
+                                 dan kamu sudah memeriksa direktori vendor di giliran ini. JANGAN mengorek isi `node_modules/` lagi — \
+                                 perbaiki langsung berkas konfigurasi sumber proyek (`tsconfig.json`, `package.json`, `svelte.config.*`, `vite.config.*`) \
+                                 atau jalankan skrip sync/check proyek resmi."
+                            ),
+                            false,
+                        )
                     } else {
                         let args_str = call.args.to_string();
                         let pre_res = if !ctx.hooks.is_empty() {
@@ -2093,6 +2123,13 @@ async fn run_turn_inner(
                                     None => (format!("ERROR: tool '{}' tidak dikenal", call.name), true),
                                 };
                                 if !err_flag {
+                                    if vendor_read_rel.is_some() {
+                                        vendor_reads_in_turn += 1;
+                                        out_txt.push_str(
+                                            "\n\n[PANDUAN PERKAKAS] Jangan menelusuri isi internal `node_modules/` berulang-ulang untuk galat typecheck/build/config — \
+                                             fokus perbaiki berkas konfigurasi sumber (`tsconfig.json`, `package.json`, `svelte.config.*`, `vite.config.*`) atau jalankan skrip proyek resmi.",
+                                        );
+                                    }
                                     if matches!(
                                         call.name.as_str(),
                                         "write_file" | "edit_file" | "lsp_rename"
@@ -2100,6 +2137,13 @@ async fn run_turn_inner(
                                     {
                                         let p = call.args.get("path").and_then(|v| v.as_str());
                                         dedup.invalidate_on_edit(p);
+                                        if let Some(rel) = p {
+                                            if call.name == "write_file" {
+                                                dedup.record_write(rel, &ctx.cwd);
+                                            } else if call.name == "edit_file" {
+                                                dedup.update_write_baseline_if_known(rel, &ctx.cwd);
+                                            }
+                                        }
                                         green_verify_dedup_hits = 0;
                                     } else {
                                         dedup.record_success(
@@ -2108,6 +2152,24 @@ async fn run_turn_inner(
                                             &out_txt,
                                             &ctx.cwd,
                                         );
+                                        if call.name == "run_shell" {
+                                            let cmd_s = call
+                                                .args
+                                                .get("command")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            if out_txt.starts_with("exit code: 0") {
+                                                tooling_hint_injected = false;
+                                            } else if !tooling_hint_injected {
+                                                if let Some(hint) =
+                                                    detect_tooling_config_error_hint(cmd_s, &out_txt)
+                                                {
+                                                    tooling_hint_injected = true;
+                                                    out_txt.push_str("\n\n");
+                                                    out_txt.push_str(hint);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 if !ctx.hooks.is_empty() {
@@ -2470,8 +2532,10 @@ async fn run_turn_inner(
                     let after_est =
                         analyze_token_breakdown(messages, &tools, registry.names().len())
                             .total_tokens();
+                    // v0.5.20 Masalah 4 (diambil dari Hermes `agent/context_compressor_prune.py:200`):
+                    // landasan rearm penuh `after + max(reclaimed, proactive_trigger, min_reclaim)`.
                     let runway = post_reclaimed
-                        .max(proactive_trigger / 2)
+                        .max(proactive_trigger)
                         .max(ctx.tool_budget.proactive_prune_min_reclaim_tokens);
                     proactive_prune_rearm_tokens = after_est.saturating_add(runway);
                     last_provider_prompt_tokens =

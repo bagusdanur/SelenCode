@@ -504,7 +504,7 @@ fn default_file_read_default_lines() -> usize {
     crate::tools::file::DEFAULT_FILE_READ_LINES
 }
 fn default_proactive_prune_tokens() -> usize {
-    28_000
+    96_000
 }
 fn default_proactive_prune_min_reclaim_tokens() -> usize {
     4_096

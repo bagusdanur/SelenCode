@@ -72,12 +72,26 @@ struct DedupRecord {
     preview: String,
 }
 
-/// Cache deduplikasi panggilan tool identik yang SUDAH SUKSES dalam sesi/turn aktif (Tahap 2):
-/// - `read_file`: cek mtime/ukuran file — kalau belum berubah, kembalikan stub hemat token; kalau berubah, baca ulang!
+fn normalize_rel_path(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
+}
+
+/// Cache deduplikasi panggilan tool identik yang SUDAH SUKSES dalam sesi/turn aktif (Tahap 2 + v0.5.20):
+/// - `read_file`: cek mtime/ukuran file — kalau belum berubah (baik dari `read_file` sebelumnya maupun
+///   dari `write_file` / `edit_file` pada baseline penuh milik sesi sendiri, terinspirasi Hermes
+///   `tools/file_tools_read_tracking.py`: `full_write_baselines`), kembalikan stub hemat token;
+///   kalau berubah eksternal atau memakai rentang baris eksplisit (`start`/`end`), baca ulang!
 /// - `run_shell` & `verify_project`: dedup perintah identik yang baru saja sukses sejak edit file terakhir!
 #[derive(Debug, Default)]
 pub struct ToolDedupCache {
     records: HashMap<u64, DedupRecord>,
+    /// Berkas yang isi penuhnya baru saja ditulis (atau di-patch dari baseline penuh) pada generasi
+    /// konteks aktif — mencegah agen membaca ulang karya sendiri secara penuh (Masalah 3 v0.5.20).
+    /// Dikosongkan saat `clear_file_reads()` sesudah prune/compaction agar bacaan pemulihan tetap bisa jalan.
+    written_files: HashMap<String, (u128, u64)>,
     pub dedup_hits: usize,
 }
 
@@ -89,30 +103,77 @@ impl ToolDedupCache {
     /// Cek apakah panggilan ini bisa di-dedup. Mengembalikan `Some(stub)` bila identik & masih valid.
     pub fn check_hit(&mut self, name: &str, args: &Value, cwd: &Path) -> Option<String> {
         let fp = canonical_tool_fingerprint(name, args);
-        let rec = self.records.get(&fp)?.clone();
-        match name {
-            "read_file" => {
-                let rel = rec.file_rel.as_deref()?;
-                let cur_sig = file_signature(cwd, rel)?;
-                if rec.file_sig == Some(cur_sig) {
-                    self.dedup_hits += 1;
-                    return Some(format!(
-                        "[Dedup: `read_file` '{rel}' tidak berubah sejak pembacaan sebelumnya — gunakan isi sebelumnya tanpa membaca ulang. Cuplikan: {}]",
-                        rec.preview
-                    ));
+        if let Some(rec) = self.records.get(&fp).cloned() {
+            return match name {
+                "read_file" => {
+                    let rel = rec.file_rel.as_deref()?;
+                    let cur_sig = file_signature(cwd, rel)?;
+                    if rec.file_sig == Some(cur_sig) {
+                        self.dedup_hits += 1;
+                        return Some(format!(
+                            "[Dedup: `read_file` '{rel}' tidak berubah sejak pembacaan sebelumnya — gunakan isi sebelumnya tanpa membaca ulang. Cuplikan: {}]",
+                            rec.preview
+                        ));
+                    }
+                    // File berubah di disk -> hapus cache lama dan izinkan baca ulang beneran!
+                    self.records.remove(&fp);
+                    None
                 }
-                // File berubah di disk -> hapus cache lama dan izinkan baca ulang beneran!
-                self.records.remove(&fp);
-                None
+                "run_shell" | "verify_project" => {
+                    self.dedup_hits += 1;
+                    Some(format!(
+                        "[Dedup: perintah `{name}` identik baru saja LULUS pada giliran ini tanpa perubahan file baru — tidak dijalankan ulang. Hasil sebelumnya: {}. Verifikasi sudah HIJAU; jika seluruh kriteria tugas sudah terpenuhi, langsung tutup jawaban dengan ringkasan hasil tanpa mengulang verifikasi.]",
+                        rec.preview
+                    ))
+                }
+                _ => None,
+            };
+        }
+        // Masalah 3 (v0.5.20 — terinspirasi Hermes `tools/file_tools_read_tracking.py`: `full_write_baselines`):
+        // Cegah bacaan penuh ulang (`start`/`end` kosong) atas berkas yang baru saja ditulis sendiri di sesi ini
+        // dan belum berubah secara eksternal di disk. Bacaan terarah dengan `start`/`end` (mis. melacak baris galat)
+        // tetap diizinkan penuh.
+        if name == "read_file" && args.get("start").is_none() && args.get("end").is_none() {
+            let rel = args.get("path").and_then(|v| v.as_str())?;
+            let norm = normalize_rel_path(rel);
+            if let Some(&saved_sig) = self.written_files.get(&norm) {
+                if let Some(cur_sig) = file_signature(cwd, rel) {
+                    if cur_sig == saved_sig {
+                        self.dedup_hits += 1;
+                        return Some(format!(
+                            "[Dedup: berkas '{rel}' baru saja kamu tulis/ubah di sesi ini dan belum berubah di disk — isinya sudah ada di konteks percakapanmu. Langsung gunakan `edit_file` tanpa membaca ulang penuh, kecuali butuh memeriksa rentang baris tertentu (`start`/`end`) karena galat.]"
+                        ));
+                    }
+                }
+                // Berubah secara eksternal atau dihapus -> hapus baseline & izinkan baca segar!
+                self.written_files.remove(&norm);
             }
-            "run_shell" | "verify_project" => {
-                self.dedup_hits += 1;
-                Some(format!(
-                    "[Dedup: perintah `{name}` identik baru saja LULUS pada giliran ini tanpa perubahan file baru — tidak dijalankan ulang. Hasil sebelumnya: {}. Verifikasi sudah HIJAU; jika seluruh kriteria tugas sudah terpenuhi, langsung tutup jawaban dengan ringkasan hasil tanpa mengulang verifikasi.]",
-                    rec.preview
-                ))
+        }
+        None
+    }
+
+    /// Catat berkas yang baru saja ditulis penuh via `write_file` agar tidak dibaca ulang mentah-mentah
+    /// selama belum berubah eksternal dan belum ter-prune (Masalah 3 v0.5.20).
+    pub fn record_write(&mut self, path: &str, cwd: &Path) {
+        let norm = normalize_rel_path(path);
+        if norm.is_empty() {
+            return;
+        }
+        if let Some(sig) = file_signature(cwd, path) {
+            self.written_files.insert(norm, sig);
+        }
+    }
+
+    /// Perbarui tanda tangan baseline sesudah `edit_file` HANYA jika berkas itu sudah memiliki
+    /// baseline penuh (terinspirasi Hermes `full_write_baselines`: patch dari baseline yang sudah diketahui).
+    pub fn update_write_baseline_if_known(&mut self, path: &str, cwd: &Path) {
+        let norm = normalize_rel_path(path);
+        if self.written_files.contains_key(&norm) {
+            if let Some(sig) = file_signature(cwd, path) {
+                self.written_files.insert(norm, sig);
+            } else {
+                self.written_files.remove(&norm);
             }
-            _ => None,
         }
     }
 
@@ -166,7 +227,7 @@ impl ToolDedupCache {
                 return false;
             }
             if let (Some(ed), Some(ref f)) = (edited_path, &rec.file_rel) {
-                if ed == f {
+                if normalize_rel_path(ed) == normalize_rel_path(f) {
                     return false;
                 }
             }
@@ -180,6 +241,7 @@ impl ToolDedupCache {
     /// `"tidak berubah — gunakan isi sebelumnya"` bila model mencoba membacanya kembali!
     pub fn clear_file_reads(&mut self) {
         self.records.retain(|_, rec| rec.tool_name != "read_file");
+        self.written_files.clear();
     }
 }
 
@@ -396,108 +458,278 @@ impl LoopGuard {
     }
 }
 
-/// Apakah perintah shell ini merupakan aksi verifikasi (test / build / check / lint / skrip repro)?
-pub fn is_verification_shell_cmd(args: &Value) -> bool {
-    let Some(cmd) = args.get("command").and_then(|v| v.as_str()) else {
-        return false;
-    };
-    let trimmed = cmd.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    // Abaikan cek versi/bantuan/instalasi paket semata.
-    if [
-        "--version",
-        " -v",
-        " -V",
-        "--help",
-        "pip install",
-        "pip list",
-        "npm install",
-        "git status",
-        "git diff",
-        "git log",
-    ]
-    .iter()
-    .any(|excl| lower.ends_with(excl) || lower.starts_with(excl))
-    {
+/// Apakah jalur berkas berada di dalam direktori dependensi/vendor/artefak build
+/// (`node_modules/`, `.pnpm/`, `__pycache__/`, `.venv/`, `vendor/`, `.svelte-kit/output/`)?
+/// Dipakai oleh Masalah 2 (v0.5.20) untuk mencegah agen mengorek isi `node_modules/` berulang kali
+/// saat memperbaiki galat konfigurasi/typecheck.
+pub fn is_vendor_or_dependency_path(path: &str) -> bool {
+    let norm = normalize_rel_path(path).to_ascii_lowercase();
+    if norm.is_empty() {
         return false;
     }
-    let runner_hit = [
-        "cargo test",
-        "cargo check",
-        "cargo clippy",
-        "cargo build",
-        "npm test",
-        "npm run test",
-        "npm run check",
-        "npm run build",
-        "npm run lint",
-        "npm run typecheck",
-        "pnpm test",
-        "pnpm run test",
-        "pnpm check",
-        "pnpm run check",
-        "pnpm build",
-        "pnpm run build",
-        "yarn test",
-        "yarn check",
-        "yarn build",
-        "bun test",
-        "bun run test",
-        "bun run build",
-        "svelte-check",
-        "vitest",
-        "jest",
-        "playwright",
-        "eslint",
-        "biome",
-        "tsc",
-        "pytest",
-        "go test",
-        "go build",
-        "go vet",
-        "make test",
-        "make check",
-        "unittest",
-        "ruff check",
-        "flake8",
-        "mypy",
-        "pylint",
-        "bin/test",
-        "runtests.py",
-        "manage.py test",
-        "tox",
-        "nox",
-        "node --test",
-        "node --check",
-        "python -m unittest",
-        "python3 -m unittest",
-        "python -m pytest",
-        "python3 -m pytest",
-        "rspec",
-        "phpunit",
-        "mvn test",
-        "gradle test",
-        "dotnet test",
-    ]
-    .iter()
-    .any(|kw| lower.contains(kw));
-    if runner_hit {
+    if norm.starts_with(".svelte-kit/output/") || norm.contains("/.svelte-kit/output/") {
         return true;
     }
+    norm.split('/').any(|seg| {
+        matches!(
+            seg,
+            "node_modules" | ".pnpm" | ".yarn" | "__pycache__" | ".venv" | "venv" | "vendor"
+        )
+    })
+}
+
+/// Deteksi kegagalan perkakas/konfigurasi (mis. `svelte-check`, `tsconfig`, resolusi modul TS/Vite)
+/// pada keluaran perintah shell yang gagal, lalu berikan panduan pemulihan ringkas ke berkas config
+/// sumber agar agen tidak berputar puluhan langkah di `node_modules/` (Masalah 2 v0.5.20).
+pub fn detect_tooling_config_error_hint(cmd: &str, output: &str) -> Option<&'static str> {
+    let ec = parse_exit_code(output);
+    if ec == Some(0) || output.starts_with("exit code: 0") {
+        return None;
+    }
+    let cmd_low = cmd.to_ascii_lowercase();
+    let is_tooling_cmd = cmd_low.contains("check")
+        || cmd_low.contains("tsc")
+        || cmd_low.contains("build")
+        || cmd_low.contains("test")
+        || cmd_low.contains("vitest")
+        || cmd_low.contains("vite")
+        || cmd_low.contains("svelte")
+        || cmd_low.contains("lint");
+    if !is_tooling_cmd {
+        return None;
+    }
+    let out_low = output.to_ascii_lowercase();
+    let has_config_err = out_low.contains("tsconfig")
+        || out_low.contains("svelte-check")
+        || out_low.contains(".svelte-kit/")
+        || out_low.contains("cannot find module")
+        || out_low.contains("cannot find name")
+        || out_low.contains("failed to resolve")
+        || out_low.contains("err_module_not_found")
+        || out_low.contains("module not found")
+        || out_low.contains("error ts")
+        || out_low.contains("ts(")
+        || out_low.contains("moduleresolution")
+        || out_low.contains("esmoduleinterop");
+    if has_config_err {
+        Some(
+            "[PEMULIHAN PERKAKAS] Galat ini tampak berasal dari konfigurasi/perkakas proyek. \
+             Baca galat teratas, periksa & perbaiki berkas konfigurasi sumber (`tsconfig.json`, `package.json`, \
+             `svelte.config.*`, `vite.config.*`) atau jalankan perintah sync/prepare proyek (mis. `npx svelte-kit sync`), \
+             lalu jalankan ulang verifikasi — JANGAN mengorek isi `node_modules/` atau membaca ulang berkas yang baru kamu tulis.",
+        )
+    } else {
+        None
+    }
+}
+
+/// Apakah satu sub-perintah shell merupakan perintah setup/scaffold/instalasi paket/utilitas berkas
+/// yang TIDAK BOLEH pernah dilacak sebagai perintah verifikasi gerbang (Masalah 1 v0.5.20)?
+/// Contoh: `npx sv create . --add vitest tailwindcss`, `npm install -D vitest`, `npm create vite@latest`.
+pub fn is_setup_or_scaffold_shell_cmd(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if ["--version", " -v", "--help", " -h"]
+        .iter()
+        .any(|suf| lower.ends_with(suf))
+    {
+        return true;
+    }
+    let raw_toks = normalize_verify_cmd_tokens(trimmed);
+    // Lewati assignment env di awal seperti `CI=true` atau `NODE_ENV=test`
+    let toks: Vec<&str> = raw_toks
+        .iter()
+        .skip_while(|t| t.contains('=') && !t.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+    let Some(&head) = toks.first() else {
+        return true;
+    };
+    let sub = toks.get(1).copied().unwrap_or("");
+    // Utilitas shell / filesystem / git / paket non-verifikasi
+    if matches!(
+        head,
+        "cd" | "mkdir"
+            | "rm"
+            | "cp"
+            | "mv"
+            | "touch"
+            | "chmod"
+            | "chown"
+            | "ls"
+            | "dir"
+            | "pwd"
+            | "echo"
+            | "printf"
+            | "cat"
+            | "head"
+            | "tail"
+            | "curl"
+            | "wget"
+            | "which"
+            | "where"
+            | "env"
+            | "export"
+            | "set"
+            | "git"
+    ) {
+        return true;
+    }
+    if matches!(head, "npm" | "pnpm" | "yarn" | "bun") {
+        if matches!(
+            sub,
+            "create"
+                | "init"
+                | "install"
+                | "i"
+                | "add"
+                | "ci"
+                | "uninstall"
+                | "remove"
+                | "rm"
+                | "update"
+                | "up"
+                | "pkg"
+                | "cache"
+                | "config"
+                | "login"
+                | "whoami"
+                | "view"
+                | "info"
+                | "list"
+                | "ls"
+        ) {
+            return true;
+        }
+        if matches!(sub, "dlx" | "exec") {
+            let pkg = toks
+                .iter()
+                .skip(2)
+                .find(|t| !t.starts_with('-'))
+                .copied()
+                .unwrap_or("");
+            if pkg == "sv" || pkg.starts_with("create-") || pkg == "degit" || pkg == "svelte-add" {
+                return true;
+            }
+        }
+    }
+    if head == "npx" {
+        let pkg = toks
+            .iter()
+            .skip(1)
+            .find(|t| !t.starts_with('-'))
+            .copied()
+            .unwrap_or("");
+        if pkg == "sv"
+            || pkg.starts_with("sv@")
+            || pkg.starts_with("create-")
+            || pkg == "degit"
+            || pkg == "svelte-add"
+            || pkg == "shadcn"
+            || pkg == "shadcn-svelte"
+        {
+            return true;
+        }
+        let next_after_pkg = toks
+            .iter()
+            .skip(1)
+            .filter(|t| !t.starts_with('-'))
+            .nth(1)
+            .copied()
+            .unwrap_or("");
+        if (pkg == "svelte-kit" && next_after_pkg == "sync")
+            || (pkg == "tailwindcss" && next_after_pkg == "init")
+            || (pkg == "prisma" && matches!(next_after_pkg, "init" | "generate" | "migrate"))
+        {
+            return true;
+        }
+    }
+    if head == "cargo"
+        && matches!(sub, "new" | "init" | "add" | "remove" | "install" | "fetch" | "update")
+    {
+        return true;
+    }
+    if matches!(head, "pip" | "pip3" | "uv" | "poetry")
+        && matches!(sub, "install" | "add" | "init" | "venv" | "sync" | "lock" | "list" | "freeze")
+    {
+        return true;
+    }
+    false
+}
+
+fn is_single_verification_shell_cmd(part: &str) -> bool {
+    let trimmed = part.trim();
+    if trimmed.is_empty() || is_setup_or_scaffold_shell_cmd(trimmed) {
+        return false;
+    }
+    let toks = normalize_verify_cmd_tokens(trimmed);
+    let clean_toks: Vec<String> = toks
+        .into_iter()
+        .skip_while(|t| t.contains('=') && !t.starts_with('-'))
+        .collect();
+    if clean_toks.is_empty() {
+        return false;
+    }
+    if verify_runner_family(&clean_toks).is_some() {
+        return true;
+    }
+    let head = clean_toks[0].as_str();
+    let sub = clean_toks.get(1).map(String::as_str).unwrap_or("");
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        head,
+        "pytest"
+            | "vitest"
+            | "jest"
+            | "playwright"
+            | "eslint"
+            | "biome"
+            | "svelte-check"
+            | "tsc"
+            | "flake8"
+            | "mypy"
+            | "pylint"
+            | "tox"
+            | "nox"
+            | "rspec"
+            | "phpunit"
+            | "bin/test"
+    ) || head.ends_with("/bin/test")
+    {
+        return true;
+    }
+    if head == "npx"
+        && matches!(
+            sub,
+            "vitest" | "jest" | "playwright" | "eslint" | "biome" | "svelte-check" | "tsc"
+        )
+    {
+        return true;
+    }
+    if (head == "go" && matches!(sub, "test" | "build" | "vet"))
+        || (head == "make" && matches!(sub, "test" | "check"))
+        || (head == "ruff" && sub == "check")
+        || (head == "mvn" && sub == "test")
+        || (head == "gradle" && sub == "test")
+        || (head == "dotnet" && sub == "test")
+        || (head == "node" && matches!(sub, "--test" | "--check"))
+    {
+        return true;
+    }
+    if head == "python" {
+        if lower.contains("-m unittest")
+            || lower.contains("-m pytest")
+            || lower.contains("runtests.py")
+            || lower.contains("manage.py test")
+        {
+            return true;
+        }
+    }
     // Skrip repro / eksekusi tes langsung (`python repro.py`, `python -c "assert ..."`, `node hitung_total.js`, dll.)
-    let starts_runtime = lower.starts_with("python ")
-        || lower.starts_with("python3 ")
-        || lower.starts_with("node ")
-        || lower.contains(" && python ")
-        || lower.contains(" && python3 ")
-        || lower.contains(" && node ")
-        || lower.contains("; python ")
-        || lower.contains("; python3 ")
-        || lower.contains("; node ");
-    if starts_runtime {
+    if matches!(head, "python" | "node") {
         let runs_script_or_eval = lower.contains(".py")
             || lower.contains(".js")
             || lower.contains(".mjs")
@@ -510,6 +742,22 @@ pub fn is_verification_shell_cmd(args: &Value) -> bool {
         }
     }
     false
+}
+
+/// Apakah perintah shell ini merupakan aksi verifikasi (test / build / check / lint / skrip repro)?
+/// Dievaluasi per sub-perintah (dipisah `&&` / `;`) dan secara eksplisit mengecualikan perintah
+/// setup/scaffold seperti `npx sv create ... --add vitest` atau `npm install -D vitest` (Masalah 1 v0.5.20).
+pub fn is_verification_shell_cmd(args: &Value) -> bool {
+    let Some(cmd) = args.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    split_compound_shell_commands(trimmed)
+        .into_iter()
+        .any(is_single_verification_shell_cmd)
 }
 
 /// Apakah jalur berkas tampak sebagai berkas tes lintas bahasa (Perbaikan 4 v0.5.15)?
@@ -1038,35 +1286,70 @@ impl SelfCorrectState {
                     }
                     return;
                 }
-                // Perbaikan 3 (v0.5.15) + Masalah 1 (v0.5.19):
-                // - Jika belum ada perintah mapan: terima perintah verifikasi proyek mana pun.
-                // - Jika sudah ada perintah mapan: terima perintah yang sama/lebih luas/sub-perintah
-                //   komponennya; ATAU bila proyek SUDAH pernah lulus verifikasi penuh dan baru ada
-                //   edit kecil (<= 2 edit), terima juga perintah verifikasi proyek inkremental yang sah
-                //   (tetap menolak keras probe `python -c` / `node -e` dan skrip tak terkait!).
+                // Perbaikan 3 (v0.5.15) + Masalah 1 (v0.5.19 & v0.5.20):
+                // - Perintah setup/scaffold (mis. `npx sv create ... --add vitest`) tidak pernah menjadi
+                //   perintah verifikasi terlacak.
+                // - Bila belum ada perintah mapan (atau perintah mapan ternyata bukan verifikasi sah):
+                //   terima perintah verifikasi proyek mana pun.
+                // - Bila verifikasi terakhir GAGAL (`Some(false)`): tetap KETAT (v0.5.15) — hanya terima
+                //   perintah yang sama/lebih luas agar probe `python -c` atau 1 tes tak terkait tidak
+                //   bisa membypass gerbang gagal.
+                // - Bila tidak sedang dalam status gagal: terima perintah yang sama/lebih luas, verifikasi
+                //   inkremental sesudah hijau (<= 2 edit), ATAU runner verifikasi proyek resmi lainnya
+                //   (mis. `npm run check` lalu `npm test` lalu `npm run build`), dan perbarui `last_verify_cmd`
+                //   ke perintah verifikasi nyata terbaru agar status penutup selalu akurat!
                 let cand_toks = normalize_verify_cmd_tokens(&cmd);
                 let is_probe = cand_toks.iter().any(|t| t == "-c" || t == "-e");
+                let has_real_verify_runner = !is_probe
+                    && split_compound_shell_commands(&cmd).into_iter().any(|p| {
+                        if is_setup_or_scaffold_shell_cmd(p) {
+                            return false;
+                        }
+                        let t: Vec<String> = normalize_verify_cmd_tokens(p)
+                            .into_iter()
+                            .skip_while(|tok| tok.contains('=') && !tok.starts_with('-'))
+                            .collect();
+                        verify_runner_family(&t).is_some()
+                    });
                 let is_incremental_after_green = !is_probe
                     && self.has_passed_green_verify
                     && self.edits_since_last_green_verify <= 2
-                    && verify_runner_family(&cand_toks).is_some();
+                    && has_real_verify_runner;
+                let established_is_stale_non_verify = self
+                    .last_verify_cmd
+                    .as_deref()
+                    .map(|est| {
+                        est != "verify_project"
+                            && !is_verification_shell_cmd(&serde_json::json!({"command": est}))
+                    })
+                    .unwrap_or(false);
                 let should_update = match self.last_verify_cmd.as_deref() {
                     None => is_verification_shell_cmd(args),
+                    Some(_) if established_is_stale_non_verify => is_verification_shell_cmd(args),
+                    Some(est) if self.last_verify_passed == Some(false) => {
+                        is_same_or_broader_verify_cmd(est, &cmd)
+                    }
                     Some(est) => {
-                        is_same_or_broader_verify_cmd(est, &cmd) || is_incremental_after_green
+                        is_same_or_broader_verify_cmd(est, &cmd)
+                            || is_incremental_after_green
+                            || has_real_verify_runner
                     }
                 };
                 if should_update {
-                    if self.last_verify_cmd.is_none() {
+                    let ec = parse_exit_code(output);
+                    let ok = !is_error && (ec == Some(0) || output.starts_with("exit code: 0"));
+                    if self.last_verify_cmd.is_none()
+                        || established_is_stale_non_verify
+                        || !ok
+                        || has_real_verify_runner
+                    {
                         self.last_verify_cmd = Some(cmd);
                     }
                     self.has_verification_run = true;
                     self.verified_after_last_edit = true;
                     self.last_verify_step = (step_1based > 0).then_some(step_1based);
-                    let ec = parse_exit_code(output);
                     self.last_verify_exit_code = ec;
                     self.last_verify_key_line = Some(extract_verify_key_line(output));
-                    let ok = !is_error && (ec == Some(0) || output.starts_with("exit code: 0"));
                     self.last_verify_passed = Some(ok);
                     if ok {
                         self.has_passed_green_verify = true;

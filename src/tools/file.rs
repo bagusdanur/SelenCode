@@ -229,7 +229,7 @@ impl Tool for WriteFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_file".into(),
-            description: "Tulis/timpa file (persetujuan + diff).".into(),
+            description: "Buat file baru atau tulis penuh file kecil (persetujuan + diff). Untuk perubahan lokal pada file besar yang sudah ada, utamakan edit_file.".into(),
             parameters: schema(
                 json!({"path": {"type": "string"}, "content": {"type": "string"}}),
                 &["path", "content"],
@@ -246,8 +246,15 @@ impl Tool for WriteFile {
         if is_secret_file(&p) {
             return Err(anyhow!("file '{rel}' ditolak: file rahasia tidak boleh ditulis lewat tool"));
         }
+        let rel_norm = rel.trim().replace('\\', "/").to_ascii_lowercase();
+        if rel_norm.split('/').any(|s| matches!(s, "node_modules" | ".pnpm")) {
+            return Err(anyhow!(
+                "file '{rel}' ditolak: jangan memodifikasi isi node_modules/ — perbaiki berkas konfigurasi atau kode sumber proyek di luar node_modules"
+            ));
+        }
         ctx.sandbox.check_write_allowed("write_file", rel)?;
         let before = std::fs::read(&p).ok();
+        let existed = before.is_some();
         let old = before
             .as_deref()
             .map(|b| String::from_utf8_lossy(b).into_owned())
@@ -268,7 +275,20 @@ impl Tool for WriteFile {
                 after: content.as_bytes().to_vec(),
             });
         }
-        Ok(format!("OK: {rel} ditulis ({} byte).", content.len()))
+        let mut msg = format!("OK: {rel} ditulis ({} byte).", content.len());
+        // Masalah 3 (v0.5.20): beri dorongan terarah saat model menulis ulang utuh berkas besar
+        // yang sudah ada padahal mayoritas barisnya tidak berubah (seharusnya memakai `edit_file`).
+        if existed && old.len() >= 4_000 {
+            let similarity = TextDiff::from_lines(&old, content).ratio();
+            if similarity >= 0.65 {
+                msg.push_str(&format!(
+                    "\n[Efisiensi] Berkas ini sudah ada ({} byte, {:.0}% baris sama) — untuk perubahan lokal berikutnya pada berkas besar, gunakan `edit_file` (patch terarah) agar hemat token keluaran & langkah.",
+                    old.len(),
+                    similarity * 100.0
+                ));
+            }
+        }
+        Ok(msg)
     }
 }
 
@@ -280,7 +300,7 @@ impl Tool for EditFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit_file".into(),
-            description: "Ganti teks persis `old` (unik 1x) -> `new`.".into(),
+            description: "Patch terarah: ganti teks persis `old` (unik 1x) -> `new`. Utamakan ini untuk mengubah berkas yang sudah ada.".into(),
             parameters: schema(
                 json!({"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}),
                 &["path", "old", "new"],
@@ -300,6 +320,12 @@ impl Tool for EditFile {
         let p = resolve_in_sandbox(&ctx.cwd, std::path::Path::new(rel))?;
         if is_secret_file(&p) {
             return Err(anyhow!("file '{rel}' ditolak: file rahasia tidak boleh diedit lewat tool"));
+        }
+        let rel_norm = rel.trim().replace('\\', "/").to_ascii_lowercase();
+        if rel_norm.split('/').any(|s| matches!(s, "node_modules" | ".pnpm")) {
+            return Err(anyhow!(
+                "file '{rel}' ditolak: jangan mengedit isi node_modules/ — perbaiki berkas konfigurasi atau kode sumber proyek di luar node_modules"
+            ));
         }
         ctx.sandbox.check_write_allowed("edit_file", rel)?;
         let text = std::fs::read_to_string(&p).map_err(|e| anyhow!("gagal membaca {rel}: {e}"))?;

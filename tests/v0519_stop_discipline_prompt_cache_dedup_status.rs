@@ -507,9 +507,9 @@ fn m2_openai_envelope_cache_control_policy_and_markers() {
 
 #[tokio::test]
 async fn m2_prefix_stability_across_long_session_and_rearm_hysteresis() {
-    // 1. Cek default baru v0.5.19 selaras landasan Hermes (28k pemicu / 4.096 min reclaim)
+    // 1. Cek default terbaru selaras landasan Hermes (96k pemicu di v0.5.20 / 4.096 min reclaim)
     let tb_def = ToolBudgetCfg::default();
-    assert_eq!(tb_def.proactive_prune_tokens, 28_000);
+    assert_eq!(tb_def.proactive_prune_tokens, 96_000);
     assert_eq!(tb_def.proactive_prune_min_reclaim_tokens, 4_096);
 
     // 2. Simulasi sesi 14 langkah (>26 pesan, melampaui batas lama len-20!)
