@@ -235,6 +235,8 @@ fn child_ctx_for_role(parent_ctx: &Ctx) -> Ctx {
         tg_file_sender: None,
         context_cfg: parent_ctx.context_cfg.clone(),
         tool_preview_length: parent_ctx.tool_preview_length,
+        api_max_retries: parent_ctx.api_max_retries,
+        api_retry_base_delay_ms: parent_ctx.api_retry_base_delay_ms,
     }
 }
 
