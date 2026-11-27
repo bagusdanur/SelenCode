@@ -92,14 +92,16 @@ fn m1_compound_svelte_verify_and_incremental_verify_after_small_edit() {
     ));
 
     // Sub-perintah dari perintah majemuk diterima sebagai keluarga yang sah,
-    // sementara probe `python -c` / `node -e` TETAP ditolak (menjaga pagar v0.5.15).
+    // penyempitan ke 1 file tes sebelum lulus penuh ditolak (menjaga pagar v0.5.15),
+    // dan probe `python -c` / `node -e` TETAP ditolak.
     assert!(is_same_or_broader_verify_cmd(full_cmd, "npm run check"));
     assert!(is_same_or_broader_verify_cmd(full_cmd, "npm test"));
-    assert!(is_same_or_broader_verify_cmd(
+    assert!(is_same_or_broader_verify_cmd(full_cmd, "npx vitest run"));
+    assert!(is_same_or_broader_verify_cmd(full_cmd, "npm run build"));
+    assert!(!is_same_or_broader_verify_cmd(
         full_cmd,
         "npx vitest run src/lib/db.test.ts"
     ));
-    assert!(is_same_or_broader_verify_cmd(full_cmd, "npm run build"));
     assert!(!is_same_or_broader_verify_cmd(
         full_cmd,
         "python -c \"assert 1 == 1\""
@@ -195,8 +197,15 @@ async fn m1_repeated_green_verify_converges_cleanly_without_stagnation_loop() {
         ) -> Result<AssistantReply> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             for m in msgs {
-                if m.plain_text().contains("[DISIPLIN BERHENTI]") {
-                    *self.saw_stop_nudge.lock().unwrap() = true;
+                for b in &m.content {
+                    match b {
+                        Block::Text(t) | Block::ToolResult { content: t, .. } => {
+                            if t.contains("[DISIPLIN BERHENTI]") {
+                                *self.saw_stop_nudge.lock().unwrap() = true;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             if tools.is_empty() {
@@ -311,7 +320,7 @@ async fn m1_repeated_green_verify_converges_cleanly_without_stagnation_loop() {
         "dedup verifikasi hijau tidak boleh memicu alarm stagnasi palsu: {infos:?}"
     );
     assert!(
-        final_text.contains("[Verifikasi — LULUS:"),
+        final_text.contains("Verifikasi:") && final_text.contains("(LULUS)"),
         "penutupan harus menyertakan status verifikasi LULUS, dapat: {final_text}"
     );
     assert!(
@@ -914,7 +923,7 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
         "dedup pada verifikasi yang sudah lulus tidak boleh memicu Self-Correction Gate"
     );
     assert!(
-        out.contains("[Verifikasi — LULUS:"),
+        out.contains("Verifikasi:") && out.contains("(LULUS)"),
         "output akhir harus LULUS: {out}"
     );
     assert!(

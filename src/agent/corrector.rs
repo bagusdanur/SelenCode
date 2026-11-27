@@ -638,9 +638,17 @@ pub fn is_dedup_passed_verify_output(output: &str) -> bool {
 fn extract_runner_targets(tokens: &[String]) -> Vec<String> {
     let mut skip_next = false;
     let mut start = 1usize;
-    if tokens.len() >= 3 && tokens[0] == "python" && tokens[1] == "-m" {
+    if tokens.len() >= 3
+        && ((tokens[0] == "python" && tokens[1] == "-m")
+            || (matches!(tokens[0].as_str(), "npm" | "pnpm" | "yarn" | "bun") && tokens[1] == "run"))
+    {
         start = 3;
-    } else if tokens.len() >= 2 && matches!(tokens[0].as_str(), "cargo" | "go" | "npm" | "pnpm" | "yarn") {
+    } else if tokens.len() >= 2
+        && matches!(
+            tokens[0].as_str(),
+            "cargo" | "go" | "npm" | "pnpm" | "yarn" | "bun" | "npx"
+        )
+    {
         start = 2;
     } else if tokens.len() >= 2 && tokens[0] == "node" && tokens[1] == "--test" {
         start = 2;
