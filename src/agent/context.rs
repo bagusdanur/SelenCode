@@ -1331,6 +1331,109 @@ pub fn proactive_prune_context_with_archive(
     }
 }
 
+/// Gerbang pasca-tool khusus satu batch penelanan raksasa di giliran yang sama (Masalah 4 v0.5.18 —
+/// terinspirasi pengecualian pending-round di Hermes `agent/context_compressor.py` #61932):
+/// ketika 1 batch hasil tool paralel yang baru mendarat sendiri sudah mendorong total konteks
+/// melampaui `trigger_tokens`, arsipkan penuh hasil tool besar (`> 4.000` char) pada pesan
+/// `Role::Tool` terakhir dan ganti dengan pratinjau kepala/ekor 2.400 char + path arsip,
+/// sehingga model tetap melihat struktur penting tiap berkas sambil menahan lonjakan token
+/// SEBELUM panggilan model berikutnya di giliran yang sama.
+pub fn prune_oversized_pending_tool_batch_with_archive(
+    messages: &mut [Message],
+    archive_dir: &Path,
+    current_tokens: usize,
+    trigger_tokens: usize,
+) -> ProactivePruneResult {
+    const MIN_PENDING_RESULT_CHARS: usize = 4_000;
+    const PENDING_PREVIEW_CHARS: usize = 2_400;
+
+    if messages.is_empty() || trigger_tokens == 0 || current_tokens < trigger_tokens {
+        return ProactivePruneResult::default();
+    }
+    let last_idx = messages.len() - 1;
+    if messages[last_idx].role != Role::Tool {
+        return ProactivePruneResult::default();
+    }
+
+    let targets: Vec<(usize, String, String)> = messages[last_idx]
+        .content
+        .iter()
+        .enumerate()
+        .filter_map(|(bi, b)| match b {
+            Block::ToolResult { id, content, .. } => {
+                let clen = content.chars().count();
+                if clen > MIN_PENDING_RESULT_CHARS
+                    && !content.contains("dipangkas proaktif pasca-tool")
+                    && !content.contains("diringkas — arsip:")
+                    && !content.contains("isi penuh terarsip:")
+                {
+                    let tname = resolve_tool_name_for_id(messages, last_idx, id);
+                    Some((bi, id.clone(), tname))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    if targets.is_empty() {
+        return ProactivePruneResult::default();
+    }
+
+    let before_tokens = estimate_tokens(messages);
+    let mut cand_last = messages[last_idx].clone();
+    let mut planned_archives: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut pruned_results = 0usize;
+
+    for (bi, call_id, tool_name) in targets {
+        if let Some(Block::ToolResult { content, .. }) = cand_last.content.get_mut(bi) {
+            let safe_id: String = call_id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .take(32)
+                .collect();
+            let fname = format!(
+                "{:04}_batch_{}_{}.txt",
+                last_idx,
+                tool_name.replace('/', "_"),
+                if safe_id.is_empty() { "res".to_string() } else { safe_id }
+            );
+            let archive_path = archive_dir.join(fname);
+            let orig = content.clone();
+            let orig_chars = orig.chars().count();
+            let preview = head_tail_truncate(&orig, PENDING_PREVIEW_CHARS);
+            planned_archives.push((archive_path.clone(), orig));
+            *content = format!(
+                "[Hasil {tool_name} dipangkas proaktif pasca-tool ({orig_chars} char) — arsip utuh: {}]\n{preview}",
+                archive_path.display()
+            );
+            pruned_results += 1;
+        }
+    }
+
+    if pruned_results == 0 {
+        return ProactivePruneResult::default();
+    }
+    if std::fs::create_dir_all(archive_dir).is_err() {
+        return ProactivePruneResult::default();
+    }
+    for (path, body) in &planned_archives {
+        if std::fs::write(path, body.as_str()).is_err() {
+            return ProactivePruneResult::default();
+        }
+    }
+    messages[last_idx] = cand_last;
+    let after_tokens = estimate_tokens(messages);
+    let reclaimed_tokens = before_tokens.saturating_sub(after_tokens);
+    ProactivePruneResult {
+        pruned_count: pruned_results,
+        reclaimed_tokens,
+        deduped_tool_results: 0,
+        pruned_tool_results: pruned_results,
+        pruned_tool_args: 0,
+    }
+}
+
 /// Diet konteks ringan (kompatibilitas tes lama): padatkan `Block::ToolResult` lama di luar
 /// `keep_recent_tool_msgs` pesan tool terakhir.
 pub fn prune_old_tool_results(messages: &mut [Message], keep_recent_tool_msgs: usize) -> usize {

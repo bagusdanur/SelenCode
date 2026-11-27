@@ -11,8 +11,9 @@ use super::context::{
     build_resume_system_prompt, build_system_prompt, cap_dynamic_injection,
     compact_messages_hermes, estimate_tokens, expand_at_mentions, head_tail_truncate,
     needs_compaction, proactive_prune_context_with_archive,
-    prune_old_skill_results_with_archive, prune_old_tool_results_with_archive, session_archive_dir,
-    spillover_if_needed, spillover_with_preview,
+    prune_old_skill_results_with_archive, prune_old_tool_results_with_archive,
+    prune_oversized_pending_tool_batch_with_archive, session_archive_dir, spillover_if_needed,
+    spillover_with_preview,
 };
 use crate::tool_display::{
     build_template_closing_summary_with_status, format_tool_event_from_preview,
@@ -716,8 +717,76 @@ pub fn prompt_requests_file_change(prompt: &str) -> bool {
 }
 
 /// Batas rentetan stream macet beruntun lintas langkah sebelum circuit breaker berhenti bersih
-/// (diporting dari Hermes Agent `agent/chat_completion_helpers.py`: `_consecutive_stale_streams` / `stale_giveup`).
+/// (angka sendiri `3` untuk interaktivitas cepat, terinspirasi mekanisme `_consecutive_stale_streams`
+/// di Hermes `agent/chat_completion_helpers.py` & `stale_giveup()` di `agent/chat_completion_local.py`).
 pub const STALE_STREAM_GIVEUP_LIMIT: usize = 3;
+
+/// Penanda baku penutupan jujur saat generasi model terpotong `max_output_tokens` (Masalah 2 v0.5.18).
+pub const OUTPUT_TRUNCATION_HEADER: &str = "[GENERASI TERPOTONG BATAS TOKEN KELUARAN]";
+
+/// Cek apakah `finish_reason` menandakan generasi terpotong batas token keluaran
+/// (`"length"` OpenAI/9Router, `"max_tokens"` Anthropic, `"MAX_TOKENS"` Gemini).
+pub fn is_output_length_truncated(finish_reason: Option<&str>) -> bool {
+    let Some(fr) = finish_reason else {
+        return false;
+    };
+    matches!(
+        fr.trim().to_ascii_lowercase().as_str(),
+        "length" | "max_tokens" | "max_output_tokens"
+    )
+}
+
+/// Cek apakah balasan model memuat tool call yang terpotong/rusak JSON-nya (mis. `_raw` karena
+/// parse gagal, atau `finish_reason` menyentuh batas panjang di tengah pemanggilan tool).
+/// Tool call terpotong TIDAK BOLEH dieksekusi agar tidak terjadi penulisan sebagian yang senyap.
+pub fn has_truncated_tool_call(reply: &crate::providers::AssistantReply) -> bool {
+    if reply.tool_calls.is_empty() {
+        return false;
+    }
+    if is_output_length_truncated(reply.finish_reason.as_deref()) {
+        return true;
+    }
+    reply
+        .tool_calls
+        .iter()
+        .any(|c| c.args.get("_raw").is_some())
+}
+
+/// Susun pesan penutup yang terlihat, jujur, dan tersimpan saat generasi terpotong batas token keluaran
+/// (Masalah 2 v0.5.18): menyebut penyebab pemotongan, apa yang sudah diterapkan, dan apa yang belum.
+pub fn build_output_truncation_closing_message(
+    finish_reason: Option<&str>,
+    truncated_tools: &[String],
+    edited_files: &[String],
+    prior_text: &str,
+) -> String {
+    let fr = finish_reason.unwrap_or("length");
+    let applied_line = if edited_files.is_empty() {
+        "belum ada perubahan berkas yang diterapkan".to_string()
+    } else {
+        edited_files.join(", ")
+    };
+    let not_applied_line = if truncated_tools.is_empty() {
+        "aksi penulisan/lanjutan pada langkah terakhir belum sempat dijalankan (tidak ada penerapan sebagian)".to_string()
+    } else {
+        format!(
+            "tool call terpotong DIBATALKAN dan tidak diterapkan sebagian: {}",
+            truncated_tools.join(", ")
+        )
+    };
+    let body = format!(
+        "{OUTPUT_TRUNCATION_HEADER} Generasi model mencapai batas max_output_tokens (finish_reason: {fr}) di tengah aksi sehingga giliran dihentikan aman.\n\
+         - Sudah diterapkan di giliran ini: {applied_line}\n\
+         - Belum diterapkan: {not_applied_line}\n\
+         - Saran lanjut: pecah perubahan menjadi edit kecil memakai `edit_file` (bukan tulis ulang penuh) atau naikkan `[agent] max_output_tokens`."
+    );
+    let trimmed_prior = prior_text.trim();
+    if trimmed_prior.is_empty() {
+        body
+    } else {
+        format!("{trimmed_prior}\n\n{body}")
+    }
+}
 
 /// Klasifikasi kegagalan panggilan API dalam giliran aktif untuk menentukan jalur pemulihan
 /// (diporting dari Hermes Agent `agent/error_classifier.py`: `FailoverReason` & `classify_api_error`).
@@ -1534,6 +1603,83 @@ async fn run_turn_inner(
         }
         last_text = reply.text.clone();
 
+        // Masalah 2 (v0.5.18): JANGAN pernah mengakhiri giliran secara DIAM ataupun mengeksekusi
+        // tool call yang terpotong saat generasi menyentuh batas `max_output_tokens` (`finish_reason=length`
+        // / `max_tokens` atau argumen JSON terpotong `_raw`).
+        let truncated_tool = has_truncated_tool_call(&reply);
+        let length_cut_final =
+            reply.tool_calls.is_empty() && is_output_length_truncated(reply.finish_reason.as_deref());
+        let empty_silent_final = reply.tool_calls.is_empty() && reply.text.trim().is_empty();
+        if truncated_tool || length_cut_final || empty_silent_final {
+            let trunc_names: Vec<String> = reply
+                .tool_calls
+                .iter()
+                .map(|c| {
+                    if let Some(p) = c.args.get("path").and_then(|v| v.as_str()) {
+                        format!("{}({p})", c.name)
+                    } else {
+                        c.name.clone()
+                    }
+                })
+                .collect();
+            let closing_text = if truncated_tool || length_cut_final {
+                build_output_truncation_closing_message(
+                    reply.finish_reason.as_deref(),
+                    &trunc_names,
+                    &corrector.edited_files,
+                    &reply.text,
+                )
+            } else {
+                let applied = if corrector.edited_files.is_empty() {
+                    "belum ada perubahan berkas".to_string()
+                } else {
+                    corrector.edited_files.join(", ")
+                };
+                format!(
+                    "[Respons model kosong] Model tidak menghasilkan teks maupun aksi tool pada langkah ini.\n\
+                     - Sudah diterapkan di giliran ini: {applied}"
+                )
+            };
+            let delta_to_emit = if !reply.text.trim().is_empty()
+                && closing_text.starts_with(reply.text.trim())
+            {
+                let suffix = closing_text[reply.text.trim().len()..].to_string();
+                if suffix.is_empty() {
+                    None
+                } else {
+                    Some(suffix)
+                }
+            } else {
+                Some(closing_text.clone())
+            };
+            let closing_msg = Message::text(Role::Assistant, closing_text.clone());
+            persist_message(ctx, &closing_msg);
+            messages.push(closing_msg);
+            if let Some(emit_txt) = delta_to_emit {
+                match &ui {
+                    Some(tx) => {
+                        let _ = tx.send(UiEvent::Token(emit_txt)).await;
+                    }
+                    None => println!("{}", emit_txt.trim()),
+                }
+            }
+            if let Some(cp_id) = turn_checkpoint_id {
+                if corrector.edited_files.is_empty() {
+                    if let Ok(mut st) = ctx.undo_stack.lock() {
+                        st.discard_empty_checkpoint(cp_id);
+                    }
+                }
+            }
+            if let Some(tx) = &ui {
+                let _ = tx
+                    .send(UiEvent::TurnDone {
+                        usage: have_usage.then_some(turn_usage),
+                    })
+                    .await;
+            }
+            return Ok((closing_text, have_usage.then_some(turn_usage)));
+        }
+
         // Perbaikan 2 (v0.5.11) — Gerbang Skill di level loop harness (bukan sekadar kalimat prompt!):
         // Bila tugas tergolong debugging/TDD dan model mencoba menjalankan aksi pengubah berkas
         // (`edit_file`/`write_file`/`lsp_rename`) SEBELUM memuat skill yang cocok, tahan aksi pengubah
@@ -2221,6 +2367,70 @@ async fn run_turn_inner(
         };
         persist_message(ctx, &tool_msg);
         messages.push(tool_msg);
+
+        // Masalah 4 (v0.5.18 — terinspirasi gerbang post-tool Hermes `agent/turn_preflight.py`:
+        // `compress_after_tool_results` & pengecualian pending-round `agent/context_compressor.py` #61932):
+        // evaluasi tekanan konteks SEGERA sesudah hasil tool mendarat (di giliran yang sama, SEBELUM
+        // panggilan model berikutnya), pangkas bila melampaui ambang absolut, dan catat `pruned_count`
+        // langsung pada baris metrik panggilan penelanan ini!
+        if ctx.tool_budget.proactive_prune_tokens > 0 {
+            let est_post =
+                analyze_token_breakdown(messages, &tools, registry.names().len()).total_tokens();
+            let anchored_post = if last_provider_prompt_tokens > 0 {
+                est_post.max(
+                    last_provider_prompt_tokens
+                        .saturating_add(est_post.saturating_sub(last_est_tokens_at_call)),
+                )
+            } else {
+                est_post
+            };
+            let proactive_trigger = ctx
+                .tool_budget
+                .proactive_prune_tokens
+                .min((ctx.context_limit_tokens * 45 / 100).max(4_000));
+            if anchored_post >= proactive_trigger {
+                let old_res = proactive_prune_context_with_archive(
+                    messages,
+                    &prune_dir,
+                    anchored_post,
+                    proactive_trigger,
+                    ctx.tool_budget.proactive_prune_min_reclaim_tokens,
+                    2,
+                    false,
+                );
+                let est_after_old =
+                    analyze_token_breakdown(messages, &tools, registry.names().len())
+                        .total_tokens();
+                let batch_res = if est_after_old >= proactive_trigger {
+                    prune_oversized_pending_tool_batch_with_archive(
+                        messages,
+                        &prune_dir,
+                        est_after_old,
+                        proactive_trigger,
+                    )
+                } else {
+                    Default::default()
+                };
+                let post_pruned = old_res.pruned_count + batch_res.pruned_count;
+                let post_reclaimed = old_res.reclaimed_tokens + batch_res.reclaimed_tokens;
+                if post_pruned > 0 {
+                    dedup.clear_file_reads();
+                    if let (Some(store), Some(sid)) = (&ctx.store, &ctx.session_id) {
+                        let _ = store.add_latest_call_pruned_count(sid, post_pruned);
+                    }
+                    let note = format!(
+                        "✦ Prune proaktif pasca-tool: {} item diringkas (~{} token dibebaskan, arsip tersimpan)",
+                        post_pruned, post_reclaimed
+                    );
+                    match &ui {
+                        Some(tx) => {
+                            let _ = tx.send(UiEvent::Info(note)).await;
+                        }
+                        None => eprintln!("[selen] {note}"),
+                    }
+                }
+            }
+        }
 
         // Perbaikan 2 (v0.5.11) — Suntikan nol-pemborosan pasca-langkah-pertama:
         // Bila pada langkah 0 model hanya membaca/memeriksa berkas tanpa memanggil `skill_view`

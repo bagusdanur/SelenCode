@@ -70,7 +70,7 @@ async fn tui_worker(
                         &s.ctx,
                         &mut s.messages,
                         &prompt,
-                        s.cfg.agent.max_steps,
+                        0,
                         ui_tx.clone(),
                     ) => match r {
                         Ok(_) => {
@@ -123,7 +123,7 @@ async fn tui_worker(
                         &s.ctx,
                         &mut s.messages,
                         &prompt,
-                        s.cfg.agent.max_steps,
+                        0,
                         ui_tx.clone(),
                         TurnMode::Plan,
                     ) => match r {
@@ -167,7 +167,7 @@ async fn tui_worker(
                         &s.ctx,
                         &mut s.messages,
                         &prompt,
-                        s.cfg.agent.max_steps,
+                        0,
                         ui_tx.clone(),
                     ) => match r {
                         Ok(_) => {
@@ -294,7 +294,7 @@ async fn tui_worker(
                                 &s.ctx,
                                 &mut s.messages,
                                 &prompt,
-                                s.cfg.agent.max_steps,
+                                0,
                                 ui_tx.clone(),
                             ) => match r {
                                 Ok(_) => {
@@ -744,7 +744,7 @@ pub(crate) async fn interactive_tui(
         s.ctx.cwd.to_string_lossy().to_string(),
         s.provider_name.clone(),
         s.pcfg.model.clone(),
-        s.cfg.agent.max_steps,
+        0,
         init_in,
         init_out,
     );

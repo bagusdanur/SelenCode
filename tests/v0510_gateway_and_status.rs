@@ -484,8 +484,8 @@ fn p1_os_watchdog_triggers_records_recovery_and_preserves_watches_and_cron() {
     let empty_cfg = Config::empty();
     assert_eq!(empty_cfg.timeouts.connect_secs, 20);
     assert_eq!(empty_cfg.timeouts.response_secs, 60);
-    assert_eq!(empty_cfg.timeouts.stream_idle_secs, 90);
-    assert_eq!(empty_cfg.timeouts.total_secs, 300);
+    assert_eq!(empty_cfg.timeouts.stream_idle_secs, 180);
+    assert_eq!(empty_cfg.timeouts.total_secs, 600);
     assert_eq!(empty_cfg.telegram.turn_timeout_secs, 900);
     assert_eq!(empty_cfg.telegram.stall_notice_secs, 180);
     assert_eq!(empty_cfg.telegram.poll_watchdog_secs, 300);

@@ -194,6 +194,12 @@ pub fn is_retryable_error(err: &str) -> bool {
             "tidak ada data selama",
             "tidak merespons",
             "terputus",
+            "macet",
+            "koneksi dihentikan",
+            "unexpected eof",
+            "end of file",
+            "stream closed",
+            "stale",
             "500",
             "502",
             "503",
@@ -228,6 +234,9 @@ pub fn is_timeout_error(err: &str) -> bool {
             "ketidakaktifan",
             "stream provider macet",
             "tidak ada data selama",
+            "macet",
+            "koneksi dihentikan",
+            "stale",
         ],
     )
 }
@@ -1049,7 +1058,18 @@ impl Provider for DynamicRouterProvider {
                             }
                             continue;
                         }
+                        // Masalah 1 (v0.5.18): jika stream mati-diam/terputus di tengah jawaban
+                        // (meski sudah sempat mengirim sebagian token) DAN masih ada rute fallback
+                        // BERBEDA yang belum dicoba, JANGAN bunuh loop kandidat — alihkan ke fallback!
+                        let has_more_candidates = models_tried < max_models_to_try
+                            && candidates[cand_idx + 1..]
+                                .iter()
+                                .any(|(r, _, _)| !tried_route_ids.contains(&r.id));
                         if emitted_any {
+                            if fallback_eligible && has_more_candidates {
+                                primary_fail_short = Some("stream macet di tengah");
+                                break;
+                            }
                             return Err(anyhow!(
                                 "stream terputus di tengah jawaban ({}): {}",
                                 route.id,

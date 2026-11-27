@@ -490,8 +490,8 @@ fn p3_config_example_and_unknown_or_misplaced_key_warnings() {
     assert!(example.contains("[timeouts]"));
     assert!(example.contains("connect_secs = 20"));
     assert!(example.contains("response_secs = 60"));
-    assert!(example.contains("stream_idle_secs = 90"));
-    assert!(example.contains("total_secs = 300"));
+    assert!(example.contains("stream_idle_secs = 180"));
+    assert!(example.contains("total_secs = 600"));
     assert!(example.contains("TOP-LEVEL"));
     assert!(example.contains("turn_timeout_secs = 900"));
     assert!(example.contains("stall_notice_secs = 180"));

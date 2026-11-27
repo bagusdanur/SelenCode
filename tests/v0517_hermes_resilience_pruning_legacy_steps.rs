@@ -9,8 +9,8 @@ use selencode::agent::{
     STALE_STREAM_GIVEUP_LIMIT,
 };
 use selencode::config::{
-    load_from, parse_config_str_with_policy, validate_config_str, MaxStepsSource, ProviderCfg,
-    LEGACY_DEFAULT_MAX_STEPS,
+    load_from, parse_config_str_with_policy, save_to, validate_config_str, MaxStepsSource,
+    ProviderCfg,
 };
 use selencode::doctor::run_doctor;
 use selencode::providers::{
@@ -47,12 +47,12 @@ fn temp_dir(tag: &str) -> PathBuf {
 #[test]
 fn m1_context_scaled_stream_idle_and_backoff_match_hermes() {
     let base = ProviderTimeouts::default();
-    assert_eq!(base.effective_stream_idle(4_000), Duration::from_secs(90));
+    assert_eq!(base.effective_stream_idle(4_000), Duration::from_secs(180));
     assert_eq!(base.effective_stream_idle(20_000), Duration::from_secs(180));
     assert_eq!(base.effective_stream_idle(60_000), Duration::from_secs(240));
     assert_eq!(base.effective_stream_idle(120_000), Duration::from_secs(300));
     assert!(
-        base.effective_total(120_000) >= Duration::from_secs(360),
+        base.effective_total(120_000) >= Duration::from_secs(600),
         "total timeout operasional harus memberi ruang di atas effective_stream_idle"
     );
 
@@ -557,7 +557,7 @@ fn m3_legacy_max_steps_25_liberated_explicit_respected_and_doctor_reports() {
         fallback: Vec::new(),
     };
 
-    // 1. Config warisan memuat `max_steps = 25` -> dibebaskan otomatis menjadi 0 + pemberitahuan terlihat!
+    // 1. Config lama memuat `max_steps = 25` -> diabaikan (selalu 0) + pemberitahuan terlihat + tidak ditulis ulang saat save!
     let legacy_path = cwd.join("legacy-config.toml");
     let legacy_toml = r#"
 default_provider = "router"
@@ -575,18 +575,28 @@ max_steps = 25
     let legacy_cfg = load_from(&legacy_path).unwrap();
     assert_eq!(
         legacy_cfg.agent.max_steps, 0,
-        "max_steps = 25 warisan wajib dibebaskan menjadi tanpa batas (0)"
+        "max_steps = 25 dari config lama wajib diabaikan menjadi tanpa batas (0)"
     );
     assert!(matches!(
         legacy_cfg.max_steps_source,
-        MaxStepsSource::Legacy25Liberated { .. }
+        MaxStepsSource::DeprecatedIgnored {
+            legacy_value: 25,
+            ..
+        }
     ));
     assert!(
         !legacy_cfg.startup_notices.is_empty()
             && legacy_cfg.startup_notices[0].contains("25")
             && legacy_cfg.startup_notices[0].contains("tanpa batas"),
-        "harus ada pemberitahuan terlihat tentang pembebasan warisan 25: {:?}",
+        "harus ada pemberitahuan terlihat tentang diabaikannya max_steps lama: {:?}",
         legacy_cfg.startup_notices
+    );
+    let saved_path = cwd.join("saved-clean.toml");
+    save_to(&legacy_cfg, &saved_path).unwrap();
+    let saved_txt = std::fs::read_to_string(&saved_path).unwrap();
+    assert!(
+        !saved_txt.contains("max_steps"),
+        "config tersimpan baru tidak boleh menulis max_steps lagi: {saved_txt}"
     );
     let rep_legacy = run_doctor(&legacy_cfg, &cwd, "router", &pcfg, &store, &sandbox);
     let step_chk_legacy = rep_legacy
@@ -596,15 +606,14 @@ max_steps = 25
         .expect("doctor wajib melaporkan pemeriksaan Batas Langkah");
     assert!(
         step_chk_legacy.detail.contains("tanpa batas")
-            && step_chk_legacy
-                .detail
-                .contains(&format!("warisan max_steps = {LEGACY_DEFAULT_MAX_STEPS}")),
-        "doctor harus melaporkan pagu efektif & sumber warisan: {}",
+            && step_chk_legacy.detail.contains("max_steps = 25")
+            && step_chk_legacy.detail.contains("diabaikan"),
+        "doctor harus melaporkan tanpa batas & catatan max_steps=25 diabaikan: {}",
         step_chk_legacy.detail
     );
 
-    // 2. Pagu eksplisit lain (mis. 40, 15, 50) WAJIB tetap dihormati apa adanya!
-    let explicit_toml = r#"
+    // 2. Nilai max_steps lain (mis. 40) juga diabaikan pada giliran utama (Opsi A — ala Hermes)!
+    let other_toml = r#"
 default_provider = "router"
 
 [providers.router]
@@ -615,30 +624,36 @@ api_key = "dummy"
 [agent]
 max_steps = 40
 "#;
-    let explicit_cfg = parse_config_str_with_policy(explicit_toml, "/tmp/custom.toml").unwrap();
-    assert_eq!(explicit_cfg.agent.max_steps, 40);
+    let other_cfg = parse_config_str_with_policy(other_toml, "/tmp/custom.toml").unwrap();
+    assert_eq!(other_cfg.agent.max_steps, 0);
     assert_eq!(
-        explicit_cfg.max_steps_source,
-        MaxStepsSource::ExplicitConfig {
-            value: 40,
+        other_cfg.max_steps_source,
+        MaxStepsSource::DeprecatedIgnored {
+            legacy_value: 40,
             config_path: "/tmp/custom.toml".into()
         }
     );
-    assert!(explicit_cfg.startup_notices.is_empty());
-    let rep_explicit = run_doctor(&explicit_cfg, &cwd, "router", &pcfg, &store, &sandbox);
-    let step_chk_explicit = rep_explicit
+    assert!(!other_cfg.startup_notices.is_empty());
+    let rep_other = run_doctor(&other_cfg, &cwd, "router", &pcfg, &store, &sandbox);
+    let step_chk_other = rep_other
         .checks
         .iter()
         .find(|c| c.name == "Batas Langkah")
         .unwrap();
     assert!(
-        step_chk_explicit.detail.contains("40 langkah")
-            && step_chk_explicit.detail.contains("/tmp/custom.toml"),
-        "doctor harus melaporkan pagu eksplisit & sumbernya: {}",
-        step_chk_explicit.detail
+        step_chk_other.detail.contains("tanpa batas")
+            && step_chk_other.detail.contains("max_steps = 40")
+            && step_chk_other.detail.contains("/tmp/custom.toml"),
+        "doctor harus melaporkan tanpa batas & catatan max_steps=40 diabaikan: {}",
+        step_chk_other.detail
     );
 
-    // 3. Config tanpa `max_steps` -> bawaan tanpa batas (0)
+    // 3. Config bersih tanpa `max_steps` + config.example.toml tidak memuat `max_steps =`
+    let example = include_str!("../config.example.toml");
+    assert!(
+        !example.contains("max_steps ="),
+        "config.example.toml tidak boleh memuat max_steps = lagi"
+    );
     let default_toml = r#"
 default_provider = "router"
 
@@ -660,6 +675,7 @@ proactive_prune_min_reclaim_tokens = 2000
     let default_cfg = parse_config_str_with_policy(default_toml, "/tmp/default.toml").unwrap();
     assert_eq!(default_cfg.agent.max_steps, 0);
     assert_eq!(default_cfg.max_steps_source, MaxStepsSource::DefaultUnbounded);
+    assert!(default_cfg.startup_notices.is_empty());
     let rep_default = run_doctor(&default_cfg, &cwd, "router", &pcfg, &store, &sandbox);
     let step_chk_default = rep_default
         .checks
@@ -667,8 +683,8 @@ proactive_prune_min_reclaim_tokens = 2000
         .find(|c| c.name == "Batas Langkah")
         .unwrap();
     assert!(
-        step_chk_default.detail.contains("tanpa batas")
-            && step_chk_default.detail.contains("bawaan tanpa batas"),
+        step_chk_default.detail.contains("tanpa batas langkah")
+            && step_chk_default.detail.contains("LoopGuard"),
         "{}",
         step_chk_default.detail
     );

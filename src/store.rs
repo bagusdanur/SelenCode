@@ -660,6 +660,22 @@ impl Store {
         Ok(())
     }
 
+    /// Tambahkan hitungan `pruned_count` dari gerbang prune pasca-tool pada baris metrik panggilan
+    /// terakhir sesi ini (Masalah 4 v0.5.18) agar giliran penelanan itu sendiri tercatat > 0.
+    pub fn add_latest_call_pruned_count(&self, session_id: &str, extra_pruned: usize) -> Result<()> {
+        if extra_pruned == 0 {
+            return Ok(());
+        }
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "UPDATE call_token_metrics
+             SET pruned_count = pruned_count + ?1
+             WHERE id = (SELECT MAX(id) FROM call_token_metrics WHERE session_id = ?2)",
+            rusqlite::params![extra_pruned as i64, session_id],
+        )?;
+        Ok(())
+    }
+
     /// Ringkas metrik rincian token seluruh panggilan pada satu sesi (Tahap 0).
     pub fn session_token_metrics(&self, session_id: &str) -> Result<SessionTokenMetricsSummary> {
         let conn = self.conn.lock().expect("mutex store poisoned");

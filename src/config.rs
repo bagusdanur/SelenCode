@@ -3,19 +3,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Nilai pagu langkah bawaan era lama (pra-v0.5.15) yang otomatis dibebaskan oleh sistem (v0.5.17).
+/// Nilai pagu langkah bawaan era lama (pra-v0.5.15) untuk kompatibilitas referensi.
 pub const LEGACY_DEFAULT_MAX_STEPS: usize = 25;
 
-/// Asal usul nilai efektif `[agent] max_steps` untuk pelaporan transparan di startup & `selen doctor`.
+/// Status sumber `max_steps` untuk pelaporan transparan di startup & `selen doctor` (Opsi A — ala Hermes).
+/// Giliran utama pengguna selalu berjalan tanpa batas langkah (`0`); batas iterasi hanya dipakai
+/// secara internal oleh subagent/orchestrator/cron latar agar tidak runaway.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum MaxStepsSource {
-    /// Tidak diatur di config atau bernilai `0` — bawaan tanpa batas ala Hermes (sejak v0.5.15).
+    /// Bersih — tidak ada kunci `max_steps` aktif di config; giliran utama selalu tanpa batas langkah.
     #[default]
     DefaultUnbounded,
-    /// Config lama memuat `max_steps = 25` (pagu warisan pra-v0.5.15) yang dibebaskan otomatis menjadi `0`.
-    Legacy25Liberated { config_path: String },
-    /// Pagu keras yang dipilih secara eksplisit oleh pengguna di config (nilai > 0 selain 25).
-    ExplicitConfig { value: usize, config_path: String },
+    /// Config lama masih memuat `max_steps = N` (`N > 0`) — sudah tidak dipakai dan diabaikan otomatis.
+    DeprecatedIgnored {
+        legacy_value: usize,
+        config_path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,10 +94,10 @@ pub struct ProviderTimeoutsCfg {
     /// Tenggat menunggu header respons awal dari provider dalam detik (default: 60).
     #[serde(default = "default_provider_response_secs")]
     pub response_secs: u64,
-    /// Tenggat ketidakaktifan streaming (tanpa byte/potongan baru) dalam detik (default: 90).
+    /// Tenggat ketidakaktifan streaming (tanpa byte/potongan baru) dalam detik (default: 180, sama dengan dasar Hermes).
     #[serde(default = "default_provider_stream_idle_secs")]
     pub stream_idle_secs: u64,
-    /// Tenggat keras total 1 panggilan HTTP/stream ke provider dalam detik (default: 300).
+    /// Tenggat keras total 1 panggilan HTTP/stream ke provider dalam detik (default: 600).
     #[serde(default = "default_provider_total_secs")]
     pub total_secs: u64,
 }
@@ -106,10 +109,10 @@ fn default_provider_response_secs() -> u64 {
     60
 }
 fn default_provider_stream_idle_secs() -> u64 {
-    90
+    180
 }
 fn default_provider_total_secs() -> u64 {
-    300
+    600
 }
 
 impl Default for ProviderTimeoutsCfg {
@@ -845,7 +848,8 @@ fn default_kind() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCfg {
-    #[serde(default = "default_max_steps")]
+    /// Bidang warisan (deprecated): tidak pernah membatasi giliran utama lagi dan tidak ditulis saat save.
+    #[serde(default = "default_max_steps", skip_serializing)]
     pub max_steps: usize,
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
@@ -1292,12 +1296,11 @@ fn emit_legacy_max_steps_notice_once(path_label: &str, notice: &str) {
     }
 }
 
-/// Terapkan kebijakan `max_steps` v0.5.17 (Masalah 3):
-/// - Tidak diset atau `0` -> bawaan tanpa batas (`DefaultUnbounded`).
-/// - Nilai warisan `25` dari config pra-v0.5.15 -> dibebaskan otomatis menjadi tanpa batas (`0`)
-///   dengan pemberitahuan terlihat + dicatat sumbernya (`Legacy25Liberated`).
-/// - Nilai pagu lain (`> 0` selain `25`, mis. `15`, `30`, `40`, `50`) -> dihormati apa adanya
-///   sebagai pilihan eksplisit pengguna (`ExplicitConfig`).
+/// Terapkan kebijakan tanpa `max_steps` ala Hermes (Opsi A):
+/// - Giliran utama pengguna SELALU tanpa batas langkah (`0`); tidak ada pagu langkah dari config user.
+/// - Jika config lama masih memuat `max_steps = N` (`N > 0`, mis. `25`, `40`, dll.), nilai itu
+///   diabaikan otomatis dengan 1 pemberitahuan terlihat dan dicatat di `selen doctor`.
+/// - Batas langkah hanya dipertahankan sebagai pengaman internal pada subagent/orchestrator/cron latar.
 fn apply_max_steps_policy(
     cfg: &mut Config,
     explicit: Option<(usize, String)>,
@@ -1308,23 +1311,20 @@ fn apply_max_steps_policy(
             cfg.agent.max_steps = 0;
             cfg.max_steps_source = MaxStepsSource::DefaultUnbounded;
         }
-        Some((LEGACY_DEFAULT_MAX_STEPS, config_path)) => {
+        Some((legacy_value, config_path)) => {
             cfg.agent.max_steps = 0;
-            cfg.max_steps_source = MaxStepsSource::Legacy25Liberated {
+            cfg.max_steps_source = MaxStepsSource::DeprecatedIgnored {
+                legacy_value,
                 config_path: config_path.clone(),
             };
             let notice = format!(
-                "Pagu langkah warisan max_steps = {LEGACY_DEFAULT_MAX_STEPS} di {config_path} dibebaskan otomatis menjadi tanpa batas (0). \
-                 Set angka lain di [agent] max_steps (mis. 20, 30, atau 40) jika memang menginginkan pagu keras."
+                "Kunci [agent] max_steps = {legacy_value} di {config_path} sudah tidak dipakai dan diabaikan — \
+                 SelenCode selalu berjalan tanpa batas langkah ala Hermes (rem memakai LoopGuard, konvergensi, & timeout)."
             );
             cfg.startup_notices.push(notice.clone());
             if emit_stderr {
                 emit_legacy_max_steps_notice_once(&config_path, &notice);
             }
-        }
-        Some((value, config_path)) => {
-            cfg.agent.max_steps = value;
-            cfg.max_steps_source = MaxStepsSource::ExplicitConfig { value, config_path };
         }
     }
 }

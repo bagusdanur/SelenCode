@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
                     &s.ctx,
                     &mut s.messages,
                     &prompt,
-                    s.cfg.agent.max_steps,
+                    0,
                     TurnMode::Plan,
                 )
                 .await?;
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
                     &s.ctx,
                     &mut s.messages,
                     &prompt,
-                    s.cfg.agent.max_steps,
+                    0,
                 )
                 .await?;
                 // Perbaikan 2 (v0.5.9): 1 putaran polling sebelum sesi CLI ditutup bersih bila ada watch aktif.

@@ -172,35 +172,21 @@ pub fn run_doctor(
         },
     });
 
-    // 2c. Pagu langkah efektif & sumbernya (v0.5.17 Masalah 3: warisan `max_steps = 25` dibebaskan otomatis)
+    // 2c. Kebijakan langkah giliran utama (Opsi A — tanpa batas langkah ala Hermes)
     let (steps_status, steps_detail) = match &cfg.max_steps_source {
-        crate::config::MaxStepsSource::DefaultUnbounded => {
-            if cfg.agent.max_steps == 0 {
-                (
-                    CheckStatus::Ok,
-                    "tanpa batas (max_steps = 0) · sumber: bawaan tanpa batas".to_string(),
-                )
-            } else {
-                (
-                    CheckStatus::Ok,
-                    format!(
-                        "{} langkah (pagu keras) · sumber: konfigurasi runtime",
-                        cfg.agent.max_steps
-                    ),
-                )
-            }
-        }
-        crate::config::MaxStepsSource::Legacy25Liberated { config_path } => (
+        crate::config::MaxStepsSource::DefaultUnbounded => (
+            CheckStatus::Ok,
+            "tanpa batas langkah (model Hermes — rem memakai LoopGuard, konvergensi, & timeout)"
+                .to_string(),
+        ),
+        crate::config::MaxStepsSource::DeprecatedIgnored {
+            legacy_value,
+            config_path,
+        } => (
             CheckStatus::Ok,
             format!(
-                "tanpa batas (efektif: 0) · sumber: warisan max_steps = {} dari {} dibebaskan otomatis",
-                crate::config::LEGACY_DEFAULT_MAX_STEPS,
-                config_path
+                "tanpa batas langkah (model Hermes) · catatan: max_steps = {legacy_value} di {config_path} sudah tidak dipakai dan diabaikan"
             ),
-        ),
-        crate::config::MaxStepsSource::ExplicitConfig { value, config_path } => (
-            CheckStatus::Ok,
-            format!("{value} langkah (pagu keras) · sumber: eksplisit di {config_path}"),
         ),
     };
     checks.push(DoctorCheck {

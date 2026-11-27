@@ -193,7 +193,7 @@ pub(crate) fn make_routed_provider(
         push_fallback_spec(&mut routes, fb);
     }
     for fb in &cfg.routing.fallbacks {
-        push_spec(&mut routes, fb);
+        push_fallback_spec(&mut routes, fb);
     }
     for target in cfg.routing.task_routes.values() {
         push_spec(&mut routes, target);

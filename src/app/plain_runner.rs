@@ -233,7 +233,7 @@ pub(crate) async fn interactive_plain(
                             &s.ctx,
                             &mut s.messages,
                             &prompt,
-                            s.cfg.agent.max_steps,
+                            0,
                         )
                         .await
                         {
@@ -370,7 +370,7 @@ pub(crate) async fn interactive_plain(
                         &s.ctx,
                         &mut s.messages,
                         line,
-                        s.cfg.agent.max_steps,
+                        0,
                         TurnMode::Plan,
                     )
                     .await
@@ -391,7 +391,7 @@ pub(crate) async fn interactive_plain(
                                             &s.ctx,
                                             &mut s.messages,
                                             &exec_prompt,
-                                            s.cfg.agent.max_steps,
+                                            0,
                                         )
                                         .await
                                         {
@@ -415,7 +415,7 @@ pub(crate) async fn interactive_plain(
                     &s.ctx,
                     &mut s.messages,
                     line,
-                    s.cfg.agent.max_steps,
+                    0,
                 )
                 .await
                 {

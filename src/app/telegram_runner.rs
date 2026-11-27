@@ -235,7 +235,7 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                         sandbox,
                         &job,
                         &cur_cfg.shell,
-                        cur_cfg.agent.max_steps,
+                        30, // Pengaman internal cron latar agar tidak runaway tanpa pengawasan user
                     )
                     .await;
                     let status_lbl = if ok { "sukses" } else { "gagal" };
@@ -1159,7 +1159,7 @@ async fn handle_telegram_chat_message(
                     &s.ctx,
                     &mut s.messages,
                     &prompt,
-                    s.cfg.agent.max_steps,
+                    0,
                 )
                 .await?;
                 let reply_text = if res.0.trim().is_empty() {
@@ -1269,7 +1269,7 @@ async fn handle_telegram_chat_message(
     let tg_prog = tg.clone();
     let hub_for_col = hub.clone();
     let ask_hub_col = ask_hub.clone();
-    let max_steps_ui = s.cfg.agent.max_steps;
+    let max_steps_ui = 0usize;
     let stall_notice_secs = latest_cfg.telegram.stall_notice_secs;
     let turn_timeout_secs = latest_cfg.telegram.turn_timeout_secs;
     let mut collector_guard = AbortTaskOnDrop(Some(tokio::spawn(async move {
@@ -1429,7 +1429,7 @@ async fn handle_telegram_chat_message(
             &s.ctx,
             &mut s.messages,
             &text,
-            s.cfg.agent.max_steps,
+            0,
             ui_tx,
         ) => TurnOutcome::Finished(r),
         _ = cancel.notified() => TurnOutcome::Cancelled,

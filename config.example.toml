@@ -36,7 +36,7 @@ api_key_env = "SELENCODE_ROUTER_KEY"
 # api_key_env = "GEMINI_API_KEY"
 
 [agent]
-max_steps = 0                                    # 0 / kosong = tanpa batas ala Hermes; angka > 0 = pagu keras langkah
+# Giliran utama selalu berjalan tanpa batas langkah ala Hermes (rem memakai LoopGuard, konvergensi, & timeout).
 max_output_tokens = 8192
 approval = "ask"                                 # ask | auto
 context_limit_tokens = 100000                    # compaction konteks memicu di 80% batas ini
@@ -60,8 +60,8 @@ timeout_secs = 120
 [timeouts]
 connect_secs = 20                                # batas sambung TCP/TLS (detik)
 response_secs = 60                               # batas menunggu header respons awal provider (detik)
-stream_idle_secs = 90                            # batas diam antar-potongan streaming (detik)
-total_secs = 300                                 # batas keras total 1 panggilan provider (detik)
+stream_idle_secs = 180                           # batas diam antar-potongan streaming (detik; dasar Hermes 180s)
+total_secs = 600                                 # batas keras total 1 panggilan provider (detik)
 
 # Telegram Bot Gateway (`selen telegram`) — opsional.
 # [telegram]

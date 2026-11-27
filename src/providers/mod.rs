@@ -17,9 +17,9 @@ pub struct ProviderTimeouts {
     pub connect: Duration,
     /// Tenggat menunggu respons header awal (default: 60s).
     pub response: Duration,
-    /// Tenggat ketidakaktifan streaming tanpa potongan data baru (default: 90s).
+    /// Tenggat ketidakaktifan streaming tanpa potongan data baru (default: 180s, sama dengan dasar Hermes).
     pub stream_idle: Duration,
-    /// Tenggat keras total satu panggilan ke provider (default: 300s).
+    /// Tenggat keras total satu panggilan ke provider (default: 600s).
     pub total: Duration,
 }
 
@@ -28,20 +28,17 @@ impl Default for ProviderTimeouts {
         Self {
             connect: Duration::from_secs(20),
             response: Duration::from_secs(60),
-            stream_idle: Duration::from_secs(90),
-            total: Duration::from_secs(300),
+            stream_idle: Duration::from_secs(180),
+            total: Duration::from_secs(600),
         }
     }
 }
 
 impl ProviderTimeouts {
     /// Skalasi batas diam streaming berbasis estimasi ukuran konteks permintaan
-    /// (diporting dari Hermes Agent `agent/chat_completion_helpers.py`:
-    /// `_scale_stale_timeout_for_context` & `_stream_env_stale_base`).
+    /// (diambil dari Hermes Agent `agent/chat_completion_helpers.py`:
+    /// `_stream_env_stale_base` = 180s dasar + `_scale_stale_timeout_for_context` >50k -> 240s, >100k -> 300s).
     ///
-    /// - Konteks besar (>16k / >50k / >100k token) membuat model/proxy (mis. 9Router)
-    ///   berpikir lebih lama sebelum potongan token pertama atau antar-potongan keluar;
-    ///   menaikkan kesabaran ke 180s / 240s / 300s mencegah stream sehat dipotong prematur.
     /// - Nilai uji pendek (`stream_idle < 30s`) TIDAK dinaikkan agar tes timeout tetap cepat.
     pub fn effective_stream_idle(&self, est_context_tokens: usize) -> Duration {
         let base_secs = self.stream_idle.as_secs();
@@ -52,8 +49,6 @@ impl ProviderTimeouts {
             base_secs.max(300)
         } else if est_context_tokens > 50_000 {
             base_secs.max(240)
-        } else if est_context_tokens > 16_000 {
-            base_secs.max(180)
         } else {
             base_secs
         };
