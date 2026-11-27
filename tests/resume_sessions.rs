@@ -94,9 +94,9 @@ fn store_auto_names_sessions_lists_ten_and_resolves_numeric_ids() {
     let by_prefix = store.resolve_session(cwd, prefix, 10).unwrap();
     assert_eq!(by_prefix.id, ids[5]);
 
-    // Nomor di luar jangkauan ditolak dengan pesan jelas.
-    assert!(store.resolve_session(cwd, "0", 10).is_err());
-    assert!(store.resolve_session(cwd, "11", 10).is_err());
+    // Nomor di luar jangkauan ditolak dengan pesan jelas (pakai `#11` agar tidak bentrok acak dengan prefix UUID hex `11...`).
+    assert!(store.resolve_session(cwd, "#0", 10).is_err());
+    assert!(store.resolve_session(cwd, "#11", 10).is_err());
 
     let _ = std::fs::remove_file(&db);
 }
