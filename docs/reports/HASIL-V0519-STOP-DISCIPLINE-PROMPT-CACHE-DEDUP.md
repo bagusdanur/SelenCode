@@ -64,16 +64,13 @@
 | Rata-rata token tugas A + B (`usage`) | ≤ 5.000 token | pengukuran penerimaan oleh Muse | Menunggu uji live Muse |
 | Token giliran Resume E (`usage`) | ≤ 7.500 token | pengukuran penerimaan oleh Muse | Menunggu uji live Muse |
 | Tes banding ulang KASKU (total token, panggilan, berhenti sendiri, 45/45, `cache_read_tokens`) | Turun drastis dari 2,55 juta, selesai sendiri sebelum pagu, 45/45 + build hijau, `cache_read_tokens` tercatat | pengukuran penerimaan oleh Muse | Menunggu uji live Muse |
-| Suite unit & integrasi Linux CI (`cargo test`) | 100% lulus, 0 gagal | Menunggu CI Run | Menunggu CI |
-| Suite unit & integrasi Windows x64 CI (`cargo test`) | 100% lulus, 0 gagal | Menunggu CI Run | Menunggu CI |
-| `cargo clippy --all-targets -- -D clippy::correctness` | 0 error | Menunggu CI Run | Menunggu CI |
+| Suite unit & integrasi Linux CI (`cargo test`) | 100% lulus, 0 gagal | 100% lulus, 0 gagal (CI Run `45984429127`, job `140456286171`) | LULUS |
+| Suite unit & integrasi Windows x64 CI (`cargo test`) | 100% lulus, 0 gagal | 100% lulus, 0 gagal (CI Run `45984429127`, job `140456286775`) | LULUS |
+| `cargo clippy --all-targets -- -D clippy::correctness` | 0 error | 0 error (CI Run `45984429127`) | LULUS |
 
 Tidak diukur — Rata-rata token tugas A + B (`usage`): pengukuran penerimaan oleh Muse (sesuai pembagian tugas, pengujian live tidak dijalankan oleh pengembang).
 Tidak diukur — Token giliran Resume E (`usage`): pengukuran penerimaan oleh Muse (sesuai pembagian tugas, pengujian live tidak dijalankan oleh pengembang).
 Tidak diukur — Tes banding ulang KASKU (total token, panggilan, berhenti sendiri, 45/45, `cache_read_tokens`): pengukuran penerimaan oleh Muse (sesuai pembagian tugas, pengujian live tidak dijalankan oleh pengembang).
-Tidak diukur — Suite unit & integrasi Linux CI (`cargo test`): akan diisi nomor Run ID CI resmi segera setelah workflow GitHub Actions selesai sebelum tag rilis `v0.5.19`.
-Tidak diukur — Suite unit & integrasi Windows x64 CI (`cargo test`): akan diisi nomor Run ID CI resmi segera setelah workflow GitHub Actions selesai sebelum tag rilis `v0.5.19`.
-Tidak diukur — `cargo clippy --all-targets -- -D clippy::correctness`: akan diisi nomor Run ID CI resmi segera setelah workflow GitHub Actions selesai sebelum tag rilis `v0.5.19`.
 
 ---
 
