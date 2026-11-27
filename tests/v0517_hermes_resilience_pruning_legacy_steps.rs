@@ -648,11 +648,13 @@ max_steps = 40
         step_chk_other.detail
     );
 
-    // 3. Config bersih tanpa `max_steps` + config.example.toml tidak memuat `max_steps =`
+    // 3. Config bersih tanpa `max_steps` + config.example.toml tidak memuat kunci `max_steps`
     let example = include_str!("../config.example.toml");
     assert!(
-        !example.contains("max_steps ="),
-        "config.example.toml tidak boleh memuat max_steps = lagi"
+        !example
+            .lines()
+            .any(|l| l.trim_start().starts_with("max_steps")),
+        "config.example.toml tidak boleh memuat kunci max_steps lagi"
     );
     let default_toml = r#"
 default_provider = "router"
