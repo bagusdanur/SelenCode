@@ -666,7 +666,7 @@ async fn m3_skip_rereading_own_written_files_and_nudge_targeted_edit_on_large_fi
 
 // =========================================================================
 // MASALAH 4: Porsi cache tinggi — tidak memotong/compaction prematur di 28k/48k
-// pada jendela 1M (seperti KASKU 58k–65k) + histeresis rearm penuh ala Hermes
+// pada jendela 1M (seperti KASKU 58k–65k) + histeresis rearm penuh terstruktur
 // =========================================================================
 
 #[tokio::test]
@@ -679,7 +679,7 @@ async fn m4_large_context_preserves_cache_prefix_without_premature_prune_or_comp
     assert_eq!(compaction_threshold_tokens(100_000), 50_000);
     assert_eq!(compaction_threshold_tokens(64_000), 32_000);
 
-    // Simulasi konteks ~60.000 token (rata-rata KASKU Hermes = 58.772 token):
+    // Simulasi konteks ~60.000 token (rata-rata KASKU SelenCode = 58.772 token):
     // pada model 1M, `needs_compaction` WAJIB false (sebelumnya v0.5.19 true karena cap 48.000!).
     let big_msgs: Vec<Message> = (0..30)
         .map(|i| Message::text(Role::User, format!("blok-{i}: {}", "k".repeat(7_000))))

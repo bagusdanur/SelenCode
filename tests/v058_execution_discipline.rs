@@ -1,11 +1,11 @@
 //! Suite uji penerimaan terpadu SelenCode v0.5.8:
-//! - Perbaikan 1: Tumpukan 3 lapis Hermes (Lapis A prompt disiplin + opencode guard, Lapis A2 `folder_map`
+//! - Perbaikan 1: Tumpukan 3 lapis SelenCode (Lapis A prompt disiplin + opencode guard, Lapis A2 `folder_map`
 //!   tree-sitter <=300 token & kosong di folder hampa, Lapis B deskripsi skill investigasi, Lapis C
 //!   aturan ulang/resume job, serta riset ter-batch paralel tidak dihukum anti-spin).
 //! - Perbaikan 2: Ringkasan penutup wajib saat menabrak `max_steps` (via model & fallback templat saat
 //!   model gagal; pesan terakhir DB selalu Assistant, bukan ToolResult; giliran normal tanpa duplikat)
 //!   + daftar periksa penutup tugas coding ala SWE-agent `review_on_submit`.
-//! - Perbaikan 3: Tampilan aksi tool ala Hermes (`prepare_tool_preview`, `format_tool_event`, redaksi
+//! - Perbaikan 3: Tampilan aksi tool terstruktur (`prepare_tool_preview`, `format_tool_event`, redaksi
 //!   argumen rahasia di progres & blok akhir, penggabungan pengulangan berturut `×N`, batas <=10 baris
 //!   dengan seluruh baris gagal tetap tampil beralasan, giliran <=3 aksi tanpa penggabungan paksa).
 
@@ -42,7 +42,7 @@ fn temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-// ---------- PERBAIKAN 1: Tumpukan 3 lapis Hermes + folder_map Aider/SWE-agent ----------
+// ---------- PERBAIKAN 1: Tumpukan 3 lapis SelenCode + folder_map Aider/SWE-agent ----------
 
 #[test]
 fn perbaikan1_three_layer_prompt_folder_map_and_skill_trigger() {
@@ -297,7 +297,7 @@ fn perbaikan2_swe_agent_coding_closing_checklist() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---------- PERBAIKAN 3: Tampilan aksi tool ala Hermes + blok ringkasan <=10 baris ----------
+// ---------- PERBAIKAN 3: Tampilan aksi tool terstruktur + blok ringkasan <=10 baris ----------
 
 #[test]
 fn perbaikan3_tool_preview_redaction_progress_and_collapsed_action_block() {

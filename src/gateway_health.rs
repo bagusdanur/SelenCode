@@ -1,9 +1,9 @@
 //! Ketahanan Gateway Telegram SelenCode (Perbaikan 1 v0.5.10):
-//! 1. `StallTracker` (padanan `gateway/session_stall.py` Hermes):
+//! 1. `StallTracker` (mekanisme internal SelenCode):
 //!    melacak kemajuan giliran aktif; mengirim TEPAT SATU peringatan macet per episode
 //!    diam melewati ambang `stall_notice_secs`, lalu menutup episode secara diam-diam saat
 //!    giliran bergerak lagi.
-//! 2. `GatewayHealthClock` + OS-thread watchdog (padanan `gateway/shutdown_watchdog.py` Hermes):
+//! 2. `GatewayHealthClock` + OS-thread watchdog (mekanisme internal SelenCode):
 //!    memantau detak jantung loop utama dan waktu keberhasilan polling Telegram di luar runtime
 //!    Tokio; bila macet melewati `poll_watchdog_secs`, mencatat marker pemulihan di SQLite,
 //!    menulis log bermakna ke stderr, lalu keluar non-nol agar systemd me-restart otomatis.
@@ -11,7 +11,7 @@
 //!    (memangkas lampiran gambar base64 lama & memadatkan riwayat in-memory di atas pagu
 //!    sambil menjaga riwayat penuh tetap aman di SQLite).
 
-use crate::agent::context::{compact_messages_hermes, prune_old_tool_results_with_archive};
+use crate::agent::context::{compact_messages_structured, prune_old_tool_results_with_archive};
 use crate::providers::{Block, Message};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -45,7 +45,7 @@ pub fn format_duration_id(d: Duration) -> String {
     }
 }
 
-/// Pelacak kemacetan giliran aktif ala `gateway/session_stall.py` Hermes.
+/// Pelacak kemacetan giliran aktif internal SelenCode.
 /// - Mengirim TEPAT SATU peringatan per episode macet.
 /// - `record_progress()` menutup episode secara diam-diam saat giliran bergerak lagi.
 /// - Dapat dijeda (`paused = true`) saat sedang menunggu tombol approval / `ask_user` dari pengguna.
@@ -300,7 +300,7 @@ pub struct GatewayMemoryTrimReport {
 /// Batasi retensi memori `messages` sesi gateway di RAM sesudah giliran selesai (Perbaikan 1 #5 v0.5.10):
 /// 1. Ganti payload `Block::Image` base64 di luar `KEEP_RECENT_IMAGE_MSGS` pesan terakhir menjadi stub teks ringan.
 /// 2. Bila jumlah pesan > `MAX_GATEWAY_IN_MEM_MSGS` atau ukuran > `MAX_GATEWAY_IN_MEM_BYTES`,
-///    jalankan `prune_old_tool_results_with_archive` lalu `compact_messages_hermes` pada salinan RAM
+///    jalankan `prune_old_tool_results_with_archive` lalu `compact_messages_structured` pada salinan RAM
 ///    (riwayat mentah di SQLite tetap 100% utuh).
 pub fn trim_gateway_session_memory(
     messages: &mut Vec<Message>,
@@ -346,7 +346,7 @@ pub fn trim_gateway_session_memory_with_limits(
         tool_results_pruned = prune_old_tool_results_with_archive(messages, archive_dir, 12);
     }
     if messages.len() > max_msgs || estimate_messages_bytes(messages) > max_bytes {
-        *messages = compact_messages_hermes(messages);
+        *messages = compact_messages_structured(messages);
         compacted = true;
     }
 

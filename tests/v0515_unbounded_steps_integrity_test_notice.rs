@@ -1,5 +1,5 @@
 //! Uji unit & integrasi SelenCode v0.5.15 (4 Butir):
-//! - Perbaikan 1: Bawaan `max_steps = 0` (tanpa batas ala Hermes), rumus konvergensi berpagu
+//! - Perbaikan 1: Bawaan `max_steps = 0` (tanpa batas terstruktur), rumus konvergensi berpagu
 //!   tepat spesifikasi (sisa <= 5 ATAU >= 85%: pagu 15 -> langkah 10, pagu 25 -> langkah 20),
 //!   notice konvergensi 20-langkah di mode tanpa pagu (tekanan bukan penghentian),
 //!   penjaga pengulangan 3x tetap aktif, & tag langkah Telegram menyesuaikan (`langkah N` vs `langkah N/M`).

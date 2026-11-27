@@ -7,7 +7,7 @@
 
 use crate::providers::Usage;
 
-/// Snapshot data untuk modal pemilih model interaktif (ala Hermes) di TUI.
+/// Snapshot data untuk modal pemilih model interaktif (terstruktur) di TUI.
 #[derive(Debug, Clone)]
 pub struct ModelPickerData {
     pub provider: String,

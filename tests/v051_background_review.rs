@@ -243,7 +243,7 @@ async fn scenario1_correction_patches_skill_records_separate_usage_and_enforces_
     assert!(umems[0].contains("~/data/raws"));
     assert!(store.list_memories(&cwd_str, 10).unwrap().is_empty());
 
-    // Laporan tepat satu baris bergaya Hermes/SelenCode!
+    // Laporan tepat satu baris bergaya SelenCode/SelenCode!
     let report = outcome.report_message.as_deref().unwrap();
     assert!(report.starts_with("💾 Self-improvement review:"));
     assert!(report.contains("Skill 'raw-downloader' patched (tambah aturan folder kanonik)"));

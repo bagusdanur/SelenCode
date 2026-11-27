@@ -64,7 +64,7 @@ pub enum ModelPickerCmd {
 #[derive(Debug)]
 pub enum TuiCommand {
     Prompt(String),
-    /// Interupsi giliran yang sedang berjalan dan langsung jalankan prompt baru (ala OpenCode/Hermes).
+    /// Interupsi giliran yang sedang berjalan dan langsung jalankan prompt baru (ala SelenCode).
     InterruptPrompt(String),
     /// Giliran plan mode (Fase 6): baca-saja, diakhiri rencana.
     PromptPlan(String),
@@ -73,7 +73,7 @@ pub enum TuiCommand {
     /// `!cmd` — jalankan shell lokal cepat tanpa memanggil LLM.
     InlineShell(String),
     ShowModels,
-    /// Aksi modal pemilih model interaktif ala Hermes.
+    /// Aksi modal pemilih model interaktif terstruktur.
     ModelPicker(ModelPickerCmd),
     /// /model <arg>: ganti provider, `/model set <id>`, `/model <prov>:<id>`, `/model add ...`, `/model rm ...`, `/model clear`.
     SwitchOrSetModel(String),
@@ -838,7 +838,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ));
     frame.render_widget(status, chunks[1]);
 
-    // Input: bingkai BORDER (atau VIOLET saat sibuk + petunjuk interupsi ala OpenCode/Hermes).
+    // Input: bingkai BORDER (atau VIOLET saat sibuk + petunjuk interupsi ala SelenCode).
     let mut input_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if app.busy {
@@ -1297,7 +1297,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    // Modal Pemilih Model Interaktif Moonlit Ungu (ala Hermes: pilih 1-per-1, tambah manual, hapus)
+    // Modal Pemilih Model Interaktif Moonlit Ungu (terstruktur: pilih 1-per-1, tambah manual, hapus)
     if let Some(mp) = &app.model_picker {
         let pct_x = if area.width < 90 { 94 } else { 80 };
         let pct_y = if area.height < 26 { 84 } else { 72 };
@@ -2083,7 +2083,7 @@ fn submit(
             ));
         }
         SlashCommand::NotCommand => {
-            // Interupsi mulus ala OpenCode & Hermes: saat Selena sibuk, mengirim pesan
+            // Interupsi mulus ala SelenCode: saat Selena sibuk, mengirim pesan
             // baru langsung menghentikan giliran/tool aktif dan memproses instruksi baru!
             if app.busy {
                 let dropped = app.cancel_all_approvals();

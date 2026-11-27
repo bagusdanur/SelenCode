@@ -3,7 +3,7 @@
 //! - Perbaikan 2: Aturan pemuatan skill bawaan sebelum tool pertama + 4 deskripsi tajam <= 60 char + upgrade deskripsi aman.
 //! - Perbaikan 3: Pemantau tugas asinkron (`watch_job`, S1->S2->SELESAI, anti-spam, gagal 3x, restart persisten, 0 token LLM, batas 5/chat).
 //! - Perbaikan 4: Kirim berkas Telegram (`send_file`, sandbox, batas 50 MB -> saran Drive, fallback CLI).
-//! - Perbaikan 5: Memory pengguna persisten ala Hermes (`memory` 2200 char & `profile` 1375 char, pagu keras, snapshot beku, lintas sesi).
+//! - Perbaikan 5: Memory pengguna persisten terstruktur (`memory` 2200 char & `profile` 1375 char, pagu keras, snapshot beku, lintas sesi).
 //! - Perbaikan 6: `delegate` `mode: "work"` di Git worktree terisolasi (non-git ditolak, pohon utama utuh saat ditolak, mendarat saat disetujui, 2 pekerja paralel, usage terpisah).
 //! - Perbaikan 7: Laporan `/usage` langsung dari tabel `usage` (sesi + hari ini, baris terpisah `main`/`fallback`/`review`/`cron`/`delegate_work`, 0 API call).
 //! - Perbaikan 8: `selen skills install` & `remove` (clone git staging, validasi frontmatter/keamanan, penandaan skrip, bentrok nama + rename, `.selen-source.json`, blokir hapus bawaan/proyek).
@@ -436,7 +436,7 @@ async fn perbaikan4_send_file_sandbox_size_limit_and_cli_fallback() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---------- PERBAIKAN 5: Memory persisten + profil beku ala Hermes ----------
+// ---------- PERBAIKAN 5: Memory persisten + profil beku terstruktur ----------
 
 #[tokio::test]
 async fn perbaikan5_persistent_memory_profile_caps_and_frozen_snapshot() {

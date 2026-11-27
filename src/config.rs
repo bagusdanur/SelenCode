@@ -6,7 +6,7 @@ use std::path::PathBuf;
 /// Nilai pagu langkah bawaan era lama (pra-v0.5.15) untuk kompatibilitas referensi.
 pub const LEGACY_DEFAULT_MAX_STEPS: usize = 25;
 
-/// Status sumber `max_steps` untuk pelaporan transparan di startup & `selen doctor` (Opsi A — ala Hermes).
+/// Status sumber `max_steps` untuk pelaporan transparan di startup & `selen doctor` (Opsi A — terstruktur).
 /// Giliran utama pengguna selalu berjalan tanpa batas langkah (`0`); batas iterasi hanya dipakai
 /// secara internal oleh subagent/orchestrator/cron latar agar tidak runaway.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -94,7 +94,7 @@ pub struct ProviderTimeoutsCfg {
     /// Tenggat menunggu header respons awal dari provider dalam detik (default: 60).
     #[serde(default = "default_provider_response_secs")]
     pub response_secs: u64,
-    /// Tenggat ketidakaktifan streaming (tanpa byte/potongan baru) dalam detik (default: 180, sama dengan dasar Hermes).
+    /// Tenggat ketidakaktifan streaming (tanpa byte/potongan baru) dalam detik (default: 180, dasar standar 180s).
     #[serde(default = "default_provider_stream_idle_secs")]
     pub stream_idle_secs: u64,
     /// Tenggat keras total 1 panggilan HTTP/stream ke provider dalam detik (default: 600).
@@ -178,7 +178,7 @@ impl ContextCfg {
 /// Konfigurasi tampilan pratinjau aksi tool (`[display]`, v0.5.8 Perbaikan 3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DisplayCfg {
-    /// Panjang maksimum pratinjau argumen utama tool (default: 40 karakter, meniru Hermes).
+    /// Panjang maksimum pratinjau argumen utama tool (default: 40 karakter, standar ringkas).
     #[serde(default = "default_tool_preview_length")]
     pub tool_preview_length: usize,
 }
@@ -469,18 +469,18 @@ pub struct ToolBudgetCfg {
     #[serde(default = "default_dynamic_inject_max_tokens")]
     pub dynamic_inject_max_tokens: usize,
     /// Batas karakter praktis per panggilan `read_file` sebelum dipotong di akhir baris utuh + petunjuk `start`/`end`
-    /// (diporting dari Hermes `tools/file_tools.py`, default 16.000 char; 0 = batas 100KB penuh).
+    /// (desain internal SelenCode).
     #[serde(default = "default_file_read_max_chars")]
     pub file_read_max_chars: usize,
     /// Batas baris bawaan `read_file` saat model tidak menentukan `start`/`end` (default 250 baris; 0 = 2000).
     #[serde(default = "default_file_read_default_lines")]
     pub file_read_default_lines: usize,
     /// Ambang token pemicu pemangkasan proaktif hasil tool/argumen lama tanpa menunggu 80% jendela 1M
-    /// (diporting dari Hermes `agent/context_compressor.py`, default 18.000 token; 0 = matikan).
+    /// (desain internal SelenCode).
     #[serde(default = "default_proactive_prune_tokens")]
     pub proactive_prune_tokens: usize,
     /// Penghematan token minimum agar proactive prune di-commit (mencegah pemecahan prompt cache untuk
-    /// penghematan kecil — diporting dari Hermes `proactive_prune_min_reclaim_tokens`, default 2.000 token).
+    /// penghematan kecil — desain internal SelenCode `proactive_prune_min_reclaim_tokens`, default 2.000 token).
     #[serde(default = "default_proactive_prune_min_reclaim_tokens")]
     pub proactive_prune_min_reclaim_tokens: usize,
 }
@@ -861,7 +861,7 @@ pub struct AgentCfg {
     /// Batas subagent `delegate` yang berjalan paralel (Fase 6).
     #[serde(default = "default_max_parallel_subagents")]
     pub max_parallel_subagents: usize,
-    /// Review self-improvement otomatis pasca-giliran kompleks (ala Hermes Agent).
+    /// Review self-improvement otomatis pasca-giliran kompleks (terstruktur).
     #[serde(default = "default_auto_skills")]
     pub auto_skills: bool,
     /// Self-Correction Engine & Automatic Verification Gate setelah edit kode (Tahap 1).
@@ -895,7 +895,7 @@ fn default_max_parallel_subagents() -> usize {
     3
 }
 
-/// Bawaan tanpa batas langkah ala Hermes (`0` = tanpa batas; angka > 0 = pagu keras, v0.5.15).
+/// Bawaan tanpa batas langkah terstruktur (`0` = tanpa batas; angka > 0 = pagu keras, v0.5.15).
 fn default_max_steps() -> usize {
     0
 }
@@ -1296,7 +1296,7 @@ fn emit_legacy_max_steps_notice_once(path_label: &str, notice: &str) {
     }
 }
 
-/// Terapkan kebijakan tanpa `max_steps` ala Hermes (Opsi A):
+/// Terapkan kebijakan tanpa `max_steps` terstruktur (Opsi A):
 /// - Giliran utama pengguna SELALU tanpa batas langkah (`0`); tidak ada pagu langkah dari config user.
 /// - Jika config lama masih memuat `max_steps = N` (`N > 0`, mis. `25`, `40`, dll.), nilai itu
 ///   diabaikan otomatis dengan 1 pemberitahuan terlihat dan dicatat di `selen doctor`.
@@ -1319,7 +1319,7 @@ fn apply_max_steps_policy(
             };
             let notice = format!(
                 "Kunci [agent] max_steps = {legacy_value} di {config_path} sudah tidak dipakai dan diabaikan — \
-                 SelenCode selalu berjalan tanpa batas langkah ala Hermes (rem memakai LoopGuard, konvergensi, & timeout)."
+                 SelenCode selalu berjalan tanpa batas langkah (rem memakai LoopGuard, konvergensi, & timeout)."
             );
             cfg.startup_notices.push(notice.clone());
             if emit_stderr {

@@ -296,7 +296,7 @@ impl AnthropicStreamParser {
     }
 }
 
-/// Terapkan Prompt Caching ala Hermes (`system_and_3`, Tahap 3) pada body request Anthropic:
+/// Terapkan Prompt Caching terstruktur (`system_and_3`, Tahap 3) pada body request Anthropic:
 /// - Tandai blok `system` sebagai ephemeral cache breakpoint.
 /// - Tandai skema tool terakhir (bila ada) sebagai cache breakpoint.
 /// - Tandai hingga 3 pesan non-system terakhir dengan `cache_control: {"type": "ephemeral"}`.

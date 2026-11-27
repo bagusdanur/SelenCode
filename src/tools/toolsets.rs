@@ -1,4 +1,4 @@
-//! Progressive Disclosure & Tiered Toolsets (terinspirasi Hermes Agent `toolsets.py`).
+//! Progressive Disclosure & Tiered Toolsets (desain internal SelenCode).
 //!
 //! Menghemat 70–85% token schema tool per panggilan LLM dengan cara:
 //! 1. Hanya mengirim **Core Toolset** (8 tool inti + meta-tool `activate_toolset`) secara default.

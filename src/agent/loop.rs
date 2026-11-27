@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use super::context::{
     analyze_token_breakdown, auto_outline, build_folder_map, build_resume_snapshot,
     build_resume_system_prompt, build_system_prompt, cap_dynamic_injection,
-    compact_messages_hermes, estimate_tokens, expand_at_mentions, head_tail_truncate,
+    compact_messages_structured, estimate_tokens, expand_at_mentions, head_tail_truncate,
     needs_compaction, proactive_prune_context_with_archive,
     prune_old_skill_results_with_archive, prune_old_tool_results_with_archive,
     prune_oversized_pending_tool_batch_with_archive, session_archive_dir, spillover_if_needed,
@@ -722,7 +722,7 @@ pub fn prompt_requests_file_change(prompt: &str) -> bool {
 
 /// Batas rentetan stream macet beruntun lintas langkah sebelum circuit breaker berhenti bersih
 /// (angka sendiri `3` untuk interaktivitas cepat, terinspirasi mekanisme `_consecutive_stale_streams`
-/// di Hermes `agent/chat_completion_helpers.py` & `stale_giveup()` di `agent/chat_completion_local.py`).
+/// di SelenCode `agent/chat_completion_helpers.py` & `stale_giveup()` di `agent/chat_completion_local.py`).
 pub const STALE_STREAM_GIVEUP_LIMIT: usize = 3;
 
 /// Penanda baku penutupan jujur saat generasi model terpotong `max_output_tokens` (Masalah 2 v0.5.18).
@@ -793,7 +793,7 @@ pub fn build_output_truncation_closing_message(
 }
 
 /// Klasifikasi kegagalan panggilan API dalam giliran aktif untuk menentukan jalur pemulihan
-/// (diporting dari Hermes Agent `agent/error_classifier.py`: `FailoverReason` & `classify_api_error`).
+/// (desain internal SelenCode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnApiErrorKind {
     /// Stream berhenti mengalir / terputus di tengah / timeout jaringan — layak dipulihkan dengan
@@ -899,7 +899,7 @@ pub fn classify_turn_api_error(err_msg: &str) -> TurnApiErrorKind {
 }
 
 /// Hitung jeda exponential backoff + uniform jitter `[0, delay/2]` dalam milidetik
-/// (diporting dari Hermes Agent `agent/retry_utils.py`: `jittered_backoff`).
+/// (desain internal SelenCode).
 /// `attempt` bersifat 1-based (`1, 2, 3, ...`).
 pub fn jittered_backoff_ms(attempt: usize, base_ms: u64, max_ms: u64) -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1184,7 +1184,7 @@ async fn run_turn_inner(
         None
     };
     let mut loop_guard = if ctx.guard.enabled {
-        LoopGuard::with_hermes_guards()
+        LoopGuard::with_default_guards()
     } else {
         LoopGuard::new()
     };
@@ -1223,15 +1223,14 @@ async fn run_turn_inner(
     let mut loaded_skills_in_turn: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut skill_gate_fired = false;
-    // v0.5.17 Masalah 1 (Hermes `agent/chat_completion_helpers.py`): pelacak rentetan stream macet
+    // v0.5.17 Masalah 1 (SelenCode `agent/chat_completion_helpers.py`): pelacak rentetan stream macet
     // lintas langkah — direset ke 0 setiap kali panggilan model berhasil.
     let mut consecutive_stale_streams: usize = 0;
-    // v0.5.17 Masalah 2 (Hermes `agent/usage_anchor.py`): jangkar token aktual terakhir dari provider
+    // v0.5.17 Masalah 2 (SelenCode `agent/usage_anchor.py`): jangkar token aktual terakhir dari provider
     // agar pemangkasan proaktif menyala berdasarkan ukuran riil, bukan hanya perkiraan kasar.
     let mut last_provider_prompt_tokens: usize = 0;
     let mut last_est_tokens_at_call: usize = 0;
-    // v0.5.19 Masalah 2 (diambil dari Hermes `agent/context_compressor_prune.py:148-200`,
-    // `_proactive_prune_rearm_tokens`): landasan histeresis agar prune proaktif tidak
+    // v0.5.19 Masalah 2 (desain internal SelenCode): landasan histeresis agar prune proaktif tidak
     // memotong prefiks berulang-ulang di setiap panggilan sehingga prompt cache provider tetap menempel.
     let mut proactive_prune_rearm_tokens: usize = 0;
     // v0.5.19 Masalah 1: pelacak pengulangan perintah verifikasi yang sudah hijau tanpa edit baru.
@@ -1241,7 +1240,7 @@ async fn run_turn_inner(
     let mut vendor_reads_in_turn: usize = 0;
     let mut tooling_hint_injected = false;
     // Perbaikan 1 (v0.5.14 + v0.5.15): kesadaran anggaran langkah.
-    // `max_steps == 0` berarti TANPA BATAS ala Hermes (tidak ada pagu tersembunyi);
+    // `max_steps == 0` berarti TANPA BATAS terstruktur (tidak ada pagu tersembunyi);
     // `max_steps > 0` berlaku sebagai pagu keras dengan checkpoint rasio + konvergensi tepat spesifikasi.
     let has_step_cap = max_steps > 0;
     let budget_ratio = ctx.guard.budget_warning_ratio.clamp(0.1, 0.95);
@@ -1286,8 +1285,7 @@ async fn run_turn_inner(
         if pruned_now > 0 {
             dedup.clear_file_reads();
         }
-        // v0.5.17 Masalah 2 + v0.5.19 Masalah 2 (diambil dari Hermes `agent/turn_preflight.py` +
-        // `agent/context_compressor_prune.py` termasuk histeresis `_proactive_prune_rearm_tokens`):
+        // v0.5.17 Masalah 2 + v0.5.19 Masalah 2 (desain internal SelenCode):
         // Pemangkasan proaktif 3-pass berdasarkan tekanan token riil, hanya menyala saat melewati
         // ambang pemicu DAN landasan rearm agar prefiks tetap stabil byte-identik di antara gelombang.
         if ctx.tool_budget.proactive_prune_tokens > 0 {
@@ -1333,7 +1331,7 @@ async fn run_turn_inner(
                     let after_est =
                         analyze_token_breakdown(messages, &tools, registry.names().len())
                             .total_tokens();
-                    // v0.5.20 Masalah 4 (diambil dari Hermes `agent/context_compressor_prune.py:200`):
+                    // v0.5.20 Masalah 4 (desain internal SelenCode):
                     // landasan rearm penuh `after + max(reclaimed, proactive_trigger, min_reclaim)` agar
                     // pemangkasan bersifat episodik dan prefiks prompt cache tidak cepat patah ulang.
                     let runway = pres
@@ -1367,7 +1365,7 @@ async fn run_turn_inner(
                 }
                 None => eprintln!("[selen] compaction dua tahap dijalankan"),
             }
-            *messages = compact_messages_hermes(messages);
+            *messages = compact_messages_structured(messages);
             proactive_prune_rearm_tokens = 0;
             last_provider_prompt_tokens = 0;
             last_est_tokens_at_call = 0;
@@ -1385,8 +1383,7 @@ async fn run_turn_inner(
                 }
             }
         }
-        // v0.5.17 Masalah 1 (diporting dari Hermes `agent/turn_api_error.py`, `agent/retry_utils.py`,
-        // `agent/chat_completion_helpers.py`): loop pemulihan panggilan API di dalam giliran agar
+        // v0.5.17 Masalah 1 (desain internal SelenCode): loop pemulihan panggilan API di dalam giliran agar
         // stream macet (>90s/180s), koneksi putus tengah jalan, 429/5xx sementara, atau 413 overflow
         // TIDAK langsung membunuh giliran kerja pengguna!
         let mut api_retry_count: usize = 0;
@@ -1488,7 +1485,7 @@ async fn run_turn_inner(
                             );
                             pruned_now += em.pruned_count;
                             if em.pruned_count == 0 {
-                                *messages = compact_messages_hermes(messages);
+                                *messages = compact_messages_structured(messages);
                                 proactive_prune_rearm_tokens = 0;
                             }
                             dedup.clear_file_reads();
@@ -1955,7 +1952,7 @@ async fn run_turn_inner(
         }
 
         // Jalankan batch tool: untuk batch independen (read-only / write_file non-overlapping di mode auto_yes),
-        // jalankan secara KONKUREN (diambil dari Hermes `agent/tool_dispatch_helpers.py:34-52`), lalu proses
+        // jalankan secara KONKUREN (desain internal SelenCode), lalu proses
         // seluruh hasil secara deterministik dalam urutan asli `reply.tool_calls`!
         let mut results: Vec<Block> = Vec::new();
         let mut step_had_search = false;
@@ -2445,7 +2442,7 @@ async fn run_turn_inner(
                 is_error,
                 error_reason: is_error.then(|| short_error_reason(&content)),
             });
-            // BAGIAN 2 (#4) & Perbaikan 1 Lapis A (#3) & v0.5.21 (Cache-Safe Fixed Toolset ala Hermes):
+            // BAGIAN 2 (#4) & Perbaikan 1 Lapis A (#3) & v0.5.21 (Cache-Safe Fixed Toolset terstruktur):
             // hitung pencarian per giliran assistant (bukan per tool); kemajuan nyata (mutasi berkas atau
             // perintah verifikasi proyek) mereset penghitung anti-berputar agar sesi bangun produktif
             // tidak pernah memicu false-positive & memutasi array `tools` di tengah sesi!
@@ -2526,7 +2523,7 @@ async fn run_turn_inner(
             });
         }
         // Perbarui counter anti-berputar per giliran (bukan per tool paralel).
-        // v0.5.21 (diambil dari prinsip Hermes `agent/prompt_builder.py:520`: toolset tetap sepanjang sesi):
+        // v0.5.21 (desain internal SelenCode):
         // - Kemajuan nyata (`step_had_progress`: edit/tulis berkas atau verifikasi proyek) mereset counter
         //   sehingga sesi bangun panjang tidak memicu alarm palsu.
         // - Di mode non-interaktif (`ctx.approver.auto_yes()`), JANGAN memutasi array `tools` dengan
@@ -2562,7 +2559,7 @@ async fn run_turn_inner(
         // Perbaikan 1 #1, #2, #3 (v0.5.14 + v0.5.15):
         // - Mode berpagu (`has_step_cap`): checkpoint 1x pada rasio (bawaan 0.7) + konvergensi belum-ada-edit
         //   tepat di `compute_convergence_step(max_steps)` (sisa <= 5 ATAU >= 85%, mana yang tercapai lebih dulu).
-        // - Mode tanpa pagu (`!has_step_cap`, bawaan Hermes): tidak ada checkpoint pagu, tetapi menyuntikkan
+        // - Mode tanpa pagu (`!has_step_cap`, bawaan tanpa pagu): tidak ada checkpoint pagu, tetapi menyuntikkan
         //   SATU notice konvergensi keras saat langkah tanpa satu pun mutasi melewati ambang (bawaan 20) —
         //   tekanan saja, BUKAN penghentian.
         let used_steps = step + 1;
@@ -2650,7 +2647,7 @@ async fn run_turn_inner(
         persist_message(ctx, &tool_msg);
         messages.push(tool_msg);
 
-        // Masalah 4 (v0.5.18 — terinspirasi gerbang post-tool Hermes `agent/turn_preflight.py`:
+        // Masalah 4 (v0.5.18 — terinspirasi gerbang post-tool SelenCode `agent/turn_preflight.py`:
         // `compress_after_tool_results` & pengecualian pending-round `agent/context_compressor.py` #61932):
         // evaluasi tekanan konteks SEGERA sesudah hasil tool mendarat (di giliran yang sama, SEBELUM
         // panggilan model berikutnya), pangkas bila melampaui ambang absolut, dan catat `pruned_count`
@@ -2702,7 +2699,7 @@ async fn run_turn_inner(
                     let after_est =
                         analyze_token_breakdown(messages, &tools, registry.names().len())
                             .total_tokens();
-                    // v0.5.20 Masalah 4 (diambil dari Hermes `agent/context_compressor_prune.py:200`):
+                    // v0.5.20 Masalah 4 (desain internal SelenCode):
                     // landasan rearm penuh `after + max(reclaimed, proactive_trigger, min_reclaim)`.
                     let runway = post_reclaimed
                         .max(proactive_trigger)
@@ -2850,7 +2847,7 @@ async fn run_turn_inner(
     }
 
     // Perbaikan 2 (v0.5.8) + Perbaikan 1 #3 (v0.5.14) + Perbaikan 2/3/4 (v0.5.15):
-    // Giliran terpotong memakai struktur wajib opencode `MAX_STEPS_PROMPT` + pelabelan jujur Hermes.
+    // Giliran terpotong memakai struktur wajib opencode `MAX_STEPS_PROMPT` + pelabelan jujur SelenCode.
     // Kalimat kegagalan nol-edit ditegakkan PASCA-GENERASI secara programatis — tidak bergantung kepatuhan model!
     if let Some(stop_reason) = forced_stop_reason {
         let zero_edit_failure = turn_requests_edit && corrector.edited_files.is_empty();

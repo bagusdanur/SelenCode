@@ -47,7 +47,7 @@ impl Tool for ManageMemory {
     }
 }
 
-/// Tool `memory` (Perbaikan 5 v0.5.7 — wadah `memory` 2.200 char & `profile` 1.375 char ala Hermes).
+/// Tool `memory` (Perbaikan 5 v0.5.7 — wadah `memory` 2.200 char & `profile` 1.375 char terstruktur).
 /// Menyimpan fakta/preferensi/profil pemilik secara persisten dengan pagu karakter keras;
 /// snapshot keduanya dibekukan di awal sesi agar prompt tidak membengkak diam-diam.
 pub struct UserMemoryTool;

@@ -1,8 +1,8 @@
-//! Format tampilan aksi tool ala Hermes (`agent/display.py::prepare_tool_preview` &
+//! Format tampilan aksi tool terstruktur (`agent/display.py::prepare_tool_preview` &
 //! `gateway/platforms/base.py::format_tool_event`) + blok ringkasan akhir SelenCode (Perbaikan 3 v0.5.8).
 //!
 //! - Tiap aksi dirender sebagai `{tool} — {pratinjau}` (atau `{tool}` saja jika tanpa argumen utama).
-//! - Argumen utama dipetakan per tool (meniru `_PRIMARY_ARGS` Hermes), diredaksi dulu dari rahasia/token,
+//! - Argumen utama dipetakan per tool (meniru `_PRIMARY_ARGS` SelenCode), diredaksi dulu dari rahasia/token,
 //!   dijadikan 1 baris, dan dipotong ekor di `tool_preview_length` (default 40 karakter).
 //! - Blok ringkasan akhir menggabungkan pengulangan berturut-turut dengan pratinjau identik
 //!   (`run_shell ×6 — job_queue.py show …`), mempertahankan total aksi asli di judul,
@@ -55,7 +55,7 @@ pub fn redact_tool_args_for_display(raw: &str) -> String {
     s
 }
 
-/// Ambil nilai argumen utama (sesuai peta `_PRIMARY_ARGS` Hermes -> tool SelenCode).
+/// Ambil nilai argumen utama (peta argumen utama tool SelenCode).
 fn extract_primary_arg(tool_name: &str, args: &Value) -> Option<String> {
     let get_str = |k: &str| -> Option<String> {
         args.get(k)
@@ -127,7 +127,7 @@ pub fn prepare_tool_preview(tool_name: &str, args: &Value, max_len: usize) -> St
     truncate_tail(&one_line, max_len.max(12))
 }
 
-/// Format 1 kejadian tool ala Hermes (`{tool} — {pratinjau}` atau `{tool}` saja jika tanpa pratinjau).
+/// Format 1 kejadian tool terstruktur (`{tool} — {pratinjau}` atau `{tool}` saja jika tanpa pratinjau).
 pub fn format_tool_event(tool_name: &str, args: &Value, max_len: usize) -> String {
     let preview = prepare_tool_preview(tool_name, args, max_len);
     format_tool_event_from_preview(tool_name, &preview)
@@ -325,7 +325,7 @@ pub fn build_action_summary_lines(
 }
 
 /// Susun ringkasan penutup templat ketika giliran berhenti mendadak & model tidak dapat dipanggil lagi
-/// (Perbaikan 2 v0.5.8 + Perbaikan 1 v0.5.14 — selaras `MAX_STEPS_PROMPT` opencode & pelabelan jujur Hermes).
+/// (Perbaikan 2 v0.5.8 + Perbaikan 1 v0.5.14 — selaras `MAX_STEPS_PROMPT` opencode & pelabelan jujur SelenCode).
 pub fn build_template_closing_summary(events: &[ToolActionEvent], stop_reason: &str) -> String {
     build_template_closing_summary_with_status(events, stop_reason, false)
 }

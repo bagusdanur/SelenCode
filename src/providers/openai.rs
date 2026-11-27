@@ -113,7 +113,7 @@ pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>> 
 }
 
 /// Ekstrak `Usage` termasuk `cache_read_tokens` & `cache_write_tokens` dari objek JSON `usage`
-/// respons OpenAI-compatible (diambil dari Hermes `agent/usage_pricing.py`: `_CHAT_USAGE_SHAPE`).
+/// respons OpenAI-compatible (desain internal SelenCode).
 /// Mendukung:
 /// - OpenAI / 9Router / Gemini-via-OpenAI (`prompt_tokens_details.cached_tokens`)
 /// - Anthropic-style proxy (`cache_read_input_tokens`, `cache_creation_input_tokens`)
@@ -168,8 +168,7 @@ pub fn parse_openai_usage(u: &Value) -> Usage {
 }
 
 /// Tentukan apakah rute OpenAI-wire ini menerima & diuntungkan oleh penanda `cache_control`
-/// gaya Anthropic pada amplop pesan (diambil dari Hermes `agent/agent_runtime_helpers.py`:
-/// `anthropic_prompt_cache_policy`).
+/// gaya Anthropic pada amplop pesan (desain internal SelenCode).
 ///
 /// - Claude pada gateway non-OpenAI (OpenRouter, Nous, LiteLLM, 9Router): `true`.
 /// - Kimi/Moonshot & Qwen pada OpenRouter/Nous/Alibaba/DashScope: `true`.
@@ -204,8 +203,7 @@ pub fn should_apply_openai_envelope_cache_control(base_url: &str, model: &str) -
 }
 
 /// Terapkan penanda `cache_control: {"type": "ephemeral"}` gaya amplop pada array pesan OpenAI-wire
-/// (diambil dari Hermes `agent/prompt_caching.py`: `apply_anthropic_cache_control`, maks 4 breakpoint:
-/// pesan `system` + hingga 3 pesan non-system terbaru yang memiliki konten teks non-kosong).
+/// (desain internal SelenCode).
 pub fn apply_openai_envelope_cache_control(messages: &mut [Value]) {
     if messages.is_empty() {
         return;

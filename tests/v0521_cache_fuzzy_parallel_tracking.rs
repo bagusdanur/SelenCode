@@ -144,7 +144,7 @@ async fn b1_productive_session_keeps_tools_fixed_and_no_false_antispin() {
 
 // =========================================================================
 // BUTIR 2: Fuzzy / whitespace-tolerant edit_file + multi-edit atomik +
-// petunjuk "Maksudmu baris X-Y?" (diporting dari Hermes tools/fuzzy_match.py)
+// petunjuk "Maksudmu baris X-Y?" (desain internal SelenCode)
 // =========================================================================
 
 #[tokio::test]
@@ -171,7 +171,7 @@ async fn b2_fuzzy_edit_file_strategies_multiedit_and_no_match_hint() {
         "indentasi 4 spasi milik file asli harus terjaga: {res_ind:?}"
     );
 
-    // 4. Strategy unicode_normalized (smart quotes / en-dash / NBSP ala Hermes UNICODE_MAP)
+    // 4. Strategy unicode_normalized (smart quotes / en-dash / NBSP terstruktur UNICODE_MAP)
     let uni_src = "const msg = \u{201c}Halo\u{00a0}Dunia\u{201d};\n";
     let (res_uni, strat_uni) =
         fuzzy_find_and_replace(uni_src, "const msg = \"Halo Dunia\";", "const msg = \"Halo KASKU\";", "u.ts")
@@ -218,7 +218,7 @@ async fn b2_fuzzy_edit_file_strategies_multiedit_and_no_match_hint() {
 }
 
 // =========================================================================
-// BUTIR 3: Eksekusi paralel batch tool independen (Hermes tool_dispatch_helpers)
+// BUTIR 3: Eksekusi paralel batch tool independen (SelenCode tool_dispatch_helpers)
 // =========================================================================
 
 #[tokio::test]
@@ -337,7 +337,7 @@ async fn b3_parallel_batch_admission_and_deterministic_order() {
 
 // =========================================================================
 // BUTIR 4: Negative cache not-found read_file (TTL 60 dtk) & eskalasi
-// kegagalan patch beruntun (Hermes tools/file_tools_read_tracking.py)
+// kegagalan patch beruntun (SelenCode tools/file_tools_read_tracking.py)
 // =========================================================================
 
 #[test]

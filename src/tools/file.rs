@@ -9,15 +9,15 @@ use similar::{ChangeTag, TextDiff};
 pub const MAX_READ_LINES: usize = 2000;
 pub const MAX_READ_BYTES: usize = 100 * 1024;
 pub const MAX_LIST: usize = 500;
-/// Batas karakter per baris sebelum dipotong rapi (diporting dari Hermes `tools/tool_output_limits.py`).
+/// Batas karakter per baris sebelum dipotong rapi (desain internal SelenCode).
 pub const DEFAULT_MAX_LINE_LENGTH: usize = 2000;
-/// Batas baris bawaan untuk `read_file` tanpa rentang eksplisit `start`/`end` (pola Hermes `file_tools.py`).
+/// Batas baris bawaan untuk `read_file` tanpa rentang eksplisit `start`/`end` (pola terstruktur `file_tools.py`).
 pub const DEFAULT_FILE_READ_LINES: usize = 250;
-/// Batas karakter praktis bawaan per panggilan `read_file` (diporting dari Hermes `tools/file_tools.py`: `_truncate_to_char_budget`).
+/// Batas karakter praktis bawaan per panggilan `read_file` (desain internal SelenCode).
 pub const DEFAULT_FILE_READ_MAX_CHARS: usize = 16_000;
 
 /// Potong daftar baris `read_file` pada BARIS UTUH terakhir yang muat di dalam `max_chars`
-/// (diporting dari Hermes Agent `tools/file_tools.py`: `_truncate_to_char_budget`).
+/// (desain internal SelenCode).
 /// Mengembalikan `(teks_terjaga, jumlah_baris_terjaga, terpotong)`.
 /// Jika baris pertama sendiri melebihi `max_chars`, baris pertama dipotong aman UTF-8 agar kursor tetap maju.
 pub fn truncate_lines_to_char_budget(lines: &[String], max_chars: usize) -> (String, usize, bool) {
@@ -292,7 +292,7 @@ impl Tool for WriteFile {
     }
 }
 
-// ---------- Fuzzy find-and-replace (diporting dari Hermes `tools/fuzzy_match.py`) ----------
+// ---------- Fuzzy find-and-replace (desain internal SelenCode) ----------
 
 fn normalize_unicode_typographic(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -412,11 +412,11 @@ fn closest_window_hint(text: &str, old: &str) -> Option<String> {
     ))
 }
 
-/// Pencocokan & penggantian bertingkat untuk `edit_file` (diambil dari Hermes `tools/fuzzy_match.py`):
+/// Pencocokan & penggantian bertingkat untuk `edit_file` (desain internal SelenCode):
 /// 1. `exact` — cocok persis (unik 1x).
 /// 2. `line_trimmed` — toleran spasi ujung & CRLF/LF (unik 1x).
 /// 3. `indent_preserving` — toleran selisih indentasi dengan melestarikan indentasi blok target (unik 1x).
-/// 4. `unicode_normalized` — normalisasi tanda kutip pintar/dash/NBSP (Hermes `UNICODE_MAP`, unik 1x).
+/// 4. `unicode_normalized` — normalisasi tanda kutip pintar/dash/NBSP (SelenCode `UNICODE_MAP`, unik 1x).
 /// Mengembalikan `(isi_baru, nama_strategi)`.
 pub fn fuzzy_find_and_replace(
     content: &str,
@@ -515,7 +515,7 @@ pub fn fuzzy_find_and_replace(
         ));
     }
 
-    // 4. Unicode typographic normalization (Hermes UNICODE_MAP)
+    // 4. Unicode typographic normalization (SelenCode UNICODE_MAP)
     let old_uni: Vec<String> = old_lines_raw
         .iter()
         .map(|l| normalize_unicode_typographic(line_body(l).trim_end()))

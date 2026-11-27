@@ -17,7 +17,7 @@ pub struct ProviderTimeouts {
     pub connect: Duration,
     /// Tenggat menunggu respons header awal (default: 60s).
     pub response: Duration,
-    /// Tenggat ketidakaktifan streaming tanpa potongan data baru (default: 180s, sama dengan dasar Hermes).
+    /// Tenggat ketidakaktifan streaming tanpa potongan data baru (default: 180s, dasar standar 180s).
     pub stream_idle: Duration,
     /// Tenggat keras total satu panggilan ke provider (default: 600s).
     pub total: Duration,
@@ -36,8 +36,7 @@ impl Default for ProviderTimeouts {
 
 impl ProviderTimeouts {
     /// Skalasi batas diam streaming berbasis estimasi ukuran konteks permintaan
-    /// (diambil dari Hermes Agent `agent/chat_completion_helpers.py`:
-    /// `_stream_env_stale_base` = 180s dasar + `_scale_stale_timeout_for_context` >50k -> 240s, >100k -> 300s).
+    /// (desain internal SelenCode).
     ///
     /// - Nilai uji pendek (`stream_idle < 30s`) TIDAK dinaikkan agar tes timeout tetap cepat.
     pub fn effective_stream_idle(&self, est_context_tokens: usize) -> Duration {
@@ -174,7 +173,7 @@ pub struct ToolCall {
 }
 
 /// Pemakaian token 1 panggilan provider (bila provider melaporkannya).
-/// Mencakup token cache read/write (Masalah 2 v0.5.19 — pola normalisasi Hermes `agent/usage_pricing.py`).
+/// Mencakup token cache read/write (Masalah 2 v0.5.19 — pola terstruktur `agent/usage_pricing.py`).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u64,

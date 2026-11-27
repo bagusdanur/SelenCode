@@ -172,11 +172,11 @@ pub fn run_doctor(
         },
     });
 
-    // 2c. Kebijakan langkah giliran utama (Opsi A — tanpa batas langkah ala Hermes)
+    // 2c. Kebijakan langkah giliran utama (Opsi A — tanpa batas langkah terstruktur)
     let (steps_status, steps_detail) = match &cfg.max_steps_source {
         crate::config::MaxStepsSource::DefaultUnbounded => (
             CheckStatus::Ok,
-            "tanpa batas langkah (model Hermes — rem memakai LoopGuard, konvergensi, & timeout)"
+            "tanpa batas langkah (rem memakai LoopGuard, konvergensi, & timeout)"
                 .to_string(),
         ),
         crate::config::MaxStepsSource::DeprecatedIgnored {
@@ -185,7 +185,7 @@ pub fn run_doctor(
         } => (
             CheckStatus::Ok,
             format!(
-                "tanpa batas langkah (model Hermes) · catatan: max_steps = {legacy_value} di {config_path} sudah tidak dipakai dan diabaikan"
+                "tanpa batas langkah · catatan: max_steps = {legacy_value} di {config_path} sudah tidak dipakai dan diabaikan"
             ),
         ),
     };

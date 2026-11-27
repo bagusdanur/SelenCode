@@ -1,5 +1,5 @@
 //! Uji penerimaan v0.5.14:
-//! - Perbaikan 1: Kesadaran anggaran langkah (checkpoint rasio bawaan 0.7 ala Hermes,
+//! - Perbaikan 1: Kesadaran anggaran langkah (checkpoint rasio bawaan 0.7 terstruktur,
 //!   pemicu konvergensi belum-ada-edit, akhir pagu pola opencode + label kegagalan eksplisit
 //!   bila nol edit, penjaga pengulangan identik 3x berturut-turut dengan pengecualian poller,
 //!   serta knob config `[guard] budget_warning_enabled` / `budget_warning_ratio`).
@@ -307,8 +307,8 @@ budget_warning_ratio = 0.7
 
 #[tokio::test]
 async fn p1_identical_repeat_notice_fires_on_3rd_consecutive_and_exempts_polling() {
-    // Unit check: poller (`watch_job` status/wait) dikecualikan seperti Hermes
-    let mut lg = LoopGuard::with_hermes_guards();
+    // Unit check: poller (`watch_job` status/wait) dikecualikan bawaan
+    let mut lg = LoopGuard::with_default_guards();
     for _ in 0..5 {
         assert_eq!(
             lg.record_with_result(

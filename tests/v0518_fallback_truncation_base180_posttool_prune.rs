@@ -397,7 +397,7 @@ async fn m2_max_output_tokens_truncation_is_visible_persisted_and_cancels_partia
 }
 
 // =========================================================================
-// MASALAH 3: Kesabaran dasar sesi kecil = 180 detik (sama dengan dasar Hermes)
+// MASALAH 3: Kesabaran dasar sesi kecil = 180 detik (dasar standar 180s)
 // =========================================================================
 
 #[test]

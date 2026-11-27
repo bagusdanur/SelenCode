@@ -361,7 +361,7 @@ fn render_modal_model_picker_interaktif_saved_manual_dan_katalog() {
         status: None,
     }));
 
-    // 1. Mode Saved: daftar bernomor + tombol shortcut ala Hermes tampil.
+    // 1. Mode Saved: daftar bernomor + tombol shortcut terstruktur tampil.
     let backend = TestBackend::new(96, 28);
     let mut term = Terminal::new(backend).unwrap();
     term.draw(|f| selencode::tui::draw(f, &mut a)).unwrap();

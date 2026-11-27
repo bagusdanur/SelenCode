@@ -6,7 +6,7 @@ use std::path::Path;
 
 const MAX_AGENT_MD: usize = 8 * 1024;
 
-/// Rakit system prompt ramping (Hermes-style progressive disclosure):
+/// Rakit system prompt ramping (terstruktur progressive disclosure):
 /// - TIDAK mengulang deskripsi semua tool yang sudah dikirim di array `tools` API (hemat ~1.400 token/call!).
 /// - Katalog skill dibatasi Tier-1 metadata maks 8 item (~150 token).
 /// - Isi AGENT.md/AGENTS.md dipotong maks 8KB.
@@ -1089,7 +1089,7 @@ pub fn prune_old_tool_results_with_archive(
     pruned
 }
 
-/// Ringkasan hasil pemangkasan proaktif deterministik (tanpa LLM) ala Hermes Agent
+/// Ringkasan hasil pemangkasan proaktif deterministik (tanpa LLM) terstruktur
 /// (`agent/context_compressor_prune.py` + `agent/context_compressor.py`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProactivePruneResult {
@@ -1106,8 +1106,7 @@ pub struct ProactivePruneResult {
 }
 
 /// Pemangkasan proaktif konteks 3-pass deterministik TANPA LLM dengan gerbang `min_reclaim_tokens`
-/// dan arsip byte-exact (diporting dari Hermes Agent `agent/context_compressor_prune.py`:
-/// `ProactivePruneMixin.prune_tool_results_only` & `agent/context_compressor.py`: `_prune_old_tool_results`).
+/// dan arsip byte-exact (desain internal SelenCode).
 ///
 /// - Hanya aktif bila `force_emergency` bernilai `true` ATAU `current_tokens >= trigger_tokens`.
 /// - Ekor terlindungi (`keep_tail_msgs`) dimundurkan bila jatuh di tengah pesan `Role::Tool`
@@ -1140,7 +1139,7 @@ pub fn proactive_prune_context_with_archive(
         return ProactivePruneResult::default();
     }
 
-    // Selaraskan batas ekor mundur agar tidak membelah pesan Tool paralel (Hermes `_align_boundary_backward`).
+    // Selaraskan batas ekor mundur agar tidak membelah pesan Tool paralel (SelenCode `_align_boundary_backward`).
     let mut boundary = messages.len().saturating_sub(keep_tail_msgs);
     while boundary > 0 && messages[boundary].role == Role::Tool {
         boundary -= 1;
@@ -1332,7 +1331,7 @@ pub fn proactive_prune_context_with_archive(
 }
 
 /// Gerbang pasca-tool khusus satu batch penelanan raksasa di giliran yang sama (Masalah 4 v0.5.18 —
-/// terinspirasi pengecualian pending-round di Hermes `agent/context_compressor.py` #61932):
+/// terinspirasi pengecualian pending-round di SelenCode `agent/context_compressor.py` #61932):
 /// ketika 1 batch hasil tool paralel yang baru mendarat sendiri sudah mendorong total konteks
 /// melampaui `trigger_tokens`, arsipkan penuh hasil tool besar (`> 4.000` char) pada pesan
 /// `Role::Tool` terakhir dan ganti dengan pratinjau kepala/ekor 2.400 char + path arsip,
@@ -1468,16 +1467,16 @@ pub fn prune_old_tool_results(messages: &mut [Message], keep_recent_tool_msgs: u
     pruned
 }
 
-/// Header penanda pesan ringkasan kompresi dua tahap ala Hermes (Tahap 5).
-pub const HERMES_SUMMARY_MARKER: &str = "[RINGKASAN KONTEKS HERMES]";
+/// Header penanda pesan ringkasan kompresi dua tahap terstruktur (Tahap 5).
+pub const STRUCTURED_SUMMARY_MARKER: &str = "[RINGKASAN KONTEKS]";
 
 /// Hitung anggaran token ringkasan kompresi (20% dari isi yang dikompresi, min 2.000, maks 12.000).
 pub fn compression_summary_budget(compressed_tokens: usize) -> usize {
     (compressed_tokens * 20 / 100).clamp(2_000, 12_000)
 }
 
-/// Template tetap ringkasan kompresi ala Hermes Agent (Tahap 5).
-pub fn format_hermes_summary_deterministic(
+/// Template tetap ringkasan kompresi terstruktur (Tahap 5).
+pub fn format_structured_summary_deterministic(
     prev_summary: Option<&str>,
     evicted: &[Message],
 ) -> String {
@@ -1557,7 +1556,7 @@ pub fn format_hermes_summary_deterministic(
         .unwrap_or_default();
 
     format!(
-        "{HERMES_SUMMARY_MARKER}\n\
+        "{STRUCTURED_SUMMARY_MARKER}\n\
          ## Goal\n{}\n\
          ## Constraints & Preferences\n- Ikuti aturan kerja SelenCode, redaksi rahasia, & verifikasi hemat.\n\
          ## Progress\n- Done: {} pesan lama dikompresi (tool dipakai: {})\n- In Progress: lanjutkan konteks dari 20 pesan terbaru\n- Blocked: {}\n\
@@ -1604,10 +1603,10 @@ pub fn format_hermes_summary_deterministic(
     )
 }
 
-/// Kompresi dua tahap ala Hermes (Tahap 5):
+/// Kompresi dua tahap terstruktur (Tahap 5):
 /// Lindungi 3 pesan pertama + 20 pesan terakhir; perbarui ringkasan sebelumnya bila ada;
 /// pastikan ekor tidak memutus pasangan ToolUse/ToolResult.
-pub fn compact_messages_hermes(messages: &[Message]) -> Vec<Message> {
+pub fn compact_messages_structured(messages: &[Message]) -> Vec<Message> {
     const KEEP_HEAD: usize = 3;
     const KEEP_TAIL: usize = 20;
     if messages.len() <= KEEP_HEAD + KEEP_TAIL {
@@ -1629,17 +1628,17 @@ pub fn compact_messages_hermes(messages: &[Message]) -> Vec<Message> {
     let middle = &messages[head_end..tail_start];
     let tail = &messages[tail_start..];
 
-    // Cari apakah sudah ada ringkasan Hermes sebelumnya untuk diperbarui secara inkremental.
+    // Cari apakah sudah ada ringkasan terstruktur sebelumnya untuk diperbarui secara inkremental.
     let prev_summary = middle.iter().find_map(|m| {
         let txt = m.plain_text();
-        txt.starts_with(HERMES_SUMMARY_MARKER).then_some(txt)
+        txt.starts_with(STRUCTURED_SUMMARY_MARKER).then_some(txt)
     });
     let new_evicted: Vec<Message> = middle
         .iter()
-        .filter(|m| !m.plain_text().starts_with(HERMES_SUMMARY_MARKER))
+        .filter(|m| !m.plain_text().starts_with(STRUCTURED_SUMMARY_MARKER))
         .cloned()
         .collect();
-    let summary = format_hermes_summary_deterministic(prev_summary.as_deref(), &new_evicted);
+    let summary = format_structured_summary_deterministic(prev_summary.as_deref(), &new_evicted);
 
     let mut out = Vec::with_capacity(head.len() + 1 + tail.len());
     out.extend_from_slice(head);
@@ -1687,7 +1686,7 @@ impl AuxCooldownState {
 }
 
 /// Ambang token compaction untuk batas konteks `limit_tokens` (Masalah 4 v0.5.20):
-/// mengikuti rasio 50% ala Hermes (`agent/context_compressor.py:2663`, `threshold_percent = 0.50`)
+/// mengikuti rasio 50% terstruktur (`agent/context_compressor.py:2663`, `threshold_percent = 0.50`)
 /// tanpa memotong prematur di 48.000 token pada model berjendela jumbo (200k–1M) agar prefiks
 /// prompt cache tetap utuh sepanjang sesi bangun aplikasi; dipatok aman di maks 200.000 token
 /// agar payload proxy/router tetap terkendali.
@@ -1700,7 +1699,7 @@ pub fn compaction_threshold_tokens(limit_tokens: usize) -> usize {
         .max(limit_tokens.min(10))
 }
 
-/// Compaction memicu pada 50% batas konteks (Tahap 5 Hermes-style, maks 200.000 token untuk model jumbo).
+/// Compaction memicu pada 50% batas konteks (Tahap 5 terstruktur , maks 200.000 token untuk model jumbo).
 pub fn needs_compaction(messages: &[Message], limit_tokens: usize) -> bool {
     if limit_tokens == 0 {
         return false;

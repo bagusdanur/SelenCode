@@ -1,12 +1,12 @@
-//! Tes menyeluruh Paket Hemat Token ala Hermes (Tahap 0–6) + Bagian A (Performa TUI Laptop Kentang).
+//! Tes menyeluruh Paket Hemat Token terstruktur (Tahap 0–6) + Bagian A (Performa TUI Laptop Kentang).
 
 use async_trait::async_trait;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use selencode::agent::context::{
-    cap_dynamic_injection, compact_messages_hermes, compression_summary_budget, head_tail_truncate,
+    cap_dynamic_injection, compact_messages_structured, compression_summary_budget, head_tail_truncate,
     prune_old_tool_results_with_archive, spillover_if_needed, spillover_with_preview,
-    AuxCooldownState, HERMES_SUMMARY_MARKER,
+    AuxCooldownState, STRUCTURED_SUMMARY_MARKER,
 };
 use selencode::agent::corrector::{
     canonical_tool_fingerprint, LoopGuard, SelfCorrectState, ToolDedupCache,
@@ -170,11 +170,11 @@ fn tahap2_canonical_fingerprint_dedup_and_self_correct_rem() {
     assert!(sc.completion_gate(5).is_some()); // putaran 1/1
     assert!(sc.completion_gate(5).is_none()); // putaran ke-2 ditahan!
 
-    // LoopGuard: 2x gagal identik -> peringatan, dan 3x gagal tool sama (arg berbeda) pada guard Hermes!
-    let mut lg = LoopGuard::with_hermes_guards();
+    // LoopGuard: 2x gagal identik -> peringatan, dan 3x gagal tool sama (arg berbeda) pada guard penuh!
+    let mut lg = LoopGuard::with_default_guards();
     let _ = lg.record("run_shell", &sh_args, true);
     assert!(lg.record("run_shell", &sh_args, true).hint_message().is_some());
-    let mut lg_same_tool = LoopGuard::with_hermes_guards();
+    let mut lg_same_tool = LoopGuard::with_default_guards();
     assert!(lg_same_tool.record("run_shell", &json!({"command": "e1"}), true).hint_message().is_none());
     assert!(lg_same_tool.record("run_shell", &json!({"command": "e2"}), true).hint_message().is_none());
     assert!(lg_same_tool.record("run_shell", &json!({"command": "e3"}), true).hint_message().is_some());
@@ -215,7 +215,7 @@ fn tahap3_and_tahap4_anthropic_cache_breakpoints_and_shell_head_tail_spillover()
 }
 
 #[test]
-fn tahap5_and_tahap6_hermes_compression_template_aux_cooldown_and_mcp_index() {
+fn tahap5_and_tahap6_structured_compression_template_aux_cooldown_and_mcp_index() {
     assert_eq!(compression_summary_budget(20_000), 4_000);
     assert_eq!(compression_summary_budget(1_000), 2_000);
     assert_eq!(compression_summary_budget(200_000), 12_000);
@@ -228,7 +228,7 @@ fn tahap5_and_tahap6_hermes_compression_template_aux_cooldown_and_mcp_index() {
     cd.record_success();
     assert!(!cd.is_in_cooldown());
 
-    // Buat 28 pesan -> compact_messages_hermes lindungi 3 awal + 20 akhir & pakai template tetap!
+    // Buat 28 pesan -> compact_messages_structured lindungi 3 awal + 20 akhir & pakai template tetap!
     let mut msgs = vec![Message::text(Role::System, "sys")];
     for i in 0..27 {
         msgs.push(Message::text(
@@ -236,11 +236,11 @@ fn tahap5_and_tahap6_hermes_compression_template_aux_cooldown_and_mcp_index() {
             format!("pesan ke-{i}"),
         ));
     }
-    let compacted = compact_messages_hermes(&msgs);
+    let compacted = compact_messages_structured(&msgs);
     assert_eq!(compacted.len(), 24); // 3 head + 1 summary + 20 tail
     let sum_text = compacted[3].plain_text();
     for section in [
-        HERMES_SUMMARY_MARKER,
+        STRUCTURED_SUMMARY_MARKER,
         "## Goal",
         "## Constraints & Preferences",
         "## Progress",

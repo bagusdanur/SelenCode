@@ -1,4 +1,4 @@
-//! Memory pengguna persisten ala Hermes (Perbaikan 5 v0.5.7):
+//! Memory pengguna persisten terstruktur (Perbaikan 5 v0.5.7):
 //! Dua wadah terstruktur dengan pagu karakter keras & snapshot beku di awal sesi:
 //! 1. `memory`  (`<data_dir>/selencode/memory/memory.md`,  pagu default 2.200 char):
 //!    fakta, prosedur, dan preferensi yang dipelajari lintas sesi.

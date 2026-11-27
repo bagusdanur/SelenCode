@@ -71,3 +71,16 @@ Seluruh fitur, pagar, dan kontrak `v0.5.7`–`v0.5.20` di bawah ini sengaja tida
 - Pemulihan perkakas `node_modules/` guard + `[PEMULIHAN PERKAKAS]`, baseline dedup `write_file` (`full_write_baselines`), dan dorongan `[Efisiensi]` pada tulis ulang berkas besar (`v0.5.20`).
 - Pencatatan `cache_read_tokens`/`cache_write_tokens`, penanda `cache_control` selektif, ambang `proactive_prune_tokens = 96.000` & `compaction_threshold_tokens` maks `200.000`, serta histeresis rearm penuh (`v0.5.19`–`v0.5.20`).
 - Penghapusan `max_steps` dari config/UI user (Opsi A `v0.5.18`), fallback mati-diam & mid-stream stall, penutupan jujur `max_output_tokens`, dasar `stream_idle = 180s`, retry + breaker, batas ganda `read_file`, dan pagar hemat resume/skill (`v0.5.7`–`v0.5.18`).
+
+---
+
+## Bukti Rilis & Artefak CI
+
+- **Commit tag `v0.5.21`:** `84397d3`
+- **CI Run (Linux + Windows x64):** `46012397047` (`success` — Linux job `140550929984`, Windows x64 job `140550929767`)
+- **Release Run (Tests + 3 Biner + GitHub Release):** `46013496497` (`success`)
+- **URL Rilis:** https://github.com/bagusdanur/SelenCode/releases/tag/v0.5.21
+- **Aset Biner Terbit (3 berkas):**
+  - `selen-termux-arm64` — 15.388.664 byte
+  - `selen-linux-x64` — 17.123.088 byte
+  - `selen-windows-x64.exe` — 15.806.976 byte

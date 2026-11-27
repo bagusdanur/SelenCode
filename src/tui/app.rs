@@ -416,7 +416,7 @@ impl SetupWizardState {
     }
 }
 
-/// Mode tampilan di dalam modal pemilih model interaktif (ala Hermes).
+/// Mode tampilan di dalam modal pemilih model interaktif (terstruktur).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelPickerMode {
     /// Daftar model pribadi tersimpan (curated 1-per-1).

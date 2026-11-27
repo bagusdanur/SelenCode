@@ -1,4 +1,4 @@
-//! Tes fitur baru ala OpenCode & Hermes Agent:
+//! Tes fitur baru ala SelenCode Agent:
 //! - `/undo` & `/redo` checkpoint edit file (`WriteFile` / `EditFile`)
 //! - Memori persisten SQLite (`/memory`) & format recall ke system prompt
 //! - `@file` context expansion (sandboxed, anti-secret, redaksi)
@@ -285,7 +285,7 @@ async fn autonomous_manage_skill_and_self_improvement_review() {
     assert!(body.contains("[REDACTED]"));
     assert!(!body.contains("rahasia12345678"));
 
-    // 2. Self-improvement review melakukan patch otomatis ala Hermes.
+    // 2. Self-improvement review melakukan patch otomatis terstruktur.
     let history = vec![
         Message::text(Role::User, "perbaiki selector scraper ryukomik"),
         Message::text(Role::Assistant, "Sudah diganti ke .ch-list a dan jeda 1s."),

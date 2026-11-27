@@ -490,7 +490,7 @@ fn m2_openai_envelope_cache_control_policy_and_markers() {
             .filter(|p| p.get("cache_control").is_some())
             .count()
     };
-    assert_eq!(count_markers(&wire), 4, "maks 4 breakpoint ala Hermes");
+    assert_eq!(count_markers(&wire), 4, "maks 4 breakpoint terstruktur");
     assert!(
         wire[0]["content"][0]["cache_control"]["type"] == "ephemeral",
         "pesan system wajib ditandai ephemeral"
@@ -507,7 +507,7 @@ fn m2_openai_envelope_cache_control_policy_and_markers() {
 
 #[tokio::test]
 async fn m2_prefix_stability_across_long_session_and_rearm_hysteresis() {
-    // 1. Cek default terbaru selaras landasan Hermes (96k pemicu di v0.5.20 / 4.096 min reclaim)
+    // 1. Cek default terbaru selaras landasan SelenCode (96k pemicu di v0.5.20 / 4.096 min reclaim)
     let tb_def = ToolBudgetCfg::default();
     assert_eq!(tb_def.proactive_prune_tokens, 96_000);
     assert_eq!(tb_def.proactive_prune_min_reclaim_tokens, 4_096);

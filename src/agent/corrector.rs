@@ -80,12 +80,11 @@ fn normalize_rel_path(path: &str) -> String {
 }
 
 /// TTL negative cache untuk berkas tidak ditemukan pada `read_file`
-/// (diambil dari Hermes `tools/file_tools_read_tracking.py:82`: `_NOT_FOUND_TTL_SECONDS = 60.0`).
+/// (desain internal SelenCode).
 pub const NOT_FOUND_TTL_SECS: u64 = 60;
 
 /// Evaluasi apakah satu batch `ToolCall` dalam giliran assistant yang sama aman dijalankan
-/// secara konkuren (diambil dari Hermes `agent/tool_dispatch_helpers.py:34-52`:
-/// `_PARALLEL_SAFE_TOOLS`, `_PATH_SCOPED_READERS`, `_PATH_SCOPED_WRITERS`).
+/// secara konkuren (desain internal SelenCode).
 ///
 /// Aturan:
 /// - Minimal 2 tool call.
@@ -152,7 +151,7 @@ pub fn can_run_tool_batch_in_parallel(calls: &[crate::providers::ToolCall], auto
 
 /// Cache deduplikasi panggilan tool identik yang SUDAH SUKSES dalam sesi/turn aktif (Tahap 2 + v0.5.20 + v0.5.21):
 /// - `read_file`: cek mtime/ukuran file — kalau belum berubah (baik dari `read_file` sebelumnya maupun
-///   dari `write_file` / `edit_file` pada baseline penuh milik sesi sendiri, terinspirasi Hermes
+///   dari `write_file` / `edit_file` pada baseline penuh milik sesi sendiri, desain internal SelenCode
 ///   `tools/file_tools_read_tracking.py`: `full_write_baselines`), kembalikan stub hemat token;
 ///   juga menyertakan negative cache 60 dtk untuk berkas tidak ditemukan (`_check_not_found_cache`).
 /// - `edit_file`: pelacak kegagalan patch beruntun per berkas (`_record_patch_failure`).
@@ -165,10 +164,10 @@ pub struct ToolDedupCache {
     /// Dikosongkan saat `clear_file_reads()` sesudah prune/compaction agar bacaan pemulihan tetap bisa jalan.
     written_files: HashMap<String, (u128, u64)>,
     /// Negative cache singkat (TTL 60 dtk) untuk `read_file` pada path yang tidak ada
-    /// (diambil dari Hermes `tools/file_tools_read_tracking.py:151-183`).
+    /// (desain internal SelenCode).
     not_found_reads: HashMap<String, (Instant, String)>,
     /// Penghitung kegagalan `edit_file` beruntun per berkas untuk eskalasi panduan
-    /// (diambil dari Hermes `tools/file_tools_read_tracking.py:69-116`).
+    /// (desain internal SelenCode).
     edit_failures: HashMap<String, usize>,
     pub dedup_hits: usize,
 }
@@ -207,7 +206,7 @@ impl ToolDedupCache {
                 _ => None,
             };
         }
-        // Masalah 3 (v0.5.20 — terinspirasi Hermes `tools/file_tools_read_tracking.py`: `full_write_baselines`):
+        // Masalah 3 (v0.5.20 — desain internal SelenCode `tools/file_tools_read_tracking.py`: `full_write_baselines`):
         // Cegah bacaan penuh ulang (`start`/`end` kosong) atas berkas yang baru saja ditulis sendiri di sesi ini
         // dan belum berubah secara eksternal di disk. Bacaan terarah dengan `start`/`end` (mis. melacak baris galat)
         // tetap diizinkan penuh.
@@ -228,7 +227,7 @@ impl ToolDedupCache {
             }
         }
         // Negative cache `read_file` untuk path yang baru gagal "tidak ditemukan" (< 60 dtk)
-        // dan masih belum muncul di disk (diambil dari Hermes `tools/file_tools_read_tracking.py:151-174`).
+        // dan masih belum muncul di disk (desain internal SelenCode).
         if name == "read_file" {
             if let Some(rel) = args.get("path").and_then(|v| v.as_str()) {
                 let norm = normalize_rel_path(rel);
@@ -271,7 +270,7 @@ impl ToolDedupCache {
     }
 
     /// Tambah penghitung kegagalan `edit_file` beruntun untuk `path` dan kembalikan jumlah barunya
-    /// (diambil dari Hermes `tools/file_tools_read_tracking.py:97-106`).
+    /// (desain internal SelenCode).
     pub fn record_edit_failure(&mut self, path: &str) -> usize {
         let norm = normalize_rel_path(path);
         if norm.is_empty() {
@@ -303,7 +302,7 @@ impl ToolDedupCache {
     }
 
     /// Perbarui tanda tangan baseline sesudah `edit_file` HANYA jika berkas itu sudah memiliki
-    /// baseline penuh (terinspirasi Hermes `full_write_baselines`: patch dari baseline yang sudah diketahui).
+    /// baseline penuh (desain internal SelenCode).
     pub fn update_write_baseline_if_known(&mut self, path: &str, cwd: &Path) {
         let norm = normalize_rel_path(path);
         self.not_found_reads.remove(&norm);
@@ -376,7 +375,7 @@ impl ToolDedupCache {
     }
 
     /// Bersihkan cache deduplikasi bacaan berkas sesudah proactive prune / compaction
-    /// (diporting dari Hermes Agent `agent/turn_preflight.py`: `_reset_read_dedup_caches`).
+    /// (desain internal SelenCode).
     /// Tanpa reset ini, berkas yang isinya sudah di-prune menjadi stub 1 baris akan dijawab
     /// `"tidak berubah — gunakan isi sebelumnya"` bila model mencoba membacanya kembali!
     pub fn clear_file_reads(&mut self) {
@@ -391,7 +390,7 @@ pub enum LoopWarning {
     None,
     /// Tool yang sama dipanggil berulang kali dengan argumen identik.
     RepeatedCall { name: String, count: usize },
-    /// Pola Hermes `tool_guardrails.py` (v0.5.14 Perbaikan 1 #4): panggilan `(tool, args, result)`
+    /// pola terstruktur `tool_guardrails.py` (v0.5.14 Perbaikan 1 #4): panggilan `(tool, args, result)`
     /// identik berturut-turut sebanyak `>= 3` kali — langkah terbakar tanpa kemajuan.
     ConsecutiveIdenticalResult { name: String, count: usize },
     /// Terlalu banyak error beruntun tanpa ada perubahan kode yang berhasil.
@@ -418,7 +417,7 @@ impl LoopWarning {
     }
 }
 
-/// Apakah tool ini merupakan poller/penunggu latar yang sah diulang (pengecualian poller ala Hermes)?
+/// Apakah tool ini merupakan poller/penunggu latar yang sah diulang (pengecualian poller terstruktur)?
 pub fn is_polling_tool(tool_name: &str, args: &Value) -> bool {
     match tool_name {
         "watch_job" => {
@@ -443,7 +442,7 @@ fn fnv1a_hash_str(seed: u64, s: &str) -> u64 {
     hash
 }
 
-/// Pendeteksi pengulangan panggilan tool, pengulangan hasil identik 3x beruntun (Hermes),
+/// Pendeteksi pengulangan panggilan tool, pengulangan hasil identik 3x beruntun (SelenCode),
 /// kegagalan berulang, & stagnasi error dalam satu giliran agent.
 #[derive(Debug, Default)]
 pub struct LoopGuard {
@@ -456,7 +455,7 @@ pub struct LoopGuard {
     tool_fail_limit: Option<usize>,
     /// Fingerprint `(tool, args)` terakhir untuk mendeteksi rentetan identik berturut-turut.
     last_call_fp: Option<u64>,
-    /// Fingerprint `(tool, args, result)` terakhir (pola Hermes `tool_guardrails.py`).
+    /// Fingerprint `(tool, args, result)` terakhir (pola terstruktur `tool_guardrails.py`).
     last_result_fp: Option<u64>,
     /// Jumlah panggilan identik berturut-turut dengan hasil yang sama (ambang = 3).
     consecutive_identical_streak: usize,
@@ -467,8 +466,8 @@ impl LoopGuard {
         Self::default()
     }
 
-    /// Guard lengkap Tahap 2 (Hermes): peringatkan pada 2x gagal identik ATAU 3x gagal tool yang sama.
-    pub fn with_hermes_guards() -> Self {
+    /// Guard lengkap Tahap 2 (SelenCode): peringatkan pada 2x gagal identik ATAU 3x gagal tool yang sama.
+    pub fn with_default_guards() -> Self {
         Self {
             tool_fail_limit: Some(3),
             ..Self::default()
@@ -484,7 +483,7 @@ impl LoopGuard {
         self.record_internal(tool_name, args, None, is_error)
     }
 
-    /// Catat satu eksekusi tool beserta keluarannya (v0.5.14 Perbaikan 1 #4, pola Hermes `tool_guardrails.py`):
+    /// Catat satu eksekusi tool beserta keluarannya (v0.5.14 Perbaikan 1 #4, pola terstruktur `tool_guardrails.py`):
     /// menempelkan peringatan tepat pada pengulangan `(tool, args, result)` identik ke-3 berturut-turut,
     /// sambil mengecualikan tool polling/penunggu yang sah (`watch_job`).
     pub fn record_with_result(
@@ -517,7 +516,7 @@ impl LoopGuard {
         *count += 1;
         let current_count = *count;
 
-        // Lacak rentetan `(tool, args, result)` identik berturut-turut (ambang Hermes/opencode = 3).
+        // Lacak rentetan `(tool, args, result)` identik berturut-turut (ambang standar = 3).
         if let Some(out) = output {
             let trimmed = out.trim();
             let is_dedup_stub = trimmed.starts_with("[Dedup:");
@@ -1657,7 +1656,7 @@ impl SelfCorrectState {
         ))
     }
 
-    /// Catatan status jujur (pola Hermes + Perbaikan 2 #3 v0.5.14): bila penutupan diterima
+    /// Catatan status jujur (pola terstruktur + Perbaikan 2 #3 v0.5.14): bila penutupan diterima
     /// sesudah batas putaran refleksi tercapai sementara verifikasi terakhir masih GAGAL atau
     /// belum dijalankan ulang sesudah edit terakhir, kembalikan blok status jujur untuk ditempel
     /// pada ringkasan penutup agar tidak pernah menyamar sebagai sukses.

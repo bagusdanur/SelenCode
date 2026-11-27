@@ -40,12 +40,11 @@ fn temp_dir(tag: &str) -> PathBuf {
 
 // =========================================================================
 // MASALAH 1: Skalasi stale-stream timeout + pemulihan retry & circuit breaker
-// (diporting dari Hermes `agent/chat_completion_helpers.py`, `turn_api_error.py`,
-//  `error_classifier.py`, `retry_utils.py`)
+// (desain internal SelenCode)
 // =========================================================================
 
 #[test]
-fn m1_context_scaled_stream_idle_and_backoff_match_hermes() {
+fn m1_context_scaled_stream_idle_and_backoff_tiers() {
     let base = ProviderTimeouts::default();
     assert_eq!(base.effective_stream_idle(4_000), Duration::from_secs(180));
     assert_eq!(base.effective_stream_idle(20_000), Duration::from_secs(180));
@@ -200,8 +199,7 @@ async fn m1_mid_turn_stale_stream_recovers_and_circuit_breaker_stops_infinite_ha
 
 // =========================================================================
 // MASALAH 2: Batas ganda read_file di sumber + proactive 3-pass context prune
-// (diporting dari Hermes `tools/file_tools.py`, `tools/tool_output_limits.py`,
-//  `agent/context_compressor_prune.py`, `agent/turn_preflight.py`)
+// (desain internal SelenCode)
 // =========================================================================
 
 #[tokio::test]
@@ -617,7 +615,7 @@ max_steps = 25
         step_chk_legacy.detail
     );
 
-    // 2. Nilai max_steps lain (mis. 40) juga diabaikan pada giliran utama (Opsi A — ala Hermes)!
+    // 2. Nilai max_steps lain (mis. 40) juga diabaikan pada giliran utama (Opsi A — terstruktur)!
     let other_toml = r#"
 default_provider = "router"
 

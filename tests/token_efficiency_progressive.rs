@@ -1,4 +1,4 @@
-//! Tes Hermes-Style Progressive Disclosure & Diet Token:
+//! Tes terstruktur Progressive Disclosure & Diet Token:
 //! Membuktikan penghematan token terukur pada system prompt + schema tool + aktivasi on-demand.
 
 use anyhow::Result;
@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 #[test]
-fn hermes_progressive_toolsets_cut_initial_token_overhead_drastically() {
+fn progressive_toolsets_cut_initial_token_overhead_drastically() {
     let reg = default_registry();
     let all_specs = reg.specs();
     let cwd = std::env::temp_dir();
@@ -81,7 +81,7 @@ struct ActivateToolsetMock {
 #[async_trait]
 impl Provider for ActivateToolsetMock {
     fn model_name(&self) -> &str {
-        "mock-hermes"
+        "mock-SelenCode"
     }
     async fn stream_chat(
         &self,
@@ -121,7 +121,7 @@ impl Provider for ActivateToolsetMock {
 #[tokio::test]
 async fn activate_toolset_dynamically_expands_tools_mid_turn() {
     let cwd: PathBuf = std::env::temp_dir().join(format!(
-        "selen-hermes-{}",
+        "selen-SelenCode-{}",
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::create_dir_all(&cwd).unwrap();

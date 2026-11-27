@@ -96,9 +96,9 @@ pub struct Ctx {
     pub context_cfg: crate::config::ContextCfg,
     /// Panjang maksimum pratinjau argumen utama tool (`[display]`, Perbaikan 3 v0.5.8).
     pub tool_preview_length: usize,
-    /// Batas retry panggilan API transien/stream-macet dalam 1 giliran (ala Hermes `turn_api_error.py`, default 3).
+    /// Batas retry panggilan API transien/stream-macet dalam 1 giliran (terstruktur `turn_api_error.py`, default 3).
     pub api_max_retries: usize,
-    /// Basis jeda jittered exponential backoff dalam milidetik sebelum retry API (ala Hermes `retry_utils.py`, default 2000ms).
+    /// Basis jeda jittered exponential backoff dalam milidetik sebelum retry API (terstruktur `retry_utils.py`, default 2000ms).
     pub api_retry_base_delay_ms: u64,
 }
 
