@@ -10,9 +10,9 @@
 //!    agent mengklaim selesai.
 
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Batas pengulangan panggilan tool dengan argumen persis sama sebelum peringatan loop.
 pub const MAX_IDENTICAL_CALLS: usize = 3;
@@ -79,11 +79,83 @@ fn normalize_rel_path(path: &str) -> String {
         .to_string()
 }
 
-/// Cache deduplikasi panggilan tool identik yang SUDAH SUKSES dalam sesi/turn aktif (Tahap 2 + v0.5.20):
+/// TTL negative cache untuk berkas tidak ditemukan pada `read_file`
+/// (diambil dari Hermes `tools/file_tools_read_tracking.py:82`: `_NOT_FOUND_TTL_SECONDS = 60.0`).
+pub const NOT_FOUND_TTL_SECS: u64 = 60;
+
+/// Evaluasi apakah satu batch `ToolCall` dalam giliran assistant yang sama aman dijalankan
+/// secara konkuren (diambil dari Hermes `agent/tool_dispatch_helpers.py:34-52`:
+/// `_PARALLEL_SAFE_TOOLS`, `_PATH_SCOPED_READERS`, `_PATH_SCOPED_WRITERS`).
+///
+/// Aturan:
+/// - Minimal 2 tool call.
+/// - Setiap tool harus berupa read-only parallel-safe (`read_file`, `list_files`, `search_text`,
+///   `outline`, `retrieve_context`, `fetch_url`, `session_search`) ATAU `write_file` ketika
+///   `auto_yes == true` (tanpa dialog persetujuan interaktif yang bertabrakan).
+/// - Tidak boleh ada tumpang tindih jalur normalisasi antara writer dengan writer lain maupun
+///   writer dengan reader pada berkas yang sama.
+pub fn can_run_tool_batch_in_parallel(calls: &[crate::providers::ToolCall], auto_yes: bool) -> bool {
+    if calls.len() < 2 {
+        return false;
+    }
+    let mut read_paths: HashSet<String> = HashSet::new();
+    let mut write_paths: HashSet<String> = HashSet::new();
+    for c in calls {
+        match c.name.as_str() {
+            "read_file" | "outline" => {
+                let p = c
+                    .args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(normalize_rel_path)
+                    .unwrap_or_default();
+                if !p.is_empty() {
+                    if write_paths.contains(&p) {
+                        return false;
+                    }
+                    read_paths.insert(p);
+                }
+            }
+            "list_files" | "search_text" | "retrieve_context" | "fetch_url" | "session_search" => {
+                // Jika ada writer di batch yang sama, hindari list/search berjalan balapan dengan write_file.
+                if !write_paths.is_empty() {
+                    return false;
+                }
+            }
+            "write_file" if auto_yes => {
+                // Jangan gabungkan write_file paralel dengan list/search di batch yang sama agar pembacaan
+                // direktori tidak melihat keadaan setengah tertulis.
+                if calls.iter().any(|other| {
+                    matches!(
+                        other.name.as_str(),
+                        "list_files" | "search_text" | "retrieve_context"
+                    )
+                }) {
+                    return false;
+                }
+                let p = c
+                    .args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(normalize_rel_path)
+                    .unwrap_or_default();
+                if p.is_empty() || write_paths.contains(&p) || read_paths.contains(&p) {
+                    return false;
+                }
+                write_paths.insert(p);
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Cache deduplikasi panggilan tool identik yang SUDAH SUKSES dalam sesi/turn aktif (Tahap 2 + v0.5.20 + v0.5.21):
 /// - `read_file`: cek mtime/ukuran file — kalau belum berubah (baik dari `read_file` sebelumnya maupun
 ///   dari `write_file` / `edit_file` pada baseline penuh milik sesi sendiri, terinspirasi Hermes
 ///   `tools/file_tools_read_tracking.py`: `full_write_baselines`), kembalikan stub hemat token;
-///   kalau berubah eksternal atau memakai rentang baris eksplisit (`start`/`end`), baca ulang!
+///   juga menyertakan negative cache 60 dtk untuk berkas tidak ditemukan (`_check_not_found_cache`).
+/// - `edit_file`: pelacak kegagalan patch beruntun per berkas (`_record_patch_failure`).
 /// - `run_shell` & `verify_project`: dedup perintah identik yang baru saja sukses sejak edit file terakhir!
 #[derive(Debug, Default)]
 pub struct ToolDedupCache {
@@ -92,6 +164,12 @@ pub struct ToolDedupCache {
     /// konteks aktif — mencegah agen membaca ulang karya sendiri secara penuh (Masalah 3 v0.5.20).
     /// Dikosongkan saat `clear_file_reads()` sesudah prune/compaction agar bacaan pemulihan tetap bisa jalan.
     written_files: HashMap<String, (u128, u64)>,
+    /// Negative cache singkat (TTL 60 dtk) untuk `read_file` pada path yang tidak ada
+    /// (diambil dari Hermes `tools/file_tools_read_tracking.py:151-183`).
+    not_found_reads: HashMap<String, (Instant, String)>,
+    /// Penghitung kegagalan `edit_file` beruntun per berkas untuk eskalasi panduan
+    /// (diambil dari Hermes `tools/file_tools_read_tracking.py:69-116`).
+    edit_failures: HashMap<String, usize>,
     pub dedup_hits: usize,
 }
 
@@ -149,7 +227,65 @@ impl ToolDedupCache {
                 self.written_files.remove(&norm);
             }
         }
+        // Negative cache `read_file` untuk path yang baru gagal "tidak ditemukan" (< 60 dtk)
+        // dan masih belum muncul di disk (diambil dari Hermes `tools/file_tools_read_tracking.py:151-174`).
+        if name == "read_file" {
+            if let Some(rel) = args.get("path").and_then(|v| v.as_str()) {
+                let norm = normalize_rel_path(rel);
+                if let Some((ts, cached_err)) = self.not_found_reads.get(&norm).cloned() {
+                    let expired = ts.elapsed() > Duration::from_secs(NOT_FOUND_TTL_SECS);
+                    let now_exists = crate::security::resolve_in_sandbox(cwd, Path::new(rel))
+                        .map(|p| p.exists())
+                        .unwrap_or(false);
+                    if expired || now_exists {
+                        self.not_found_reads.remove(&norm);
+                    } else {
+                        self.dedup_hits += 1;
+                        return Some(format!(
+                            "[Cache Not-Found: '{rel}' belum ada di disk ({cached_err}). Periksa daftar berkas via `list_files` atau buat dulu dengan `write_file`.]"
+                        ));
+                    }
+                }
+            }
+        }
         None
+    }
+
+    /// Catat hasil gagal "berkas tidak ditemukan" pada `read_file` ke negative cache (TTL 60 dtk).
+    pub fn record_read_not_found(&mut self, path: &str, err_msg: &str) {
+        let low = err_msg.to_ascii_lowercase();
+        if !(low.contains("no such file")
+            || low.contains("cannot find")
+            || low.contains("not found")
+            || low.contains("os error 2")
+            || low.contains("os error 3"))
+        {
+            return;
+        }
+        let norm = normalize_rel_path(path);
+        if norm.is_empty() {
+            return;
+        }
+        let short: String = err_msg.chars().take(120).collect();
+        self.not_found_reads.insert(norm, (Instant::now(), short));
+    }
+
+    /// Tambah penghitung kegagalan `edit_file` beruntun untuk `path` dan kembalikan jumlah barunya
+    /// (diambil dari Hermes `tools/file_tools_read_tracking.py:97-106`).
+    pub fn record_edit_failure(&mut self, path: &str) -> usize {
+        let norm = normalize_rel_path(path);
+        if norm.is_empty() {
+            return 0;
+        }
+        let entry = self.edit_failures.entry(norm).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// Reset penghitung kegagalan `edit_file` untuk `path` saat edit/tulis berhasil.
+    pub fn reset_edit_failures(&mut self, path: &str) {
+        let norm = normalize_rel_path(path);
+        self.edit_failures.remove(&norm);
     }
 
     /// Catat berkas yang baru saja ditulis penuh via `write_file` agar tidak dibaca ulang mentah-mentah
@@ -159,6 +295,8 @@ impl ToolDedupCache {
         if norm.is_empty() {
             return;
         }
+        self.not_found_reads.remove(&norm);
+        self.edit_failures.remove(&norm);
         if let Some(sig) = file_signature(cwd, path) {
             self.written_files.insert(norm, sig);
         }
@@ -168,6 +306,8 @@ impl ToolDedupCache {
     /// baseline penuh (terinspirasi Hermes `full_write_baselines`: patch dari baseline yang sudah diketahui).
     pub fn update_write_baseline_if_known(&mut self, path: &str, cwd: &Path) {
         let norm = normalize_rel_path(path);
+        self.not_found_reads.remove(&norm);
+        self.edit_failures.remove(&norm);
         if self.written_files.contains_key(&norm) {
             if let Some(sig) = file_signature(cwd, path) {
                 self.written_files.insert(norm, sig);

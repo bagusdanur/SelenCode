@@ -20,7 +20,8 @@ use crate::tool_display::{
     prepare_tool_preview, short_error_reason, ToolActionEvent,
 };
 use super::corrector::{
-    detect_tooling_config_error_hint, is_dedup_passed_verify_output, is_vendor_or_dependency_path,
+    can_run_tool_batch_in_parallel, detect_tooling_config_error_hint,
+    is_dedup_passed_verify_output, is_vendor_or_dependency_path, is_verification_shell_cmd,
     LoopGuard, SelfCorrectState, ToolDedupCache,
 };
 use super::plan::{is_read_only, TurnMode, PLAN_NOTE};
@@ -1953,13 +1954,79 @@ async fn run_turn_inner(
             return Ok((last_text, have_usage.then_some(turn_usage)));
         }
 
-        // Jalankan tool satu per satu; error -> ToolResult is_error.
-        // Catat apakah giliran ini melakukan pencarian ter-batch (maks +1 terhadap guard anti-berputar
-        // per giliran assistant agar riset ter-batch paralel TIDAK dihukum — Perbaikan 1 Lapis A #3).
+        // Jalankan batch tool: untuk batch independen (read-only / write_file non-overlapping di mode auto_yes),
+        // jalankan secara KONKUREN (diambil dari Hermes `agent/tool_dispatch_helpers.py:34-52`), lalu proses
+        // seluruh hasil secara deterministik dalam urutan asli `reply.tool_calls`!
         let mut results: Vec<Block> = Vec::new();
         let mut step_had_search = false;
+        let mut step_had_progress = false;
         let mut step_asked_user = false;
-        for call in &reply.tool_calls {
+        let parallel_batch_ok = ctx.hooks.is_empty()
+            && (mode != TurnMode::Plan
+                || reply.tool_calls.iter().all(|c| is_read_only(&c.name)))
+            && can_run_tool_batch_in_parallel(&reply.tool_calls, ctx.approver.auto_yes());
+        // Jika batch layak paralel: jalankan panggilan yang lolos dedup & vendor-guard secara konkuren dulu,
+        // lalu konsumsi hasilnya satu per satu di loop utama agar seluruh telemetri, redaksi, dan urutan 100% identik.
+        let mut precomputed_parallel: Vec<Option<(String, bool, bool)>> =
+            vec![None; reply.tool_calls.len()];
+        if parallel_batch_ok {
+            let mut futs = Vec::new();
+            let mut fut_indices = Vec::new();
+            let mut sim_vendor_reads = vendor_reads_in_turn;
+            for (idx, call) in reply.tool_calls.iter().enumerate() {
+                let vendor_rel = if call.name == "read_file" {
+                    call.args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .filter(|p| is_vendor_or_dependency_path(p))
+                } else {
+                    None
+                };
+                if ctx.guard.enabled {
+                    if let Some(dedup_stub) = dedup.check_hit(&call.name, &call.args, &ctx.cwd) {
+                        last_step_deduped += 1;
+                        precomputed_parallel[idx] = Some((dedup_stub, false, true));
+                        continue;
+                    }
+                    if let Some(vpath) = vendor_rel {
+                        if sim_vendor_reads >= 1 {
+                            sim_vendor_reads += 1;
+                            last_step_deduped += 1;
+                            precomputed_parallel[idx] = Some((
+                                format!(
+                                    "[PANDUAN PERKAKAS — BACAAN VENDOR DICEGAH] Berkas '{vpath}' berada di direktori dependensi/vendor \
+                                     dan kamu sudah memeriksa direktori vendor di giliran ini. JANGAN mengorek isi `node_modules/` lagi — \
+                                     perbaiki langsung berkas konfigurasi sumber proyek (`tsconfig.json`, `package.json`, `svelte.config.*`, `vite.config.*`) \
+                                     atau jalankan skrip sync/check proyek resmi."
+                                ),
+                                false,
+                                true,
+                            ));
+                            continue;
+                        }
+                        sim_vendor_reads += 1;
+                    }
+                }
+                let tool_opt = registry.get(&call.name);
+                let args_clone = call.args.clone();
+                let name_clone = call.name.clone();
+                fut_indices.push(idx);
+                futs.push(async move {
+                    match tool_opt {
+                        Some(tool) => match tool.run(args_clone, ctx).await {
+                            Ok(out) => (redact_secrets(&out), false),
+                            Err(e) => (redact_secrets(&format!("ERROR: {e}")), true),
+                        },
+                        None => (format!("ERROR: tool '{name_clone}' tidak dikenal"), true),
+                    }
+                });
+            }
+            let joined = futures::future::join_all(futs).await;
+            for (idx, (raw_txt, err_flag)) in fut_indices.into_iter().zip(joined.into_iter()) {
+                precomputed_parallel[idx] = Some((raw_txt, err_flag, false));
+            }
+        }
+        for (call_idx, call) in reply.tool_calls.iter().enumerate() {
             let preview_arg = prepare_tool_preview(&call.name, &call.args, ctx.tool_preview_length);
             match &ui {
                 Some(tx) => {
@@ -2064,6 +2131,76 @@ async fn run_turn_inner(
                         ),
                         true,
                     )
+                } else if let Some((raw_or_stub, err_flag, was_shortcircuit)) =
+                    precomputed_parallel[call_idx].take()
+                {
+                    if was_shortcircuit {
+                        if call.name == "read_file"
+                            && call
+                                .args
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .map(is_vendor_or_dependency_path)
+                                .unwrap_or(false)
+                            && raw_or_stub.contains("BACAAN VENDOR DICEGAH")
+                        {
+                            vendor_reads_in_turn += 1;
+                        }
+                        (raw_or_stub, err_flag)
+                    } else {
+                        let mut out_txt = if err_flag {
+                            raw_or_stub
+                        } else {
+                            shape_tool_output(
+                                &sid_for_archive,
+                                &call.id,
+                                &call.name,
+                                raw_or_stub,
+                                &ctx.tool_budget,
+                                &mut turn_tool_chars_used,
+                                scaled_turn_budget,
+                            )
+                        };
+                        if !err_flag {
+                            let is_vendor_r = call.name == "read_file"
+                                && call
+                                    .args
+                                    .get("path")
+                                    .and_then(|v| v.as_str())
+                                    .map(is_vendor_or_dependency_path)
+                                    .unwrap_or(false);
+                            if is_vendor_r {
+                                vendor_reads_in_turn += 1;
+                                out_txt.push_str(
+                                    "\n\n[PANDUAN PERKAKAS] Jangan menelusuri isi internal `node_modules/` berulang-ulang untuk galat typecheck/build/config — \
+                                     fokus perbaiki berkas konfigurasi sumber (`tsconfig.json`, `package.json`, `svelte.config.*`, `vite.config.*`) atau jalankan skrip proyek resmi.",
+                                );
+                            }
+                            if matches!(
+                                call.name.as_str(),
+                                "write_file" | "edit_file" | "lsp_rename"
+                            ) && !out_txt.starts_with("Ditolak user")
+                            {
+                                let p = call.args.get("path").and_then(|v| v.as_str());
+                                dedup.invalidate_on_edit(p);
+                                if let Some(rel) = p {
+                                    if call.name == "write_file" {
+                                        dedup.record_write(rel, &ctx.cwd);
+                                    } else if call.name == "edit_file" {
+                                        dedup.update_write_baseline_if_known(rel, &ctx.cwd);
+                                    }
+                                }
+                                green_verify_dedup_hits = 0;
+                            } else {
+                                dedup.record_success(&call.name, &call.args, &out_txt, &ctx.cwd);
+                            }
+                        } else if ctx.guard.enabled && call.name == "read_file" {
+                            if let Some(rel) = call.args.get("path").and_then(|v| v.as_str()) {
+                                dedup.record_read_not_found(rel, &out_txt);
+                            }
+                        }
+                        (out_txt, err_flag)
+                    }
                 } else if ctx.guard.enabled {
                     let vendor_read_rel = if call.name == "read_file" {
                         call.args
@@ -2169,6 +2306,22 @@ async fn run_turn_inner(
                                                     out_txt.push_str(hint);
                                                 }
                                             }
+                                        }
+                                    }
+                                } else if call.name == "read_file" {
+                                    if let Some(rel) = call.args.get("path").and_then(|v| v.as_str())
+                                    {
+                                        dedup.record_read_not_found(rel, &out_txt);
+                                    }
+                                } else if call.name == "edit_file" {
+                                    if let Some(rel) = call.args.get("path").and_then(|v| v.as_str())
+                                    {
+                                        let nfail = dedup.record_edit_failure(rel);
+                                        if nfail >= 2 {
+                                            out_txt.push_str(&format!(
+                                                "\n\n[PANDUAN PATCH] `edit_file` pada '{rel}' gagal {nfail}× beruntun. \
+                                                 Baca rentang baris target via `read_file(path=\"{rel}\", start=..., end=...)` 1× agar potongan `old` cocok persis."
+                                            ));
                                         }
                                     }
                                 }
@@ -2292,10 +2445,21 @@ async fn run_turn_inner(
                 is_error,
                 error_reason: is_error.then(|| short_error_reason(&content)),
             });
-            // BAGIAN 2 (#4) & Perbaikan 1 Lapis A (#3): hitung pencarian per giliran assistant (bukan per tool)
-            // agar riset ter-batch (mis. 4 baca paralel dalam 1 giliran) tidak memicu false-positive anti-spin.
+            // BAGIAN 2 (#4) & Perbaikan 1 Lapis A (#3) & v0.5.21 (Cache-Safe Fixed Toolset ala Hermes):
+            // hitung pencarian per giliran assistant (bukan per tool); kemajuan nyata (mutasi berkas atau
+            // perintah verifikasi proyek) mereset penghitung anti-berputar agar sesi bangun produktif
+            // tidak pernah memicu false-positive & memutasi array `tools` di tengah sesi!
             if call.name == "ask_user" {
                 step_asked_user = true;
+            } else if matches!(
+                call.name.as_str(),
+                "write_file" | "edit_file" | "lsp_rename"
+            ) && !is_error
+                && !content.starts_with("Ditolak user")
+            {
+                step_had_progress = true;
+            } else if call.name == "run_shell" && is_verification_shell_cmd(&call.args) {
+                step_had_progress = true;
             } else if matches!(
                 call.name.as_str(),
                 "search_text" | "list_files" | "run_shell" | "fetch_url"
@@ -2362,7 +2526,13 @@ async fn run_turn_inner(
             });
         }
         // Perbarui counter anti-berputar per giliran (bukan per tool paralel).
-        if step_asked_user {
+        // v0.5.21 (diambil dari prinsip Hermes `agent/prompt_builder.py:520`: toolset tetap sepanjang sesi):
+        // - Kemajuan nyata (`step_had_progress`: edit/tulis berkas atau verifikasi proyek) mereset counter
+        //   sehingga sesi bangun panjang tidak memicu alarm palsu.
+        // - Di mode non-interaktif (`ctx.approver.auto_yes()`), JANGAN memutasi array `tools` dengan
+        //   menambahkan `clarify` di tengah giliran karena tidak ada user interaktif dan mutasi `tools`
+        //   menghancurkan seluruh prompt prefix cache provider!
+        if step_asked_user || step_had_progress {
             unconfirmed_search_calls = 0;
             anti_spin_reminded = false;
         } else if step_had_search {
@@ -2372,7 +2542,7 @@ async fn run_turn_inner(
                 && registry.get("ask_user").is_some()
             {
                 anti_spin_reminded = true;
-                if active_toolsets.insert("clarify".to_string()) {
+                if !ctx.approver.auto_yes() && active_toolsets.insert("clarify".to_string()) {
                     tools = crate::tools::toolsets::active_tool_specs_for_turn(
                         registry,
                         &active_toolsets,
