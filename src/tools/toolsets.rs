@@ -361,11 +361,10 @@ pub fn select_initial_toolsets(
         set.insert("skills_mem".to_string());
     }
 
-    if has_mcp
-        && (lower.contains("mcp")
-            || lower.contains("resource")
-            || lower.contains("prompt"))
-    {
+    // Jika ada server MCP terpasang di mode Execute, aktifkan toolset `mcp` otomatis tanpa
+    // mewajibkan user menulis kata kunci "mcp" (untuk >15 tool tetap super ramping lewat
+    // mode indeks + `load_mcp_tools`, dan untuk <=15 tool langsung siap pakai tanpa mutasi array `tools`).
+    if has_mcp && mode == TurnMode::Execute {
         set.insert("mcp".to_string());
     }
 
@@ -480,27 +479,52 @@ pub fn load_mcp_tools_spec() -> ToolSpec {
     }
 }
 
-/// Susun indeks 1 baris (nama + deskripsi maks 60 char) untuk tool MCP ketika jumlahnya > 15 (Tahap 6).
+/// Batas jumlah tool MCP sebelum beralih dari daftar 1-baris-berdeskripsi ke daftar
+/// terkelompok per server agar 100% nama tool (mis. 58–200+ tool) tetap terlihat utuh tanpa terpotong.
+pub const MCP_GROUPED_INDEX_THRESHOLD: usize = 30;
+
+/// Susun indeks ringkas untuk tool MCP ketika jumlahnya > 15 (Tahap 6 + perbaikan v0.5.23).
+/// - 16..=30 tool: 1 baris per tool (`- mcp__srv__tool: deskripsi <=55 char`).
+/// - >30 tool: dikelompokkan per server dengan nama penuh `mcp__<server>__<tool>` agar super hemat
+///   token dan 100% nama tool dari seluruh server selalu terlihat oleh model (tidak pernah terpotong ekornya).
 pub fn build_mcp_compact_index(registry: &Registry) -> Option<String> {
     let mcp_specs: Vec<ToolSpec> = registry.specs_where(|n| n.starts_with("mcp__"));
     if mcp_specs.len() <= MCP_ON_DEMAND_THRESHOLD {
         return None;
     }
+    let total = mcp_specs.len();
     let mut out = format!(
-        "Indeks MCP ({} tool — muat skema penuh lewat `{LOAD_MCP_TOOLS_NAME}` bila perlu):\n",
-        mcp_specs.len()
+        "Indeks MCP ({total} tool — muat skema penuh lewat `{LOAD_MCP_TOOLS_NAME}` bila perlu):\n"
     );
-    for s in mcp_specs {
-        let short_desc: String = s
-            .description
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .chars()
-            .take(60)
-            .collect();
-        out.push_str(&format!("- {}: {short_desc}\n", s.name));
+    if total <= MCP_GROUPED_INDEX_THRESHOLD {
+        for s in mcp_specs {
+            let short_desc: String = s
+                .description
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(55)
+                .collect();
+            out.push_str(&format!("- {}: {short_desc}\n", s.name));
+        }
+    } else {
+        let mut by_server: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for s in mcp_specs {
+            let server = s
+                .name
+                .strip_prefix("mcp__")
+                .and_then(|rest| rest.split("__").next())
+                .unwrap_or("mcp")
+                .to_string();
+            by_server.entry(server).or_default().push(s.name);
+        }
+        for (server, mut names) in by_server {
+            names.sort();
+            out.push_str(&format!("- {server} ({}): {}\n", names.len(), names.join(", ")));
+        }
     }
     Some(out.trim_end().to_string())
 }

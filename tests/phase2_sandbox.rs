@@ -81,7 +81,7 @@ async fn sandbox_read_only_blocks_write_edit_and_shell_and_records_audit_log() {
 async fn sandbox_scrubs_sensitive_env_from_subprocess_and_redacts_audit_log() {
     let cwd = temp_dir("scrub");
     let audit = cwd.join("audit.jsonl");
-    std::env::set_var("SELENCODE_TEST_SECRET_TOKEN", "sk-leaktest99999999");
+    unsafe { std::env::set_var("SELENCODE_TEST_SECRET_TOKEN", "sk-leaktest99999999") };
 
     let sandbox = Arc::new(SandboxController::from_config(
         &SandboxCfg::default(),
@@ -109,7 +109,7 @@ async fn sandbox_scrubs_sensitive_env_from_subprocess_and_redacts_audit_log() {
     assert!(raw_audit.contains("[REDACTED]"));
     assert!(!raw_audit.contains("sk-auditsecret123456"));
 
-    std::env::remove_var("SELENCODE_TEST_SECRET_TOKEN");
+    unsafe { std::env::remove_var("SELENCODE_TEST_SECRET_TOKEN") };
     std::fs::remove_dir_all(&cwd).ok();
 }
 

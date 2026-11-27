@@ -102,7 +102,7 @@ async fn custom_hooks_matcher_pre_block_and_post_notes() {
 
 #[test]
 fn mcp_http_sse_parser_and_header_env_expansion() {
-    std::env::set_var("SELENCODE_TEST_MCP_HDR", "rahasia123");
+    unsafe { std::env::set_var("SELENCODE_TEST_MCP_HDR", "rahasia123") };
     assert_eq!(
         expand_env_header("Bearer ${SELENCODE_TEST_MCP_HDR}"),
         "Bearer rahasia123"

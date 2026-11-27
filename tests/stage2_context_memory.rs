@@ -283,7 +283,7 @@ async fn structured_project_memory_crud_grouping_migration_and_secret_guard() {
     ));
     std::fs::create_dir_all(&mem_data_dir).unwrap();
     let prev_data_dir = std::env::var_os("SELENCODE_DATA_DIR");
-    std::env::set_var("SELENCODE_DATA_DIR", &mem_data_dir);
+    unsafe { std::env::set_var("SELENCODE_DATA_DIR", &mem_data_dir) };
 
     let reg = default_registry();
     let mem_tool = reg.get("memory").expect("tool memory wajib aktif");
@@ -310,8 +310,8 @@ async fn structured_project_memory_crud_grouping_migration_and_secret_guard() {
     assert!(listed.contains("Hindari pipe literal"));
 
     match prev_data_dir {
-        Some(v) => std::env::set_var("SELENCODE_DATA_DIR", v),
-        None => std::env::remove_var("SELENCODE_DATA_DIR"),
+        Some(v) => unsafe { std::env::set_var("SELENCODE_DATA_DIR", v) },
+        None => unsafe { std::env::remove_var("SELENCODE_DATA_DIR") },
     }
     std::fs::remove_dir_all(&mem_data_dir).ok();
 

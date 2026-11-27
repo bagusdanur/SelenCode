@@ -263,6 +263,7 @@ struct Inner {
     server_name: String,
     capabilities: Mutex<McpCapabilities>,
     reconnect_lock: Mutex<()>,
+    reconnect_count: AtomicU64,
 }
 
 /// Ekspansi pola `${ENV_VAR}` di nilai header HTTP MCP remote (mis. `Bearer ${MCP_TOKEN}`).
@@ -439,6 +440,7 @@ impl McpClient {
                 server_name: cfg.name.clone(),
                 capabilities: Mutex::new(McpCapabilities::default()),
                 reconnect_lock: Mutex::new(()),
+                reconnect_count: AtomicU64::new(0),
             })
         } else {
             let (transport, stdout) = spawn_transport(cfg)?;
@@ -452,6 +454,7 @@ impl McpClient {
                 server_name: cfg.name.clone(),
                 capabilities: Mutex::new(McpCapabilities::default()),
                 reconnect_lock: Mutex::new(()),
+                reconnect_count: AtomicU64::new(0),
             });
             spawn_reader_task(arc.clone(), stdout);
             arc
@@ -500,7 +503,7 @@ impl McpClient {
         if !self.inner.dead.load(Ordering::SeqCst) {
             return Ok(());
         }
-        match &self.inner.transport {
+        let res = match &self.inner.transport {
             TransportKind::Stdio(tr_mu) => {
                 let (new_transport, stdout) = spawn_transport(&self.inner.cfg)?;
                 {
@@ -516,7 +519,19 @@ impl McpClient {
                 self.inner.dead.store(false, Ordering::SeqCst);
                 self.perform_handshake().await
             }
+        };
+        if res.is_ok() {
+            self.inner.reconnect_count.fetch_add(1, Ordering::SeqCst);
+            eprintln!(
+                "[mcp] server '{}' terputus — tersambung ulang otomatis",
+                self.inner.server_name
+            );
         }
+        res
+    }
+
+    pub fn reconnect_count(&self) -> u64 {
+        self.inner.reconnect_count.load(Ordering::SeqCst)
     }
 
     pub fn server_name(&self) -> &str {

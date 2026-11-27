@@ -258,12 +258,12 @@ fn store_roundtrip_messages_usage_and_cwd_isolation() {
 
 #[test]
 fn db_path_env_override() {
-    std::env::set_var("SELENCODE_DB", "/tmp/selencode-override-test.db");
+    unsafe { std::env::set_var("SELENCODE_DB", "/tmp/selencode-override-test.db") };
     assert_eq!(
         selencode::store::db_path(),
         PathBuf::from("/tmp/selencode-override-test.db")
     );
-    std::env::remove_var("SELENCODE_DB");
+    unsafe { std::env::remove_var("SELENCODE_DB") };
 }
 
 // ---------- fetch_url: penolakan SSRF (tanpa jaringan keluar) ----------

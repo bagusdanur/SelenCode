@@ -517,6 +517,7 @@ impl LoopGuard {
         let current_count = *count;
 
         // Lacak rentetan `(tool, args, result)` identik berturut-turut (ambang standar = 3).
+        let mut distinct_mcp_progress = false;
         if let Some(out) = output {
             let trimmed = out.trim();
             let is_dedup_stub = trimmed.starts_with("[Dedup:");
@@ -530,6 +531,9 @@ impl LoopGuard {
             if same_as_prev {
                 self.consecutive_identical_streak += 1;
             } else {
+                if !is_error && tool_name.starts_with("mcp__") && !is_dedup_stub {
+                    distinct_mcp_progress = true;
+                }
                 self.last_call_fp = Some(fp);
                 if !is_dedup_stub {
                     self.last_result_fp = Some(res_fp);
@@ -587,7 +591,10 @@ impl LoopGuard {
             };
         }
 
-        if current_count >= MAX_IDENTICAL_CALLS {
+        // Perbaikan 2 (v0.5.23): pemanggilan batch MCP yang sah (mis. `pptx_add_slide` 6-7x berurutan
+        // dengan argumen sama namun setiap panggilan sukses dan menghasilkan keluaran berbeda)
+        // BUKAN loop — hanya beri peringatan bila gagal berulang atau keluaran identik beruntun.
+        if !distinct_mcp_progress && current_count >= MAX_IDENTICAL_CALLS {
             return LoopWarning::RepeatedCall {
                 name: tool_name.to_string(),
                 count: current_count,

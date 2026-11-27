@@ -156,7 +156,7 @@ fn aux_model_resolution_and_trivial_control_eligibility() {
 async fn scenario1_correction_patches_skill_records_separate_usage_and_enforces_cooldown() {
     let dir = temp_dir("sc1");
     let prev_data_dir = std::env::var_os("SELENCODE_DATA_DIR");
-    std::env::set_var("SELENCODE_DATA_DIR", &dir);
+    unsafe { std::env::set_var("SELENCODE_DATA_DIR", &dir) };
     let skill_md = write_sample_skill(&dir);
     let store = Store::open_at(&dir.join("selen.db")).unwrap();
     let cwd_str = dir.to_string_lossy().to_string();
@@ -267,8 +267,8 @@ async fn scenario1_correction_patches_skill_records_separate_usage_and_enforces_
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     match prev_data_dir {
-        Some(v) => std::env::set_var("SELENCODE_DATA_DIR", v),
-        None => std::env::remove_var("SELENCODE_DATA_DIR"),
+        Some(v) => unsafe { std::env::set_var("SELENCODE_DATA_DIR", v) },
+        None => unsafe { std::env::remove_var("SELENCODE_DATA_DIR") },
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

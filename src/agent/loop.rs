@@ -1051,10 +1051,6 @@ async fn run_turn_inner(
                 installed_skills.len()
             ));
         }
-        if let Some(mcp_idx) = crate::tools::toolsets::build_mcp_compact_index(registry) {
-            dynamic_snapshot.push_str(&mcp_idx);
-            dynamic_snapshot.push('\n');
-        }
         // Perbaikan 5 (v0.5.7) & Perbaikan 3 (v0.5.9): SATU sumber kebenaran memori persisten —
         // hanya snapshot beku wadah `memory` + `profile` yang dimuat 1x di awal sesi (tanpa store SQLite ganda).
         if let Some(frozen) = &ctx.frozen_user_memory {
@@ -1067,6 +1063,13 @@ async fn run_turn_inner(
             let capped = cap_dynamic_injection(dynamic_snapshot.trim(), dyn_cap);
             sys.push_str("\n--- Konteks Sesi (Snapshot Awal) ---\n");
             sys.push_str(&capped);
+            sys.push('\n');
+        }
+        // Perbaikan 1 (v0.5.23): Indeks MCP ditempatkan terpisah di luar pagu `dyn_cap` 1.500 token
+        // agar server MCP ke-2+ tidak pernah terpotong ekornya secara diam-diam.
+        if let Some(mcp_idx) = crate::tools::toolsets::build_mcp_compact_index(registry) {
+            sys.push_str("\n--- Indeks MCP ---\n");
+            sys.push_str(&mcp_idx);
             sys.push('\n');
         }
         sys

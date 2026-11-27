@@ -243,7 +243,7 @@ async fn perbaikan2_run_shell_finds_executable_in_custom_path_and_scrubs_secrets
         .map(|p| std::env::split_paths(p).collect())
         .unwrap_or_default();
     joined.push(fake_bin.clone());
-    std::env::set_var("PATH", std::env::join_paths(&joined).unwrap());
+    unsafe { std::env::set_var("PATH", std::env::join_paths(&joined).unwrap()) };
 
     let ctx = Ctx::new(tmp.clone(), true);
     let out = RunShell::new(vec![], 30)
@@ -251,7 +251,7 @@ async fn perbaikan2_run_shell_finds_executable_in_custom_path_and_scrubs_secrets
         .await
         .unwrap();
     if let Some(old) = prev_path {
-        std::env::set_var("PATH", old);
+        unsafe { std::env::set_var("PATH", old) };
     }
     assert!(out.contains("DUMMY_BIN_OK"), "{out}");
 

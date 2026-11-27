@@ -281,7 +281,7 @@ fn live_test_p1_context_diet_prunes_old_tool_outputs_and_p4_friendly_error() {
     assert!(after < before * 60 / 100, "token harus turun drastis: {before} -> {after}");
 
     // Live-test P4: error ramah 1 baris tanpa rantai `Caused by:` saat SELENCODE_DEBUG tidak diset.
-    std::env::remove_var("SELENCODE_DEBUG");
+    unsafe { std::env::remove_var("SELENCODE_DEBUG") };
     let raw_err = anyhow::anyhow!("UnknownIssuer certificate failed")
         .context("gagal menghubungi GitHub — periksa koneksi internet");
     let clean = format_update_error(raw_err);
