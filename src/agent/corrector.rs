@@ -365,7 +365,7 @@ impl ToolDedupCache {
             if matches!(rec.tool_name.as_str(), "run_shell" | "verify_project") {
                 return false;
             }
-            if let (Some(ed), Some(ref f)) = (edited_path, &rec.file_rel) {
+            if let (Some(ed), Some(f)) = (edited_path, &rec.file_rel) {
                 if normalize_rel_path(ed) == normalize_rel_path(f) {
                     return false;
                 }

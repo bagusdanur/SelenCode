@@ -193,3 +193,29 @@ fn mcp_toolset_activates_without_literal_mcp_keyword_in_execute_mode() {
     assert!(specs_small.iter().any(|s| s.name == "mcp__notes__search"));
     assert!(!specs_small.iter().any(|s| s.name == LOAD_MCP_TOOLS_NAME));
 }
+
+#[test]
+fn tui_keeps_full_moonlit_welcome_header_even_when_resumed() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use selencode::tui::app::App;
+    use selencode::tui::draw;
+
+    let mut app = App::new("/tmp/proj".into(), "router".into(), "model-x".into(), 18, 0, 0);
+    app.resumed = true;
+    app.info("Melanjutkan sesi: \"Sesi Terakhir\" — 8 pesan dimuat.");
+
+    let backend = TestBackend::new(110, 30);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| draw(f, &mut app)).unwrap();
+
+    let welcome = app
+        .welcome
+        .as_ref()
+        .expect("header sambutan Moonlit wajib dibuat");
+    assert!(
+        welcome.len() >= 6,
+        "header Moonlit penuh harus tetap tampil saat resume (bukan 1 baris ringkas), dapat {} baris",
+        welcome.len()
+    );
+}

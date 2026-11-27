@@ -797,11 +797,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     if app.welcome.is_none() {
         let info = app.welcome_info();
-        app.welcome = Some(if app.resumed {
-            moonlit::resume_lines(&info)
-        } else {
-            moonlit::welcome_lines(area.width, &info)
-        });
+        // Selalu tampilkan header sambutan Moonlit penuh (termasuk saat auto-resume / `/resume`),
+        // sementara catatan "Melanjutkan sesi: ..." tampil rapi tepat di bawahnya pada transkrip.
+        app.welcome = Some(moonlit::welcome_lines(area.width, &info));
     }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
