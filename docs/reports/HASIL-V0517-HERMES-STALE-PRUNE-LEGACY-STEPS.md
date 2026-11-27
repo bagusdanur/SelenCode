@@ -82,3 +82,16 @@ Seluruh fitur dan kontrak `v0.5.7`–`v0.5.16` di bawah ini sengaja tidak diubah
 - Gerbang skill harness + opt-out eksplisit pengguna, `skill_view` salinan kerja ringkas & prune dini skill, serta `build_resume_snapshot` / `build_resume_system_prompt` (`v0.5.7`–`v0.5.13`).
 - Kontrak `DynamicRouterProvider` v0.5.11 (timeout header respons awal ≈1× `response_secs` pada rute tunggal dan fallback langsung ke rute berbeda) serta default `[timeouts]` (`stream_idle_secs = 90`, `total_secs = 300`).
 - Store memori persisten tunggal (`memory.md` / `profile.md`), `ask_user`, `cron`, `session_search`, `watch_job`, dan mekanisme approval/sandbox.
+
+---
+
+## Bukti Rilis & Artefak CI
+
+- **Commit tag `v0.5.17`:** `96c0e3f`
+- **CI Run (Linux + Windows x64):** `45943710080` (`success`)
+- **Release Run (Tests + 3 Biner + GitHub Release):** `45944815412` (`success`)
+- **URL Rilis:** https://github.com/bagusdanur/SelenCode/releases/tag/v0.5.17
+- **Aset Biner Terbit (3 berkas):**
+  - `selen-termux-arm64` — 15.285.008 byte
+  - `selen-linux-x64` — 17.000.688 byte
+  - `selen-windows-x64.exe` — 15.684.608 byte
