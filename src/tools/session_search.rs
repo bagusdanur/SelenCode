@@ -49,7 +49,8 @@ impl Tool for SessionSearch {
             .unwrap_or(10);
 
         let _ = store.backfill_fts_if_needed();
-        let hits = store.search_sessions_fts(query, None, limit)?;
+        let cwd_scope = ctx.cwd.to_string_lossy().to_string();
+        let hits = store.search_sessions_fts(query, Some(&cwd_scope), limit)?;
         if hits.is_empty() {
             return Ok(format!(
                 "Tidak ditemukan sesi tersimpan yang cocok dengan \"{query}\" di database sesi lokal."

@@ -222,8 +222,11 @@ pub fn is_shell_command_allowlisted(command: &str, allowlist: &[String]) -> bool
     if cmd.is_empty() || allowlist.is_empty() {
         return false;
     }
-    // Tolak chaining berbahaya (`;`, `&&`, `||`, `|`, backtick, `$(`) pada perintah allowlist agar tidak bisa dibajak.
-    if [";", "&&", "||", "|", "`", "$("].iter().any(|op| cmd.contains(op)) {
+    // Tolak chaining, subshell, newline, background `&`, dan redirection (`>`, `<`) agar perintah allowlist tidak bisa dibajak.
+    if cmd.contains([';', '|', '&', '`', '>', '<', '\n', '\r'])
+        || cmd.contains("$(")
+        || cmd.contains("${")
+    {
         return false;
     }
     allowlist.iter().any(|allowed| {

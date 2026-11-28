@@ -3123,13 +3123,9 @@ fn extract_at_images(cwd: &std::path::Path, prompt: &str) -> (Vec<Block>, Vec<St
         let Some(mime) = crate::providers::detect_image_mime(cand) else {
             continue;
         };
-        let resolved = if cand.is_absolute() {
-            cand.to_path_buf()
-        } else {
-            match crate::security::resolve_in_sandbox(cwd, cand) {
-                Ok(p) => p,
-                Err(_) => continue,
-            }
+        let resolved = match crate::security::resolve_in_sandbox(cwd, cand) {
+            Ok(p) => p,
+            Err(_) => continue,
         };
         if crate::security::is_secret_file(&resolved) || !resolved.is_file() {
             continue;

@@ -563,9 +563,19 @@ impl Store {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("gagal membuka DB sesi {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
         let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
         conn.execute_batch(SCHEMA).context("gagal membuat skema sesi")?;
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+             CREATE INDEX IF NOT EXISTS idx_usage_session_ts ON usage(session_id, ts);
+             CREATE INDEX IF NOT EXISTS idx_watches_status_chat ON job_watches(status, chat_id);",
+        );
         migrate_memories_schema(&conn)?;
         migrate_usage_schema(&conn)?;
         migrate_review_schema(&conn)?;
@@ -624,24 +634,49 @@ impl Store {
                 return Ok(true);
             }
         }
-        let conn = self.conn.lock().expect("mutex store poisoned");
-        conn.execute(
-            "DELETE FROM messages WHERE session_id = ?1",
-            rusqlite::params![session_id],
-        )?;
-        let _ = conn.execute(
-            "DELETE FROM messages_fts WHERE session_id = ?1",
-            rusqlite::params![session_id],
-        );
-        conn.execute(
-            "DELETE FROM usage WHERE session_id = ?1",
-            rusqlite::params![session_id],
-        )?;
-        let n = conn.execute(
-            "DELETE FROM sessions WHERE id = ?1",
-            rusqlite::params![session_id],
-        )?;
-        Ok(n > 0)
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = conn.execute_batch("BEGIN IMMEDIATE;");
+        let res = (|| -> Result<bool> {
+            conn.execute(
+                "DELETE FROM messages WHERE session_id = ?1",
+                rusqlite::params![session_id],
+            )?;
+            let _ = conn.execute(
+                "DELETE FROM messages_fts WHERE session_id = ?1",
+                rusqlite::params![session_id],
+            );
+            conn.execute(
+                "DELETE FROM usage WHERE session_id = ?1",
+                rusqlite::params![session_id],
+            )?;
+            let _ = conn.execute(
+                "DELETE FROM call_token_metrics WHERE session_id = ?1",
+                rusqlite::params![session_id],
+            );
+            let _ = conn.execute(
+                "DELETE FROM review_runs WHERE session_id = ?1",
+                rusqlite::params![session_id],
+            );
+            let _ = conn.execute(
+                "DELETE FROM review_proposals WHERE session_id = ?1",
+                rusqlite::params![session_id],
+            );
+            let n = conn.execute(
+                "DELETE FROM sessions WHERE id = ?1",
+                rusqlite::params![session_id],
+            )?;
+            Ok(n > 0)
+        })();
+        match res {
+            Ok(deleted) => {
+                let _ = conn.execute_batch("COMMIT;");
+                Ok(deleted)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     /// Bersihkan sesi kosong lama (`0 msg` dengan judul placeholder) agar daftar `/resume` rapi.
@@ -663,7 +698,16 @@ impl Store {
         if clean.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock().expect("mutex store poisoned");
+        // Jangan pernah simpan kredensial/token/API key atau perintah setup token di riwayat SQLite.
+        let low = clean.to_ascii_lowercase();
+        if low.starts_with("/telegram setup")
+            || low.starts_with("/provider add")
+            || low.starts_with("/provider preset")
+            || crate::security::contains_secret(clean)
+        {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let last: Option<String> = conn
             .query_row(
                 "SELECT prompt FROM prompt_history WHERE cwd = ?1 ORDER BY id DESC LIMIT 1",
@@ -837,8 +881,36 @@ impl Store {
     }
 
     pub fn save_message(&self, session_id: &str, msg: &Message) -> Result<()> {
-        let content = blocks_to_json(&msg.content);
-        let conn = self.conn.lock().expect("mutex store poisoned");
+        // Redaksi secret pada seluruh blok teks/argumen tool sebelum ditulis ke SQLite & FTS5!
+        let safe_blocks: Vec<Block> = msg
+            .content
+            .iter()
+            .map(|b| match b {
+                Block::Text(t) => Block::Text(crate::security::redact_secrets(t)),
+                Block::ToolUse { id, name, args } => {
+                    let raw = args.to_string();
+                    let red = crate::security::redact_secrets(&raw);
+                    let safe_args = if red == raw {
+                        args.clone()
+                    } else {
+                        serde_json::from_str(&red).unwrap_or_else(|_| serde_json::json!({ "redacted": red }))
+                    };
+                    Block::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args: safe_args,
+                    }
+                }
+                Block::ToolResult { id, content, is_error } => Block::ToolResult {
+                    id: id.clone(),
+                    content: crate::security::redact_secrets(content),
+                    is_error: *is_error,
+                },
+                other => other.clone(),
+            })
+            .collect();
+        let content = blocks_to_json(&safe_blocks);
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         self.materialize_if_pending(&conn, session_id)?;
         conn.execute(
             "INSERT INTO messages (session_id, role, content, ts) VALUES (?1, ?2, ?3, ?4)",
@@ -847,7 +919,7 @@ impl Store {
         let msg_id = conn.last_insert_rowid();
         // Indeks FTS5 (Bagian 4A v0.5.6): bangun HANYA dari isi pesan tersimpan yang sudah teredaksi.
         if msg.role != Role::System {
-            let searchable = extract_searchable_text_from_blocks(&msg.content);
+            let searchable = extract_searchable_text_from_blocks(&safe_blocks);
             if !searchable.is_empty() {
                 let _ = conn.execute(
                     "INSERT INTO messages_fts (session_id, message_id, role, content_text) VALUES (?1, ?2, ?3, ?4)",
@@ -990,11 +1062,15 @@ impl Store {
         {
             return Ok(found);
         }
-        let conn = self.conn.lock().expect("mutex store poisoned");
-        let pattern = format!("{clean}%");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let escaped = clean
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
         let mut stmt = conn.prepare(
             "SELECT id, cwd, provider, model, created_at, title FROM sessions \
-             WHERE cwd = ?1 AND id LIKE ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+             WHERE cwd = ?1 AND id LIKE ?2 ESCAPE '\\' ORDER BY created_at DESC, rowid DESC LIMIT 1",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![cwd, pattern], |row| {
             Ok(SessionInfo {
@@ -3245,8 +3321,13 @@ fn build_safe_fts_query(raw: &str) -> String {
     }
     let tokens: Vec<String> = trimmed
         .split_whitespace()
-        .map(|tok| tok.replace('"', ""))
+        .map(|tok| {
+            tok.chars()
+                .filter(|c| !c.is_control() && *c != '"' && *c != '\0')
+                .collect::<String>()
+        })
         .filter(|tok| !tok.is_empty())
+        .take(16)
         .map(|tok| format!("\"{tok}\""))
         .collect();
     tokens.join(" AND ")

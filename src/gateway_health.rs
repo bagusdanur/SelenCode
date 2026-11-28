@@ -16,7 +16,7 @@ use crate::providers::{Block, Message};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// Batas jumlah pesan yang dipertahankan di RAM per sesi gateway setelah giliran selesai.
 pub const MAX_GATEWAY_IN_MEM_MSGS: usize = 80;
@@ -103,12 +103,14 @@ impl StallTracker {
     }
 }
 
-/// Waktu epoch milidetik saat ini (monotonik-aman untuk perbandingan lintas thread).
+/// Cap waktu milidetik MONOTONIK (tahan terhadap loncatan jam NTP/VM/Termux ke depan maupun ke belakang).
+/// Berawal dari baseline 10^12 ms agar operasi pengurangan `saturating_sub` di uji deterministik aman.
 pub fn now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let base = START.get_or_init(Instant::now);
+    const MONO_OFFSET_MS: u64 = 1_000_000_000_000;
+    MONO_OFFSET_MS.saturating_add(base.elapsed().as_millis() as u64)
 }
 
 /// Hasil evaluasi kesehatan loop utama & polling Telegram oleh watchdog eksternal.
@@ -241,7 +243,16 @@ where
                 eprintln!(
                     "[watchdog] KRITIS: {reason} (ambang {threshold_secs}s, chat_id={chat_id}) — menyimpan status pemulihan & keluar agar supervisor me-restart gateway."
                 );
-                let _ = store.record_gateway_recovery(chat_id, &reason);
+                // Rekam marker pemulihan dengan batas waktu 2 detik agar mutex Store yang deadlock
+                // tidak pernah menahan watchdog untuk memanggil `on_unhealthy` (`exit(2)`).
+                let store_rec = store.clone();
+                let reason_rec = reason.clone();
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let _ = std::thread::spawn(move || {
+                    let _ = store_rec.record_gateway_recovery(chat_id, &reason_rec);
+                    let _ = done_tx.send(());
+                });
+                let _ = done_rx.recv_timeout(Duration::from_secs(2));
                 on_unhealthy(verdict);
                 return;
             }

@@ -226,7 +226,7 @@ impl Session {
     }
 
     pub(crate) fn handle_checkpoint(&self, arg: Option<&str>) -> Result<String> {
-        let mut stack = self.ctx.undo_stack.lock().expect("undo_stack poisoned");
+        let mut stack = self.ctx.undo_stack.lock().unwrap_or_else(|e| e.into_inner());
         let label = arg.map(|s| s.trim()).filter(|s| !s.is_empty());
         if let Some(lbl) = label {
             if !lbl.eq_ignore_ascii_case("list") && !lbl.eq_ignore_ascii_case("ls") {
@@ -260,6 +260,7 @@ impl Session {
     }
 
     pub(crate) fn handle_rollback(&self, arg: Option<&str>) -> Result<String> {
+        self.ctx.sandbox.check_write_allowed("rollback", "workspace")?;
         let target_id = match arg.map(|s| s.trim()).filter(|s| !s.is_empty()) {
             Some(s) => {
                 let clean = s.trim_start_matches('#');
@@ -270,7 +271,7 @@ impl Session {
             }
             None => None,
         };
-        let mut stack = self.ctx.undo_stack.lock().expect("undo_stack poisoned");
+        let mut stack = self.ctx.undo_stack.lock().unwrap_or_else(|e| e.into_inner());
         let report = stack.rollback_to(target_id)?;
         let mut out = format!(
             "# Rollback ke Checkpoint #{} ({})\n",
@@ -344,6 +345,7 @@ impl Session {
             .strip_prefix("new ")
             .or_else(|| raw.strip_prefix("create "))
         {
+            self.ctx.sandbox.check_write_allowed("worktree_new", rest.trim())?;
             let info = worktree::create_isolated_worktree(&self.ctx.cwd, rest.trim())?;
             return Ok(format!(
                 "# Git Worktree Terisolasi Dibuat\n\
@@ -387,6 +389,7 @@ impl Session {
             .strip_prefix("apply ")
             .or_else(|| raw.strip_prefix("merge "))
         {
+            self.ctx.sandbox.check_write_allowed("worktree_apply", rest.trim())?;
             let rep = worktree::apply_worktree_to_main(
                 &self.ctx.cwd,
                 rest.trim(),
@@ -409,6 +412,7 @@ impl Session {
             .or_else(|| raw.strip_prefix("discard "))
         {
             let id = rest.trim();
+            self.ctx.sandbox.check_write_allowed("worktree_rm", id)?;
             worktree::discard_worktree(&self.ctx.cwd, id)?;
             return Ok(format!(
                 "# Worktree Dihapus\n> {id} | worktree & branch sementara dihapus bersih"
@@ -539,18 +543,16 @@ impl Session {
         out
     }
 
-    /// `!perintah` — jalankan shell lokal cepat tanpa memanggil LLM (ala OpenCode).
+    /// `!perintah` — jalankan shell lokal cepat tanpa memanggil LLM (terikat batas memori).
     pub(crate) async fn handle_inline_shell(&self, command: &str) -> Result<String> {
         let mut cmd = self
             .ctx
             .sandbox
             .prepare_shell_command("inline_shell", command, &self.ctx.cwd)?;
-        let out = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+        let (code_opt, combined) = selencode::tools::run_timed(&mut cmd, 60)
             .await
-            .map_err(|_| anyhow::anyhow!("timeout 60 detik menjalankan `!{command}`"))??;
-        let code = out.status.code().unwrap_or(-1);
-        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-        combined.push_str(&String::from_utf8_lossy(&out.stderr));
+            .map_err(|e| anyhow::anyhow!("menjalankan `!{command}`: {e}"))?;
+        let code = code_opt.unwrap_or(-1);
         let clean = redact_secrets(&combined);
         let mut lines: Vec<&str> = clean.lines().collect();
         let truncated = if lines.len() > 30 {
@@ -575,7 +577,8 @@ impl Session {
     }
 
     pub(crate) fn handle_undo(&self) -> Result<String> {
-        let mut stack = self.ctx.undo_stack.lock().expect("undo_stack poisoned");
+        self.ctx.sandbox.check_write_allowed("undo", "workspace")?;
+        let mut stack = self.ctx.undo_stack.lock().unwrap_or_else(|e| e.into_inner());
         match stack.undo()? {
             Some(msg) => Ok(format!(
                 "# Undo Berhasil\n* dipulihkan | {msg} | sisa undo: {}, redo: {}",
@@ -587,7 +590,8 @@ impl Session {
     }
 
     pub(crate) fn handle_redo(&self) -> Result<String> {
-        let mut stack = self.ctx.undo_stack.lock().expect("undo_stack poisoned");
+        self.ctx.sandbox.check_write_allowed("redo", "workspace")?;
+        let mut stack = self.ctx.undo_stack.lock().unwrap_or_else(|e| e.into_inner());
         match stack.redo()? {
             Some(msg) => Ok(format!(
                 "# Redo Berhasil\n* diterapkan | {msg} | sisa undo: {}, redo: {}",
@@ -603,7 +607,7 @@ impl Session {
             .ctx
             .repo_index
             .lock()
-            .expect("repo_index poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         Ok(idx.format_status_card(arg))
     }
 
@@ -1363,7 +1367,13 @@ impl Session {
                     "format: `/memory update <no|teks_lama> => <teks_baru>` atau `/memory update <no> <teks_baru>`"
                 );
             }
-            let clean_sel = sel.trim_start_matches(['M', 'm', '#']);
+            // Hanya kupas prefiks `M#`/`m#`/`#` bila diikuti nomor indeks valid (jangan rusak teks biasa seperti "Make...").
+            let clean_sel = sel
+                .strip_prefix("M#")
+                .or_else(|| sel.strip_prefix("m#"))
+                .or_else(|| sel.strip_prefix('#'))
+                .filter(|s| s.parse::<usize>().is_ok())
+                .unwrap_or(sel);
             let (idx, chars) = replace_entry_in(
                 &mem_dir,
                 MemoryStoreKind::Memory,
@@ -1381,7 +1391,13 @@ impl Session {
             .or_else(|| arg.strip_prefix("del "))
             .or_else(|| arg.strip_prefix("remove "))
         {
-            let clean_sel = rest.trim().trim_start_matches(['M', 'm', '#']);
+            let trimmed = rest.trim();
+            let clean_sel = trimmed
+                .strip_prefix("M#")
+                .or_else(|| trimmed.strip_prefix("m#"))
+                .or_else(|| trimmed.strip_prefix('#'))
+                .filter(|s| s.parse::<usize>().is_ok())
+                .unwrap_or(trimmed);
             let (removed, chars) = remove_entry_in(
                 &mem_dir,
                 MemoryStoreKind::Memory,
@@ -2131,6 +2147,7 @@ impl Session {
                 "format: /learn <nama> <instruksi>. Contoh: /learn test Jalankan cargo test sebelum commit"
             );
         }
+        self.ctx.sandbox.check_write_allowed("learn_skill", name)?;
         let path = save_skill(&self.ctx.cwd, name, instr)?;
         Ok(format!(
             "# Skill Baru Tersimpan\n* {name} | project | {}\n! Aktifkan kapan saja dengan: /skill {name}",
@@ -2139,6 +2156,7 @@ impl Session {
     }
 
     pub(crate) fn handle_init(&self) -> Result<String> {
+        self.ctx.sandbox.check_write_allowed("init", "AGENTS.md")?;
         let (path, created) = init_agents_md(&self.ctx.cwd)?;
         if created {
             Ok(format!(
@@ -2222,7 +2240,7 @@ impl Session {
         let policy = self.ctx.approver.policy();
         let Some(arg) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
             let (mode, mut cats) = {
-                let p = policy.lock().expect("approval policy poisoned");
+                let p = policy.lock().unwrap_or_else(|e| e.into_inner());
                 let cats: Vec<String> = p.session_allowed.iter().cloned().collect();
                 (p.mode, cats)
             };
@@ -2251,7 +2269,7 @@ impl Session {
             other => anyhow::bail!("mode '{other}' tidak dikenal. Pilihan: ask, edits, auto"),
         };
         {
-            let mut p = policy.lock().expect("approval policy poisoned");
+            let mut p = policy.lock().unwrap_or_else(|e| e.into_inner());
             p.mode = new_mode;
             if reset_cats {
                 p.session_allowed.clear();
@@ -2271,6 +2289,9 @@ impl Session {
     }
 
     pub(crate) fn handle_export(&self, arg: Option<&str>) -> Result<String> {
+        self.ctx
+            .sandbox
+            .check_write_allowed("export", arg.unwrap_or("selencode-export.md"))?;
         let path = export_conversation_md(
             &self.ctx.cwd,
             arg,

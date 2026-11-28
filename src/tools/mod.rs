@@ -282,7 +282,7 @@ async fn read_bounded_pipe<R: tokio::io::AsyncRead + Unpin>(
 /// Jalankan command sampai selesai dengan timeout; gabungkan stdout+stderr secara terikat memori.
 /// Error timeout berbunyi "timeout setelah N detik" (disengaja: jelas di log).
 /// Command harus sudah di-set `kill_on_drop(true)` oleh pemanggil.
-pub(crate) async fn run_timed(
+pub async fn run_timed(
     cmd: &mut tokio::process::Command,
     timeout_secs: u64,
 ) -> Result<(Option<i32>, String)> {

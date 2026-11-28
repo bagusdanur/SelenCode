@@ -1008,8 +1008,14 @@ pub(crate) async fn interactive_tui(
     let tui_result =
         tokio::task::spawn_blocking(move || selencode::tui::run_blocking(app, channels)).await;
     // run_blocking mengirim TuiCommand::Shutdown sebelum kembali; beri worker
-    // waktu menyelesaikan giliran / background review akhir sesi bila aktif.
-    let _ = tokio::time::timeout(Duration::from_secs(12), worker).await;
+    // waktu menyelesaikan giliran / background review akhir sesi, lalu abort bila melewati batas.
+    let mut worker = worker;
+    if tokio::time::timeout(Duration::from_secs(5), &mut worker)
+        .await
+        .is_err()
+    {
+        worker.abort();
+    }
     match tui_result {
         Ok(r) => r,
         Err(e) => anyhow::bail!("task TUI panik: {e}"),

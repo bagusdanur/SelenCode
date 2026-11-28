@@ -878,17 +878,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     app.input.set_block(Block::default());
     frame.render_widget(&app.input, cols[1]);
-    // Kursor hanya relevan tanpa popup/modal.
-    if app.approval.is_none() && app.model_picker.is_none() && app.setup_wizard.is_none() {
-        frame.set_cursor_position((
-            cols[1].x + app.input.cursor().1 as u16,
-            cols[1].y + app.input.cursor().0 as u16,
-        ));
+    // Kursor hanya relevan tanpa popup/modal (termasuk resume_picker & pending_ask), di-clamp dalam `cols[1]`.
+    let has_modal = app.approval.is_some()
+        || app.model_picker.is_some()
+        || app.setup_wizard.is_some()
+        || app.resume_picker.is_some()
+        || app.pending_ask.is_some();
+    if !has_modal && cols[1].width > 0 && cols[1].height > 0 {
+        let cur_row = (app.input.cursor().0 as u16).min(cols[1].height.saturating_sub(1));
+        let cur_col = (app.input.cursor().1 as u16).min(cols[1].width.saturating_sub(1));
+        frame.set_cursor_position((cols[1].x + cur_col, cols[1].y + cur_row));
     }
 
     // Live `/` command palette: muncul otomatis tepat di atas status bar saat
     // user mulai mengetik `/...` (tanpa popup approval/modal aktif).
-    if app.approval.is_none() && app.model_picker.is_none() && app.setup_wizard.is_none() {
+    if !has_modal {
         let cur_input = app.input.lines().join("\n");
         let palette = filter_commands(&cur_input);
         if !palette.is_empty() && chunks[0].height >= 5 {
@@ -898,7 +902,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             let h = (palette.len() as u16 + 2)
                 .min(chunks[0].height.saturating_sub(1))
                 .min(12);
-            let w = chunks[0].width.saturating_sub(2).min(86).max(24);
+            let max_w = chunks[0].width.saturating_sub(2);
+            let w = max_w.min(86);
             let popup = Rect {
                 x: chunks[0].x + 1,
                 y: chunks[0].y + chunks[0].height.saturating_sub(h),
@@ -977,7 +982,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 let h = (matches.len() as u16 + 2)
                     .min(chunks[0].height.saturating_sub(1))
                     .min(10);
-                let w = chunks[0].width.saturating_sub(2).min(78).max(24);
+                let w = chunks[0].width.saturating_sub(2).min(78);
                 let popup = Rect {
                     x: chunks[0].x + 1,
                     y: chunks[0].y + chunks[0].height.saturating_sub(h),
@@ -1931,9 +1936,18 @@ fn submit(
     if text.is_empty() {
         return;
     }
-    app.push_history(&text);
+    // Jangan pernah simpan perintah berisi token/API key ke riwayat input TUI (`↑`).
+    let low_text = text.to_ascii_lowercase();
+    let is_secret_cmd = low_text.starts_with("/telegram setup")
+        || low_text.starts_with("/provider add")
+        || low_text.starts_with("/provider preset")
+        || crate::security::contains_secret(&text);
+    if !is_secret_cmd {
+        app.push_history(&text);
+    }
     match parse_slash_command(&text) {
         SlashCommand::Exit => {
+            cancel.notify_waiters();
             app.should_quit = true;
         }
         SlashCommand::Stop => {
@@ -2784,7 +2798,9 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
                                 mp.filter_input.push_str(text.trim());
                                 mp.selected = 0;
                             }
-                        } else if app.approval.is_none() {
+                        } else if let Some(ask) = &mut app.pending_ask {
+                            ask.custom_input.push_str(text.trim());
+                        } else if app.approval.is_none() && app.resume_picker.is_none() {
                             app.input.insert_str(&text);
                         }
                         dirty = true;
@@ -2796,7 +2812,9 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
                                     app.approval_scroll = app.approval_scroll.saturating_sub(3);
                                 } else if let Some(mp) = &mut app.model_picker {
                                     mp.move_up();
-                                } else {
+                                } else if let Some(rp) = &mut app.resume_picker {
+                                    rp.move_up();
+                                } else if app.pending_ask.is_none() {
                                     app.scroll_up(3);
                                 }
                                 dirty = true;
@@ -2806,7 +2824,9 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
                                     app.approval_scroll = app.approval_scroll.saturating_add(3);
                                 } else if let Some(mp) = &mut app.model_picker {
                                     mp.move_down();
-                                } else {
+                                } else if let Some(rp) = &mut app.resume_picker {
+                                    rp.move_down();
+                                } else if app.pending_ask.is_none() {
                                     app.scroll_down(3);
                                 }
                                 dirty = true;

@@ -99,6 +99,11 @@ pub fn language_id_for_ext(ext: &str) -> &'static str {
 pub fn find_binary_on_path(bin: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
+        // Tolak segmen PATH kosong atau relatif (`.`) agar repo tak tepercaya tidak bisa
+        // menyusupkan binary palsu di folder kerja saat ini.
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+            continue;
+        }
         let direct = dir.join(bin);
         if direct.is_file() {
             return Some(direct);
@@ -181,10 +186,30 @@ pub fn path_to_file_uri(path: &Path) -> String {
     }
 }
 
+/// Dekode persen sederhana (`%20`, `%3A`, dll.) untuk path URI `file://`.
+fn percent_decode_uri_path(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &input[i + 1..i + 3];
+            if let Ok(b) = u8::from_str_radix(hex, 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Konversi URI `file://` kembali ke `PathBuf`.
 pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
-    let decoded = rest.replace("%20", " ");
+    let decoded = percent_decode_uri_path(rest);
     #[cfg(windows)]
     let clean = {
         let s = decoded.strip_prefix('/').unwrap_or(&decoded);
@@ -284,6 +309,7 @@ impl LspSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        crate::sandbox::scrub_tokio_command(&mut cmd);
 
         let mut child = cmd
             .spawn()

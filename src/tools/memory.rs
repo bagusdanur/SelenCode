@@ -22,6 +22,14 @@ impl Tool for ManageMemory {
         UserMemoryTool.spec()
     }
 
+    fn needs_approval(&self, args: &Value) -> bool {
+        let act = str_arg(args, "action")
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        !matches!(act.as_str(), "view" | "list")
+    }
+
     async fn run(&self, args: Value, ctx: &Ctx) -> Result<String> {
         let action = str_arg(&args, "action").unwrap_or("view");
         let mapped = match action {
@@ -84,6 +92,14 @@ impl Tool for UserMemoryTool {
         }
     }
 
+    fn needs_approval(&self, args: &Value) -> bool {
+        let act = str_arg(args, "action")
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        !matches!(act.as_str(), "view" | "list")
+    }
+
     async fn run(&self, args: Value, ctx: &Ctx) -> Result<String> {
         use crate::user_memory::{
             add_entry_in, load_frozen_snapshot_from, remove_entry_in, replace_entry_in,
@@ -123,6 +139,16 @@ impl Tool for UserMemoryTool {
             "add" => {
                 let content = str_arg(&args, "content")
                     .ok_or_else(|| anyhow!("argumen 'content' wajib diisi untuk action='add'"))?;
+                if !ctx
+                    .approver
+                    .ask(
+                        &format!("memory add ({})", kind.label()),
+                        &format!("Simpan catatan persisten:\n{content}"),
+                    )
+                    .await
+                {
+                    return Ok("Ditolak user — catatan memori TIDAK disimpan.".into());
+                }
                 let (count, chars) = add_entry_in(&dir, kind, content, max_chars)?;
                 Ok(format!(
                     "Tersimpan di wadah '{}' (entri #{count}, {chars}/{max_chars} char). Akan aktif pada snapshot sesi berikutnya.",
@@ -135,6 +161,16 @@ impl Tool for UserMemoryTool {
                     .ok_or_else(|| anyhow!("argumen 'selector' wajib diisi untuk action='replace'"))?;
                 let content = str_arg(&args, "content")
                     .ok_or_else(|| anyhow!("argumen 'content' wajib diisi untuk action='replace'"))?;
+                if !ctx
+                    .approver
+                    .ask(
+                        &format!("memory replace ({})", kind.label()),
+                        &format!("Ubah entri '{selector}' menjadi:\n{content}"),
+                    )
+                    .await
+                {
+                    return Ok("Ditolak user — catatan memori TIDAK diubah.".into());
+                }
                 let (idx, chars) = replace_entry_in(&dir, kind, selector, content, max_chars)?;
                 Ok(format!(
                     "Entri #{idx} di wadah '{}' diperbarui ({chars}/{max_chars} char).",
@@ -145,6 +181,16 @@ impl Tool for UserMemoryTool {
                 let selector = str_arg(&args, "selector")
                     .or_else(|| str_arg(&args, "old_text"))
                     .ok_or_else(|| anyhow!("argumen 'selector' wajib diisi untuk action='remove'"))?;
+                if !ctx
+                    .approver
+                    .ask(
+                        &format!("memory remove ({})", kind.label()),
+                        &format!("Hapus entri memori yang cocok dengan: {selector}"),
+                    )
+                    .await
+                {
+                    return Ok("Ditolak user — catatan memori TIDAK dihapus.".into());
+                }
                 let (removed, chars) = remove_entry_in(&dir, kind, selector, max_chars)?;
                 Ok(format!(
                     "Entri dihapus dari '{}': \"{removed}\" (sisa {chars}/{max_chars} char).",

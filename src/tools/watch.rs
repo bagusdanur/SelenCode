@@ -128,7 +128,9 @@ impl Tool for WatchJob {
             let watch_id = args.get("watch_id").and_then(|v| v.as_i64());
             let all = store.list_job_watches(ctx.telegram_chat_id, false)?;
             let targets: Vec<_> = if let Some(wid) = watch_id {
-                all.into_iter().filter(|w| w.id == wid).collect()
+                all.into_iter()
+                    .filter(|w| w.id == wid && normalize_watch_cwd(&w.cwd) == target_cwd)
+                    .collect()
             } else {
                 let mut active: Vec<_> = all
                     .iter()
@@ -220,12 +222,29 @@ impl Tool for WatchJob {
             .get("interval_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_WATCH_INTERVAL_SECS)
-            .max(MIN_WATCH_INTERVAL_SECS);
+            .clamp(MIN_WATCH_INTERVAL_SECS, 86_400);
         let max_age_secs = args
             .get("max_age_secs")
             .and_then(|v| v.as_u64())
             .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_WATCH_MAX_AGE_SECS);
+            .unwrap_or(DEFAULT_WATCH_MAX_AGE_SECS)
+            .clamp(60, 604_800);
+        if check_kind == "shell"
+            && !ctx
+                .approver
+                .ask(
+                    &format!("watch_job: {label}"),
+                    &format!(
+                        "Daftarkan pemantauan shell berulang setiap {interval_secs}s:\nPerintah: {check_target}\nFolder: {}",
+                        ctx.cwd.display()
+                    ),
+                )
+                .await
+        {
+            return Ok(format!(
+                "Ditolak user — pemantauan shell '{label}' TIDAK didaftarkan."
+            ));
+        }
         let done_marker = str_arg(&args, "done_marker").unwrap_or("").trim();
         let fail_marker = str_arg(&args, "fail_marker").unwrap_or("").trim();
         let expires_at = compute_watch_expires_at(chrono::Utc::now(), max_age_secs);

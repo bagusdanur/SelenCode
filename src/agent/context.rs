@@ -31,10 +31,16 @@ pub fn build_system_prompt(cwd: &Path, tools: &[ToolSpec]) -> String {
 8. Memori lintas-sesi (`memory`): satu-satunya cara mengingat preferensi/profil/fakta pemilik antar-sesi adalah tool `memory` (`target`: `memory` maks 2200 char, `profile` maks 1375 char; aktifkan `skills_mem` bila perlu; tanpa rahasia).\n",
     );
     for name in ["AGENT.md", "AGENTS.md"] {
-        let p = cwd.join(name);
+        let Ok(p) = crate::security::resolve_in_sandbox(cwd, Path::new(name)) else {
+            continue;
+        };
+        if crate::security::is_secret_file(&p) {
+            continue;
+        }
         if let Ok(text) = std::fs::read_to_string(&p) {
             let cut: String = text.chars().take(MAX_AGENT_MD).collect();
-            s.push_str(&format!("\n--- {name} ---\n{cut}\n--- akhir {name} ---\n"));
+            let safe_cut = crate::security::redact_secrets(&cut);
+            s.push_str(&format!("\n--- {name} ---\n{safe_cut}\n--- akhir {name} ---\n"));
             break;
         }
     }

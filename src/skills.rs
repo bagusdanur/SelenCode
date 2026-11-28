@@ -82,9 +82,13 @@ pub struct SkillInfo {
 }
 
 impl SkillInfo {
-    /// True bila skill ini berasal dari Selena improvement (frontmatter `origin: selena-improvement`
-    /// atau berada di dalam subfolder fisik `skills/improvement/`).
+    /// True bila skill ini berasal dari Selena improvement di store PENGGUNA
+    /// (frontmatter `origin: selena-improvement` atau subfolder `skills/improvement/`).
+    /// Repo proyek lokal tak tepercaya TIDAK pernah bisa menyamar sebagai skill improvement!
     pub fn is_improvement_skill(&self) -> bool {
+        if self.scope != "user" {
+            return false;
+        }
         if self
             .origin
             .as_deref()
@@ -1507,10 +1511,17 @@ pub fn export_conversation_md(
             }
         }
     }
+    if path.exists() {
+        return Err(anyhow!(
+            "berkas ekspor '{}' sudah ada — pilih nama file baru agar tidak menimpa berkas proyek",
+            rel
+        ));
+    }
+    let safe_md = crate::security::redact_secrets(&md);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, md)
+    std::fs::write(&path, safe_md)
         .with_context(|| format!("gagal menulis file ekspor {}", path.display()))?;
     Ok(path)
 }

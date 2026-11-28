@@ -378,12 +378,13 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         return SlashCommand::NotCommand;
     }
     let mut parts = line.splitn(2, char::is_whitespace);
-    let head = parts.next().unwrap_or("");
+    let head_raw = parts.next().unwrap_or("");
+    let head = head_raw.to_ascii_lowercase();
     let rest = parts
         .next()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    match head {
+    match head.as_str() {
         "/exit" | "/quit" => SlashCommand::Exit,
         "/model" => SlashCommand::Model(rest),
         "/models" => SlashCommand::Models(rest),

@@ -495,9 +495,10 @@ impl Tool for SkillEdit {
                 .ok_or_else(|| anyhow!("argumen 'body' wajib diisi saat menulis ref_path"))?;
             let safe_body = format!("{}\n", crate::security::redact_secrets(body));
 
-            // v0.5.27 (Masalah 1): edit selalu menulis kembali ke folder ASAL tempat skill dimuat
-            // (store pengguna atau proyek), tidak pernah menciptakan salinan bayangan di proyek!
-            let target = existing.dir.join(rel_path);
+            // v0.5.27 (Masalah 1) + hardening symlink: pastikan target terkanonisasi tetap di dalam `existing.dir`.
+            ctx.sandbox.check_write_allowed("skill_edit", raw_ref)?;
+            let target = crate::security::resolve_in_sandbox(&existing.dir, rel_path)
+                .map_err(|e| anyhow!("ref_path '{raw_ref}' ditolak: {e}"))?;
             let old_raw = std::fs::read_to_string(&target).unwrap_or_default();
             let rel_display = target
                 .strip_prefix(&ctx.cwd)
@@ -554,6 +555,7 @@ impl Tool for SkillEdit {
 
         // v0.5.27 (Masalah 1): edit WAJIB menargetkan berkas ASAL hasil resolusi pemuatan skill
         // (store + path asalnya), tidak pernah menciptakan salinan bayangan di `.selencode/skills/`.
+        ctx.sandbox.check_write_allowed("skill_edit", &clean)?;
         let target = existing.path.clone();
         // Pertahankan metadata provenans (`origin`, `source_session`, `learned_at`) bila ada.
         let new_md = render_skill_markdown_with_origin(
@@ -643,6 +645,10 @@ impl Tool for ManageSkill {
         }
     }
 
+    fn needs_approval(&self, args: &Value) -> bool {
+        matches!(str_arg(args, "action"), Some("create" | "patch"))
+    }
+
     async fn run(&self, args: Value, ctx: &Ctx) -> Result<String> {
         let action = str_arg(&args, "action")
             .ok_or_else(|| anyhow!("argumen 'action' wajib (list|read|create|patch)"))?;
@@ -668,6 +674,20 @@ impl Tool for ManageSkill {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow!("argumen 'content' wajib non-kosong untuk action='{action}'"))?;
                 let desc = str_arg(&args, "description");
+                ctx.sandbox.check_write_allowed("manage_skill", name)?;
+                let preview: String = content.chars().take(400).collect();
+                if !ctx
+                    .approver
+                    .ask(
+                        &format!("manage_skill {action} '{name}'"),
+                        &format!("Cuplikan isi skill:\n{preview}"),
+                    )
+                    .await
+                {
+                    return Ok(format!(
+                        "Ditolak user — aksi manage_skill '{action}' pada '{name}' dibatalkan."
+                    ));
+                }
                 let (path, clean, existed) = if action == "patch" {
                     let (p, c, _scope, ex) =
                         patch_resolved_skill(&ctx.cwd, name, desc, content)?;

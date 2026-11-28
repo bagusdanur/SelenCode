@@ -107,17 +107,16 @@ pub fn user_memory_dir() -> PathBuf {
 }
 
 fn contains_secret_like(text: &str) -> bool {
-    let low = text.to_ascii_lowercase();
-    let redacted = redact_secrets(text);
-    if redacted != text {
+    if crate::security::contains_secret(text) || redact_secrets(text) != text {
         return true;
     }
+    let low = text.to_ascii_lowercase();
     for pat in [
         "sk-",
         "ghp_",
         "gho_",
         "xoxb-",
-        "aiza",
+        "aizasy",
         "-----begin ",
         "password=",
         "api_key=",
@@ -187,14 +186,42 @@ fn save_entries_to(dir: &Path, kind: MemoryStoreKind, entries: &[String], max_ch
     }
     std::fs::create_dir_all(dir)
         .with_context(|| format!("gagal membuat folder memori {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
     let path = dir.join(kind.filename());
     let content = if rendered.is_empty() {
         String::new()
     } else {
         format!("{rendered}\n")
     };
-    std::fs::write(&path, content)
-        .with_context(|| format!("gagal menyimpan {}", path.display()))?;
+    let tmp = dir.join(format!(
+        ".{}.{}.tmp",
+        kind.filename(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("gagal membuat file sementara {}", tmp.display()))?;
+        f.write_all(content.as_bytes())
+            .with_context(|| format!("gagal menulis {}", tmp.display()))?;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        std::fs::write(&path, &content)
+            .with_context(|| format!("gagal menyimpan {}", path.display()))?;
+        let _ = std::fs::remove_file(&tmp);
+    }
     Ok(len)
 }
 

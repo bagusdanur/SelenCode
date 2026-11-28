@@ -30,6 +30,8 @@ pub(crate) struct Session {
     pub(crate) provider: Arc<dyn Provider>,
     /// Handle provider bersama untuk subagent (`delegate` & `orchestrate`) agar `/model` ikut menyinkronkannya (P2.2).
     pub(crate) shared_provider: Arc<std::sync::RwLock<Arc<dyn Provider>>>,
+    /// Root workspace awal saat sesi dibuat (batas sandbox `/cd` saat mode != `unrestricted`).
+    pub(crate) workspace_root: std::path::PathBuf,
     pub(crate) ctx: Ctx,
     pub(crate) registry: Registry,
     pub(crate) store: Arc<Store>,
@@ -421,12 +423,14 @@ impl Session {
         }
         let last_scheduled_review_msg_len =
             store.last_reviewed_msg_count(&session_id).unwrap_or(0);
+        let workspace_root = selencode::security::normalize_sandbox_path(&ctx.cwd);
         Ok(Session {
             cfg,
             provider_name: name,
             pcfg,
             provider,
             shared_provider,
+            workspace_root,
             ctx,
             registry,
             store,
@@ -838,6 +842,7 @@ impl Session {
                             p.models = list;
                             p.model = chosen;
                         }
+                        self.cfg.default_provider = self.provider_name.clone();
                         let saved_path = config::save(&self.cfg)?;
                         let pname = self.provider_name.clone();
                         self.switch_provider(&pname)?;
@@ -1240,7 +1245,10 @@ impl Session {
             Some(found) => found,
             None => self.store.resolve_session(&cwd_str, target, 20)?,
         };
-        let msgs = self.store.load_messages(&info.id)?;
+        let mut msgs = self.store.load_messages(&info.id)?;
+        if let Some(syn) = selencode::agent::sanitize_interrupted_messages(&mut msgs) {
+            let _ = self.store.save_message(&info.id, &syn);
+        }
         let (input_tokens, output_tokens) = self.store.total_usage(&info.id).unwrap_or((0, 0));
         let context_used = estimate_tokens(&msgs);
         let context_limit = self.ctx.context_limit_tokens;
@@ -1251,6 +1259,7 @@ impl Session {
         self.ctx.session_id = Some(info.id.clone());
         self.ctx.is_resumed_session = true;
         self.messages = msgs;
+        self.turns_since_review = 0;
         self.last_scheduled_review_msg_len = self
             .store
             .last_reviewed_msg_count(&info.id)
@@ -1347,17 +1356,36 @@ impl Session {
                 self.ctx.cwd.join(p)
             }
         };
-        let canon = std::fs::canonicalize(&expanded)
+        let canon_raw = std::fs::canonicalize(&expanded)
             .map_err(|e| anyhow::anyhow!("folder '{}' tidak ditemukan: {e}", expanded.display()))?;
+        let canon = selencode::security::strip_windows_verbatim(&canon_raw);
         if !canon.is_dir() {
             anyhow::bail!("'{}' bukan direktori.", canon.display());
         }
+        // Keamanan Sandbox: saat mode != `unrestricted`, `/cd` tidak boleh kabur keluar `workspace_root`!
+        if self.ctx.sandbox.mode() != selencode::sandbox::SandboxMode::Unrestricted {
+            let root_norm = selencode::security::normalize_sandbox_path(&self.workspace_root);
+            let target_norm = selencode::security::normalize_sandbox_path(&canon);
+            if !target_norm.starts_with(&root_norm) {
+                anyhow::bail!(
+                    "perpindahan `/cd` ke '{}' ditolak oleh sandbox ({}): di luar workspace root '{}'. Gunakan `/sandbox unrestricted` jika memang ingin berpindah keluar workspace.",
+                    canon.display(),
+                    self.ctx.sandbox.mode().as_str(),
+                    root_norm.display()
+                );
+            }
+        }
         let prev = self.ctx.cwd.display().to_string();
         self.ctx.cwd = canon.clone();
+        // Perbarui RepoIndex & LspManager agar mengikuti folder kerja baru secara konsisten.
+        self.ctx.repo_index = Arc::new(std::sync::Mutex::new(
+            selencode::context_index::RepoIndex::new(canon.clone()),
+        ));
+        self.ctx.lsp_manager = Arc::new(selencode::lsp::LspManager::new(canon.clone()));
         Ok(format!(
             "# Folder Kerja Diperbarui (/cd)\n\
              * folder | {} | aktif sekarang\n\
-             > sebelumnya | {prev} | seluruh tool & sandbox mengikuti folder baru",
+             > sebelumnya | {prev} | seluruh tool, indeks, LSP, & sandbox mengikuti folder baru",
             canon.display()
         ))
     }
@@ -1524,6 +1552,7 @@ impl Session {
             p.push_model_unique(id);
             p.model = id.to_string();
         }
+        self.cfg.default_provider = self.provider_name.clone();
         let saved_path = config::save(&self.cfg)?;
         let pname = self.provider_name.clone();
         self.switch_provider(&pname)?;

@@ -87,13 +87,70 @@ pub fn validate_readonly_watch_command(cmd: &str) -> Result<String> {
             "perintah pemeriksaan ditolak demi keamanan: {trimmed}"
         ));
     }
-    // Tolak chaining / subshell / redirect / penulisan eksplisit agar loop pantau 100% baca-saja.
-    if trimmed.contains([';', '|', '&', '`', '>', '<', '\n', '\r']) || trimmed.contains("$(") {
+    // Tolak chaining / subshell / redirect / ekspansi variabel agar loop pantau 100% baca-saja.
+    if trimmed.contains([';', '|', '&', '`', '>', '<', '\n', '\r'])
+        || trimmed.contains("$(")
+        || trimmed.contains("${")
+    {
         return Err(anyhow!(
             "perintah pemeriksaan `watch_job` wajib tunggal & baca-saja tanpa operator shell (;, |, &, >, <, $())"
         ));
     }
     let low = trimmed.to_ascii_lowercase();
+    let tokens: Vec<&str> = low.split_whitespace().collect();
+    if let Some(first) = tokens.first() {
+        let bin = first.rsplit(['/', '\\']).next().unwrap_or(first).trim_matches(['"', '\'']);
+        if matches!(
+            bin,
+            "rm" | "rm.exe"
+                | "del"
+                | "mv"
+                | "cp"
+                | "mkdir"
+                | "rmdir"
+                | "rd"
+                | "touch"
+                | "chmod"
+                | "chown"
+                | "dd"
+                | "tee"
+                | "kill"
+                | "pkill"
+                | "shutdown"
+                | "reboot"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "dash"
+                | "cmd"
+                | "cmd.exe"
+                | "powershell"
+                | "powershell.exe"
+                | "pwsh"
+                | "curl"
+                | "wget"
+                | "nc"
+                | "ncat"
+                | "eval"
+        ) {
+            return Err(anyhow!(
+                "perintah `{trimmed}` ditolak: `{bin}` tidak diizinkan untuk pemeriksaan baca-saja `watch_job`"
+            ));
+        }
+        // Tolak eksekusi kode inline interpreter (`python -c`, `node -e`, `perl -e`, `ruby -e`) dan `find -exec`.
+        if matches!(bin, "python" | "python3" | "python.exe" | "node" | "node.exe" | "perl" | "ruby")
+            && tokens.iter().any(|t| matches!(*t, "-c" | "-e" | "--eval"))
+        {
+            return Err(anyhow!(
+                "perintah `{trimmed}` ditolak: eksekusi kode inline interpreter (-c/-e) tidak diizinkan pada `watch_job`"
+            ));
+        }
+        if bin == "find" && tokens.iter().any(|t| *t == "-exec" || *t == "-execdir" || *t == "-delete") {
+            return Err(anyhow!(
+                "perintah `{trimmed}` ditolak: `find -exec/-delete` tidak diizinkan pada `watch_job`"
+            ));
+        }
+    }
     for bad in [
         "rm ", "del ", "mv ", "cp ", "mkdir ", "rmdir ", "touch ", "chmod ", "chown ", "dd ",
         "tee ", "kill ", "pkill ", "shutdown", "reboot", "git push", "git commit", "git reset",
@@ -647,7 +704,7 @@ pub fn is_watch_due(watch: &JobWatchRecord, now_utc: DateTime<Utc>) -> bool {
     let Ok(last) = DateTime::parse_from_rfc3339(&watch.last_checked_at) else {
         return true;
     };
-    let interval = Duration::seconds(watch.interval_secs.max(MIN_WATCH_INTERVAL_SECS) as i64);
+    let interval = Duration::seconds(watch.interval_secs.clamp(MIN_WATCH_INTERVAL_SECS, 86_400) as i64);
     now_utc >= last.with_timezone(&Utc) + interval
 }
 
@@ -658,13 +715,18 @@ pub async fn poll_watch_once(
 ) -> Result<String> {
     let cwd = Path::new(&watch.cwd);
     if watch.check_kind == "file" {
+        use std::io::Read;
         let p = resolve_in_sandbox(cwd, Path::new(&watch.check_target))?;
         if is_secret_file(&p) {
             return Err(anyhow!("berkas status ditolak: file rahasia"));
         }
-        let text = std::fs::read_to_string(&p)
+        let f = std::fs::File::open(&p)
             .map_err(|e| anyhow!("gagal membaca berkas status '{}': {e}", watch.check_target))?;
-        return Ok(text);
+        let mut buf = Vec::new();
+        f.take(64 * 1024)
+            .read_to_end(&mut buf)
+            .map_err(|e| anyhow!("gagal membaca berkas status '{}': {e}", watch.check_target))?;
+        return Ok(String::from_utf8_lossy(&buf).into_owned());
     }
 
     let safe_cmd = validate_readonly_watch_command(&watch.check_target)?;
@@ -685,10 +747,13 @@ pub async fn poll_watch_once(
     Ok(output)
 }
 
-/// Hitung timestamp kedaluwarsa RFC3339 dari `now_utc + max_age_secs`.
+/// Hitung timestamp kedaluwarsa RFC3339 dari `now_utc + max_age_secs` (aman dari overflow i64).
 pub fn compute_watch_expires_at(now_utc: DateTime<Utc>, max_age_secs: u64) -> String {
-    let secs = max_age_secs.max(60) as i64;
-    (now_utc + Duration::seconds(secs)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    let secs = max_age_secs.clamp(60, 604_800) as i64;
+    let exp = now_utc
+        .checked_add_signed(Duration::seconds(secs))
+        .unwrap_or(now_utc);
+    exp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// Normalisasi path folder kerja untuk pencocokan `job_watches.cwd` lintas separator/kapitalisasi OS.

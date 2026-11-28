@@ -124,7 +124,7 @@ impl Tool for Orchestrate {
             token_budget: args
                 .get("token_budget")
                 .and_then(|v| v.as_u64())
-                .map(|n| n.clamp(1_000, 500_000))
+                .map(|n| if n == 0 { 120_000 } else { n.clamp(1, 500_000) })
                 .unwrap_or(120_000),
             max_parallel_researchers: self.max_parallel_researchers,
         };
