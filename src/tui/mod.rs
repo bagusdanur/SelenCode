@@ -2092,7 +2092,11 @@ fn submit(
             send_cmd(app, cmd_tx, TuiCommand::ShowSessions);
         }
         SlashCommand::Resume(None) => {
-            send_cmd(app, cmd_tx, TuiCommand::OpenResumePicker);
+            if app.busy {
+                app.error("Tunggu giliran saat ini selesai atau gunakan /stop sebelum membuka daftar sesi.");
+            } else {
+                send_cmd(app, cmd_tx, TuiCommand::OpenResumePicker);
+            }
         }
         SlashCommand::Resume(Some(arg)) => {
             let t = arg.trim();

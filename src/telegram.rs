@@ -708,9 +708,16 @@ pub fn build_tg_approve_picker_card(current_mode: &str, session_cats: &str) -> T
     let plain = format!(
         "Mode Persetujuan Tool: {current_mode}\nIzin sesi: {session_cats}"
     );
-    let low = current_mode.to_ascii_lowercase();
+    let low = current_mode.trim().to_ascii_lowercase();
+    let active_key = if low.starts_with("edit") || low.contains("auto-edit") || low.contains("auto_edit") {
+        "edits"
+    } else if low.starts_with("auto") {
+        "auto"
+    } else {
+        "ask"
+    };
     let lbl = |key: &str, title: &str| {
-        if low.contains(key) {
+        if active_key == key {
             format!("✓ {title}")
         } else {
             title.to_string()
@@ -719,7 +726,7 @@ pub fn build_tg_approve_picker_card(current_mode: &str, session_cats: &str) -> T
     let rows = vec![
         vec![
             (lbl("ask", "Tanya (ask)"), "cfg:ap:ask".to_string()),
-            (lbl("edit", "Auto Edit (edits)"), "cfg:ap:edits".to_string()),
+            (lbl("edits", "Auto Edit (edits)"), "cfg:ap:edits".to_string()),
             (lbl("auto", "Auto Semua (auto)"), "cfg:ap:auto".to_string()),
         ],
         vec![("✕ Tutup".to_string(), "cfg:x".to_string())],

@@ -539,8 +539,9 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                         continue;
                     }
                     if let Some(skl_cb) = cb.data.as_deref().and_then(parse_callback_skill) {
+                        let chat_cwd = resolve_chat_cwd(&sessions, chat_id, &cwd).await;
                         telegram_ui::handle_tg_skill_callback(
-                            &tg, &cb, chat_id, skl_cb, &cwd, &tg_ui,
+                            &tg, &cb, chat_id, skl_cb, &chat_cwd, &tg_ui,
                         )
                         .await;
                         continue;
@@ -596,8 +597,13 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                                             .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
                                             .clone()
                                     };
-                                    if let Ok(mut b) = busy_chats.lock() {
-                                        b.insert(chat_id);
+                                    let was_busy = busy_chats
+                                        .lock()
+                                        .map(|mut b| !b.insert(chat_id))
+                                        .unwrap_or(false);
+                                    if was_busy {
+                                        let _ = hub.cancel_chat_approvals(chat_id);
+                                        cancel_notify.notify_waiters();
                                     }
                                     let tg_c = tg.clone();
                                     let hub_c = hub.clone();
@@ -656,10 +662,11 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                         continue;
                     }
                     if let Some((prop_id, approve)) = cb.data.as_deref().and_then(parse_callback_review) {
+                        let chat_cwd = resolve_chat_cwd(&sessions, chat_id, &cwd).await;
                         let res_msg = match selencode::store::Store::open() {
                             Ok(st) => {
                                 if approve {
-                                    selencode::agent::apply_staged_proposal(&st, &cwd, prop_id)
+                                    selencode::agent::apply_staged_proposal(&st, &chat_cwd, prop_id)
                                 } else {
                                     selencode::agent::discard_staged_proposal(&st, prop_id)
                                 }
@@ -998,6 +1005,22 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Ambil folder kerja live milik `chat_id` (mengikuti `/cd`) bila sesi sudah ada dan tidak terkunci,
+/// atau jatuh aman ke `fallback_cwd` startup gateway.
+async fn resolve_chat_cwd(
+    sessions: &Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>>,
+    chat_id: i64,
+    fallback_cwd: &PathBuf,
+) -> PathBuf {
+    let maybe_arc = { sessions.lock().await.get(&chat_id).cloned() };
+    if let Some(s_arc) = maybe_arc {
+        if let Ok(s) = s_arc.try_lock() {
+            return s.ctx.cwd.clone();
+        }
+    }
+    fallback_cwd.clone()
+}
+
 /// Keluarkan sesi chat yang sudah lama idle atau melebihi pagu cache dari RAM gateway
 /// (data riwayat penuh tetap persisten di SQLite; sesi aktif/sibuk tidak pernah disentuh).
 async fn evict_idle_gateway_sessions(
@@ -1117,6 +1140,7 @@ async fn handle_telegram_chat_message(
     }
 
     // Unduh foto/dokumen di dalam task chat ini agar loop polling Telegram tidak pernah terblokir.
+    // Hormati `/cd` dengan mengambil folder kerja live dari sesi chat bila sudah aktif.
     let text = match payload {
         IncomingTgPayload::Text(t) => t,
         IncomingTgPayload::Photo {
@@ -1125,6 +1149,7 @@ async fn handle_telegram_chat_message(
             caption,
             cwd,
         } => {
+            let live_cwd = resolve_chat_cwd(&sessions, chat_id, &cwd).await;
             let mut attached_path: Option<String> = None;
             if let Ok(fi) = tg.get_file(&file_id).await {
                 if let Some(fp) = fi.file_path {
@@ -1132,7 +1157,7 @@ async fn handle_telegram_chat_message(
                         if bytes.len() <= 6 * 1024 * 1024 {
                             let ext = fp.rsplit('.').next().unwrap_or("jpg");
                             let rel = format!(".selencode/tg_uploads/tg_{message_id}.{ext}");
-                            let full = cwd.join(&rel);
+                            let full = live_cwd.join(&rel);
                             if let Some(parent) = full.parent() {
                                 let _ = std::fs::create_dir_all(parent);
                             }
@@ -1157,6 +1182,7 @@ async fn handle_telegram_chat_message(
             caption,
             cwd,
         } => {
+            let live_cwd = resolve_chat_cwd(&sessions, chat_id, &cwd).await;
             let doc_res: std::result::Result<(String, usize), String> = async {
                 if let Some(sz) = file_size.filter(|&sz| sz > TG_DOCUMENT_MAX_BYTES) {
                     return Err(format_tg_document_too_large_reply(file_name.as_deref(), sz));
@@ -1179,7 +1205,7 @@ async fn handle_telegram_chat_message(
                     .await
                     .map_err(|e| format!("Gagal mengunduh berkas dari Telegram: {e}"))?;
                 let rel = save_tg_document_bytes(
-                    &cwd,
+                    &live_cwd,
                     message_id,
                     file_name.as_deref(),
                     mime_type.as_deref(),
@@ -1273,6 +1299,16 @@ async fn handle_telegram_chat_message(
                     let _ = tg
                         .send_html_message(chat_id, &html, &format!("Transkripsi: {transcript}"))
                         .await;
+                    if let Some(mid) = progress_msg_id {
+                        let _ = tg
+                            .edit_html_message(
+                                chat_id,
+                                mid,
+                                "<i>Memproses permintaan...</i>",
+                                "Memproses permintaan...",
+                            )
+                            .await;
+                    }
                     if att.caption.is_empty() {
                         transcript
                     } else {
@@ -1492,7 +1528,7 @@ async fn handle_telegram_chat_message(
                     tg.send_menu_markup(chat_id, &reply).await?;
                 }
                 ModelAction::SwitchOrModel(ref target) if s.cfg.providers.contains_key(target) => {
-                    s.switch_provider(target)?;
+                    s.switch_provider_and_persist(target)?;
                     let names = tg_sorted_providers(&s.cfg);
                     let active_pidx = names
                         .iter()
@@ -2328,21 +2364,17 @@ async fn handle_telegram_chat_message(
         let plan_text = extract_plan(&answer).unwrap_or_else(|| answer.clone());
         if !plan_text.trim().is_empty() {
             tg_ui.set_pending_plan(chat_id, plan_text.clone());
+            // Isi rencana sudah terkirim di pesan jawaban di atas — cukup kirim kartu aksi ringkas
+            // agar tidak menduplikasi teks rencana dua kali!
             let card = build_tg_plan_confirm_card(&plan_text);
-            if card.html.chars().count() <= 4050 {
-                let _ = tg
-                    .send_html_message_with_keyboard(chat_id, &card.html, &card.plain, card.rows)
-                    .await;
-            } else {
-                let _ = tg
-                    .send_html_message_with_keyboard(
-                        chat_id,
-                        "📋 <b>Rencana di atas siap dieksekusi.</b>",
-                        "Rencana di atas siap dieksekusi.",
-                        card.rows,
-                    )
-                    .await;
-            }
+            let _ = tg
+                .send_html_message_with_keyboard(
+                    chat_id,
+                    "📋 <b>Rencana di atas siap dieksekusi.</b>\n<i>Pilih tombol di bawah untuk menjalankan atau membatalkannya.</i>",
+                    "Rencana di atas siap dieksekusi.",
+                    card.rows,
+                )
+                .await;
         }
     }
 

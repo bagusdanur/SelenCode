@@ -222,6 +222,11 @@ pub(crate) fn handle_resume_picker_key(
             }
         }
         KeyCode::Enter => {
+            if app.busy {
+                app.resume_picker = None;
+                app.error("Tunggu giliran saat ini selesai atau gunakan /stop sebelum pindah sesi.");
+                return;
+            }
             let chosen_id = app.resume_picker.as_ref().and_then(|rp| {
                 let items = rp.filtered_items();
                 items.get(rp.selected).map(|it| it.id.clone())
@@ -234,6 +239,11 @@ pub(crate) fn handle_resume_picker_key(
         KeyCode::Char('n') | KeyCode::Char('N')
             if key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
+            if app.busy {
+                app.resume_picker = None;
+                app.error("Tunggu giliran saat ini selesai atau tekan Esc untuk membatalkan.");
+                return;
+            }
             app.resume_picker = None;
             send_cmd(app, cmd_tx, TuiCommand::NewSession);
         }

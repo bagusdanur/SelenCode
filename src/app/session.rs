@@ -530,6 +530,15 @@ impl Session {
         Ok(())
     }
 
+    /// Ganti provider aktif sekaligus menyimpannya sebagai `default_provider` di `config.toml`
+    /// agar tidak tertimpa balik saat giliran Telegram berikutnya menyinkronkan config atau setelah restart.
+    pub(crate) fn switch_provider_and_persist(&mut self, name: &str) -> Result<()> {
+        self.switch_provider(name)?;
+        self.cfg.default_provider = name.to_string();
+        let _ = config::save(&self.cfg)?;
+        Ok(())
+    }
+
     /// Tangani `/model <arg>`: pilih lewat nomor (`/model 2` atau `/model set 2`),
     /// tambah daftar (`/model add <id...>`), hapus (`/model rm <no|id>`),
     /// ganti provider, input model manual, atau cari cepat lewat potongan nama.
@@ -705,8 +714,37 @@ impl Session {
             }
             ModelAction::SwitchAndSetModel { provider, model } => {
                 if !self.cfg.providers.contains_key(&provider) {
+                    // Dukung ID model ber-titik-dua pada provider aktif (mis. Ollama `llama3:8b`, `deepseek-r1:70b`)
+                    // sebelum menolaknya sebagai nama provider yang tidak dikenal.
+                    let combined = format!("{provider}:{model}");
+                    let cur_list = self.pcfg.effective_models();
+                    if let SavedModelLookup::Exact(i) | SavedModelLookup::UniqueSubstring(i) =
+                        lookup_saved_model(&cur_list, &combined)
+                    {
+                        let idx = i + 1;
+                        let chosen = cur_list[i].clone();
+                        if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+                            p.models = cur_list;
+                            p.model = chosen;
+                        }
+                        self.cfg.default_provider = self.provider_name.clone();
+                        let saved_path = config::save(&self.cfg)?;
+                        let pname = self.provider_name.clone();
+                        self.switch_provider(&pname)?;
+                        let ctx_s = format_context_tokens_exact(self.ctx.context_limit_tokens);
+                        return Ok(format!(
+                            "# Model Dipilih (#{idx})\n\
+                             * model | {} | aktif di {} ({})\n\
+                             > konteks | {ctx_s} | tersimpan ({})",
+                            self.pcfg.model,
+                            self.provider_name,
+                            self.pcfg.kind,
+                            saved_path.display()
+                        ));
+                    }
                     anyhow::bail!(
-                        "provider '{provider}' belum ada. Tambah dulu lewat `/provider add` atau `/provider preset`."
+                        "provider '{provider}' belum ada (dan model '{combined}' tidak ada di daftar tersimpan '{}'). Tambah provider lewat `/provider add` atau tambah model lewat `/model add {combined}`.",
+                        self.provider_name
                     );
                 }
                 let chosen = if let Some(p) = self.cfg.providers.get_mut(&provider) {
@@ -749,6 +787,7 @@ impl Session {
                 } else {
                     model
                 };
+                self.cfg.default_provider = provider.clone();
                 let saved_path = config::save(&self.cfg)?;
                 self.switch_provider(&provider)?;
                 let ctx_s = format_context_tokens_exact(self.ctx.context_limit_tokens);
@@ -762,9 +801,28 @@ impl Session {
                 ))
             }
             ModelAction::SwitchOrModel(target) => {
-                // 1. Nama provider terdaftar -> pindah ke provider itu.
+                // 0. Tangani subcommand tanpa argumen atau nomor #0 dengan panduan jelas.
+                if target == "0" {
+                    let count = self.pcfg.effective_models().len();
+                    anyhow::bail!(
+                        "nomor model #0 tidak valid (gunakan nomor 1..={count}). Cek daftar lewat `/model`."
+                    );
+                }
+                if target.eq_ignore_ascii_case("add") {
+                    anyhow::bail!("format: `/model add <id-model>` atau `/models` lalu `/model add <nomor>`.");
+                }
+                if target.eq_ignore_ascii_case("rm")
+                    || target.eq_ignore_ascii_case("remove")
+                    || target.eq_ignore_ascii_case("del")
+                {
+                    anyhow::bail!("format: `/model rm <nomor|id-model>` atau `/model clear`.");
+                }
+                if target.eq_ignore_ascii_case("set") {
+                    anyhow::bail!("format: `/model set <nomor|id-model>`.");
+                }
+                // 1. Nama provider terdaftar -> pindah & simpan sebagai default_provider!
                 if self.cfg.providers.contains_key(&target) {
-                    self.switch_provider(&target)?;
+                    self.switch_provider_and_persist(&target)?;
                     return Ok(self.models_menu());
                 }
                 // 2. Cocokkan di daftar model tersimpan provider aktif (exact atau substring unik).
@@ -1173,10 +1231,13 @@ impl Session {
         })
     }
 
-    /// Beralih & lanjutkan sesi tersimpan berdasarkan nomor urut (`1..=10`) atau prefix ID.
+    /// Beralih & lanjutkan sesi tersimpan berdasarkan ID persis, nomor urut (`1..=20`), atau prefix ID.
     pub(crate) fn resume_by_target(&mut self, target: &str) -> Result<ResumedSessionData> {
         let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
-        let info = self.store.resolve_session(&cwd_str, target, 10)?;
+        let info = match self.store.session_by_id(target.trim())? {
+            Some(found) => found,
+            None => self.store.resolve_session(&cwd_str, target, 20)?,
+        };
         let msgs = self.store.load_messages(&info.id)?;
         let (input_tokens, output_tokens) = self.store.total_usage(&info.id).unwrap_or((0, 0));
         let context_used = estimate_tokens(&msgs);

@@ -544,7 +544,7 @@ async fn tui_worker(
                             .await;
                     }
                 },
-                ModelPickerCmd::SwitchProvider(prov) => match s.switch_provider(&prov) {
+                ModelPickerCmd::SwitchProvider(prov) => match s.switch_provider_and_persist(&prov) {
                     Ok(()) => {
                         s.last_remote_models.clear();
                         let _ = ui_tx

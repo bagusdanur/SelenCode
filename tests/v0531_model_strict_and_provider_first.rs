@@ -7,8 +7,8 @@
 
 use selencode::repl::{lookup_saved_model, SavedModelLookup};
 use selencode::telegram::{
-    build_tg_model_picker_card, build_tg_provider_picker_card, parse_callback_model,
-    TgModelCallback, TgModelEntry, TgModelProviderItem,
+    build_tg_approve_picker_card, build_tg_model_picker_card, build_tg_provider_picker_card,
+    parse_callback_model, TgModelCallback, TgModelEntry, TgModelProviderItem,
 };
 
 #[test]
@@ -105,4 +105,38 @@ fn telegram_model_picker_provider_dulu_lalu_kembali_ke_provider_selalu_tersedia(
             .any(|(lbl, cb)| lbl.contains("Provider") && cb == "mdl:p:0"),
         "tombol kembali ke daftar provider wajib selalu hadir: {flat:?}"
     );
+}
+
+#[test]
+fn ollama_model_ber_titik_dua_dan_approve_picker_tepat_satu_centang() {
+    // 1. Model Ollama seperti `llama3:8b` tetap cocok eksak saat dicari di daftar tersimpan
+    let ollama_saved = vec!["llama3:8b".to_string(), "deepseek-r1:70b".to_string()];
+    assert_eq!(
+        lookup_saved_model(&ollama_saved, "llama3:8b"),
+        SavedModelLookup::Exact(0)
+    );
+    assert_eq!(
+        lookup_saved_model(&ollama_saved, "deepseek-r1:70b"),
+        SavedModelLookup::Exact(1)
+    );
+
+    // 2. Kartu `/approve` Telegram harus menandai TEPAT 1 tombol aktif (`✓`), termasuk pada label `auto-edits`
+    for mode_label in [
+        "ask (tanya per aksi)",
+        "edits (otomatis edit/tulis file, tanya shell/git/web)",
+        "auto (otomatis semua aksi aman)",
+        "auto-edits",
+    ] {
+        let card = build_tg_approve_picker_card(mode_label, "(belum ada)");
+        let checked_count = card
+            .rows
+            .iter()
+            .flat_map(|r| r.iter())
+            .filter(|(lbl, _)| lbl.starts_with('✓'))
+            .count();
+        assert_eq!(
+            checked_count, 1,
+            "harus tepat 1 tombol bertanda ✓ untuk mode '{mode_label}', dapat {checked_count}"
+        );
+    }
 }
