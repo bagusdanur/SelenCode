@@ -427,7 +427,6 @@ async fn upgrade3a_read_file_multimodal_image_and_pdf_with_vision_loop() {
         &mut msgs,
         "Periksa gambar mockup.png di folder ini.",
         10,
-        None,
     )
     .await
     .unwrap();
