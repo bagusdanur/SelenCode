@@ -289,13 +289,13 @@ fn perbaikan2_swe_agent_coding_closing_checklist() {
 
     // (b) Berkas repro sementara masih ada -> catatan penutup deterministik menyebutnya!
     let scratch_note = st
-        .closing_scratch_files_note(&dir)
+        .closing_scratch_files_note(&dir, "Sudah beres semua.")
         .expect("catatan penutup deterministik harus menyebut berkas repro yang masih tersisa");
     assert!(scratch_note.contains("repro_bug.js"));
 
     // Sesudah berkas repro dihapus -> tidak ada catatan berkas sementara lagi
     let _ = std::fs::remove_file(dir.join("repro_bug.js"));
-    assert!(st.closing_scratch_files_note(&dir).is_none());
+    assert!(st.closing_scratch_files_note(&dir, "Sudah beres semua.").is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
