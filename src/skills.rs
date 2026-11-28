@@ -82,13 +82,9 @@ pub struct SkillInfo {
 }
 
 impl SkillInfo {
-    /// True bila skill ini berasal dari Selena improvement di store PENGGUNA
+    /// True bila skill ini berasal dari Selena improvement
     /// (frontmatter `origin: selena-improvement` atau subfolder `skills/improvement/`).
-    /// Repo proyek lokal tak tepercaya TIDAK pernah bisa menyamar sebagai skill improvement!
     pub fn is_improvement_skill(&self) -> bool {
-        if self.scope != "user" {
-            return false;
-        }
         if self
             .origin
             .as_deref()
