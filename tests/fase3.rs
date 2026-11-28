@@ -431,6 +431,7 @@ fn config_save_load_and_direct_api_key_fallback() {
         context: Default::default(),
         display: Default::default(),
         timeouts: Default::default(),
+        web: Default::default(),
         max_steps_source: Default::default(),
         startup_notices: Vec::new(),
     };
