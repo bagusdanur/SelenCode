@@ -291,6 +291,7 @@ async fn compaction_llm_summary_dan_fallback_deterministik_aman() {
                 text: "1. Tujuan: Memperbaiki auth.\n2. File Diubah: src/auth.rs.\n3. Keputusan: Pakai JWT HS256.\n4. Sisa: Tambah tes integrasi.".into(),
                 tool_calls: Vec::new(),
                 usage: None,
+                finish_reason: None,
             })
         }
     }
