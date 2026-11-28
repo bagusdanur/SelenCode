@@ -1062,13 +1062,19 @@ impl Session {
         if cur_len == 0 || cur_len <= self.last_scheduled_review_msg_len {
             return None;
         }
-        // Masalah 2 (v0.5.25): rekam sinyal kelas-satu secara persisten SEBELUM gerbang cooldown/interval
+        // Masalah 2 (v0.5.25): rekam sinyal kelas-satu secara persisten apabila cooldown aktif
         // sehingga koreksi pengguna atau kegagalan terpulihkan tidak pernah ditelan cooldown.
-        selencode::agent::record_pending_signal_if_present(
-            &self.store,
-            &self.session_id,
-            &self.messages,
-        );
+        if self
+            .store
+            .is_review_in_cooldown(&self.session_id, self.cfg.review.cooldown_mins)
+            .unwrap_or(false)
+        {
+            selencode::agent::record_pending_signal_if_present(
+                &self.store,
+                &self.session_id,
+                &self.messages,
+            );
+        }
         let has_pending_signal = self
             .store
             .get_pending_review_signal(&self.session_id)

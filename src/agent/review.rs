@@ -543,7 +543,8 @@ pub fn detect_first_class_signal_in_slice(
 }
 
 /// Catat sinyal belajar kelas-satu secara persisten pada `store` apabila muncul sejak review terakhir
-/// yang selesai, sehingga cooldown hanya menunda eksekusi dan tidak pernah membuang sinyal (Masalah 2 v0.5.25).
+/// yang selesai DAN sesi sedang berada dalam cooldown, sehingga cooldown hanya menunda eksekusi dan
+/// tidak pernah membuang sinyal (Masalah 2 v0.5.25).
 pub fn record_pending_signal_if_present(
     store: &Store,
     session_id: &str,
@@ -561,7 +562,7 @@ pub fn record_pending_signal_if_present(
 /// Cek semua prasyarat pemicu Selena improvement sebelum memanggil provider.
 /// Setiap alasan lewati dicatat ke `store` (`last_review_skip`) agar terdiagnosis di `/doctor` & `/review status`.
 /// Masalah 1 & 2 (v0.5.25): menolak snapshot yang sudah tercakup (`AlreadyReviewed`) dan selalu
-/// mempertahankan sinyal kelas-satu tertunda melewati masa cooldown.
+/// menyimpan sinyal kelas-satu secara persisten ketika tertahan oleh cooldown.
 pub fn check_review_eligibility(
     cfg: &Config,
     store: &Store,
@@ -593,9 +594,18 @@ pub fn check_review_eligibility(
         );
         return Err(ReviewSkipReason::AlreadyReviewed);
     }
-    // Selalu rekam sinyal kelas-satu SEBELUM cek cooldown agar tidak pernah hilang.
-    record_pending_signal_if_present(store, session_id, messages);
-    let pending_sig = store.get_pending_review_signal(session_id).ok().flatten();
+    let in_cooldown = store
+        .is_review_in_cooldown(session_id, cfg.review.cooldown_mins)
+        .unwrap_or(false);
+    // Hanya tahan ke pending_review_signal bila benar-benar terblokir oleh cooldown (Masalah 2).
+    if in_cooldown {
+        record_pending_signal_if_present(store, session_id, messages);
+    }
+    let pending_sig = store
+        .get_pending_review_signal(session_id)
+        .ok()
+        .flatten()
+        .filter(|sig| messages.len() > sig.first_msg_idx);
     let substantive =
         pending_sig.is_some() || is_session_substantive(messages, cfg.review.min_tool_calls);
     if !substantive {
@@ -605,10 +615,7 @@ pub fn check_review_eligibility(
         );
         return Err(ReviewSkipReason::TrivialSession);
     }
-    if store
-        .is_review_in_cooldown(session_id, cfg.review.cooldown_mins)
-        .unwrap_or(false)
-    {
+    if in_cooldown {
         let detail = match &pending_sig {
             Some(sig) => format!(
                 "cooldown {} menit masih aktif — sinyal tertunda ({}) disimpan untuk ditindaklanjuti pasca-cooldown",
