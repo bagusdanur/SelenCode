@@ -568,6 +568,9 @@ fn bagian5_builtin_skills_clean_install_no_hermes_leaks_and_budget_trim_priority
         path: user_skills.join("ops/custom-user-skill/SKILL.md"),
         dir: user_skills.join("ops/custom-user-skill"),
         scope: "user",
+        origin: None,
+        source_session: None,
+        learned_at: None,
     });
     mixed.push(SkillInfo {
         name: "project-critical-skill".into(),
@@ -578,6 +581,9 @@ fn bagian5_builtin_skills_clean_install_no_hermes_leaks_and_budget_trim_priority
         path: proj_skills.join("ops/project-critical-skill/SKILL.md"),
         dir: proj_skills.join("ops/project-critical-skill"),
         scope: "project",
+        origin: None,
+        source_session: None,
+        learned_at: None,
     });
     // Set pagu ketat (90 token) sehingga bawaan dipangkas dulu, sementara skill proyek tetap bertahan!
     let trimmed = format_skills_index_budgeted(&mixed, 90);
