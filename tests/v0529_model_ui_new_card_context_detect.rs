@@ -27,7 +27,13 @@ use selencode::tui::moonlit::{
 };
 use serde_json::json;
 use std::collections::HashMap;
-use tempfile::tempdir;
+use std::path::PathBuf;
+
+fn unique_temp_db(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("selencode_v0529_{tag}_{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("selencode.db")
+}
 
 #[test]
 fn deteksi_context_window_lintas_keluarga_dan_anti_false_positive() {
@@ -126,8 +132,7 @@ fn parser_models_multi_provider_openai_gemini_anthropic() {
 
 #[test]
 fn cache_context_window_persisten_lintas_restart_sqlite() {
-    let dir = tempdir().expect("tempdir");
-    let db = dir.path().join("selencode.db");
+    let db = unique_temp_db("ctx_cache");
     {
         let st = Store::open_at(&db).expect("open store");
         let merged = st
@@ -145,6 +150,9 @@ fn cache_context_window_persisten_lintas_restart_sqlite() {
     let loaded = st2.load_model_context_cache();
     assert_eq!(loaded.get("custom/private-llm"), Some(&320_000));
     assert_eq!(loaded.get("ag/gemini-4-hydrogen-medium"), Some(&1_048_576));
+    if let Some(parent) = db.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
 }
 
 #[test]
