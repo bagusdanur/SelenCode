@@ -38,7 +38,6 @@ use selencode::skills::{
 use selencode::store::Store;
 use selencode::tools::{default_registry, Ctx};
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -97,24 +96,21 @@ impl Provider for MockCacheProvider {
 fn config_with_primary_only(model: &str) -> Config {
     let mut cfg = Config::empty();
     cfg.default_provider = "main".into();
-    let mut providers = BTreeMap::new();
-    providers.insert(
+    cfg.providers.insert(
         "main".into(),
         ProviderCfg {
             kind: "openai".into(),
-            base_url: "https://example.com/v1".into(),
+            base_url: Some("https://example.com/v1".into()),
             model: model.into(),
+            models: Vec::new(),
             api_key_env: "TEST_KEY".into(),
             api_key: None,
-            extra_headers: BTreeMap::new(),
-            context_window: None,
-            max_output_tokens: None,
-            models: Vec::new(),
-            reasoning_effort: None,
-            cache_control: true,
+            price_in: None,
+            price_out: None,
+            context_limit: None,
+            fallback: Vec::new(),
         },
     );
-    cfg.providers = providers;
     cfg
 }
 
@@ -167,7 +163,10 @@ fn default_alive_without_aux_and_skip_reason_visible_in_doctor() {
     assert_eq!(last_skip.0, "trivial_session");
 
     let pcfg = cfg.providers.get("main").unwrap();
-    let sandbox = SandboxController::new(selencode::config::SandboxCfg::default());
+    let sandbox = SandboxController::from_config(
+        &selencode::config::SandboxCfg::default(),
+        dir.join("audit.jsonl"),
+    );
     let report = run_doctor(&cfg, &dir, "main", pcfg, &store, &sandbox);
     let check = report
         .checks
@@ -185,7 +184,7 @@ fn default_alive_without_aux_and_skip_reason_visible_in_doctor() {
 
 #[tokio::test]
 async fn frozen_system_prompt_budget_cap_and_cache_metrics_recording() {
-    let _guard = env_lock().await;
+    let _guard = env_lock().lock().await;
     let dir = temp_dir("cache-budget");
     let prev_data_dir = std::env::var_os("SELENCODE_DATA_DIR");
     unsafe { std::env::set_var("SELENCODE_DATA_DIR", &dir) };
@@ -259,7 +258,7 @@ async fn frozen_system_prompt_budget_cap_and_cache_metrics_recording() {
     let report = outcome.report_message.as_deref().unwrap();
     assert_eq!(report, "💾 Selena improvement: Memory updated");
 
-    let runs = store.recent_review_runs(5).unwrap();
+    let runs = store.list_recent_review_runs(&cwd_str, 5).unwrap();
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].cache_read_tokens, 1_200);
     assert_eq!(runs[0].cache_write_tokens, 350);
@@ -282,7 +281,7 @@ async fn frozen_system_prompt_budget_cap_and_cache_metrics_recording() {
 
 #[tokio::test]
 async fn create_skill_in_improvement_dir_cross_session_precedence_and_collision_staging() {
-    let _guard = env_lock().await;
+    let _guard = env_lock().lock().await;
     let data_root = temp_dir("data-root");
     let proj_a = temp_dir("proj-a");
     let proj_b = temp_dir("proj-b");
@@ -333,7 +332,7 @@ async fn create_skill_in_improvement_dir_cross_session_precedence_and_collision_
         Message::text(Role::Assistant, "Berhasil setelah memakai --cacert /etc/ssl/corp.pem."),
     ];
     assert!(has_recovered_failure(&recovered_msgs));
-    assert!(has_valuable_review_signal(&recovered_msgs));
+    assert!(has_valuable_review_signal(&recovered_msgs, 4));
 
     // 1. CreateSkill -> tulis ke <user_skills_dir>/improvement/<nama>/SKILL.md + metadata provenance.
     let prov = Arc::new(MockCacheProvider {
@@ -470,7 +469,7 @@ async fn create_skill_in_improvement_dir_cross_session_precedence_and_collision_
 
 #[tokio::test]
 async fn user_skill_always_staged_while_improvement_skill_patches_directly_with_rollback() {
-    let _guard = env_lock().await;
+    let _guard = env_lock().lock().await;
     let dir = temp_dir("protect-rollback");
     let prev_data_dir = std::env::var_os("SELENCODE_DATA_DIR");
     unsafe { std::env::set_var("SELENCODE_DATA_DIR", &dir) };
