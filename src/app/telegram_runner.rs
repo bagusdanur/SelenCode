@@ -1,7 +1,9 @@
 use super::cli::Cli;
 use super::session::Session;
 use anyhow::Result;
-use selencode::agent::context::sanitize_interrupted_messages;
+use selencode::agent::context::{
+    format_context_tokens_exact, infer_model_context_limit, sanitize_interrupted_messages,
+};
 use selencode::agent::{run_turn_counted, run_turn_ui, UiEvent};
 use selencode::config;
 use selencode::gateway_health::{
@@ -14,11 +16,13 @@ use selencode::repl::{
 };
 use selencode::security::{ApprovalMode, ApprovalRequest};
 use selencode::telegram::{
-    classify_tg_message, escape_telegram_html, format_telegram_progress_html,
-    format_tg_document_too_large_reply, format_tg_document_turn_prompt,
-    markdown_to_telegram_html, parse_callback_review, save_tg_document_bytes, TelegramClient,
-    TgApprovalHub, TgAskHub, TgIngressClassification, TypingLoopGuard, TELEGRAM_BOT_COMMANDS,
-    TG_DOCUMENT_MAX_BYTES,
+    build_tg_model_picker_card, build_tg_provider_picker_card, classify_tg_message,
+    escape_telegram_html, format_telegram_progress_html, format_tg_document_too_large_reply,
+    format_tg_document_turn_prompt, format_tg_model_switched_html, format_tg_new_session_html,
+    markdown_to_telegram_html, parse_callback_model, parse_callback_review, save_tg_document_bytes,
+    TelegramClient, TgApprovalHub, TgAskHub, TgCallbackQuery, TgIngressClassification,
+    TgInlineCard, TgModelCallback, TgModelEntry, TgModelProviderItem, TypingLoopGuard,
+    TELEGRAM_BOT_COMMANDS, TG_DOCUMENT_MAX_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -421,6 +425,19 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 if latest_cfg.telegram.is_allowed(cb.from.id, chat_id) {
                     health_clock.set_last_active_chat(chat_id);
                     if ask_hub.handle_callback(&tg, &cb).await {
+                        continue;
+                    }
+                    if let Some(model_cb) = cb.data.as_deref().and_then(parse_callback_model) {
+                        handle_tg_model_callback(
+                            &tg,
+                            &cb,
+                            chat_id,
+                            model_cb,
+                            &latest_cfg,
+                            &gw_store,
+                            &sessions,
+                        )
+                        .await;
                         continue;
                     }
                     if let Some((prop_id, approve)) = cb.data.as_deref().and_then(parse_callback_review) {
@@ -1085,15 +1102,18 @@ async fn handle_telegram_chat_message(
 
     // Perintah khusus Telegram (/start, /status).
     if text.eq_ignore_ascii_case("/start") {
+        let ctx_exact = format_context_tokens_exact(s.ctx.context_limit_tokens);
         let start_html = format!(
             "<b>Selena — SelenCode v{}</b>\n\
              ──────────────\n\
              • <b>Provider:</b> <code>{}</code> / <code>{}</code>\n\
+             • <b>Konteks:</b> {}\n\
              • <b>Folder:</b> <code>{}</code>\n\n\
              Kirim pesan coding apa saja langsung di chat ini.\n\n\
              ▸ <b>Perintah Populer</b>\n\
              • /resume — 10 sesi terakhir bernomor &amp; lanjutkan sesi\n\
              • /model — pilih atau kelola model AI\n\
+             • /new — mulai sesi baru yang bersih\n\
              • /skills — daftar &amp; kelola skills\n\
              • /verify — cek build, test, &amp; lint proyek\n\
              • /worktree — isolasi refactor aman pakai Git Worktree\n\
@@ -1103,10 +1123,11 @@ async fn handle_telegram_chat_message(
             env!("CARGO_PKG_VERSION"),
             escape_telegram_html(&s.provider_name),
             escape_telegram_html(&s.pcfg.model),
+            escape_telegram_html(&ctx_exact),
             escape_telegram_html(&s.ctx.cwd.display().to_string())
         );
         let plain = format!(
-            "Selena — SelenCode v{}\nProvider: {} / {}\nFolder: {}\nKetik /help untuk semua perintah.",
+            "Selena — SelenCode v{}\nProvider: {} / {}\nKonteks: {ctx_exact}\nFolder: {}\nKetik /help untuk semua perintah.",
             env!("CARGO_PKG_VERSION"),
             s.provider_name,
             s.pcfg.model,
@@ -1126,16 +1147,93 @@ async fn handle_telegram_chat_message(
             return Ok(());
         }
         SlashCommand::Model(None) => {
-            tg.send_menu_markup(chat_id, &s.models_menu()).await?;
+            let names = tg_sorted_providers(&s.cfg);
+            let active_pidx = names
+                .iter()
+                .position(|n| n == &s.provider_name)
+                .unwrap_or(0);
+            if let Some(card) = tg_build_model_picker_for_provider(
+                &s.cfg,
+                &s.provider_name,
+                &s.pcfg.model,
+                s.ctx.context_limit_tokens,
+                active_pidx,
+                0,
+                &s.model_context_cache,
+            ) {
+                tg.send_html_message_with_keyboard(chat_id, &card.html, &card.plain, card.rows)
+                    .await?;
+            } else {
+                tg.send_menu_markup(chat_id, &s.models_menu()).await?;
+            }
             return Ok(());
         }
         SlashCommand::Model(Some(arg)) => {
-            let reply = if let ModelAction::FetchList(filter) = parse_model_action(&arg) {
-                s.fetch_remote_models_menu(filter.as_deref()).await?
-            } else {
-                s.apply_model_arg(&arg)?
-            };
-            tg.send_menu_markup(chat_id, &reply).await?;
+            match parse_model_action(&arg) {
+                ModelAction::FetchList(filter) => {
+                    let reply = s.fetch_remote_models_menu(filter.as_deref()).await?;
+                    tg.send_menu_markup(chat_id, &reply).await?;
+                }
+                ModelAction::SwitchOrModel(ref target) if s.cfg.providers.contains_key(target) => {
+                    s.switch_provider(target)?;
+                    let names = tg_sorted_providers(&s.cfg);
+                    let active_pidx = names
+                        .iter()
+                        .position(|n| n == &s.provider_name)
+                        .unwrap_or(0);
+                    if let Some(card) = tg_build_model_picker_for_provider(
+                        &s.cfg,
+                        &s.provider_name,
+                        &s.pcfg.model,
+                        s.ctx.context_limit_tokens,
+                        active_pidx,
+                        0,
+                        &s.model_context_cache,
+                    ) {
+                        tg.send_html_message_with_keyboard(
+                            chat_id,
+                            &card.html,
+                            &card.plain,
+                            card.rows,
+                        )
+                        .await?;
+                    } else {
+                        tg.send_menu_markup(chat_id, &s.models_menu()).await?;
+                    }
+                }
+                ModelAction::SelectIndex(_)
+                | ModelAction::SetCurrentModel(_)
+                | ModelAction::SwitchAndSetModel { .. } => {
+                    let _ = s.apply_model_arg(&arg)?;
+                    let (html, plain) = format_tg_model_switched_html(
+                        &s.provider_name,
+                        &s.pcfg.kind,
+                        &s.pcfg.model,
+                        s.ctx.context_limit_tokens,
+                    );
+                    tg.send_html_message(chat_id, &html, &plain).await?;
+                }
+                ModelAction::SwitchOrModel(_) => {
+                    let reply = s.apply_model_arg(&arg)?;
+                    if reply.starts_with("# Ditemukan ") {
+                        tg.send_menu_markup(chat_id, &reply).await?;
+                    } else {
+                        let (html, plain) = format_tg_model_switched_html(
+                            &s.provider_name,
+                            &s.pcfg.kind,
+                            &s.pcfg.model,
+                            s.ctx.context_limit_tokens,
+                        );
+                        tg.send_html_message(chat_id, &html, &plain).await?;
+                    }
+                }
+                ModelAction::AddModels(_)
+                | ModelAction::RemoveModel(_)
+                | ModelAction::ClearModels => {
+                    let reply = s.apply_model_arg(&arg)?;
+                    tg.send_menu_markup(chat_id, &reply).await?;
+                }
+            }
             return Ok(());
         }
         SlashCommand::Models(filter) => {
@@ -1143,8 +1241,25 @@ async fn handle_telegram_chat_message(
             tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
-        SlashCommand::Provider(arg) => {
-            let reply = s.handle_provider(arg.as_deref())?;
+        SlashCommand::Provider(None) => {
+            if !s.cfg.providers.is_empty() {
+                let card = tg_build_provider_picker(
+                    &s.cfg,
+                    &s.provider_name,
+                    &s.pcfg.model,
+                    s.ctx.context_limit_tokens,
+                    0,
+                );
+                tg.send_html_message_with_keyboard(chat_id, &card.html, &card.plain, card.rows)
+                    .await?;
+            } else {
+                let reply = s.handle_provider(None)?;
+                tg.send_menu_markup(chat_id, &reply).await?;
+            }
+            return Ok(());
+        }
+        SlashCommand::Provider(Some(arg)) => {
+            let reply = s.handle_provider(Some(&arg))?;
             tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());
         }
@@ -1174,13 +1289,15 @@ async fn handle_telegram_chat_message(
             let _ = s
                 .store
                 .set_telegram_chat_session(chat_id, selencode::store::Store::SESSION_POINTER_NEW);
-            let short: String = sid.chars().take(10).collect();
-            tg.send_html_message(
-                chat_id,
-                &format!("<b>Sesi baru dimulai</b> (<code>{short}</code>)."),
-                &format!("Sesi baru dimulai ({short})."),
-            )
-            .await?;
+            let (html, plain) = format_tg_new_session_html(
+                &sid,
+                &s.provider_name,
+                &s.pcfg.kind,
+                &s.pcfg.model,
+                s.ctx.context_limit_tokens,
+                &s.ctx.cwd.display().to_string(),
+            );
+            tg.send_html_message(chat_id, &html, &plain).await?;
             return Ok(());
         }
         SlashCommand::Compact => {
@@ -1922,4 +2039,277 @@ fn spawn_telegram_bg_review(
         }
     });
 }
+
+/// Daftar nama provider terurut deterministik (dipakai konsisten antara render tombol & callback `mdl:`).
+fn tg_sorted_providers(cfg: &config::Config) -> Vec<String> {
+    let mut names: Vec<String> = cfg.providers.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+/// Deteksi kapasitas context window satu model pada Telegram gateway (prioritas sama dengan `Session`).
+fn tg_resolve_model_ctx(
+    cfg: &config::Config,
+    pcfg: &config::ProviderCfg,
+    model_id: &str,
+    cache: &HashMap<String, usize>,
+) -> usize {
+    if model_id == pcfg.model {
+        if let Some(n) = pcfg.context_limit.filter(|&n| n > 0) {
+            return n;
+        }
+    }
+    if let Some(&n) = cache.get(model_id) {
+        if n >= 1024 {
+            return n;
+        }
+    }
+    if cfg.agent.context_limit_tokens != 100_000 && cfg.agent.context_limit_tokens > 0 {
+        return cfg.agent.context_limit_tokens;
+    }
+    infer_model_context_limit(model_id)
+}
+
+/// Bangun kartu pemilih model Telegram untuk provider indeks `view_pidx` halaman `page`.
+fn tg_build_model_picker_for_provider(
+    cfg: &config::Config,
+    active_prov: &str,
+    active_model: &str,
+    active_ctx: usize,
+    view_pidx: usize,
+    page: usize,
+    cache: &HashMap<String, usize>,
+) -> Option<TgInlineCard> {
+    let names = tg_sorted_providers(cfg);
+    let view_name = names.get(view_pidx)?;
+    let view_pcfg = cfg.providers.get(view_name)?;
+    let active_kind = cfg
+        .providers
+        .get(active_prov)
+        .map(|p| p.kind.as_str())
+        .unwrap_or("openai");
+    let models: Vec<TgModelEntry> = view_pcfg
+        .effective_models()
+        .into_iter()
+        .map(|id| {
+            let is_active = view_name == active_prov && id == active_model;
+            let context_limit = tg_resolve_model_ctx(cfg, view_pcfg, &id, cache);
+            TgModelEntry {
+                id,
+                context_limit,
+                is_active,
+            }
+        })
+        .collect();
+    Some(build_tg_model_picker_card(
+        active_prov,
+        active_kind,
+        active_model,
+        active_ctx,
+        view_pidx,
+        view_name,
+        &view_pcfg.kind,
+        names.len(),
+        &models,
+        page,
+    ))
+}
+
+/// Bangun kartu pemilih provider 2-kolom Telegram untuk halaman `page`.
+fn tg_build_provider_picker(
+    cfg: &config::Config,
+    active_prov: &str,
+    active_model: &str,
+    active_ctx: usize,
+    page: usize,
+) -> TgInlineCard {
+    let names = tg_sorted_providers(cfg);
+    let active_kind = cfg
+        .providers
+        .get(active_prov)
+        .map(|p| p.kind.as_str())
+        .unwrap_or("openai");
+    let items: Vec<TgModelProviderItem> = names
+        .iter()
+        .filter_map(|name| {
+            let p = cfg.providers.get(name)?;
+            Some(TgModelProviderItem {
+                name: name.clone(),
+                kind: p.kind.clone(),
+                active_model: p.model.clone(),
+                model_count: p.effective_models().len(),
+                is_active: name == active_prov,
+                key_ready: cfg.is_key_ready(name),
+            })
+        })
+        .collect();
+    build_tg_provider_picker_card(
+        active_prov,
+        active_kind,
+        active_model,
+        active_ctx,
+        &items,
+        page,
+    )
+}
+
+/// Tangani callback tombol inline `/model` & `/provider` Telegram secara instan (in-place edit,
+/// simpan konfigurasi, dan perbarui sesi chat aktif tanpa memblokir giliran lain).
+async fn handle_tg_model_callback(
+    tg: &TelegramClient,
+    cb: &TgCallbackQuery,
+    chat_id: i64,
+    action: TgModelCallback,
+    fallback_cfg: &config::Config,
+    gw_store: &Option<Arc<selencode::store::Store>>,
+    sessions: &Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>>,
+) {
+    let msg_id = cb.message.as_ref().map(|m| m.message_id);
+    let mut cur_cfg = config::load().unwrap_or_else(|_| fallback_cfg.clone());
+    let cache: HashMap<String, usize> = gw_store
+        .as_ref()
+        .map(|st| st.load_model_context_cache())
+        .unwrap_or_default();
+
+    let active_prov = cur_cfg.default_provider.clone();
+    let (active_model, active_ctx) = cur_cfg
+        .providers
+        .get(&active_prov)
+        .map(|p| {
+            let m = p.model.clone();
+            let c = tg_resolve_model_ctx(&cur_cfg, p, &m, &cache);
+            (m, c)
+        })
+        .unwrap_or_else(|| ("(belum diatur)".to_string(), 128_000));
+
+    match action {
+        TgModelCallback::Noop => {
+            let _ = tg.answer_callback_query(&cb.id, None).await;
+        }
+        TgModelCallback::Close => {
+            let _ = tg.answer_callback_query(&cb.id, Some("Ditutup")).await;
+            let ctx_s = format_context_tokens_exact(active_ctx);
+            let html = format!(
+                "<i>Pengaturan model ditutup.</i>\nModel aktif: <code>{}</code> ({})",
+                escape_telegram_html(&active_model),
+                escape_telegram_html(&ctx_s)
+            );
+            let plain = format!("Pengaturan model ditutup.\nModel aktif: {active_model} ({ctx_s})");
+            if let Some(mid) = msg_id {
+                let _ = tg
+                    .edit_html_message_with_keyboard(chat_id, mid, &html, &plain, Vec::new())
+                    .await;
+            }
+        }
+        TgModelCallback::ProviderPage(page) => {
+            let _ = tg.answer_callback_query(&cb.id, None).await;
+            let card = tg_build_provider_picker(&cur_cfg, &active_prov, &active_model, active_ctx, page);
+            if let Some(mid) = msg_id {
+                let _ = tg
+                    .edit_html_message_with_keyboard(chat_id, mid, &card.html, &card.plain, card.rows)
+                    .await;
+            } else {
+                let _ = tg
+                    .send_html_message_with_keyboard(chat_id, &card.html, &card.plain, card.rows)
+                    .await;
+            }
+        }
+        TgModelCallback::ModelPage { provider_idx, page } => {
+            let _ = tg.answer_callback_query(&cb.id, None).await;
+            if let Some(card) = tg_build_model_picker_for_provider(
+                &cur_cfg,
+                &active_prov,
+                &active_model,
+                active_ctx,
+                provider_idx,
+                page,
+                &cache,
+            ) {
+                if let Some(mid) = msg_id {
+                    let _ = tg
+                        .edit_html_message_with_keyboard(
+                            chat_id,
+                            mid,
+                            &card.html,
+                            &card.plain,
+                            card.rows,
+                        )
+                        .await;
+                } else {
+                    let _ = tg
+                        .send_html_message_with_keyboard(chat_id, &card.html, &card.plain, card.rows)
+                        .await;
+                }
+            } else {
+                let _ = tg
+                    .answer_callback_query(&cb.id, Some("Daftar provider berubah, ketik /model lagi."))
+                    .await;
+            }
+        }
+        TgModelCallback::SelectModel {
+            provider_idx,
+            model_idx,
+        } => {
+            let names = tg_sorted_providers(&cur_cfg);
+            let Some(target_prov) = names.get(provider_idx).cloned() else {
+                let _ = tg
+                    .answer_callback_query(&cb.id, Some("Provider tidak ditemukan, ketik /model lagi."))
+                    .await;
+                return;
+            };
+            let (chosen_model, chosen_kind, chosen_ctx) = {
+                let Some(p) = cur_cfg.providers.get_mut(&target_prov) else {
+                    let _ = tg
+                        .answer_callback_query(&cb.id, Some("Provider tidak ditemukan."))
+                        .await;
+                    return;
+                };
+                let list = p.effective_models();
+                let Some(chosen) = list.get(model_idx).cloned() else {
+                    let _ = tg
+                        .answer_callback_query(&cb.id, Some("Daftar model berubah, ketik /model lagi."))
+                        .await;
+                    return;
+                };
+                p.models = list;
+                p.model = chosen.clone();
+                let kind = p.kind.clone();
+                let p_snap = p.clone();
+                (chosen, kind, tg_resolve_model_ctx(&cur_cfg, &p_snap, &p_snap.model, &cache))
+            };
+            cur_cfg.default_provider = target_prov.clone();
+            if let Err(e) = config::save(&cur_cfg) {
+                let _ = tg
+                    .answer_callback_query(&cb.id, Some(&format!("Gagal simpan: {e}")))
+                    .await;
+                return;
+            }
+            // Segera sinkronkan ke sesi live chat ini bila sedang tidak sibuk (non-blocking via try_lock).
+            let live_session = { sessions.lock().await.get(&chat_id).cloned() };
+            let mut final_ctx = chosen_ctx;
+            if let Some(s_arc) = live_session {
+                if let Ok(mut s_guard) = s_arc.try_lock() {
+                    s_guard.cfg = cur_cfg.clone();
+                    if s_guard.switch_provider(&target_prov).is_ok() {
+                        final_ctx = s_guard.ctx.context_limit_tokens;
+                    }
+                }
+            }
+            let toast_model: String = chosen_model.chars().take(40).collect();
+            let _ = tg
+                .answer_callback_query(&cb.id, Some(&format!("✓ {toast_model}")))
+                .await;
+            let (html, plain) =
+                format_tg_model_switched_html(&target_prov, &chosen_kind, &chosen_model, final_ctx);
+            if let Some(mid) = msg_id {
+                let _ = tg
+                    .edit_html_message_with_keyboard(chat_id, mid, &html, &plain, Vec::new())
+                    .await;
+            } else {
+                let _ = tg.send_html_message(chat_id, &html, &plain).await;
+            }
+        }
+    }
+}
+
 

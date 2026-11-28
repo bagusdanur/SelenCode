@@ -519,6 +519,15 @@ async fn tui_worker(
                 }
                 ModelPickerCmd::FetchCatalog => match s.fetch_remote_models_raw().await {
                     Ok(ids) => {
+                        let _ = ui_tx
+                            .send(UiEvent::ModelContexts(s.model_context_cache.clone()))
+                            .await;
+                        let _ = ui_tx
+                            .send(UiEvent::ContextInfo {
+                                used_tokens: estimate_tokens(&s.messages),
+                                limit_tokens: s.ctx.context_limit_tokens,
+                            })
+                            .await;
                         let msg = format!(
                             "{} model di katalog API (Space: pilih 1-per-1, Enter: pakai)",
                             ids.len()
@@ -570,6 +579,15 @@ async fn tui_worker(
                 if let ModelAction::FetchList(filter) = parse_model_action(&arg) {
                     match s.fetch_remote_models_menu(filter.as_deref()).await {
                         Ok(card) => {
+                            let _ = ui_tx
+                                .send(UiEvent::ModelContexts(s.model_context_cache.clone()))
+                                .await;
+                            let _ = ui_tx
+                                .send(UiEvent::ContextInfo {
+                                    used_tokens: estimate_tokens(&s.messages),
+                                    limit_tokens: s.ctx.context_limit_tokens,
+                                })
+                                .await;
                             let _ = ui_tx.send(UiEvent::Menu(card)).await;
                         }
                         Err(e) => {
@@ -602,6 +620,15 @@ async fn tui_worker(
             TuiCommand::FetchRemoteModels(filter) => {
                 match s.fetch_remote_models_menu(filter.as_deref()).await {
                     Ok(card) => {
+                        let _ = ui_tx
+                            .send(UiEvent::ModelContexts(s.model_context_cache.clone()))
+                            .await;
+                        let _ = ui_tx
+                            .send(UiEvent::ContextInfo {
+                                used_tokens: estimate_tokens(&s.messages),
+                                limit_tokens: s.ctx.context_limit_tokens,
+                            })
+                            .await;
                         let _ = ui_tx.send(UiEvent::Menu(card)).await;
                     }
                     Err(e) => {
@@ -615,6 +642,12 @@ async fn tui_worker(
                         .send(UiEvent::ModelChanged {
                             provider: s.provider_name.clone(),
                             model: s.pcfg.model.clone(),
+                        })
+                        .await;
+                    let _ = ui_tx
+                        .send(UiEvent::ContextInfo {
+                            used_tokens: estimate_tokens(&s.messages),
+                            limit_tokens: s.ctx.context_limit_tokens,
                         })
                         .await;
                     let _ = ui_tx.send(UiEvent::Menu(card)).await;
@@ -684,6 +717,7 @@ async fn tui_worker(
                             &cwd_str,
                             selencode::store::Store::SESSION_POINTER_NEW,
                         );
+                        let new_card = s.new_session_card(&sid);
                         let _ = ui_tx
                             .send(UiEvent::SessionReset {
                                 session_id: sid,
@@ -691,6 +725,13 @@ async fn tui_worker(
                                 model: s.pcfg.model.clone(),
                             })
                             .await;
+                        let _ = ui_tx
+                            .send(UiEvent::ContextInfo {
+                                used_tokens: 0,
+                                limit_tokens: s.ctx.context_limit_tokens,
+                            })
+                            .await;
+                        let _ = ui_tx.send(UiEvent::Menu(new_card)).await;
                     }
                     Err(e) => {
                         let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
@@ -798,6 +839,7 @@ pub(crate) async fn interactive_tui(
     app.provider_label = provider_label(&s.provider_name, &s.pcfg);
     app.tool_count = s.registry.names().len();
     app.session_id = s.session_id.clone();
+    app.model_contexts = s.model_context_cache.clone();
     app.context_limit = s.ctx.context_limit_tokens;
     app.context_used = estimate_tokens(&s.messages);
     app.context_pct = calc_context_pct(app.context_used, app.context_limit);

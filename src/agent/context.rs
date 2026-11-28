@@ -620,37 +620,61 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
     chars / 4
 }
 
+/// Cek apakah penanda ukuran konteks (mis. `1m`, `200k`, `128k`) muncul sebagai token terpisah
+/// agar tidak salah cocok pada potongan kata seperti `v1mini` (`1m`) atau `r1medium`.
+fn has_context_size_tag(model_lower: &str, tag: &str) -> bool {
+    let bytes = model_lower.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = model_lower[start..].find(tag) {
+        let idx = start + rel;
+        let end = idx + tag.len();
+        let left_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+        let right_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if left_ok && right_ok {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
+}
+
 /// Deteksi kapasitas context window (dalam token) berdasarkan nama/ID model AI.
-/// Otomatis membuang prefix provider (`ag/`, `openai/`, `anthropic/`, `google/`, dll.).
+/// Otomatis membuang prefix provider (`ag/`, `openai/`, `anthropic/`, `google/`, `custom:`, dll.).
 pub fn infer_model_context_limit(model: &str) -> usize {
     let raw = model.trim().to_ascii_lowercase();
     let short = raw.rsplit('/').next().unwrap_or(&raw);
     let m = short.rsplit(':').next().unwrap_or(short);
 
-    // Cek penanda eksplisit kapasitas di nama model (mis. `-1m`, `-200k`, `-128k`, `-32k`).
-    if m.contains("1m") || m.contains("1000k") {
-        return 1_000_000;
-    }
-    if m.contains("2m") {
+    // Cek penanda eksplisit kapasitas di nama model (mis. `-1m`, `-200k`, `-128k`, `-32k`, `:1m`).
+    if has_context_size_tag(m, "2m") || has_context_size_tag(m, "2000k") {
         return 2_000_000;
     }
-    if m.contains("256k") {
-        return 256_000;
+    if has_context_size_tag(m, "1m") || has_context_size_tag(m, "1000k") {
+        return 1_000_000;
     }
-    if m.contains("200k") {
+    if has_context_size_tag(m, "512k") {
+        return 524_288;
+    }
+    if has_context_size_tag(m, "256k") {
+        return 262_144;
+    }
+    if has_context_size_tag(m, "200k") {
         return 200_000;
     }
-    if m.contains("128k") {
+    if has_context_size_tag(m, "128k") {
         return 128_000;
     }
-    if m.contains("64k") {
+    if has_context_size_tag(m, "64k") {
         return 64_000;
     }
-    if m.contains("32k") {
+    if has_context_size_tag(m, "32k") {
         return 32_768;
     }
+    if has_context_size_tag(m, "16k") {
+        return 16_384;
+    }
 
-    // Keluarga Gemini
+    // Keluarga Gemini (1.5 Pro 2M; 1.5 Flash / 2.0 / 2.5 / 3 / 4 semua 1M)
     if m.contains("gemini-1.5-pro") || m.contains("gemini-1-5-pro") {
         return 2_000_000;
     }
@@ -658,12 +682,12 @@ pub fn infer_model_context_limit(model: &str) -> usize {
         return 1_048_576;
     }
 
-    // Keluarga Claude
+    // Keluarga Claude (default 200k; varian `-1m` sudah tertangkap di atas)
     if m.contains("claude") {
         return 200_000;
     }
 
-    // Keluarga OpenAI (GPT-4.1, GPT-5, o1/o3/o4, GPT-4o)
+    // Keluarga OpenAI (GPT-4.1, GPT-5, o1/o3/o4, gpt-oss, GPT-4o, GPT-3.5)
     if m.contains("gpt-4.1") || m.contains("gpt-4-1") {
         return 1_047_576;
     }
@@ -679,6 +703,9 @@ pub fn infer_model_context_limit(model: &str) -> usize {
     {
         return 200_000;
     }
+    if m.contains("gpt-oss") {
+        return 131_072;
+    }
     if m.contains("gpt-4o") || m.contains("gpt-4-turbo") || m.contains("gpt-4") {
         return 128_000;
     }
@@ -686,7 +713,7 @@ pub fn infer_model_context_limit(model: &str) -> usize {
         return 16_385;
     }
 
-    // Keluarga Grok / Llama / Qwen / DeepSeek / Kimi / Mistral / GLM
+    // Keluarga Grok / Llama / Qwen / Kimi / GLM / MiniMax / DeepSeek / Mistral / MiMo
     if m.contains("grok-4") {
         return 256_000;
     }
@@ -696,7 +723,34 @@ pub fn infer_model_context_limit(model: &str) -> usize {
     if m.contains("llama-4") || m.contains("llama4") {
         return 1_000_000;
     }
+    if m.contains("qwen3-coder") || m.contains("qwen-3-coder") {
+        return 262_144;
+    }
     if m.contains("qwen") {
+        return 131_072;
+    }
+    if m.contains("kimi-k2.5") || m.contains("kimi-k2-5") {
+        return 262_144;
+    }
+    if m.contains("kimi-k2") {
+        return 131_072;
+    }
+    if m.contains("glm-5") || m.contains("glm5") || m.contains("glm-4.7") || m.contains("glm-4-7") {
+        return 200_000;
+    }
+    if m.contains("glm-4.5") || m.contains("glm-4.6") {
+        return 131_072;
+    }
+    if m.contains("minimax-01") {
+        return 1_000_000;
+    }
+    if m.contains("minimax-m2") || m.contains("minimax-m1") {
+        return 204_800;
+    }
+    if m.contains("devstral") || m.contains("codestral-25") || m.contains("command-a") {
+        return 256_000;
+    }
+    if m.contains("mimo") || m.contains("nemotron") {
         return 131_072;
     }
     if m.contains("deepseek")
@@ -706,15 +760,43 @@ pub fn infer_model_context_limit(model: &str) -> usize {
         || m.contains("moonshot")
         || m.contains("mistral")
         || m.contains("codestral")
-        || m.contains("devstral")
         || m.contains("glm-4")
         || m.contains("glm4")
         || m.contains("minimax")
+        || m.contains("gemma-3")
+        || m.contains("command-r")
     {
         return 128_000;
     }
 
     128_000
+}
+
+/// Format angka integer dengan pemisah ribuan koma (mis. `1_048_576` -> `"1,048,576"`).
+pub fn format_tokens_with_commas(n: usize) -> String {
+    let s = n.to_string();
+    let len = s.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Format jumlah token eksak beserta ringkasannya (mis. `"1,048,576 token (1M)"`, `"200,000 token (200k)"`).
+pub fn format_context_tokens_exact(tokens: usize) -> String {
+    if tokens >= 1_000 {
+        format!(
+            "{} token ({})",
+            format_tokens_with_commas(tokens),
+            format_context_compact(tokens)
+        )
+    } else {
+        format!("{tokens} token")
+    }
 }
 
 /// Format jumlah token ringkas untuk status bar & info konteks (mis. `1M`, `200k`, `12.4k`, `850`).

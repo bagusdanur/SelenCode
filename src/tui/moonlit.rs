@@ -163,6 +163,7 @@ pub struct WelcomeInfo {
     pub cwd: String,
     pub tool_count: usize,
     pub session_short: String,
+    pub context_limit: usize,
 }
 
 impl WelcomeInfo {
@@ -173,6 +174,7 @@ impl WelcomeInfo {
         cwd: String,
         tool_count: usize,
     ) -> Self {
+        let context_limit = crate::agent::context::infer_model_context_limit(&model);
         Self {
             version: env!("CARGO_PKG_VERSION").to_string(),
             provider_name,
@@ -181,6 +183,7 @@ impl WelcomeInfo {
             cwd,
             tool_count,
             session_short: "baru".to_string(),
+            context_limit,
         }
     }
 
@@ -188,6 +191,13 @@ impl WelcomeInfo {
         let short: String = session_id.chars().take(10).collect();
         if !short.is_empty() {
             self.session_short = short;
+        }
+        self
+    }
+
+    pub fn with_context_limit(mut self, limit: usize) -> Self {
+        if limit > 0 {
+            self.context_limit = limit;
         }
         self
     }
@@ -384,11 +394,13 @@ fn welcome_wide(width: usize, info: &WelcomeInfo) -> Vec<Line<'static>> {
         sp("☾ Selena", stb(LAV)),
         sp(concat!("  ·  v", env!("CARGO_PKG_VERSION")), st(DIM)),
     ]);
+    let ctx_tag = crate::agent::context::format_context_compact(info.context_limit);
     right_rows.push(vec![
         sp("● ", st(MINT)),
-        sp(truncate_chars(&info.model, 28), stb(LILAC)),
+        sp(truncate_chars(&info.model, 26), stb(LILAC)),
+        sp(format!(" · ctx {ctx_tag}"), st(CYAN_MOON)),
         sp("  via  ", st(FAINT)),
-        sp(truncate_chars(&info.provider_label, 30), st(SILVER)),
+        sp(truncate_chars(&info.provider_label, 24), st(SILVER)),
     ]);
     right_rows.push(vec![
         sp("⌂ ", st(VIOLET)),
@@ -517,9 +529,10 @@ fn welcome_narrow(width: usize, info: &WelcomeInfo) -> Vec<Line<'static>> {
                 ));
             }
             5 => {
+                let ctx_tag = crate::agent::context::format_context_compact(info.context_limit);
                 row.push(sp("    ", st(DIM)));
                 row.push(sp(
-                    format!("{} · {} tool aktif", info.provider_name, info.tool_count),
+                    format!("{} · ctx {ctx_tag} · {} tool", info.provider_name, info.tool_count),
                     st(DIM),
                 ));
             }
@@ -565,12 +578,13 @@ fn welcome_narrow(width: usize, info: &WelcomeInfo) -> Vec<Line<'static>> {
 
 /// Sambutan ringkas untuk sesi resume: 1 baris bergaya Moonlit ungu.
 pub fn resume_lines(info: &WelcomeInfo) -> Vec<Line<'static>> {
+    let ctx_tag = crate::agent::context::format_context_compact(info.context_limit);
     vec![Line::from(vec![
         sp("☾ ", stb(VIOLET)),
         sp("SelenCode", stb(LILAC)),
         sp(
             format!(
-                " — sesi dilanjutkan · {}/{}",
+                " — sesi dilanjutkan · {}/{} (ctx {ctx_tag})",
                 info.provider_name, info.model
             ),
             st(DIM),
@@ -725,18 +739,26 @@ pub fn status_line_responsive(
 
 // ---------- banner mode polos ----------
 
-/// Banner teks sederhana untuk mode polos (non-TUI): bulan braille kecil
-/// berwarna violet (ANSI truecolor) + sapaan + baris provider/perintah.
-pub fn plain_banner(provider_name: &str, model: &str) -> String {
+/// Banner teks sederhana untuk mode polos (non-TUI) dengan kapasitas context window terdeteksi.
+pub fn plain_banner_with_context(provider_name: &str, model: &str, context_limit: usize) -> String {
     let mut out = String::new();
     for row in moon_art(10, 5) {
         out.push_str(&format!("\u{1b}[38;2;167;139;250m{row}\u{1b}[0m\n"));
     }
+    let ctx_str = crate::agent::context::format_context_tokens_exact(context_limit);
     out.push_str(
         "SelenCode — halo, aku Selena. Ketik perintah, /help untuk bantuan, /exit untuk keluar.\n",
     );
     out.push_str(&format!(
-        "Perintah: /plan · /model [nama] · /sessions · /help · /exit — provider aktif: {provider_name} ({model})"
+        "Provider aktif: {provider_name} ({model}) · konteks {ctx_str}\n\
+         Perintah: /model · /new · /sessions · /plan · /help · /exit"
     ));
     out
+}
+
+/// Banner teks sederhana untuk mode polos (non-TUI): bulan braille kecil
+/// berwarna violet (ANSI truecolor) + sapaan + baris provider/perintah.
+pub fn plain_banner(provider_name: &str, model: &str) -> String {
+    let limit = crate::agent::context::infer_model_context_limit(model);
+    plain_banner_with_context(provider_name, model, limit)
 }

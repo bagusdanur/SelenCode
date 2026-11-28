@@ -57,8 +57,41 @@ impl OpenAiProvider {
     }
 }
 
+/// Parse respons JSON `GET {base_url}/models` OpenAI-compatible menjadi daftar `(model_id, Option<context_limit>)`.
+/// Mendukung berbagai skema field context window (OpenAI, OpenRouter, 9Router, LiteLLM, vLLM, Ollama, Fireworks, Groq).
+pub fn parse_openai_models_response(v: &Value) -> Vec<(String, Option<usize>)> {
+    let mut map: BTreeMap<String, Option<usize>> = BTreeMap::new();
+    let arr_opt = v["data"].as_array().or_else(|| v["models"].as_array());
+    if let Some(arr) = arr_opt {
+        for m in arr {
+            let Some(id) = m["id"].as_str().or_else(|| m["name"].as_str()) else {
+                continue;
+            };
+            let id = id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            let ctx_len = m["context_length"]
+                .as_u64()
+                .or_else(|| m["max_context_length"].as_u64())
+                .or_else(|| m["context_window"].as_u64())
+                .or_else(|| m["context_size"].as_u64())
+                .or_else(|| m["max_model_len"].as_u64())
+                .or_else(|| m["input_token_limit"].as_u64())
+                .or_else(|| m["inputTokenLimit"].as_u64())
+                .or_else(|| m["top_provider"]["context_length"].as_u64())
+                .or_else(|| m["limits"]["context"].as_u64())
+                .or_else(|| m["meta"]["context_length"].as_u64())
+                .filter(|&n| n >= 1024)
+                .map(|n| n as usize);
+            map.entry(id.to_string()).or_insert(ctx_len);
+        }
+    }
+    map.into_iter().collect()
+}
+
 /// Tarik daftar ID model + kapasitas context window opsional (bila API melaporkan
-/// `context_length` / `max_context_length` / `context_window` / `input_token_limit`)
+/// `context_length` / `max_context_length` / `context_window` / `max_model_len` / `input_token_limit`)
 /// dari endpoint OpenAI-compatible `GET {base_url}/models`.
 pub async fn fetch_models_with_context(
     base_url: &str,
@@ -85,24 +118,7 @@ pub async fn fetch_models_with_context(
         ));
     }
     let v: Value = resp.json().await.context("respons /models bukan JSON valid")?;
-    let mut map: BTreeMap<String, Option<usize>> = BTreeMap::new();
-    if let Some(arr) = v["data"].as_array() {
-        for m in arr {
-            let Some(id) = m["id"].as_str() else {
-                continue;
-            };
-            let ctx_len = m["context_length"]
-                .as_u64()
-                .or_else(|| m["max_context_length"].as_u64())
-                .or_else(|| m["context_window"].as_u64())
-                .or_else(|| m["input_token_limit"].as_u64())
-                .or_else(|| m["top_provider"]["context_length"].as_u64())
-                .filter(|&n| n >= 1024)
-                .map(|n| n as usize);
-            map.entry(id.to_string()).or_insert(ctx_len);
-        }
-    }
-    Ok(map.into_iter().collect())
+    Ok(parse_openai_models_response(&v))
 }
 
 /// Tarik daftar ID model yang tersedia dari endpoint OpenAI-compatible

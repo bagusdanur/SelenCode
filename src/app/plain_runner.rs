@@ -123,7 +123,11 @@ pub(crate) async fn interactive_plain(
     }
     println!(
         "{}",
-        selencode::tui::moonlit::plain_banner(&s.provider_name, &s.pcfg.model)
+        selencode::tui::moonlit::plain_banner_with_context(
+            &s.provider_name,
+            &s.pcfg.model,
+            s.ctx.context_limit_tokens,
+        )
     );
     // Tampilkan laporan Background Self-Improvement Review tertunda dari sesi sebelumnya (v0.5.1).
     let cwd_str_init = s.ctx.cwd.to_string_lossy().to_string();
@@ -343,7 +347,7 @@ pub(crate) async fn interactive_plain(
                             &cwd_str,
                             selencode::store::Store::SESSION_POINTER_NEW,
                         );
-                        println!("Sesi baru dimulai ({sid}).");
+                        println!("{}", strip_menu_markup(&s.new_session_card(&sid)));
                     }
                     Err(e) => eprintln!("[error] {e}"),
                 }

@@ -436,3 +436,65 @@ impl Provider for AnthropicProvider {
         Ok(parser.finish())
     }
 }
+
+/// Parse respons JSON `GET {base_url}/v1/models` Anthropic menjadi `(model_id, Option<context_limit>)`.
+pub fn parse_anthropic_models_response(v: &Value) -> Vec<(String, Option<usize>)> {
+    let mut map: BTreeMap<String, Option<usize>> = BTreeMap::new();
+    if let Some(arr) = v["data"].as_array() {
+        for m in arr {
+            let Some(id) = m["id"].as_str() else {
+                continue;
+            };
+            let id = id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            let ctx_len = m["context_window"]
+                .as_u64()
+                .or_else(|| m["max_input_tokens"].as_u64())
+                .or_else(|| m["context_length"].as_u64())
+                .filter(|&n| n >= 1024)
+                .map(|n| n as usize);
+            map.entry(id.to_string()).or_insert(ctx_len);
+        }
+    }
+    map.into_iter().collect()
+}
+
+/// Tarik daftar model Anthropic dari endpoint `GET {base_url}/v1/models?limit=100`.
+pub async fn fetch_models_with_context(
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<(String, Option<usize>)>> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let base = if base_url.trim().is_empty() {
+        DEFAULT_BASE_URL
+    } else {
+        base_url.trim_end_matches('/')
+    };
+    let url = format!("{base}/v1/models?limit=100");
+    let resp = client
+        .get(&url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .send()
+        .await
+        .with_context(|| format!("gagal menghubungi {url}"))?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let txt = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "endpoint Anthropic /v1/models membalas {st}: {}",
+            txt.chars().take(300).collect::<String>()
+        ));
+    }
+    let v: Value = resp
+        .json()
+        .await
+        .context("respons Anthropic /v1/models bukan JSON valid")?;
+    Ok(parse_anthropic_models_response(&v))
+}

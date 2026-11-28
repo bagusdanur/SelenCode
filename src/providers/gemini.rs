@@ -365,3 +365,76 @@ impl Provider for GeminiProvider {
         Ok(parser.finish())
     }
 }
+
+/// Parse respons JSON `GET {base_url}/v1beta/models` Gemini menjadi `(model_id, Option<inputTokenLimit>)`.
+/// Otomatis memangkas prefix `models/` dan memfilter model yang mendukung `generateContent` bila field tersedia.
+pub fn parse_gemini_models_response(v: &Value) -> Vec<(String, Option<usize>)> {
+    let mut map: std::collections::BTreeMap<String, Option<usize>> =
+        std::collections::BTreeMap::new();
+    if let Some(arr) = v["models"].as_array() {
+        for m in arr {
+            let Some(raw_name) = m["name"].as_str() else {
+                continue;
+            };
+            if let Some(methods) = m["supportedGenerationMethods"].as_array() {
+                let supports_gen = methods
+                    .iter()
+                    .any(|x| x.as_str() == Some("generateContent"));
+                if !supports_gen {
+                    continue;
+                }
+            }
+            let id = raw_name
+                .trim()
+                .strip_prefix("models/")
+                .unwrap_or(raw_name.trim());
+            if id.is_empty() {
+                continue;
+            }
+            let ctx_len = m["inputTokenLimit"]
+                .as_u64()
+                .or_else(|| m["input_token_limit"].as_u64())
+                .filter(|&n| n >= 1024)
+                .map(|n| n as usize);
+            map.entry(id.to_string()).or_insert(ctx_len);
+        }
+    }
+    map.into_iter().collect()
+}
+
+/// Tarik daftar model Gemini beserta `inputTokenLimit` dari endpoint native `GET {base_url}/v1beta/models`.
+pub async fn fetch_models_with_context(
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<(String, Option<usize>)>> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let base = if base_url.trim().is_empty() {
+        DEFAULT_BASE_URL
+    } else {
+        base_url.trim_end_matches('/')
+    };
+    let url = format!("{base}/v1beta/models?pageSize=200");
+    let resp = client
+        .get(&url)
+        .header("x-goog-api-key", api_key)
+        .send()
+        .await
+        .with_context(|| format!("gagal menghubungi {url}"))?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let txt = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "endpoint Gemini /v1beta/models membalas {st}: {}",
+            txt.chars().take(300).collect::<String>()
+        ));
+    }
+    let v: Value = resp
+        .json()
+        .await
+        .context("respons Gemini /v1beta/models bukan JSON valid")?;
+    Ok(parse_gemini_models_response(&v))
+}

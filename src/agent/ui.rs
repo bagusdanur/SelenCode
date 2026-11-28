@@ -49,6 +49,8 @@ pub enum UiEvent {
         used_tokens: usize,
         limit_tokens: usize,
     },
+    /// Pembaruan cache kapasitas context window model hasil deteksi API `/models` (lintas permukaan).
+    ModelContexts(std::collections::HashMap<String, usize>),
     /// Checklist update_plan diperbarui (Fase 6) — dirender sebagai blok
     /// khusus di transkrip.
     PlanUpdated(String),

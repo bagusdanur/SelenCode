@@ -2737,6 +2737,64 @@ impl Store {
         Ok(())
     }
 
+    const MODEL_CONTEXT_CACHE_KEY: &'static str = "model_context_cache";
+
+    /// Muat cache persisten kapasitas context window model AI hasil deteksi API `/models`
+    /// agar TUI, CLI, Plain REPL, Telegram, dan compaction langsung mengetahui limit akurat lintas restart.
+    pub fn load_model_context_cache(&self) -> std::collections::HashMap<String, usize> {
+        let Ok(Some((raw, _))) = self.get_gateway_state(Self::MODEL_CONTEXT_CACHE_KEY) else {
+            return std::collections::HashMap::new();
+        };
+        serde_json::from_str::<std::collections::HashMap<String, usize>>(&raw)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(k, v)| !k.trim().is_empty() && *v >= 1024)
+            .collect()
+    }
+
+    /// Simpan cache kapasitas context window model AI ke SQLite (`gateway_state`),
+    /// dibatasi maks 512 entri agar tetap ringan.
+    pub fn save_model_context_cache(
+        &self,
+        cache: &std::collections::HashMap<String, usize>,
+    ) -> Result<()> {
+        let mut entries: Vec<(&String, &usize)> = cache
+            .iter()
+            .filter(|(k, v)| !k.trim().is_empty() && **v >= 1024)
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        if entries.len() > 512 {
+            entries.truncate(512);
+        }
+        let capped: std::collections::BTreeMap<&str, usize> =
+            entries.into_iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let json = serde_json::to_string(&capped)?;
+        self.set_gateway_state(Self::MODEL_CONTEXT_CACHE_KEY, &json)
+    }
+
+    /// Gabungkan hasil deteksi context window baru `(model_id, context_limit)` ke cache persisten SQLite.
+    pub fn upsert_model_context_cache(
+        &self,
+        new_entries: &[(String, usize)],
+    ) -> Result<std::collections::HashMap<String, usize>> {
+        let mut merged = self.load_model_context_cache();
+        let mut changed = false;
+        for (id, limit) in new_entries {
+            let key = id.trim();
+            if key.is_empty() || *limit < 1024 {
+                continue;
+            }
+            if merged.get(key).copied() != Some(*limit) {
+                merged.insert(key.to_string(), *limit);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_model_context_cache(&merged)?;
+        }
+        Ok(merged)
+    }
+
     /// Penanda bahwa user secara eksplisit menjalankan `/new` (atau `--new`) dan belum mengirim pesan,
     /// sehingga restart sebelum pesan pertama tetap menghormati sesi baru yang bersih.
     pub const SESSION_POINTER_NEW: &'static str = "__new__";

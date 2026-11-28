@@ -1,11 +1,13 @@
 use super::{make_review_provider, make_routed_provider};
 use anyhow::Result;
 use selencode::agent::context::{
-    compact_messages, estimate_tokens, format_context_compact, infer_model_context_limit,
-    sanitize_interrupted_messages,
+    compact_messages, estimate_tokens, format_context_compact, format_context_tokens_exact,
+    infer_model_context_limit, sanitize_interrupted_messages,
 };
 use selencode::agent::ui::ModelPickerData;
 use selencode::config::{self, Config, ProviderCfg};
+use selencode::providers::anthropic;
+use selencode::providers::gemini;
 use selencode::providers::openai::fetch_models_with_context;
 use selencode::providers::router::RouterTelemetry;
 use selencode::providers::{Block, Message, Provider, Role, UnconfiguredProvider};
@@ -341,9 +343,11 @@ impl Session {
             Some(tx) => Arc::new(Approver::channel_with_policy(policy, tx)),
             None => Arc::new(Approver::stdin_with_policy(policy)),
         };
+        let model_context_cache = store.load_model_context_cache();
         let init_ctx_limit = pcfg
             .context_limit
             .filter(|&n| n > 0)
+            .or_else(|| model_context_cache.get(&pcfg.model).copied().filter(|&n| n > 0))
             .unwrap_or_else(|| {
                 if cfg.agent.context_limit_tokens != 100_000 && cfg.agent.context_limit_tokens > 0 {
                     cfg.agent.context_limit_tokens
@@ -430,7 +434,7 @@ impl Session {
             messages,
             resumed_note,
             last_remote_models: Vec::new(),
-            model_context_cache: HashMap::new(),
+            model_context_cache,
             needs_setup,
             setup_reason,
             router_telemetry,
@@ -548,12 +552,14 @@ impl Session {
                 let saved_path = config::save(&self.cfg)?;
                 let pname = self.provider_name.clone();
                 self.switch_provider(&pname)?;
+                let ctx_s = format_context_tokens_exact(self.ctx.context_limit_tokens);
                 Ok(format!(
                     "# Model Dipilih (#{idx})\n\
-                     * #{idx} | {} | aktif di provider {}\n\
-                     ! Config disimpan ke: {}",
+                     * model | {} | aktif di {} ({})\n\
+                     > konteks | {ctx_s} | tersimpan ({})",
                     self.pcfg.model,
                     self.provider_name,
+                    self.pcfg.kind,
                     saved_path.display()
                 ))
             }
@@ -573,12 +579,14 @@ impl Session {
                     .position(|m| m == &self.pcfg.model)
                     .map(|i| i + 1)
                     .unwrap_or(1);
+                let ctx_s = format_context_tokens_exact(self.ctx.context_limit_tokens);
                 Ok(format!(
                     "# Model Diperbarui (#{pos})\n\
-                     * #{pos} | {} | aktif di provider {} & tersimpan\n\
-                     ! Config disimpan ke: {}",
+                     * model | {} | aktif di {} ({})\n\
+                     > konteks | {ctx_s} | tersimpan ({})",
                     self.pcfg.model,
                     self.provider_name,
+                    self.pcfg.kind,
                     saved_path.display()
                 ))
             }
@@ -723,11 +731,13 @@ impl Session {
                 };
                 let saved_path = config::save(&self.cfg)?;
                 self.switch_provider(&provider)?;
+                let ctx_s = format_context_tokens_exact(self.ctx.context_limit_tokens);
                 Ok(format!(
                     "# Provider & Model Diperbarui\n\
-                     * {} | {chosen} | aktif & tersimpan\n\
-                     ! Config disimpan ke: {}",
+                     * model | {chosen} | aktif di {} ({})\n\
+                     > konteks | {ctx_s} | tersimpan ({})",
                     self.provider_name,
+                    self.pcfg.kind,
                     saved_path.display()
                 ))
             }
@@ -759,12 +769,14 @@ impl Session {
                     let saved_path = config::save(&self.cfg)?;
                     let pname = self.provider_name.clone();
                     self.switch_provider(&pname)?;
+                    let ctx_s = format_context_tokens_exact(self.ctx.context_limit_tokens);
                     return Ok(format!(
                         "# Model Dipilih (#{idx})\n\
-                         * #{idx} | {} | aktif di provider {}\n\
-                         ! Config disimpan ke: {}",
+                         * model | {} | aktif di {} ({})\n\
+                         > konteks | {ctx_s} | tersimpan ({})",
                         self.pcfg.model,
                         self.provider_name,
+                        self.pcfg.kind,
                         saved_path.display()
                     ));
                 }
@@ -776,7 +788,12 @@ impl Session {
                     for (idx, m) in matches.iter().take(25) {
                         let active = **m == self.pcfg.model;
                         let mark = if active { "*" } else { ">" };
-                        let note = if active { "aktif" } else { "" };
+                        let m_ctx = format_context_compact(self.model_context_for(m));
+                        let note = if active {
+                            format!("✓ aktif · ctx {m_ctx}")
+                        } else {
+                            format!("ctx {m_ctx}")
+                        };
                         out.push_str(&format!("{mark} #{idx} | {m} | {note}\n"));
                     }
                     out.push_str("---\n");
@@ -799,39 +816,66 @@ impl Session {
                     .position(|m| m == &self.pcfg.model)
                     .map(|i| i + 1)
                     .unwrap_or(1);
+                let ctx_s = format_context_tokens_exact(self.ctx.context_limit_tokens);
                 Ok(format!(
                     "# Model Manual Dipasang (#{pos})\n\
-                     * #{pos} | {} | aktif & tersimpan ke daftar\n\
-                     ! Config disimpan ke: {}",
+                     * model | {} | aktif di {} ({})\n\
+                     > konteks | {ctx_s} | tersimpan ({})",
                     self.pcfg.model,
+                    self.provider_name,
+                    self.pcfg.kind,
                     saved_path.display()
                 ))
             }
         }
     }
 
-    /// Tarik katalog model real-time dari endpoint `/models` provider aktif
-    /// (disimpan ke cache memori sesi, TIDAK mengotori daftar pribadi di config)
-    /// agar user bisa memilih 1-per-1 yang memang ingin dipakai.
+    /// Tarik katalog model real-time dari endpoint API provider aktif (OpenAI-compatible,
+    /// Gemini native `/v1beta/models`, atau Anthropic `/v1/models`) sekaligus menyimpan
+    /// kapasitas context window hasil deteksi API ke cache SQLite persisten lintas permukaan.
     pub(crate) async fn fetch_remote_models_raw(&mut self) -> Result<Vec<String>> {
-        if self.pcfg.kind != "openai" {
-            anyhow::bail!(
-                "provider '{}' (kind={}) tidak menyediakan endpoint /models standar OpenAI. Tambah manual: `/model add <id-model>`",
-                self.provider_name,
-                self.pcfg.kind
-            );
-        }
         let (_n, pcfg, api_key) = self.cfg.resolve_provider(Some(&self.provider_name))?;
-        let base_url = pcfg
-            .base_url
-            .ok_or_else(|| anyhow::anyhow!("base_url kosong untuk provider '{}'", self.provider_name))?;
-        let items = fetch_models_with_context(&base_url, &api_key).await?;
+        let items: Vec<(String, Option<usize>)> = match pcfg.kind.as_str() {
+            "openai" => {
+                let base_url = pcfg.base_url.ok_or_else(|| {
+                    anyhow::anyhow!("base_url kosong untuk provider '{}'", self.provider_name)
+                })?;
+                fetch_models_with_context(&base_url, &api_key).await?
+            }
+            "gemini" => {
+                let base_url = pcfg
+                    .base_url
+                    .as_deref()
+                    .unwrap_or(gemini::DEFAULT_BASE_URL);
+                gemini::fetch_models_with_context(base_url, &api_key).await?
+            }
+            "anthropic" => {
+                let base_url = pcfg
+                    .base_url
+                    .as_deref()
+                    .unwrap_or(anthropic::DEFAULT_BASE_URL);
+                anthropic::fetch_models_with_context(base_url, &api_key).await?
+            }
+            other => {
+                anyhow::bail!(
+                    "provider '{}' (kind={other}) belum mendukung penarikan katalog /models. Tambah manual: `/model add <id-model>`",
+                    self.provider_name
+                );
+            }
+        };
         let mut ids = Vec::with_capacity(items.len());
+        let mut discovered: Vec<(String, usize)> = Vec::new();
         for (id, ctx_opt) in items {
             if let Some(limit) = ctx_opt {
                 self.model_context_cache.insert(id.clone(), limit);
+                discovered.push((id.clone(), limit));
             }
             ids.push(id);
+        }
+        if !discovered.is_empty() {
+            if let Ok(merged) = self.store.upsert_model_context_cache(&discovered) {
+                self.model_context_cache = merged;
+            }
         }
         // Perbarui kapasitas konteks model aktif bila baru ditemukan dari API.
         self.ctx.context_limit_tokens = self.resolve_context_limit();
@@ -840,10 +884,10 @@ impl Session {
     }
 
     pub(crate) async fn fetch_remote_models_menu(&mut self, filter: Option<&str>) -> Result<String> {
-        if self.pcfg.kind != "openai" {
+        if !matches!(self.pcfg.kind.as_str(), "openai" | "gemini" | "anthropic") {
             return Ok(format!(
                 "# Katalog Model ({})\n\
-                 ! Provider kind '{}' tidak menyediakan endpoint /models standar OpenAI.\n\
+                 ! Provider kind '{}' belum mendukung endpoint katalog model.\n\
                  ! Tambah manual 1-per-1 ke daftar: /model add <id-model>\n\
                  ! Lalu pilih cepat dengan: /model <nomor>",
                 self.provider_name, self.pcfg.kind
@@ -887,12 +931,13 @@ impl Session {
                 let is_active = **id == self.pcfg.model;
                 let is_saved = saved.iter().any(|s| s == *id);
                 let mark = if is_active { "*" } else { ">" };
+                let m_ctx = format_context_compact(self.model_context_for(id));
                 let note = if is_active {
-                    "aktif · tersimpan"
+                    format!("✓ aktif · ctx {m_ctx}")
                 } else if is_saved {
-                    "✓ sudah di daftar"
+                    format!("✓ tersimpan · ctx {m_ctx}")
                 } else {
-                    ""
+                    format!("ctx {m_ctx}")
                 };
                 out.push_str(&format!("{mark} #{idx} | {id} | {note}\n"));
             }
@@ -1204,21 +1249,44 @@ impl Session {
         }
     }
 
-    /// Kartu menu `/model`: daftar model bernomor milik provider aktif + daftar provider lain.
+    /// Kartu informasi sesi baru (`/new`) untuk terminal TUI & Plain REPL:
+    /// menampilkan ID sesi baru, model aktif, provider, kapasitas konteks terdeteksi, dan folder kerja.
+    pub(crate) fn new_session_card(&self, sid: &str) -> String {
+        let short: String = sid.chars().take(10).collect();
+        let ctx_exact = format_context_tokens_exact(self.ctx.context_limit_tokens);
+        format!(
+            "# Sesi Baru Dimulai\n\
+             * model | {} | ✓ aktif · {}\n\
+             > provider | {} | {}\n\
+             > sesi | {} | folder {}",
+            self.pcfg.model,
+            ctx_exact,
+            self.provider_name,
+            self.pcfg.kind,
+            short,
+            self.ctx.cwd.display(),
+        )
+    }
+
+    /// Kartu menu `/model`: ringkas & jelas menyorot model aktif + kapasitas konteks tiap model + provider.
     pub(crate) fn models_menu(&self) -> String {
         let list = self.pcfg.effective_models();
-        let active_ctx = format_context_compact(self.ctx.context_limit_tokens);
+        let active_ctx = format_context_tokens_exact(self.ctx.context_limit_tokens);
         let mut out = format!(
-            "# Model di Provider {} ({} tersimpan · ctx {active_ctx})\n",
+            "# Konfigurasi Model · {} ({} tersimpan)\n\
+             * aktif | {} | {}\n\
+             ---\n",
             self.provider_name,
-            list.len()
+            list.len(),
+            self.pcfg.model,
+            active_ctx,
         );
         for (i, m) in list.iter().take(30).enumerate() {
             let active = *m == self.pcfg.model;
             let mark = if active { "*" } else { ">" };
             let m_ctx = format_context_compact(self.model_context_for(m));
             let note = if active {
-                format!("aktif · ctx {m_ctx}")
+                format!("✓ aktif · ctx {m_ctx}")
             } else {
                 format!("ctx {m_ctx}")
             };
@@ -1226,34 +1294,34 @@ impl Session {
         }
         if list.len() > 30 {
             out.push_str(&format!(
-                "! ... dan {} model lainnya (cari cepat: `/models <kata>` atau `/model <kata>`)\n",
+                "! ... dan {} model lainnya (cari cepat: /models <kata> atau /model <kata>)\n",
                 list.len() - 30
             ));
         }
-        out.push_str("---\n");
-        let mut names: Vec<&String> = self.cfg.providers.keys().collect();
-        names.sort();
-        for n in names {
-            let p = &self.cfg.providers[n];
-            let active = *n == self.provider_name;
-            let mark = if active { "*" } else { ">" };
-            let key_ok = if self.cfg.is_key_ready(n) {
-                "siap"
-            } else {
-                "key belum diset"
-            };
-            let count = p.effective_models().len();
-            let tag = if active {
-                format!("provider aktif · {} · {count} model · {key_ok}", p.kind)
-            } else {
-                format!("provider · {} · {count} model · {key_ok}", p.kind)
-            };
-            out.push_str(&format!("{mark} {n} | {} | {tag}\n", p.model));
+        if self.cfg.providers.len() > 1 {
+            out.push_str("---\n");
+            let mut names: Vec<&String> = self.cfg.providers.keys().collect();
+            names.sort();
+            for n in names {
+                let p = &self.cfg.providers[n];
+                let active = *n == self.provider_name;
+                let mark = if active { "*" } else { ">" };
+                let key_ok = if self.cfg.is_key_ready(n) {
+                    "siap"
+                } else {
+                    "key belum diset"
+                };
+                let count = p.effective_models().len();
+                let tag = if active {
+                    format!("✓ aktif · {} · {count} model · {key_ok}", p.kind)
+                } else {
+                    format!("{} · {count} model · {key_ok}", p.kind)
+                };
+                out.push_str(&format!("{mark} {n} | {} | {tag}\n", p.model));
+            }
         }
         out.push_str("---\n");
-        out.push_str("! Ganti cepat:       /model 2   (pakai nomor)   |   /model claude   (potongan nama)\n");
-        out.push_str("! Tambah 1-per-1:    /model add <id>   |   Intip API: /models [cari] lalu /model add 1 3\n");
-        out.push_str("! Hapus daftar:      /model rm <no>   |   Hapus semua: /model clear   |   Provider: /provider");
+        out.push_str("! Ganti: /model <no|nama> · Tambah: /model add <id> · Katalog API: /models [cari] · Hapus: /model rm <no> · Provider: /provider");
         out
     }
 
@@ -1292,12 +1360,14 @@ impl Session {
             .position(|m| m == &self.pcfg.model)
             .map(|i| i + 1)
             .unwrap_or(1);
+        let ctx_s = format_context_tokens_exact(self.ctx.context_limit_tokens);
         Ok(format!(
             "# Model Diperbarui (#{pos})\n\
-             * #{pos} | {} | aktif di provider {} & tersimpan\n\
-             ! Config disimpan ke: {}",
+             * model | {} | aktif di {} ({})\n\
+             > konteks | {ctx_s} | tersimpan ({})",
             self.pcfg.model,
             self.provider_name,
+            self.pcfg.kind,
             saved_path.display()
         ))
     }

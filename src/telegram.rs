@@ -154,6 +154,394 @@ pub fn parse_callback_ask(data: &str) -> Option<(u64, usize)> {
     Some((id, idx))
 }
 
+/// Aksi callback inline keyboard untuk pemilih `/model` & `/provider` Telegram (`mdl:...`).
+/// Semua payload dijaga <= 16 byte agar selalu aman jauh di bawah batas 64 byte Telegram Bot API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TgModelCallback {
+    /// Tampilkan daftar provider halaman `page` (`mdl:p:<page>`).
+    ProviderPage(usize),
+    /// Tampilkan daftar model milik provider ke-`provider_idx` halaman `page` (`mdl:m:<pidx>:<page>`).
+    ModelPage { provider_idx: usize, page: usize },
+    /// Aktifkan model ke-`model_idx` pada provider ke-`provider_idx` (`mdl:s:<pidx>:<midx>`).
+    SelectModel { provider_idx: usize, model_idx: usize },
+    /// Tutup pemilih model (`mdl:x`).
+    Close,
+    /// Tombol indikator halaman yang tidak mengubah state (`mdl:noop`).
+    Noop,
+}
+
+/// Parse payload `callback_data` pemilih `/model` (`mdl:p:<page>`, `mdl:m:<pidx>:<page>`,
+/// `mdl:s:<pidx>:<midx>`, `mdl:x`, `mdl:noop`).
+pub fn parse_callback_model(data: &str) -> Option<TgModelCallback> {
+    let mut parts = data.trim().split(':');
+    if parts.next()? != "mdl" {
+        return None;
+    }
+    match parts.next()? {
+        "x" => {
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(TgModelCallback::Close)
+        }
+        "noop" => {
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(TgModelCallback::Noop)
+        }
+        "p" => {
+            let page = parts.next()?.parse::<usize>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(TgModelCallback::ProviderPage(page))
+        }
+        "m" => {
+            let provider_idx = parts.next()?.parse::<usize>().ok()?;
+            let page = parts.next()?.parse::<usize>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(TgModelCallback::ModelPage { provider_idx, page })
+        }
+        "s" => {
+            let provider_idx = parts.next()?.parse::<usize>().ok()?;
+            let model_idx = parts.next()?.parse::<usize>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(TgModelCallback::SelectModel {
+                provider_idx,
+                model_idx,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Ringkasan satu provider untuk kartu pemilih `/model` Telegram.
+#[derive(Debug, Clone)]
+pub struct TgModelProviderItem {
+    pub name: String,
+    pub kind: String,
+    pub active_model: String,
+    pub model_count: usize,
+    pub is_active: bool,
+    pub key_ready: bool,
+}
+
+/// Ringkasan satu model untuk kartu pemilih `/model` Telegram.
+#[derive(Debug, Clone)]
+pub struct TgModelEntry {
+    pub id: String,
+    pub context_limit: usize,
+    pub is_active: bool,
+}
+
+/// Hasil render kartu Telegram HTML + fallback teks polos + baris inline keyboard.
+#[derive(Debug, Clone)]
+pub struct TgInlineCard {
+    pub html: String,
+    pub plain: String,
+    pub rows: Vec<Vec<(String, String)>>,
+}
+
+fn clip_tg_btn_label(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+/// Bangun kartu pemilih model interaktif untuk Telegram (header bersih + penanda `✓` model aktif
+/// + paginasi + tombol pindah provider + tutup).
+#[allow(clippy::too_many_arguments)]
+pub fn build_tg_model_picker_card(
+    active_provider: &str,
+    active_provider_kind: &str,
+    active_model: &str,
+    active_context_limit: usize,
+    viewing_provider_idx: usize,
+    viewing_provider: &str,
+    viewing_provider_kind: &str,
+    total_providers: usize,
+    models: &[TgModelEntry],
+    page: usize,
+) -> TgInlineCard {
+    const PAGE_SIZE: usize = 8;
+    let total = models.len();
+    let total_pages = total.max(1).div_ceil(PAGE_SIZE);
+    let cur_page = page.min(total_pages.saturating_sub(1));
+    let start = cur_page * PAGE_SIZE;
+    let end = (start + PAGE_SIZE).min(total);
+    let slice = if start < total { &models[start..end] } else { &[] };
+
+    let ctx_str = crate::agent::context::format_context_tokens_exact(active_context_limit);
+    let range_text = if total == 0 {
+        format!("Belum ada model tersimpan di {viewing_provider}.")
+    } else if viewing_provider == active_provider {
+        format!(
+            "Pilih model ({}–{} dari {total}):",
+            start + 1,
+            end
+        )
+    } else {
+        format!(
+            "Model di {viewing_provider} ({viewing_provider_kind}) ({}–{} dari {total}):",
+            start + 1,
+            end
+        )
+    };
+
+    let html = format!(
+        "⚙️ <i>Konfigurasi Model</i>\n\n\
+         <b>Model aktif:</b> <code>{}</code>\n\
+         <b>Provider:</b> <code>{}</code> ({})\n\
+         <b>Konteks:</b> {}\n\n\
+         {}",
+        escape_telegram_html(active_model),
+        escape_telegram_html(active_provider),
+        escape_telegram_html(active_provider_kind),
+        escape_telegram_html(&ctx_str),
+        escape_telegram_html(&range_text),
+    );
+    let plain = format!(
+        "Konfigurasi Model\n\n\
+         Model aktif: {active_model}\n\
+         Provider: {active_provider} ({active_provider_kind})\n\
+         Konteks: {ctx_str}\n\n\
+         {range_text}"
+    );
+
+    // Gunakan 2 kolom bila semua label model ringkas (<= 16 char), atau 1 kolom bila nama model panjang
+    // agar ID seperti `ag/gemini-4-hydrogen-medium` tetap terbaca utuh di layar ponsel.
+    let use_two_cols = !slice.is_empty()
+        && slice.iter().all(|m| m.id.chars().count() <= 16);
+
+    let mut rows: Vec<Vec<(String, String)>> = Vec::new();
+    if use_two_cols {
+        for chunk in slice.chunks(2).enumerate() {
+            let (row_idx, pair) = chunk;
+            let mut row = Vec::with_capacity(pair.len());
+            for (offset, m) in pair.iter().enumerate() {
+                let global_idx = start + row_idx * 2 + offset;
+                let ctx_tag = crate::agent::context::format_context_compact(m.context_limit);
+                let label = if m.is_active {
+                    format!("✓ {} · {ctx_tag}", clip_tg_btn_label(&m.id, 14))
+                } else {
+                    format!("{} · {ctx_tag}", clip_tg_btn_label(&m.id, 16))
+                };
+                row.push((label, format!("mdl:s:{viewing_provider_idx}:{global_idx}")));
+            }
+            rows.push(row);
+        }
+    } else {
+        for (offset, m) in slice.iter().enumerate() {
+            let global_idx = start + offset;
+            let ctx_tag = crate::agent::context::format_context_compact(m.context_limit);
+            let label = if m.is_active {
+                format!("✓ {} · {ctx_tag}", clip_tg_btn_label(&m.id, 30))
+            } else {
+                format!("{} · {ctx_tag}", clip_tg_btn_label(&m.id, 32))
+            };
+            rows.push(vec![(
+                label,
+                format!("mdl:s:{viewing_provider_idx}:{global_idx}"),
+            )]);
+        }
+    }
+
+    if total_pages > 1 {
+        let mut nav = Vec::new();
+        if cur_page > 0 {
+            nav.push((
+                "◀ Prev".to_string(),
+                format!("mdl:m:{viewing_provider_idx}:{}", cur_page - 1),
+            ));
+        }
+        nav.push((
+            format!("{}/{}", cur_page + 1, total_pages),
+            "mdl:noop".to_string(),
+        ));
+        if cur_page + 1 < total_pages {
+            nav.push((
+                "Next ▶".to_string(),
+                format!("mdl:m:{viewing_provider_idx}:{}", cur_page + 1),
+            ));
+        }
+        rows.push(nav);
+    }
+
+    let mut footer = Vec::new();
+    if total_providers > 1 {
+        footer.push((
+            format!("🔄 Provider ({total_providers})"),
+            "mdl:p:0".to_string(),
+        ));
+    }
+    footer.push(("✕ Tutup".to_string(), "mdl:x".to_string()));
+    rows.push(footer);
+
+    TgInlineCard { html, plain, rows }
+}
+
+/// Bangun kartu pemilih provider interaktif 2-kolom untuk Telegram (paginasi 10 per halaman + `✓` provider aktif).
+pub fn build_tg_provider_picker_card(
+    active_provider: &str,
+    active_provider_kind: &str,
+    active_model: &str,
+    active_context_limit: usize,
+    providers: &[TgModelProviderItem],
+    page: usize,
+) -> TgInlineCard {
+    const PAGE_SIZE: usize = 10;
+    let total = providers.len();
+    let total_pages = total.max(1).div_ceil(PAGE_SIZE);
+    let cur_page = page.min(total_pages.saturating_sub(1));
+    let start = cur_page * PAGE_SIZE;
+    let end = (start + PAGE_SIZE).min(total);
+    let slice = if start < total {
+        &providers[start..end]
+    } else {
+        &[]
+    };
+
+    let ctx_str = crate::agent::context::format_context_tokens_exact(active_context_limit);
+    let range_text = if total == 0 {
+        "Belum ada provider terkonfigurasi.".to_string()
+    } else {
+        format!("Pilih provider ({}–{} dari {total}):", start + 1, end)
+    };
+
+    let html = format!(
+        "⚙️ <i>Konfigurasi Model</i>\n\n\
+         <b>Model aktif:</b> <code>{}</code>\n\
+         <b>Provider:</b> <code>{}</code> ({})\n\
+         <b>Konteks:</b> {}\n\n\
+         {}",
+        escape_telegram_html(active_model),
+        escape_telegram_html(active_provider),
+        escape_telegram_html(active_provider_kind),
+        escape_telegram_html(&ctx_str),
+        escape_telegram_html(&range_text),
+    );
+    let plain = format!(
+        "Konfigurasi Model\n\n\
+         Model aktif: {active_model}\n\
+         Provider: {active_provider} ({active_provider_kind})\n\
+         Konteks: {ctx_str}\n\n\
+         {range_text}"
+    );
+
+    let mut rows: Vec<Vec<(String, String)>> = Vec::new();
+    for (row_idx, pair) in slice.chunks(2).enumerate() {
+        let mut row = Vec::with_capacity(pair.len());
+        for (offset, p) in pair.iter().enumerate() {
+            let global_idx = start + row_idx * 2 + offset;
+            let suffix = if p.key_ready {
+                format!("({})", p.model_count)
+            } else {
+                format!("({}!)", p.model_count)
+            };
+            let label = if p.is_active {
+                format!("✓ {} {suffix}", clip_tg_btn_label(&p.name, 14))
+            } else {
+                format!("{} {suffix}", clip_tg_btn_label(&p.name, 16))
+            };
+            row.push((label, format!("mdl:m:{global_idx}:0")));
+        }
+        rows.push(row);
+    }
+
+    if total_pages > 1 {
+        let mut nav = Vec::new();
+        if cur_page > 0 {
+            nav.push(("◀ Prev".to_string(), format!("mdl:p:{}", cur_page - 1)));
+        }
+        nav.push((
+            format!("{}/{}", cur_page + 1, total_pages),
+            "mdl:noop".to_string(),
+        ));
+        if cur_page + 1 < total_pages {
+            nav.push(("Next ▶".to_string(), format!("mdl:p:{}", cur_page + 1)));
+        }
+        rows.push(nav);
+    }
+
+    rows.push(vec![("✕ Tutup".to_string(), "mdl:x".to_string())]);
+
+    TgInlineCard { html, plain, rows }
+}
+
+/// Format konfirmasi ringkas & bersih saat model berhasil diganti di Telegram (HTML + teks polos).
+pub fn format_tg_model_switched_html(
+    provider: &str,
+    provider_kind: &str,
+    model: &str,
+    context_limit: usize,
+) -> (String, String) {
+    let ctx_str = crate::agent::context::format_context_tokens_exact(context_limit);
+    let html = format!(
+        "<b>Model diganti ke</b> <code>{}</code>\n\
+         <b>Provider:</b> <code>{}</code> ({})\n\
+         <b>Konteks:</b> {}\n\
+         <i>Tersimpan otomatis ke konfigurasi.</i>",
+        escape_telegram_html(model),
+        escape_telegram_html(provider),
+        escape_telegram_html(provider_kind),
+        escape_telegram_html(&ctx_str),
+    );
+    let plain = format!(
+        "Model diganti ke {model}\n\
+         Provider: {provider} ({provider_kind})\n\
+         Konteks: {ctx_str}\n\
+         Tersimpan otomatis ke konfigurasi."
+    );
+    (html, plain)
+}
+
+/// Format kartu informasi sesi baru `/new` untuk Telegram (menampilkan ID sesi, model aktif,
+/// provider, kapasitas context window terdeteksi, dan folder kerja).
+pub fn format_tg_new_session_html(
+    session_id: &str,
+    provider: &str,
+    provider_kind: &str,
+    model: &str,
+    context_limit: usize,
+    cwd: &str,
+) -> (String, String) {
+    let short: String = session_id.chars().take(10).collect();
+    let ctx_str = crate::agent::context::format_context_tokens_exact(context_limit);
+    let html = format!(
+        "✨ <b>Sesi baru dimulai</b>\n\n\
+         • <b>Sesi:</b> <code>{}</code>\n\
+         • <b>Model:</b> <code>{}</code>\n\
+         • <b>Provider:</b> <code>{}</code> ({})\n\
+         • <b>Konteks:</b> {}\n\
+         • <b>Folder:</b> <code>{}</code>",
+        escape_telegram_html(&short),
+        escape_telegram_html(model),
+        escape_telegram_html(provider),
+        escape_telegram_html(provider_kind),
+        escape_telegram_html(&ctx_str),
+        escape_telegram_html(cwd),
+    );
+    let plain = format!(
+        "Sesi baru dimulai\n\n\
+         Sesi: {short}\n\
+         Model: {model}\n\
+         Provider: {provider} ({provider_kind})\n\
+         Konteks: {ctx_str}\n\
+         Folder: {cwd}"
+    );
+    (html, plain)
+}
+
 /// Potong teks panjang menjadi beberapa potongan aman UTF-8 <= `max_chars`
 /// karakter (mengutamakan batas baris `\n` agar blok kode tidak pecah di tengah baris).
 pub fn split_telegram_chunks(text: &str, max_chars: usize) -> Vec<String> {
@@ -2079,6 +2467,69 @@ impl TelegramClient {
                     .await
                 {
                     Ok(()) => Ok(()),
+                    Err(e2) if e2.to_string().contains("message is not modified") => Ok(()),
+                    Err(e2) => Err(e2),
+                }
+            }
+        }
+    }
+
+    /// Edit pesan berformat Telegram HTML in-place sekaligus memperbarui (atau menghapus bila `rows` kosong)
+    /// inline keyboardnya. Mengabaikan `"message is not modified"` dan fallback aman ke teks polos.
+    pub async fn edit_html_message_with_keyboard(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        html: &str,
+        plain_fallback: &str,
+        rows: Vec<Vec<(String, String)>>,
+    ) -> Result<()> {
+        let inline_keyboard: Vec<Vec<Value>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|(label, cb)| json!({ "text": label, "callback_data": cb }))
+                    .collect()
+            })
+            .collect();
+        let res: Result<Value> = self
+            .post_json(
+                "editMessageText",
+                json!({
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": html,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": true,
+                    "reply_markup": { "inline_keyboard": inline_keyboard },
+                }),
+            )
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("message is not modified") => Ok(()),
+            Err(e) => {
+                eprintln!(
+                    "[telegram][render-fallback] editMessageText HTML keyboard ditolak ({e}) — fallback teks polos bersih."
+                );
+                let clean_plain = if plain_fallback.trim().is_empty() {
+                    strip_telegram_html_tags(html)
+                } else {
+                    markdown_to_clean_plain_text(plain_fallback)
+                };
+                let fallback_res: Result<Value> = self
+                    .post_json(
+                        "editMessageText",
+                        json!({
+                            "chat_id": chat_id,
+                            "message_id": message_id,
+                            "text": clean_plain,
+                            "reply_markup": { "inline_keyboard": inline_keyboard },
+                        }),
+                    )
+                    .await;
+                match fallback_res {
+                    Ok(_) => Ok(()),
                     Err(e2) if e2.to_string().contains("message is not modified") => Ok(()),
                     Err(e2) => Err(e2),
                 }

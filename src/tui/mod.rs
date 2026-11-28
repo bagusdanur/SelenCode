@@ -1390,6 +1390,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         Span::styled(st.clone(), Style::default().fg(moonlit::LAV)),
                     ])
                 } else {
+                    let active_ctx_s = crate::agent::context::format_context_tokens_exact(
+                        app.context_limit_for_model(&mp.active_model),
+                    );
                     Line::from(vec![
                         Span::styled(" ✦ ", Style::default().fg(moonlit::GOLD)),
                         Span::styled("Aktif: ", Style::default().fg(moonlit::DIM)),
@@ -1399,6 +1402,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                                 .fg(moonlit::CYAN_MOON)
                                 .add_modifier(Modifier::BOLD),
                         ),
+                        Span::styled("  ·  ", Style::default().fg(moonlit::FAINT)),
+                        Span::styled(active_ctx_s, Style::default().fg(moonlit::LAV)),
                     ])
                 }
             }
@@ -1481,7 +1486,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     };
                     let marker = if is_sel { "▸ " } else { "  " };
                     let num = format!("#{:<2} ", idx + 1);
-                    let badge = if is_act { "  ● aktif" } else { "" };
+                    let ctx_tag = format!(
+                        "  ctx {}",
+                        crate::agent::context::format_context_compact(
+                            app.context_limit_for_model(m)
+                        )
+                    );
+                    let badge = if is_act { "  ✓ aktif" } else { "" };
                     body_lines.push(Line::from(vec![
                         Span::styled(format!(" {marker}"), bg.fg(moonlit::LILAC)),
                         Span::styled(num, bg.fg(moonlit::VIOLET).add_modifier(Modifier::BOLD)),
@@ -1492,12 +1503,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                             } else {
                                 moonlit::SILVER
                             })
-                            .add_modifier(if is_sel {
+                            .add_modifier(if is_sel || is_act {
                                 Modifier::BOLD
                             } else {
                                 Modifier::empty()
                             }),
                         ),
+                        Span::styled(ctx_tag, bg.fg(moonlit::CYAN_MOON)),
                         Span::styled(badge, bg.fg(moonlit::MINT).add_modifier(Modifier::BOLD)),
                     ]));
                 }
@@ -1537,6 +1549,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                             };
                             let check = if saved { "[✓] " } else { "[ ] " };
                             let check_color = if saved { moonlit::MINT } else { moonlit::DIM };
+                            let is_act = m.as_str() == mp.active_model;
+                            let ctx_tag = format!(
+                                "  ctx {}",
+                                crate::agent::context::format_context_compact(
+                                    app.context_limit_for_model(m)
+                                )
+                            );
+                            let badge = if is_act { "  ✓ aktif" } else { "" };
                             body_lines.push(Line::from(vec![
                                 Span::styled(
                                     if is_sel { " ▸ " } else { "   " },
@@ -1545,12 +1565,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                                 Span::styled(check, bg.fg(check_color).add_modifier(Modifier::BOLD)),
                                 Span::styled(
                                     m.to_string(),
-                                    bg.fg(if is_sel {
+                                    bg.fg(if is_sel || is_act {
                                         moonlit::LILAC
                                     } else {
                                         moonlit::SILVER
                                     }),
                                 ),
+                                Span::styled(ctx_tag, bg.fg(moonlit::CYAN_MOON)),
+                                Span::styled(badge, bg.fg(moonlit::MINT).add_modifier(Modifier::BOLD)),
                             ]));
                         }
                     }

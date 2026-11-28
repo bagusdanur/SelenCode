@@ -592,6 +592,8 @@ pub struct App {
     pub context_used: usize,
     /// Kapasitas context window model AI yang sedang aktif (dalam token).
     pub context_limit: usize,
+    /// Cache kapasitas context window per model ID hasil deteksi API `/models` (persisten dari SQLite).
+    pub model_contexts: std::collections::HashMap<String, usize>,
     pub session_in: u64,
     pub session_out: u64,
     pub approval: Option<PendingApproval>,
@@ -741,6 +743,7 @@ impl App {
             context_pct: 0,
             context_used: 0,
             context_limit,
+            model_contexts: std::collections::HashMap::new(),
             session_in,
             session_out,
             approval: None,
@@ -829,6 +832,20 @@ impl App {
         true
     }
 
+    /// Deteksi kapasitas context window (token) untuk `model_id` menggunakan prioritas:
+    /// cache metadata API `/models` -> kapasitas aktif (bila cocok model aktif) -> heuristik nama model.
+    pub fn context_limit_for_model(&self, model_id: &str) -> usize {
+        if let Some(&n) = self.model_contexts.get(model_id) {
+            if n >= 1024 {
+                return n;
+            }
+        }
+        if model_id == self.model && self.context_limit >= 1024 {
+            return self.context_limit;
+        }
+        infer_model_context_limit(model_id)
+    }
+
     /// Info untuk layar sambutan Moonlit, dari state sesi saat ini.
     pub fn welcome_info(&self) -> WelcomeInfo {
         let info = WelcomeInfo::new(
@@ -837,7 +854,8 @@ impl App {
             self.model.clone(),
             self.cwd.clone(),
             self.tool_count,
-        );
+        )
+        .with_context_limit(self.context_limit);
         if self.session_id.is_empty() {
             info
         } else {
@@ -961,7 +979,12 @@ impl App {
             }
             UiEvent::ModelChanged { provider, model } => {
                 self.provider = provider;
-                self.context_limit = infer_model_context_limit(&model);
+                self.context_limit = self
+                    .model_contexts
+                    .get(&model)
+                    .copied()
+                    .filter(|&n| n >= 1024)
+                    .unwrap_or_else(|| infer_model_context_limit(&model));
                 self.context_pct = calc_context_pct(self.context_used, self.context_limit);
                 self.model = model;
             }
@@ -974,6 +997,19 @@ impl App {
                     self.context_limit = limit_tokens;
                 }
                 self.context_pct = calc_context_pct(self.context_used, self.context_limit);
+            }
+            UiEvent::ModelContexts(map) => {
+                for (k, v) in map {
+                    if v >= 1024 {
+                        self.model_contexts.insert(k, v);
+                    }
+                }
+                if let Some(&n) = self.model_contexts.get(&self.model) {
+                    if n >= 1024 {
+                        self.context_limit = n;
+                        self.context_pct = calc_context_pct(self.context_used, self.context_limit);
+                    }
+                }
             }
             UiEvent::PlanUpdated(checklist) => {
                 self.streaming = false;
@@ -1009,7 +1045,12 @@ impl App {
                 self.session_out = 0;
                 self.context_pct = 0;
                 self.context_used = 0;
-                self.context_limit = infer_model_context_limit(&self.model);
+                self.context_limit = self
+                    .model_contexts
+                    .get(&self.model)
+                    .copied()
+                    .filter(|&n| n >= 1024)
+                    .unwrap_or_else(|| infer_model_context_limit(&self.model));
                 self.step_current = 0;
                 self.scroll = 0;
                 self.busy = false;
