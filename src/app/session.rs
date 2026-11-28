@@ -1246,7 +1246,7 @@ impl Session {
             None => self.store.resolve_session(&cwd_str, target, 20)?,
         };
         let mut msgs = self.store.load_messages(&info.id)?;
-        if let Some(syn) = selencode::agent::sanitize_interrupted_messages(&mut msgs) {
+        if let Some(syn) = sanitize_interrupted_messages(&mut msgs) {
             let _ = self.store.save_message(&info.id, &syn);
         }
         let (input_tokens, output_tokens) = self.store.total_usage(&info.id).unwrap_or((0, 0));
