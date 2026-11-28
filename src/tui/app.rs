@@ -616,6 +616,26 @@ impl ResumePickerState {
             self.selected = len - 1;
         }
     }
+
+    pub fn move_up(&mut self) {
+        let len = self.filtered_items().len();
+        if len == 0 {
+            self.selected = 0;
+        } else if self.selected > 0 {
+            self.selected -= 1;
+        } else {
+            self.selected = len - 1;
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        let len = self.filtered_items().len();
+        if len == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = (self.selected + 1) % len;
+        }
+    }
 }
 
 /// State modal pertanyaan klarifikasi `ask_user` di TUI (v0.5.6 Bagian 2 — bukan approval!).

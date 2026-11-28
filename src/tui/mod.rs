@@ -2798,9 +2798,12 @@ pub fn run_blocking(mut app: App, mut ch: TuiChannels) -> Result<()> {
                                 mp.filter_input.push_str(text.trim());
                                 mp.selected = 0;
                             }
+                        } else if let Some(rp) = &mut app.resume_picker {
+                            rp.filter_input.push_str(text.trim());
+                            rp.selected = 0;
                         } else if let Some(ask) = &mut app.pending_ask {
                             ask.custom_input.push_str(text.trim());
-                        } else if app.approval.is_none() && app.resume_picker.is_none() {
+                        } else if app.approval.is_none() {
                             app.input.insert_str(&text);
                         }
                         dirty = true;
