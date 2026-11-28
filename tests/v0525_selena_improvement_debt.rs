@@ -16,8 +16,8 @@ use selencode::agent::corrector::{
 };
 use selencode::agent::review::{
     build_pruned_review_prompt_with_reads_for_session, check_review_eligibility,
-    estimate_review_request_tokens, run_background_review, ReviewSkipReason,
-    FROZEN_REVIEW_SYSTEM_PROMPT, MAX_REVIEW_CALL_INPUT_TOKENS,
+    estimate_review_request_tokens, provider_base_overhead_tokens, run_background_review,
+    ReviewSkipReason, FROZEN_REVIEW_SYSTEM_PROMPT, MAX_REVIEW_CALL_INPUT_TOKENS,
 };
 use selencode::config::{Config, ProviderCfg};
 use selencode::providers::{
@@ -394,13 +394,15 @@ async fn masalah3_and_4_total_budget_enforced_digest_over_budget_and_cacheable_p
         ));
     }
 
-    // 1. Pagu TOTAL request (System beku + User digest) wajib <= 5.000 token DAN koreksi tetap utuh!
+    // 1. Pagu TOTAL request (System beku + User digest + overhead gateway ag/*) wajib <= 5.000 token DAN koreksi tetap utuh!
+    let ag_overhead = provider_base_overhead_tokens("ag/gemini-3-flash");
+    assert!(ag_overhead >= 2_000, "overhead gateway ag/* harus diperhitungkan");
     let (sys, user, _) = build_pruned_review_prompt_with_reads_for_session(
         &dir,
         &store,
         Some(&sid),
         &rich_msgs,
-        6_000,
+        MAX_REVIEW_CALL_INPUT_TOKENS.saturating_sub(ag_overhead),
     );
     assert_eq!(sys, FROZEN_REVIEW_SYSTEM_PROMPT);
     let total_est = estimate_review_request_tokens(
@@ -409,22 +411,23 @@ async fn masalah3_and_4_total_budget_enforced_digest_over_budget_and_cacheable_p
             Message::text(Role::User, user.as_str()),
         ],
         &[],
-    );
+    )
+    .saturating_add(ag_overhead);
     assert!(
         total_est <= MAX_REVIEW_CALL_INPUT_TOKENS,
-        "total request review wajib <= {MAX_REVIEW_CALL_INPUT_TOKENS}, dapat {total_est}"
+        "total request review (termasuk overhead ag/*) wajib <= {MAX_REVIEW_CALL_INPUT_TOKENS}, dapat {total_est}"
     );
     assert!(
         user.contains("--strict-mode"),
         "giliran koreksi pengguna wajib dipertahankan paling akhir saat pemangkasan"
     );
 
-    // 2. Masalah 4: ukuran awalan sistem beku >= 2.048 token (melampaui ambang implicit caching Gemini 3 Flash)
-    //    sambil total request tetap <= 5.000!
-    let sys_est_gemini = (FROZEN_REVIEW_SYSTEM_PROMPT.chars().count() as u64).div_ceil(3);
+    // 2. Masalah 4: awalan sistem beku byte-identik & >= 1.024 token untuk provider yang mendukung cache 1k+
+    //    sambil tetap muat di bawah pagu 5.000 termasuk overhead ag/* (+2.150)!
+    let sys_est_tok = (FROZEN_REVIEW_SYSTEM_PROMPT.chars().count() as u64).div_ceil(3);
     assert!(
-        sys_est_gemini >= 2_048,
-        "awalan sistem beku harus >= 2.048 token untuk menyalakan implicit prefix cache (dapat ~{sys_est_gemini})"
+        sys_est_tok >= 1_024 && sys_est_tok <= 1_600,
+        "awalan sistem beku harus berada di rentang 1.024..=1.600 token (dapat ~{sys_est_tok})"
     );
 
     // 3. Bila pagu terlalu sempit sehingga bahkan digest minimal tak muat -> skip `digest_over_budget`, 0 call!

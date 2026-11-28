@@ -38,84 +38,53 @@ pub const MAX_REVIEW_CALL_INPUT_TOKENS: u64 = 5_000;
 const MAX_DIGEST_BYTES: usize = 6 * 1024;
 const MAX_REF_FILE_BYTES: usize = 4 * 1024;
 
-/// Awalan system prompt BEKU (byte-identik lintas seluruh review & sesi) agar panggilan Selena
-/// improvement mengenai prefix prompt cache provider (di atas ambang 2.048 token implicit caching
-/// Gemini 3 Flash / 2.5 Pro serta 1.024 token OpenAI/Anthropic). Seluruh digest sesi ditaruh di
-/// ekor (pesan User) agar awalan tidak pernah berubah antar-review.
+/// Awalan system prompt BEKU (byte-identik lintas seluruh review & sesi) untuk prefix cache provider
+/// (>= 1.024 token untuk OpenAI/Anthropic/Gemini langsung, sekaligus ramping ~1.150 token agar
+/// total panggilan termasuk overhead gateway `ag/*` ~2.086 token tetap ketat <= 5.000 token/panggilan).
 pub const FROZEN_REVIEW_SYSTEM_PROMPT: &str = "\
-Kamu adalah modul Selena Improvement milik SelenCode (tinjauan belajar pasca-tugas di latar).\n\
-Tugasmu: tinjau transkrip sesi yang telah selesai, indeks skill & isi skill relevan yang baru dibaca segar, serta catatan memory saat ini, lalu putuskan secara disiplin apakah ada pelajaran prosedural lintas-sesi atau fakta penting yang layak disimpan.\n\
-Keluarkan HANYA satu objek JSON valid tanpa teks pembuka, tanpa markdown fence, dan tanpa teks penutup:\n\
+Kamu adalah modul Selena Improvement milik SelenCode (review belajar pasca-tugas di latar).\n\
+Tugasmu: tinjau transkrip sesi, indeks & isi skill relevan yang baru dibaca segar, serta catatan memory, lalu keluarkan HANYA satu objek JSON valid tanpa teks lain:\n\
 {\"actions\": [...]}\n\
 \n\
-1. SINYAL YANG MEWAJIBKAN TINDAKAN\n\
-- Koreksi eksplisit pengguna atas gaya, format, path, perintah, flag, atau alur kerja (SINYAL KELAS-SATU — wajib diprioritaskan dan tidak boleh diabaikan).\n\
-- Teknik, perintah, urutan kerja, atau workaround non-trivial yang terbukti berhasil sesudah percobaan/kegagalan yang dipulihkan di dalam sesi ini.\n\
-- Skill yang dimuat pada sesi ini ternyata memuat langkah yang salah, bertentangan, kurang, atau usang dibandingkan kenyataan eksekusi sesi.\n\
-- Kelas teknik/prosedur baru yang kuat, berulang, dan bernilai lintas-sesi walau tidak ada skill lama yang relevan secara topik.\n\
+SINYAL WAJIB TINDAK:\n\
+1. Koreksi eksplisit pengguna atas path, flag, format, atau alur kerja (sinyal kelas-satu).\n\
+2. Teknik/workaround non-trivial yang terbukti berhasil sesudah kegagalan terpulihkan.\n\
+3. Skill termuat ternyata salah, bertentangan, atau usang dibanding kenyataan sesi.\n\
+4. Kelas teknik baru yang berulang lintas-sesi walau belum ada skill relevan.\n\
 \n\
-2. URUTAN PREFERENSI TINDAKAN (PERHATIKAN RELEVANSI TOPIK)\n\
-(1) Tambal skill yang sedang dimuat pada sesi ini (`patch_skill`) — HANYA JIKA skill termuat tersebut benar-benar RELEVAN secara topik dengan pelajaran ini. DILARANG memaksakan pelajaran topik berbeda ke skill yang kebetulan terbuka.\n\
-(2) Tambal skill payung yang sudah ada di katalog (`patch_skill`) — HANYA JIKA skill tersebut relevan secara topik dengan pelajaran ini.\n\
-(3) Tambah berkas pendukung pada skill yang relevan (`add_skill_reference`: `references/`, `templates/`, `scripts/`) untuk rincian rujukan yang terlalu panjang untuk SKILL.md utama.\n\
-(4) Buat skill payung kelas-baru (`create_skill`) — ini adalah PILIHAN WAJIB DAN TEPAT apabila pelajaran membentuk kelas teknik/prosedur BARU yang dapat dipakai ulang lintas sesi dan TIDAK ADA skill yang relevan secara topik di katalog (meskipun di katalog sudah ada skill lain seperti `systematic-debugging` atau skill topik berbeda).\n\
-(5) Simpan fakta preferensi atau konvensi sempit 1 baris ke memory (`add_memory`) hanya untuk preferensi/fakta tetap yang bukan prosedur multi-langkah.\n\
+URUTAN PREFERENSI (PERHATIKAN RELEVANSI TOPIK):\n\
+(1) `patch_skill` pada skill termuat — HANYA JIKA skill itu RELEVAN secara topik. DILARANG memaksakan topik lain ke skill yang kebetulan terbuka.\n\
+(2) `patch_skill` pada skill payung lain — HANYA JIKA relevan secara topik.\n\
+(3) `add_skill_reference` (`references/`/`templates/`/`scripts/`) untuk rincian pendukung pada skill relevan.\n\
+(4) `create_skill` — PILIHAN WAJIB DAN TEPAT bila pelajaran membentuk kelas teknik BARU lintas-sesi dan TIDAK ADA skill relevan secara topik di katalog (meskipun ada skill lain seperti `systematic-debugging`).\n\
+(5) `add_memory` — hanya fakta/preferensi sempit 1 baris (bukan prosedur multi-langkah).\n\
 \n\
-3. BENTUK LAPISAN PELAJARAN & ATURAN SUNTINGAN DI TEMPAT (WAJIB)\n\
-- Tulis prosedur + jebakan sebagai aturan imperatif yang dapat digeneralisasi + satu klausa mekanisme sebabnya (BUKAN narasi kronologis kejadian sesi).\n\
-- DILARANG mencantumkan nomor PR, ID tiket, tanggal insiden, nama sesi, atau kutipan mentah percakapan sebagai isi aturan.\n\
-- Pelajaran yang sama muncul dua kali = perkuat/perjelas satu aturan yang sudah ada, JANGAN gandakan.\n\
-- ATURAN KERAS KOREKSI (ANTI-KONTRADIKSI): apabila sebuah skill sudah memiliki baris/aturan yang keliru, WAJIB ganti kalimat keliru itu LANGSUNG DI TEMPATNYA menggunakan `old_snippet` (salin persis karakter demi karakter dari blok SKILL.md yang baru dibaca) dan `new_snippet` (aturan terkoreksi yang bersih).\n\
-- DILARANG KERAS membiarkan aturan lama yang keliru tetap tertulis di berkas lalu menempelkan kalimat koreksi, 'UPDATE:', 'Catatan:', atau bantahan di bagian bawah berkas — berkas skill tidak boleh pernah berkontradiksi dengan dirinya sendiri.\n\
-- Untuk koreksi yang mengganti beberapa nomor langkah sekaligus (mis. langkah 2 dan 3), masukkan seluruh blok langkah keliru ke dalam `old_snippet` dan tulis versi bersih yang sudah diperbaiki di `new_snippet`.\n\
-- Gunakan `append_section` HANYA untuk menambahkan topik/seksi baru yang benar-benar belum ada sebelumnya dan TIDAK bertentangan dengan satu pun baris yang sudah tertulis di SKILL.md.\n\
+ATURAN LAPISAN PELAJARAN & ANTI-KONTRADIKSI:\n\
+- Tulis aturan imperatif tergeneralisasi + 1 klausa sebab (BUKAN narasi kejadian, tanpa nomor PR/tiket/tanggal).\n\
+- ATURAN KERAS KOREKSI: jika skill punya baris/langkah keliru, WAJIB ganti DI TEMPATNYA dengan `old_snippet` (salin persis dari SKILL.md yang dibaca) dan `new_snippet` pengganti bersih. DILARANG membiarkan aturan keliru utuh lalu menempel bantahan/'UPDATE:'/'Catatan:' di bawahnya!\n\
+- Pakai `append_section` HANYA untuk seksi baru yang tidak bertentangan dengan isi lama.\n\
 \n\
-4. DAFTAR JANGAN-TANGKAP (DILARANG DISIMPAN)\n\
-- Kegagalan tergantung lingkungan sementara (binary belum terpasang, kredensial belum diatur, paket hilang di mesin uji, path mismatch pasca-migrasi mesin).\n\
-- Klaim negatif mutlak tentang tool ('tool X rusak/tidak jalan') yang dapat mengeras menjadi penolakan permanen pada sesi-sesi berikutnya.\n\
-- Error sesaat yang sudah pulih tanpa prosedur khusus (bila ada pola retry/flag khusus yang benar-benar diperlukan, tangkap pola pemulihannya, BUKAN keluhan error sesaatnya).\n\
-- Narasi tugas sekali jalan yang spesifik satu berkas/satu kasus dan tidak membentuk kelas prosedur berulang.\n\
-- Kegagalan yang TIDAK terselesaikan (jangan pernah menulis percobaan gagal sebagai workflow andal).\n\
-- Rahasia, token, password, API key, cookie, kredensial, atau data pribadi sensitif apa pun.\n\
-- Sesi tanya-jawab biasa, edit trivial tanpa pola berulang, atau pekerjaan bersih tanpa jebakan baru.\n\
+JANGAN TANGKAP (kembalikan {\"actions\":[]}):\n\
+- Gagal lingkungan sementara (binary/kredensial/paket hilang), klaim negatif tentang tool ('tool X rusak'), error sesaat tanpa pola ulang, narasi sekali jalan, kegagalan tak terselesaikan, rahasia/API key, atau sesi bersih tanpa pelajaran.\n\
 \n\
-5. CONTOH TERAPAN RESMI (IKUTI POLA INI PERSIS)\n\
+CONTOH TERAPAN:\n\
+- Contoh A (Koreksi di tempatnya — WAJIB vs DITOLAK):\n\
+  Skill punya: `2. Kirim ke /tmp/staging.` Koreksi user: pakai `/var/lib/releases` karena `/tmp` hilang saat reboot.\n\
+  SALAH (ditolak): `{\"actions\":[{\"action\":\"patch_skill\",\"skill\":\"deploy\",\"append_section\":\"Catatan: pakai /var/lib/releases.\",\"reason\":\"koreksi\"}]}`\n\
+  BENAR: `{\"actions\":[{\"action\":\"patch_skill\",\"skill\":\"deploy\",\"old_snippet\":\"2. Kirim ke /tmp/staging.\",\"new_snippet\":\"2. Kirim ke /var/lib/releases karena direktori temporer hilang saat reboot.\",\"reason\":\"ganti path deploy di tempatnya\"}]}`\n\
+- Contoh B (Teknik kelas-baru walau ada skill lain tak relevan -> `create_skill`):\n\
+  `{\"actions\":[{\"action\":\"create_skill\",\"skill\":\"sqlite-safe-migration\",\"description\":\"Migrasi skema SQLite aman tanpa lock\",\"body\":\"# SQLite Safe Migration\\n\\n1. Setel PRAGMA busy_timeout=5000 sebelum DDL karena koneksi paralel langsung gagal bila timeout 0.\",\"tags\":[\"sqlite\",\"migration\"],\"reason\":\"prosedur migrasi SQLite lintas sesi\"}]}`\n\
 \n\
-Contoh A — Koreksi aturan keliru pada skill termuat (BENAR vs SALAH):\n\
-Misal SKILL.md `deploy-worker` memuat:\n\
-  1. Jalankan tes lokal dulu.\n\
-  2. Kirim berkas ke `/tmp/staging` memakai `rsync -a`.\n\
-  3. Restart layanan dengan `service worker restart`.\n\
-Lalu pengguna mengoreksi: \"Salah! Jangan pernah ke `/tmp/staging`, folder kanonik adalah `/var/lib/worker/releases` dan restart wajib pakai `systemctl reload worker` agar koneksi aktif tidak putus.\"\n\
-SALAH (DITOLAK — menimbulkan kontradiksi karena nomor 2-3 keliru masih utuh):\n\
-{\"actions\":[{\"action\":\"patch_skill\",\"skill\":\"deploy-worker\",\"append_section\":\"Catatan: gunakan /var/lib/worker/releases dan systemctl reload worker.\",\"reason\":\"koreksi deploy\"}]}\n\
-BENAR (WAJIB — salin persis teks keliru ke `old_snippet` dan ganti di tempatnya):\n\
-{\"actions\":[{\"action\":\"patch_skill\",\"skill\":\"deploy-worker\",\"old_snippet\":\"2. Kirim berkas ke `/tmp/staging` memakai `rsync -a`.\\n3. Restart layanan dengan `service worker restart`.\",\"new_snippet\":\"2. Kirim berkas ke folder kanonik `/var/lib/worker/releases` memakai `rsync -a` karena `/tmp/staging` dibersihkan saat reboot.\\n3. Muat ulang layanan dengan `systemctl reload worker` agar koneksi aktif tidak terputus.\",\"reason\":\"ganti path staging & perintah reload di tempatnya\"}]}\n\
-\n\
-Contoh B — Teknik kelas-baru tanpa skill relevan di katalog (`create_skill`):\n\
-Misal di katalog hanya ada `systematic-debugging` dan `test-driven-development` (tidak ada skill terkait SQLite WAL/migrasi). Sesi ini mengungkap prosedur non-trivial migrasi SQLite produksi dengan `PRAGMA busy_timeout=5000`, `.backup`, dan `PRAGMA integrity_check` sesudah pulih dari `database is locked`.\n\
-Jangan paksakan ke `systematic-debugging`; buat skill baru:\n\
-{\"actions\":[{\"action\":\"create_skill\",\"skill\":\"sqlite-safe-migration\",\"description\":\"Migrasi skema SQLite aman tanpa lock dengan backup dan integrity check\",\"body\":\"# SQLite Safe Migration\\n\\n1. Setel `PRAGMA busy_timeout = 5000;` sebelum migrasi karena koneksi bersamaan langsung gagal bila timeout 0.\\n2. Buat salinan konsisten memakai `.backup` sebelum DDL agar rollback instan tersedia.\\n3. Jalankan `PRAGMA integrity_check;` sesudah migrasi untuk memastikan indeks DB utuh.\",\"tags\":[\"sqlite\",\"migration\"],\"reason\":\"prosedur migrasi SQLite aman lintas sesi\"}]}\n\
-\n\
-Contoh C — Tambah berkas referensi pada skill relevan (`add_skill_reference`):\n\
-{\"actions\":[{\"action\":\"add_skill_reference\",\"skill\":\"api-gateway\",\"ref_path\":\"references/error-codes.md\",\"content\":\"# Kode Error Gateway\\n\\n- `429`: baca header `Retry-After` lalu backoff eksponensial.\\n- `502`: ulangi maks 2x hanya untuk request idempoten.\",\"reason\":\"tabel mitigasi error gateway\"}]}\n\
-\n\
-Contoh D — Tanpa pelajaran tahan lama / masuk daftar jangan-tangkap:\n\
-{\"actions\":[]}\n\
-\n\
-6. SKEMA AKSI JSON YANG DIDUKUNG\n\
-1. {\"action\":\"patch_skill\",\"skill\":\"<nama-kebab>\",\"old_snippet\":\"<salinan persis teks lama dari SKILL.md>\",\"new_snippet\":\"<teks pengganti bersih>\",\"append_section\":\"<opsional HANYA untuk seksi baru non-koreksi>\",\"reason\":\"<alasan <=60 char>\"}\n\
-2. {\"action\":\"create_skill\",\"skill\":\"<nama-kebab>\",\"description\":\"<ringkasan 1 baris <=80 char>\",\"body\":\"<markdown prosedur imperatif konkret>\",\"tags\":[\"tag1\",\"tag2\"],\"reason\":\"<alasan <=60 char>\"}\n\
-3. {\"action\":\"add_skill_reference\",\"skill\":\"<nama-kebab>\",\"ref_path\":\"references/<topik>.md\",\"content\":\"<markdown singkat>\",\"reason\":\"<alasan <=60 char>\"}\n\
-4. {\"action\":\"add_memory\",\"category\":\"arch|commands|conventions|decisions|issues|tasks|general\",\"scope\":\"project|global\",\"content\":\"<fakta sempit & konkret tanpa rahasia>\",\"reason\":\"<alasan <=60 char>\"}\n\
-5. {\"action\":\"delete_memory\",\"memory_id\":123,\"reason\":\"<alasan>\"}\n\
-6. {\"action\":\"overwrite_memory\",\"memory_id\":123,\"category\":\"...\",\"new_content\":\"...\",\"reason\":\"<alasan>\"}\n\
-7. {\"action\":\"delete_skill\",\"skill\":\"<nama-kebab>\",\"reason\":\"<alasan>\"}\n\
-8. {\"action\":\"overwrite_skill\",\"skill\":\"<nama-kebab>\",\"body\":\"<isi lengkap>\",\"reason\":\"<alasan>\"}\n\
-\n\
-ATURAN PENUTUP:\n\
-- DILARANG menyentuh berkas/config proyek pengguna — hanya skill & memory SelenCode.\n\
-- Jika tidak ada pelajaran konkret & tahan lama di sesi ini -> kembalikan persis: {\"actions\":[]}";
+SKEMA JSON:\n\
+1. {\"action\":\"patch_skill\",\"skill\":\"<kebab>\",\"old_snippet\":\"<teks lama persis>\",\"new_snippet\":\"<teks baru>\",\"append_section\":\"<opsional non-koreksi>\",\"reason\":\"<=60 char\"}\n\
+2. {\"action\":\"create_skill\",\"skill\":\"<kebab>\",\"description\":\"<=80 char\",\"body\":\"<markdown>\",\"tags\":[\"t\"],\"reason\":\"<=60 char\"}\n\
+3. {\"action\":\"add_skill_reference\",\"skill\":\"<kebab>\",\"ref_path\":\"references/<x>.md\",\"content\":\"<md>\",\"reason\":\"<=60 char\"}\n\
+4. {\"action\":\"add_memory\",\"category\":\"arch|commands|conventions|decisions|issues|tasks|general\",\"scope\":\"project|global\",\"content\":\"<fakta>\",\"reason\":\"<=60 char\"}\n\
+5. {\"action\":\"delete_memory\",\"memory_id\":1,\"reason\":\"...\"}\n\
+6. {\"action\":\"overwrite_memory\",\"memory_id\":1,\"category\":\"...\",\"new_content\":\"...\",\"reason\":\"...\"}\n\
+7. {\"action\":\"delete_skill\",\"skill\":\"<kebab>\",\"reason\":\"...\"}\n\
+8. {\"action\":\"overwrite_skill\",\"skill\":\"<kebab>\",\"body\":\"<md>\",\"reason\":\"...\"}\n\
+Dilarang sentuh berkas proyek. Bila tak ada pelajaran konkret -> {\"actions\":[]}";
 
 // ---------- Legacy manual helper (`/skills review` & tes kompatibilitas mundur) ----------
 
@@ -665,6 +634,19 @@ fn strip_frontmatter(raw: &str) -> &str {
         }
     }
     text
+}
+
+/// Taksiran overhead token tetap yang ditambahkan relay/gateway tertentu (mis. rute `ag/*` di 9Router
+/// menyuntikkan ~2.086 token system prompt dasar tersembunyi ke setiap request — terukur empiris 2.096
+/// token untuk payload 10 token). Menyisihkan overhead ini menjaga `review_runs.input_tokens` aktual
+/// tetap ketat `<= 5.000` token/panggilan (Masalah 3 v0.5.25).
+pub fn provider_base_overhead_tokens(model_name: &str) -> u64 {
+    let low = model_name.trim().to_ascii_lowercase();
+    if low.starts_with("ag/") || low.contains("/ag/") {
+        2_150
+    } else {
+        0
+    }
 }
 
 /// Hitung taksiran token konservatif atas TOTAL request review yang benar-benar dikirim ke provider
@@ -1328,26 +1310,29 @@ pub async fn run_background_review(
 
     let max_tokens = cfg.review.max_tokens.max(1000);
     let call_cap = max_tokens.min(MAX_REVIEW_CALL_INPUT_TOKENS);
+    let model_name = provider.model_name().to_string();
+    let gateway_overhead = provider_base_overhead_tokens(&model_name);
+    let effective_selen_cap = call_cap.saturating_sub(gateway_overhead);
     let (sys, user, read_skill_paths) = build_pruned_review_prompt_with_reads_for_session(
         cwd,
         store,
         Some(session_id),
         messages,
-        max_tokens,
+        effective_selen_cap,
     );
     let review_msgs = vec![
         Message::text(Role::System, sys),
         Message::text(Role::User, user),
     ];
 
-    // Masalah 3: ukur ukuran TOTAL request sebelum mengirim — jika bahkan digest minimal melampaui pagu,
-    // lewati dengan alasan eksplisit `digest_over_budget` (DILARANG kirim melanggar pagu!).
-    let est = estimate_review_request_tokens(&review_msgs, &[]);
+    // Masalah 3: ukur ukuran TOTAL request (payload Selen + overhead gateway terukur) sebelum mengirim —
+    // jika bahkan digest minimal melampaui pagu, lewati dengan alasan eksplisit `digest_over_budget`.
+    let est = estimate_review_request_tokens(&review_msgs, &[]).saturating_add(gateway_overhead);
     if est > call_cap {
         let _ = store.set_last_review_skip(
             ReviewSkipReason::DigestOverBudget.as_str(),
             &format!(
-                "total request minimal ({est} token) melampaui pagu {call_cap} token/panggilan"
+                "total request minimal ({est} token termasuk overhead gateway {gateway_overhead}) melampaui pagu {call_cap} token/panggilan"
             ),
         );
         eprintln!(
@@ -1365,7 +1350,6 @@ pub async fn run_background_review(
         }
     };
 
-    let model_name = provider.model_name().to_string();
     let usage = reply.usage.unwrap_or(Usage {
         input_tokens: est,
         output_tokens: 0,
@@ -1727,7 +1711,8 @@ pub async fn run_background_review(
                             Message::text(Role::System, FROZEN_REVIEW_SYSTEM_PROMPT),
                             Message::text(Role::User, repair_user),
                         ];
-                        let retry_est = estimate_review_request_tokens(&retry_msgs, &[]);
+                        let retry_est = estimate_review_request_tokens(&retry_msgs, &[])
+                            .saturating_add(gateway_overhead);
                         if retry_est <= call_cap {
                             let (rtx, _rrx) = mpsc::channel::<StreamEvent>(16);
                             if let Ok(r_reply) = provider.stream_chat(&retry_msgs, &[], rtx).await {
