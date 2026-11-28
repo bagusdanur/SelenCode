@@ -1402,46 +1402,10 @@ impl Session {
     pub(crate) async fn handle_skills(&mut self, arg: Option<&str>) -> Result<String> {
         let Some(arg) = arg.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
             let scan = selencode::skills::scan_skills_with_warnings(&self.ctx.cwd);
-            let auto_state = if self.ctx.auto_skills {
-                "AKTIF"
-            } else {
-                "NONAKTIF"
-            };
-            let mut out = format!(
-                "# Daftar Skills (Proyek > Pengguna · {} terpasang · auto-review: {auto_state})\n",
-                scan.skills.len()
-            );
-            if scan.skills.is_empty() {
-                out.push_str("! Belum ada skill tersimpan.\n");
-            } else {
-                for s in &scan.skills {
-                    let desc = selencode::skills::truncate_index_desc(
-                        &s.summary,
-                        selencode::skills::SKILL_INDEX_DESC_MAX_CHARS,
-                    );
-                    let origin_badge = if s.is_improvement_skill() {
-                        " · [selena-improvement]"
-                    } else {
-                        ""
-                    };
-                    let meta = match &s.version {
-                        Some(v) => format!("{} · {} · v{v}{origin_badge}", s.scope, s.category),
-                        None => format!("{} · {}{origin_badge}", s.scope, s.category),
-                    };
-                    out.push_str(&format!("> {} | {meta} | {desc}\n", s.name));
-                }
-            }
-            if !scan.warnings.is_empty() {
-                out.push_str("---\n");
-                for w in scan.warnings.iter().take(5) {
-                    out.push_str(&format!("! Peringatan: {w}\n"));
-                }
-            }
-            out.push_str("---\n");
-            out.push_str("! Muat paksa skill:         /skill <nama>   ·   Lihat isi: /skills show <nama>\n");
-            out.push_str("! Pasang save-token / rm:   /skills save-token   ·   /skills rm <nama>\n");
-            out.push_str("! Review / buat manual:     /skills review   ·   /learn <nama> <instruksi>");
-            return Ok(out);
+            return Ok(selencode::skills::format_skills_list_card(
+                &scan,
+                self.ctx.auto_skills,
+            ));
         };
 
         if arg.eq_ignore_ascii_case("save-token")
@@ -1486,9 +1450,47 @@ impl Session {
                 Some(summary) => Ok(format!("# {summary}\n* tersimpan | .selencode/skills/ | siap dipakai di sesi berikutnya")),
                 None => Ok("# Selena Improvement\n! Belum ditemukan pola baru yang perlu disimpan atau di-patch sebagai skill.".into()),
             }
+        } else if let Some(name) = arg
+            .strip_prefix("override ")
+            .or_else(|| arg.strip_prefix("copy-to-project "))
+        {
+            let name = name.trim();
+            if name.is_empty() {
+                anyhow::bail!("format: `/skills override <nama-skill-user>`");
+            }
+            let detail = format!(
+                "Menyalin skill pengguna '{name}' ke store proyek (.selencode/skills/) sebagai salinan timpa proyek (override)."
+            );
+            if !self
+                .ctx
+                .approver
+                .ask(&format!("skills override {name}"), &detail)
+                .await
+            {
+                return Ok(format!(
+                    "# Salin-ke-Proyek Dibatalkan\n! Ditolak user — skill '{name}' tetap di store pengguna."
+                ));
+            }
+            let (src, dst) = selencode::skills::copy_user_skill_to_project(&self.ctx.cwd, name)?;
+            Ok(format!(
+                "# Salinan Proyek Dibuat (Override Eksplisit)\n\
+                 * aktif (project) | {}\n\
+                 > menimpa (user)  | {}\n\
+                 ! Hapus kapan saja dengan `/skills rm {name}` untuk kembali memakai versi global.",
+                dst.display(),
+                src.display()
+            ))
         } else if let Some(name) = arg.strip_prefix("show ").or_else(|| arg.strip_prefix("view ")) {
             let (info, content) = load_skill(&self.ctx.cwd, name.trim())?;
-            let mut out = format!("# Skill: {} ({})\n", info.name, info.scope);
+            let mut out = format!("# Skill: {} ({}) — {}\n", info.name, info.scope, info.path.display());
+            for sh in &info.shadows {
+                out.push_str(&format!(
+                    "! Catatan: salinan {} ini menimpa versi {} di {}\n",
+                    info.scope,
+                    sh.scope,
+                    sh.path.display()
+                ));
+            }
             for line in content.lines().take(40) {
                 out.push_str(line);
                 out.push('\n');
@@ -1611,12 +1613,21 @@ impl Session {
                 out.push_str("---\n");
                 for r in runs {
                     let note = if r.report_text.is_empty() {
-                        "(tanpa perubahan)".to_string()
+                        if r.event_calls > 1 && r.call_index < r.event_calls {
+                            "(panggilan awal; lanjut retry)".to_string()
+                        } else {
+                            "(tanpa perubahan)".to_string()
+                        }
                     } else {
                         r.report_text
                     };
+                    let call_tag = if r.event_calls > 1 {
+                        format!(" [call {}/{} {}]", r.call_index, r.event_calls, r.call_kind)
+                    } else {
+                        String::new()
+                    };
                     out.push_str(&format!(
-                        "> {} | {} ({} in · {} cache / {} out) | {note}\n",
+                        "> {} | {}{call_tag} ({} in · {} cache / {} out) | {note}\n",
                         &r.created_at.chars().take(19).collect::<String>(),
                         r.model,
                         r.input_tokens,

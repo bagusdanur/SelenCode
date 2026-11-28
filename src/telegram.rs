@@ -1600,6 +1600,42 @@ pub fn format_approval_card_html(
     (preamble, short_card_html, short_card_plain)
 }
 
+/// Env override KHUSUS PENGUJIAN untuk mengarahkan seluruh panggilan Telegram Bot API
+/// (polling `getUpdates`, `getMe`, `getFile`, pengiriman pesan/dokumen, DAN `download_file_bytes`)
+/// ke server Bot API palsu/lokal (v0.5.27 Masalah 3).
+/// BUKAN pengaturan pemakaian produksi normal — bila tidak diset/kosong, gateway memakai
+/// alamat resmi `https://api.telegram.org`.
+pub const TELEGRAM_API_BASE_ENV: &str = "SELENCODE_TELEGRAM_API_BASE";
+/// Origin resmi Telegram Bot API ketika `SELENCODE_TELEGRAM_API_BASE` tidak diset.
+pub const DEFAULT_TELEGRAM_API_ORIGIN: &str = "https://api.telegram.org";
+
+/// Resolusi pasangan `(api_base_url, file_base_url)` untuk `TelegramClient`:
+/// - Tanpa override (`None` / kosong): `("https://api.telegram.org/bot<tok>", "https://api.telegram.org/file/bot<tok>")`.
+/// - Dengan override origin (mis. `"http://127.0.0.1:18081"`):
+///   `("http://127.0.0.1:18081/bot<tok>", "http://127.0.0.1:18081/file/bot<tok>")`.
+/// - Dengan override yang sudah menyertakan akhiran `"/bot<tok>"`:
+///   `("<origin>/bot<tok>", "<origin>/file/bot<tok>")`.
+pub fn resolve_telegram_api_urls(
+    bot_token: &str,
+    api_base_override: Option<&str>,
+) -> (String, String) {
+    let tok = bot_token.trim();
+    let raw = api_base_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_TELEGRAM_API_ORIGIN);
+    let trimmed = raw.trim_end_matches('/');
+    let bot_suffix = format!("/bot{tok}");
+    if let Some(origin) = trimmed.strip_suffix(&bot_suffix) {
+        (trimmed.to_string(), format!("{origin}/file/bot{tok}"))
+    } else {
+        (
+            format!("{trimmed}/bot{tok}"),
+            format!("{trimmed}/file/bot{tok}"),
+        )
+    }
+}
+
 /// Klien ringan Telegram Bot API berbasis `reqwest`.
 /// Memisahkan klien cepat (`api_http`) dari klien long-polling (`poll_http`) + HTTP/1.1 & TCP keepalive
 /// agar soket zombie di Windows/ISP/NAT tidak pernah menahan pengiriman pesan hingga 60 detik.
@@ -1609,16 +1645,32 @@ pub struct TelegramClient {
     poll_http: reqwest::Client,
     token: String,
     base_url: String,
+    file_base_url: String,
 }
 
 impl TelegramClient {
     pub fn new(bot_token: &str) -> Result<Self> {
-        let tok = bot_token.trim();
-        Self::with_base_url(tok, &format!("https://api.telegram.org/bot{tok}"))
+        let override_env = std::env::var(TELEGRAM_API_BASE_ENV).ok();
+        let (api_base, file_base) = resolve_telegram_api_urls(bot_token, override_env.as_deref());
+        Self::with_urls(bot_token, &api_base, &file_base)
     }
 
-    /// Konstruktor dengan `base_url` khusus (dipakai pengujian mock HTTP lokal v0.5.10).
+    /// Konstruktor dengan `base_url` khusus (dipakai pengujian mock HTTP lokal v0.5.10+).
+    /// Sekaligus mengarahkan `download_file_bytes` ke origin yang sama (`<origin>/file/bot<tok>`).
     pub fn with_base_url(bot_token: &str, base_url: &str) -> Result<Self> {
+        let tok = bot_token.trim();
+        let trimmed = base_url.trim_end_matches('/');
+        let bot_suffix = format!("/bot{tok}");
+        let file_base = if let Some(origin) = trimmed.strip_suffix(&bot_suffix) {
+            format!("{origin}/file/bot{tok}")
+        } else {
+            format!("{trimmed}/file/bot{tok}")
+        };
+        Self::with_urls(tok, trimmed, &file_base)
+    }
+
+    /// Konstruktor penuh dengan `base_url` API dan `file_base_url` unduhan eksplisit.
+    pub fn with_urls(bot_token: &str, base_url: &str, file_base_url: &str) -> Result<Self> {
         let api_http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
@@ -1639,8 +1691,19 @@ impl TelegramClient {
             api_http,
             poll_http,
             base_url: base_url.trim_end_matches('/').to_string(),
+            file_base_url: file_base_url.trim_end_matches('/').to_string(),
             token: bot_token.trim().to_string(),
         })
+    }
+
+    /// URL dasar panggilan metode Bot API (`<origin>/bot<token>`).
+    pub fn api_base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// URL dasar unduhan berkas Bot API (`<origin>/file/bot<token>`).
+    pub fn file_base_url(&self) -> &str {
+        &self.file_base_url
     }
 
     async fn post_json_with<T: for<'de> Deserialize<'de>>(
@@ -1732,8 +1795,10 @@ impl TelegramClient {
     }
 
     /// Unduh byte mentah file Telegram berdasarkan `file_path` dari `getFile`.
+    /// Menghormati `file_base_url` (otomatis mengikuti `SELENCODE_TELEGRAM_API_BASE` saat diuji).
     pub async fn download_file_bytes(&self, file_path: &str) -> Result<Vec<u8>> {
-        let url = format!("https://api.telegram.org/file/bot{}/{file_path}", self.token);
+        let rel = file_path.trim_start_matches('/');
+        let url = format!("{}/{rel}", self.file_base_url);
         let resp = self.api_http.get(&url).send().await.map_err(|e| {
             let clean = redact_tg_token(&e.without_url().to_string(), &self.token);
             anyhow!("gagal mengunduh file Telegram: {clean}")

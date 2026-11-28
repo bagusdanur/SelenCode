@@ -85,6 +85,15 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
 
     println!("☾ SelenCode Telegram Gateway aktif!");
     println!("  Bot      : {bot_handle} (id: {}) — terhubung ({conn_ms} ms)", me.id);
+    if let Ok(api_override) = std::env::var(selencode::telegram::TELEGRAM_API_BASE_ENV) {
+        let trimmed = api_override.trim();
+        if !trimmed.is_empty() {
+            println!(
+                "  API Base : {trimmed} (override khusus uji via {})",
+                selencode::telegram::TELEGRAM_API_BASE_ENV
+            );
+        }
+    }
     println!("  Provider : {prov_name} / {}", pcfg.model);
     println!("  Config   : {}", config::active_config_path().display());
     println!("  Folder   : {}", cwd.display());

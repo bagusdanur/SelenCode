@@ -43,6 +43,17 @@ pub struct SkillFrontmatter {
     pub learned_at: Option<String>,
 }
 
+/// Detail salinan skill di store prioritas lebih rendah yang tertimpa oleh skill bernama sama
+/// di store prioritas lebih tinggi (mis. salinan `project` menimpa skill `user`, v0.5.27).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowedSkillInfo {
+    /// Store yang tertimpa (mis. `"user"`).
+    pub scope: &'static str,
+    pub category: String,
+    pub path: PathBuf,
+    pub is_improvement: bool,
+}
+
 /// Informasi 1 skill yang terindeks dari disk.
 #[derive(Debug, Clone)]
 pub struct SkillInfo {
@@ -65,6 +76,9 @@ pub struct SkillInfo {
     pub source_session: Option<String>,
     /// Tanggal pembelajaran (bila ada).
     pub learned_at: Option<String>,
+    /// Daftar salinan di store prioritas lebih rendah yang tertimpa oleh skill aktif ini
+    /// (keterlihatan bayangan v0.5.27 — tidak ada bayangan senyap lagi).
+    pub shadows: Vec<ShadowedSkillInfo>,
 }
 
 impl SkillInfo {
@@ -83,6 +97,11 @@ impl SkillInfo {
             || self
                 .category
                 .starts_with(&format!("{IMPROVEMENT_SKILLS_SUBDIR}/"))
+    }
+
+    /// True bila skill proyek ini menimpa skill bernama sama yang ada di store pengguna/global.
+    pub fn shadows_user_store(&self) -> bool {
+        self.scope == "project" && self.shadows.iter().any(|sh| sh.scope == "user")
     }
 }
 
@@ -412,6 +431,7 @@ fn scan_dir_recursive_filtered(
                                 origin: fm.origin,
                                 source_session: fm.source_session,
                                 learned_at: fm.learned_at,
+                                shadows: Vec::new(),
                             });
                         }
                         Err(e) => {
@@ -527,6 +547,22 @@ fn scan_dir_recursive_filtered(
                 origin,
                 source_session,
                 learned_at,
+                shadows: Vec::new(),
+            });
+        }
+    }
+}
+
+fn record_shadow(skills: &mut [SkillInfo], shadowed: &SkillInfo) {
+    if let Some(winner) = skills.iter_mut().find(|w| w.name == shadowed.name) {
+        if winner.path != shadowed.path
+            && !winner.shadows.iter().any(|sh| sh.path == shadowed.path)
+        {
+            winner.shadows.push(ShadowedSkillInfo {
+                scope: shadowed.scope,
+                category: shadowed.category.clone(),
+                path: shadowed.path.clone(),
+                is_improvement: shadowed.is_improvement_skill(),
             });
         }
     }
@@ -567,11 +603,14 @@ pub fn scan_skills_in_dirs(project_root: &Path, user_root: Option<&Path>) -> Ski
         for s in user_skills {
             if seen_names.insert(s.name.clone()) {
                 res.skills.push(s);
+            } else {
+                record_shadow(&mut res.skills, &s);
             }
         }
 
         // Prioritas #3 (lebih rendah dari skill pengguna): skill karya Selena improvement di `skills/improvement/`.
-        // Bila ada nama kembar dengan skill proyek atau skill pengguna, skill pengguna SELALU menang dimuat.
+        // Bila ada nama kembar dengan skill proyek atau skill pengguna, skill prioritas lebih tinggi menang,
+        // tetapi keberadaan bayangan dicatat di `winner.shadows` agar tidak pernah senyap.
         let imp_dir = u_dir.join(IMPROVEMENT_SKILLS_SUBDIR);
         if imp_dir.is_dir() {
             let mut imp_seen = HashSet::new();
@@ -589,6 +628,8 @@ pub fn scan_skills_in_dirs(project_root: &Path, user_root: Option<&Path>) -> Ski
             for s in imp_skills {
                 if seen_names.insert(s.name.clone()) {
                     res.skills.push(s);
+                } else {
+                    record_shadow(&mut res.skills, &s);
                 }
             }
         }
@@ -620,6 +661,8 @@ pub fn scan_skills_with_warnings(cwd: &Path) -> SkillScanResult {
         for s in leg_skills {
             if seen_names.insert(s.name.clone()) {
                 res.skills.push(s);
+            } else {
+                record_shadow(&mut res.skills, &s);
             }
         }
     }
@@ -646,6 +689,81 @@ pub fn is_builtin_skill_name(name: &str) -> bool {
         .any(|n| n.eq_ignore_ascii_case(name))
 }
 
+/// Format kartu daftar `/skills` (dipakai TUI, REPL polos, Telegram, dan CLI `selen skills list`).
+/// Menampilkan penanda bayangan eksplisit + kedua store asal apabila salinan proyek menimpa skill global (v0.5.27).
+pub fn format_skills_list_card(scan: &SkillScanResult, auto_skills: bool) -> String {
+    let auto_state = if auto_skills { "AKTIF" } else { "NONAKTIF" };
+    let shadow_count = scan.skills.iter().filter(|s| !s.shadows.is_empty()).count();
+    let shadow_hdr = if shadow_count > 0 {
+        format!(" · {shadow_count} salinan proyek menimpa global")
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "# Daftar Skills (Proyek > Pengguna · {} terpasang{shadow_hdr} · auto-review: {auto_state})\n",
+        scan.skills.len()
+    );
+    if scan.skills.is_empty() {
+        out.push_str("! Belum ada skill tersimpan.\n");
+    } else {
+        for s in &scan.skills {
+            let desc = truncate_index_desc(&s.summary, SKILL_INDEX_DESC_MAX_CHARS);
+            let origin_badge = if s.is_improvement_skill() {
+                " · [selena-improvement]"
+            } else {
+                ""
+            };
+            let scope_badge = if !s.shadows.is_empty() {
+                let sh_labels: Vec<&str> = s
+                    .shadows
+                    .iter()
+                    .map(|sh| {
+                        if sh.is_improvement {
+                            "user/improvement"
+                        } else {
+                            sh.scope
+                        }
+                    })
+                    .collect();
+                format!("{} [MENIMPA {}]", s.scope, sh_labels.join(", "))
+            } else {
+                s.scope.to_string()
+            };
+            let meta = match &s.version {
+                Some(v) => format!("{scope_badge} · {} · v{v}{origin_badge}", s.category),
+                None => format!("{scope_badge} · {}{origin_badge}", s.category),
+            };
+            out.push_str(&format!("> {} | {meta} | {desc}\n", s.name));
+            for sh in &s.shadows {
+                let sh_store = if sh.is_improvement {
+                    "user (improvement)"
+                } else {
+                    sh.scope
+                };
+                out.push_str(&format!(
+                    "!   ↳ proyek menang: {} ({}) menimpa {} ({})\n",
+                    s.scope,
+                    s.path.display(),
+                    sh_store,
+                    sh.path.display()
+                ));
+            }
+        }
+    }
+    if !scan.warnings.is_empty() {
+        out.push_str("---\n");
+        for w in scan.warnings.iter().take(5) {
+            out.push_str(&format!("! Peringatan: {w}\n"));
+        }
+    }
+    out.push_str("---\n");
+    out.push_str("! Muat paksa skill:         /skill <nama>   ·   Lihat isi: /skills show <nama>\n");
+    out.push_str("! Pasang save-token / rm:   /skills save-token   ·   /skills rm <nama>\n");
+    out.push_str("! Timpa ke proyek eksplisit:/skills override <nama>\n");
+    out.push_str("! Review / buat manual:     /skills review   ·   /learn <nama> <instruksi>");
+    out
+}
+
 /// Format indeks skill ringkas dikelompokkan per kategori (deskripsi dipotong maks 60 char)
 /// untuk disuntikkan ke snapshot dinamis awal sesi & tool `skills_list`.
 pub fn format_skills_index(skills: &[SkillInfo]) -> String {
@@ -663,7 +781,11 @@ pub fn format_skills_index(skills: &[SkillInfo]) -> String {
         out.push_str(&format!("[{cat}]\n"));
         for s in items {
             let desc = truncate_index_desc(&s.summary, SKILL_INDEX_DESC_MAX_CHARS);
-            out.push_str(&format!("- {} ({}): {desc}\n", s.name, s.scope));
+            if s.shadows_user_store() {
+                out.push_str(&format!("- {} (project; menimpa user): {desc}\n", s.name));
+            } else {
+                out.push_str(&format!("- {} ({}): {desc}\n", s.name, s.scope));
+            }
         }
     }
     out.trim_end().to_string()
@@ -909,6 +1031,96 @@ pub fn skill_file_path_for(cwd: &Path, name: &str, category: Option<&str>) -> Re
         base = base.join(clean_cat);
     }
     Ok(base.join(clean).join("SKILL.md"))
+}
+
+/// Perbarui (patch) skill yang sudah ada langsung ke berkas ASAL tempat skill dimuat
+/// (baik di store proyek maupun store pengguna, tanpa menciptakan salinan bayangan, v0.5.27).
+/// Bila belum ada di mana pun, buat skill baru di `.selencode/skills/<nama>/SKILL.md`.
+pub fn patch_resolved_skill(
+    cwd: &Path,
+    name: &str,
+    description: Option<&str>,
+    instruction: &str,
+) -> Result<(PathBuf, String, &'static str, bool)> {
+    let clean = sanitize_skill_name(name)?;
+    let existing = scan_skills_with_warnings(cwd)
+        .skills
+        .into_iter()
+        .find(|s| s.name == clean);
+
+    if let Some(info) = existing {
+        let old_raw = std::fs::read_to_string(&info.path).unwrap_or_default();
+        let old_fm = parse_skill_frontmatter(&old_raw).ok();
+        let desc = description
+            .map(|d| d.trim())
+            .filter(|d| !d.is_empty())
+            .or_else(|| old_fm.as_ref().map(|f| f.description.as_str()))
+            .unwrap_or(&info.summary);
+        let ver = old_fm.as_ref().and_then(|f| f.version.as_deref()).or(Some("1.0.0"));
+        let tags = old_fm.as_ref().map(|f| f.tags.clone()).unwrap_or_default();
+        let md = render_skill_markdown_with_origin(
+            &clean,
+            desc,
+            instruction,
+            ver,
+            &tags,
+            old_fm.as_ref().and_then(|f| f.origin.as_deref()),
+            old_fm.as_ref().and_then(|f| f.source_session.as_deref()),
+            old_fm.as_ref().and_then(|f| f.learned_at.as_deref()),
+        )?;
+        if let Some(parent) = info.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("gagal membuat folder skill {}", parent.display()))?;
+        }
+        std::fs::write(&info.path, md)
+            .with_context(|| format!("gagal menyimpan skill {}", info.path.display()))?;
+        return Ok((info.path, clean, info.scope, true));
+    }
+
+    let (path, clean, existed) = upsert_skill(cwd, &clean, description, instruction)?;
+    Ok((path, clean, "project", existed))
+}
+
+/// Salin EKSPLISIT satu skill dari store pengguna ke store proyek (`.selencode/skills/`)
+/// sebagai salinan timpa proyek (`/skills override <nama>`, v0.5.27).
+pub fn copy_user_skill_to_project(cwd: &Path, name: &str) -> Result<(PathBuf, PathBuf)> {
+    let clean = sanitize_skill_name(name)?;
+    let existing = scan_skills_with_warnings(cwd)
+        .skills
+        .into_iter()
+        .find(|s| s.name == clean)
+        .ok_or_else(|| anyhow!("skill '{clean}' tidak ditemukan"))?;
+    if existing.scope == "project" {
+        return Err(anyhow!(
+            "skill '{clean}' sudah memiliki salinan proyek di {}",
+            existing.path.display()
+        ));
+    }
+    let cat_opt = if existing.category == "umum" {
+        None
+    } else {
+        Some(existing.category.as_str())
+    };
+    let dst_skill_md = skill_file_path_for(cwd, &clean, cat_opt)?;
+    let dst_dir = dst_skill_md
+        .parent()
+        .ok_or_else(|| anyhow!("path tujuan skill proyek tidak valid"))?;
+    std::fs::create_dir_all(dst_dir)
+        .with_context(|| format!("gagal membuat folder {}", dst_dir.display()))?;
+    let raw = std::fs::read_to_string(&existing.path)
+        .with_context(|| format!("gagal membaca {}", existing.path.display()))?;
+    std::fs::write(&dst_skill_md, raw)
+        .with_context(|| format!("gagal menulis {}", dst_skill_md.display()))?;
+    // Salin subfolder referensi opsional bila ada.
+    for rel_ref in list_skill_references(&existing.dir) {
+        let src_ref = existing.dir.join(&rel_ref);
+        let dst_ref = dst_dir.join(&rel_ref);
+        if let Some(p) = dst_ref.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        let _ = std::fs::copy(&src_ref, &dst_ref);
+    }
+    Ok((existing.path, dst_skill_md))
 }
 
 /// Simpan atau perbarui (patch) skill ke `<proyek>/.selencode/skills/<nama>/SKILL.md`

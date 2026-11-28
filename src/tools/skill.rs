@@ -9,8 +9,9 @@ use super::{schema, str_arg, Ctx, Tool};
 use crate::providers::ToolSpec;
 use crate::skills::{
     format_skills_index, is_valid_kebab_case, list_skills, load_skill, load_skill_reference,
-    load_skill_with_refs, parse_skill_frontmatter, render_skill_markdown, sanitize_skill_name,
-    scan_skills_with_warnings, skill_file_path_for, upsert_skill,
+    load_skill_with_refs, parse_skill_frontmatter, patch_resolved_skill, render_skill_markdown,
+    render_skill_markdown_with_origin, sanitize_skill_name, scan_skills_with_warnings,
+    skill_file_path_for, upsert_skill,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -254,10 +255,14 @@ impl Tool for SkillView {
         } else {
             build_skill_working_copy(&info.name, &content)
         };
+        let scope_label = if info.shadows_user_store() {
+            format!("{}; menimpa user", info.scope)
+        } else {
+            info.scope.to_string()
+        };
         let mut out = format!(
-            "[Skill `{}` ({}, kategori: {}) — {}]\n\n{body}",
+            "[Skill `{}` ({scope_label}, kategori: {}) — {}]\n\n{body}",
             info.name,
-            info.scope,
             info.category,
             info.path.display()
         );
@@ -340,8 +345,8 @@ impl Tool for SkillCreate {
         let tags = extract_string_array(&args, "tags").unwrap_or_default();
 
         // Tolak jika skill proyek bernama sama sudah ada (arahkan ke `skill_edit`).
-        if scan_skills_with_warnings(&ctx.cwd)
-            .skills
+        let existing_all = scan_skills_with_warnings(&ctx.cwd).skills;
+        if existing_all
             .iter()
             .any(|s| s.scope == "project" && s.name == raw_name)
         {
@@ -349,6 +354,9 @@ impl Tool for SkillCreate {
                 "skill proyek '{raw_name}' sudah ada — gunakan `skill_edit` untuk memperbaruinya"
             ));
         }
+        let shadows_user = existing_all
+            .iter()
+            .find(|s| s.scope == "user" && s.name == raw_name);
 
         let target = skill_file_path_for(&ctx.cwd, raw_name, category)?;
         let md = render_skill_markdown(raw_name, desc, body, version, &tags)?;
@@ -358,13 +366,14 @@ impl Tool for SkillCreate {
             .display()
             .to_string();
         let diff = build_unified_diff(&rel_display, "", &md);
+        let approval_title = if shadows_user.is_some() {
+            format!("skill_create (salinan proyek menimpa user) {rel_display}")
+        } else {
+            format!("skill_create {rel_display}")
+        };
 
         // WAJIB lewat persetujuan pengguna (tidak pernah menulis skill diam-diam!).
-        if !ctx
-            .approver
-            .ask(&format!("skill_create {rel_display}"), &diff)
-            .await
-        {
+        if !ctx.approver.ask(&approval_title, &diff).await {
             return Ok(format!(
                 "Ditolak user — skill '{raw_name}' TIDAK dibuat."
             ));
@@ -376,9 +385,16 @@ impl Tool for SkillCreate {
         }
         std::fs::write(&target, &md)
             .with_context(|| format!("gagal menulis skill {}", target.display()))?;
-        Ok(format!(
-            "Skill '{raw_name}' berhasil dibuat di {rel_display}."
-        ))
+        if let Some(u) = shadows_user {
+            Ok(format!(
+                "Skill proyek '{raw_name}' berhasil dibuat di {rel_display} (menimpa skill user di {}).",
+                u.path.display()
+            ))
+        } else {
+            Ok(format!(
+                "Skill '{raw_name}' berhasil dibuat di {rel_display}."
+            ))
+        }
     }
 }
 
@@ -479,16 +495,9 @@ impl Tool for SkillEdit {
                 .ok_or_else(|| anyhow!("argumen 'body' wajib diisi saat menulis ref_path"))?;
             let safe_body = format!("{}\n", crate::security::redact_secrets(body));
 
-            // Jika skill berasal dari folder pengguna, tulis ke folder proyek override agar aman.
-            let skill_dir = if existing.scope == "project" {
-                existing.dir.clone()
-            } else {
-                skill_file_path_for(&ctx.cwd, &clean, Some(&existing.category))?
-                    .parent()
-                    .unwrap_or(&existing.dir)
-                    .to_path_buf()
-            };
-            let target = skill_dir.join(rel_path);
+            // v0.5.27 (Masalah 1): edit selalu menulis kembali ke folder ASAL tempat skill dimuat
+            // (store pengguna atau proyek), tidak pernah menciptakan salinan bayangan di proyek!
+            let target = existing.dir.join(rel_path);
             let old_raw = std::fs::read_to_string(&target).unwrap_or_default();
             let rel_display = target
                 .strip_prefix(&ctx.cwd)
@@ -499,7 +508,7 @@ impl Tool for SkillEdit {
 
             if !ctx
                 .approver
-                .ask(&format!("skill_edit {rel_display}"), &diff)
+                .ask(&format!("skill_edit ({}) {rel_display}", existing.scope), &diff)
                 .await
             {
                 return Ok(format!(
@@ -510,19 +519,11 @@ impl Tool for SkillEdit {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("gagal membuat folder {}", parent.display()))?;
             }
-            // Jika target berada di folder proyek baru (override dari skill pengguna), salin SKILL.md bila belum ada.
-            if existing.scope != "project" {
-                let dst_skill_md = skill_dir.join("SKILL.md");
-                if !dst_skill_md.exists() {
-                    if let Ok(orig) = std::fs::read_to_string(&existing.path) {
-                        let _ = std::fs::write(&dst_skill_md, orig);
-                    }
-                }
-            }
             std::fs::write(&target, &safe_body)
                 .with_context(|| format!("gagal menulis referensi {}", target.display()))?;
             return Ok(format!(
-                "Referensi skill '{clean}' ({raw_ref}) berhasil disimpan di {rel_display}.\n\n{diff}"
+                "Referensi skill '{clean}' ({}, {raw_ref}) berhasil disimpan di {rel_display}.\n\n{diff}",
+                existing.scope
             ));
         }
 
@@ -551,18 +552,19 @@ impl Tool for SkillEdit {
         let new_tags = extract_string_array(&args, "tags")
             .unwrap_or_else(|| old_fm.as_ref().map(|f| f.tags.clone()).unwrap_or_default());
 
-        // Jika skill berasal dari folder pengguna, simpan salinan override di folder proyek agar aman.
-        let target = if existing.scope == "project" {
-            existing.path.clone()
-        } else {
-            skill_file_path_for(&ctx.cwd, &clean, Some(&existing.category))?
-        };
-        let new_md = render_skill_markdown(
+        // v0.5.27 (Masalah 1): edit WAJIB menargetkan berkas ASAL hasil resolusi pemuatan skill
+        // (store + path asalnya), tidak pernah menciptakan salinan bayangan di `.selencode/skills/`.
+        let target = existing.path.clone();
+        // Pertahankan metadata provenans (`origin`, `source_session`, `learned_at`) bila ada.
+        let new_md = render_skill_markdown_with_origin(
             &clean,
             &new_desc,
             &new_body,
             new_version.as_deref(),
             &new_tags,
+            old_fm.as_ref().and_then(|f| f.origin.as_deref()),
+            old_fm.as_ref().and_then(|f| f.source_session.as_deref()),
+            old_fm.as_ref().and_then(|f| f.learned_at.as_deref()),
         )?;
         let rel_display = target
             .strip_prefix(&ctx.cwd)
@@ -573,7 +575,7 @@ impl Tool for SkillEdit {
 
         if !ctx
             .approver
-            .ask(&format!("skill_edit {rel_display}"), &diff)
+            .ask(&format!("skill_edit ({}) {rel_display}", existing.scope), &diff)
             .await
         {
             return Ok(format!(
@@ -588,7 +590,8 @@ impl Tool for SkillEdit {
         std::fs::write(&target, &new_md)
             .with_context(|| format!("gagal menyimpan skill {}", target.display()))?;
         Ok(format!(
-            "Skill '{clean}' berhasil diperbarui di {rel_display}.\n\n{diff}"
+            "Skill '{clean}' ({}) berhasil diperbarui di {rel_display}.\n\n{diff}",
+            existing.scope
         ))
     }
 }
@@ -665,7 +668,13 @@ impl Tool for ManageSkill {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow!("argumen 'content' wajib non-kosong untuk action='{action}'"))?;
                 let desc = str_arg(&args, "description");
-                let (path, clean, existed) = upsert_skill(&ctx.cwd, name, desc, content)?;
+                let (path, clean, existed) = if action == "patch" {
+                    let (p, c, _scope, ex) =
+                        patch_resolved_skill(&ctx.cwd, name, desc, content)?;
+                    (p, c, ex)
+                } else {
+                    upsert_skill(&ctx.cwd, name, desc, content)?
+                };
                 let verb = if existed || action == "patch" {
                     "patched"
                 } else {

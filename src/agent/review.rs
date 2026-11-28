@@ -273,6 +273,8 @@ pub struct AppliedReviewChange {
     pub diff: Option<String>,
     pub origin: String,
     pub backup_id: Option<i64>,
+    /// Cakupan store target perubahan (`"user"`, `"project"`, atau `"memory"`).
+    pub scope: String,
 }
 
 /// Hasil satu kali jalan Selena improvement.
@@ -287,6 +289,10 @@ pub struct BgReviewOutcome {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// Jumlah panggilan provider individual dalam peristiwa review ini (v0.5.27 Masalah 2).
+    pub calls_count: usize,
+    /// Token input terbesar dari satu panggilan individual dalam peristiwa ini (<= 5.000).
+    pub max_call_input_tokens: u64,
     pub model: String,
     pub run_id: Option<i64>,
     pub backup_ids: Vec<i64>,
@@ -1362,6 +1368,8 @@ pub async fn run_background_review(
         usage.cache_read_tokens,
         usage.cache_write_tokens,
     );
+    let event_id = uuid::Uuid::new_v4().simple().to_string();
+    let mut call_usages: Vec<(&'static str, Usage)> = vec![("initial", usage)];
 
     // Catat biaya review TERPISAH di tabel `usage` (`kind='review'`, `session_id="review:<sid>"`) lengkap dengan cache!
     let _ = store.record_review_usage_full(session_id, &model_name, usage);
@@ -1374,17 +1382,21 @@ pub async fn run_background_review(
             in_tok + out_tok,
             max_tokens
         );
-        let _ = store.record_review_run_with_coverage(
+        let _ = store.record_review_call(
             session_id,
             &cwd_str,
             &model_name,
             "",
             true,
-            in_tok,
-            out_tok,
-            cache_read,
-            cache_write,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_tokens,
+            usage.cache_write_tokens,
             covered_msg_count,
+            &event_id,
+            1,
+            1,
+            "initial",
         );
         let _ = store.clear_pending_review_signal(session_id);
         return Ok(None);
@@ -1392,17 +1404,21 @@ pub async fn run_background_review(
 
     let Some(json_str) = extract_json_object(&reply.text) else {
         eprintln!("[selena-improvement] output model bukan JSON valid (diam)");
-        let _ = store.record_review_run_with_coverage(
+        let _ = store.record_review_call(
             session_id,
             &cwd_str,
             &model_name,
             "",
             true,
-            in_tok,
-            out_tok,
-            cache_read,
-            cache_write,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_tokens,
+            usage.cache_write_tokens,
             covered_msg_count,
+            &event_id,
+            1,
+            1,
+            "initial",
         );
         let _ = store.clear_pending_review_signal(session_id);
         return Ok(None);
@@ -1412,17 +1428,21 @@ pub async fn run_background_review(
         Ok(p) => p,
         Err(e) => {
             eprintln!("[selena-improvement] gagal parse JSON review (diam): {e}");
-            let _ = store.record_review_run_with_coverage(
+            let _ = store.record_review_call(
                 session_id,
                 &cwd_str,
                 &model_name,
                 "",
                 true,
-                in_tok,
-                out_tok,
-                cache_read,
-                cache_write,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
                 covered_msg_count,
+                &event_id,
+                1,
+                1,
+                "initial",
             );
             let _ = store.clear_pending_review_signal(session_id);
             return Ok(None);
@@ -1482,18 +1502,24 @@ pub async fn run_background_review(
                         let diff = build_unified_diff(&ex.path.display().to_string(), &old_raw, &new_md);
                         let payload = serde_json::json!({
                             "skill": clean_name,
+                            "scope": ex.scope,
                             "path": ex.path.to_string_lossy(),
                             "new_markdown": new_md,
                             "diff": diff,
                             "reason": rsn,
                         })
                         .to_string();
+                        let scope_note = if ex.scope == "project" {
+                            " [salinan proyek]"
+                        } else {
+                            ""
+                        };
                         if let Ok(pid) = store.create_review_proposal(
                             session_id,
                             &cwd_str,
                             "overwrite_skill",
                             &clean_name,
-                            &format!("Perbarui skill pengguna '{clean_name}' ({rsn})"),
+                            &format!("Perbarui skill pengguna '{clean_name}'{scope_note} ({rsn})"),
                             &payload,
                         ) {
                             staged_ids.push(pid);
@@ -1519,6 +1545,11 @@ pub async fn run_background_review(
                         continue;
                     }
                     let diff = build_unified_diff(&ex.path.display().to_string(), &old_raw, &new_md);
+                    let backup_reason = if ex.scope == "project" {
+                        format!("{rsn} [salinan proyek]")
+                    } else {
+                        rsn.clone()
+                    };
                     let bid = store
                         .record_review_backup(
                             session_id,
@@ -1527,7 +1558,7 @@ pub async fn run_background_review(
                             &ex.path.to_string_lossy(),
                             &old_raw,
                             &diff,
-                            &rsn,
+                            &backup_reason,
                         )
                         .ok();
                     if let Some(id) = bid {
@@ -1541,6 +1572,7 @@ pub async fn run_background_review(
                             diff: Some(diff),
                             origin: IMPROVEMENT_SKILL_ORIGIN.to_string(),
                             backup_id: bid,
+                            scope: ex.scope.to_string(),
                         });
                     }
                     continue;
@@ -1548,8 +1580,10 @@ pub async fn run_background_review(
 
                 // Skill BARU karya Selena improvement wajib lahir di `<user_skills_dir>/improvement/<nama>/SKILL.md`
                 // dengan frontmatter `origin: selena-improvement`, sesi sumber, & tanggal (lintas sesi!).
-                let base_root = user_skills_dir()
-                    .unwrap_or_else(|| crate::skills::project_skills_dir(cwd));
+                let (base_root, new_scope) = match user_skills_dir() {
+                    Some(u) => (u, "user"),
+                    None => (crate::skills::project_skills_dir(cwd), "project"),
+                };
                 let Ok(target_path) = improvement_skill_file_path(&base_root, &clean_name) else {
                     continue;
                 };
@@ -1581,6 +1615,7 @@ pub async fn run_background_review(
                         diff: Some(diff),
                         origin: IMPROVEMENT_SKILL_ORIGIN.to_string(),
                         backup_id: None,
+                        scope: new_scope.to_string(),
                     });
                 }
             }
@@ -1716,17 +1751,22 @@ pub async fn run_background_review(
                         if retry_est <= call_cap {
                             let (rtx, _rrx) = mpsc::channel::<StreamEvent>(16);
                             if let Ok(r_reply) = provider.stream_chat(&retry_msgs, &[], rtx).await {
-                                if let Some(ru) = r_reply.usage {
-                                    in_tok = in_tok.saturating_add(ru.input_tokens);
-                                    out_tok = out_tok.saturating_add(ru.output_tokens);
-                                    cache_read = cache_read.saturating_add(ru.cache_read_tokens);
-                                    cache_write = cache_write.saturating_add(ru.cache_write_tokens);
-                                    let _ = store.record_review_usage_full(
-                                        session_id,
-                                        &model_name,
-                                        ru,
-                                    );
-                                }
+                                let ru = r_reply.usage.unwrap_or(Usage {
+                                    input_tokens: retry_est,
+                                    output_tokens: 0,
+                                    cache_read_tokens: 0,
+                                    cache_write_tokens: 0,
+                                });
+                                call_usages.push(("correction_retry", ru));
+                                in_tok = in_tok.saturating_add(ru.input_tokens);
+                                out_tok = out_tok.saturating_add(ru.output_tokens);
+                                cache_read = cache_read.saturating_add(ru.cache_read_tokens);
+                                cache_write = cache_write.saturating_add(ru.cache_write_tokens);
+                                let _ = store.record_review_usage_full(
+                                    session_id,
+                                    &model_name,
+                                    ru,
+                                );
                                 if let Some(r_json) = extract_json_object(&r_reply.text) {
                                     if let Ok(r_plan) =
                                         serde_json::from_str::<ReviewPlanResponse>(r_json)
@@ -1812,8 +1852,14 @@ pub async fn run_background_review(
                     || !was_freshly_read
                     || force_stage_unanchored_correction;
                 if must_stage {
+                    let scope_note = if info.scope == "project" {
+                        " [salinan proyek]"
+                    } else {
+                        ""
+                    };
                     let payload = serde_json::json!({
                         "skill": clean_name,
+                        "scope": info.scope,
                         "path": info.path.to_string_lossy(),
                         "new_markdown": new_md,
                         "diff": diff,
@@ -1824,11 +1870,11 @@ pub async fn run_background_review(
                     })
                     .to_string();
                     let label = if !info.is_improvement_skill() {
-                        format!("Perbarui skill pengguna '{clean_name}' ({rsn})")
+                        format!("Perbarui skill pengguna '{clean_name}'{scope_note} ({rsn})")
                     } else if force_stage_unanchored_correction {
-                        format!("Tinjau koreksi skill '{clean_name}' tanpa old_snippet persis ({rsn})")
+                        format!("Tinjau koreksi skill '{clean_name}'{scope_note} tanpa old_snippet persis ({rsn})")
                     } else {
-                        format!("Timpa skill '{clean_name}' ({rsn})")
+                        format!("Timpa skill '{clean_name}'{scope_note} ({rsn})")
                     };
                     if let Ok(pid) = store.create_review_proposal(
                         session_id,
@@ -1847,6 +1893,11 @@ pub async fn run_background_review(
                     }
                 } else {
                     // Simpan cadangan isi sebelumnya agar setiap patch langsung dapat diputar balik (`/review undo`).
+                    let backup_reason = if info.scope == "project" {
+                        format!("{rsn} [salinan proyek]")
+                    } else {
+                        rsn.clone()
+                    };
                     let bid = store
                         .record_review_backup(
                             session_id,
@@ -1855,7 +1906,7 @@ pub async fn run_background_review(
                             &info.path.to_string_lossy(),
                             &old_raw,
                             &diff,
-                            &rsn,
+                            &backup_reason,
                         )
                         .ok();
                     if let Some(id) = bid {
@@ -1869,6 +1920,7 @@ pub async fn run_background_review(
                             diff: Some(diff),
                             origin: IMPROVEMENT_SKILL_ORIGIN.to_string(),
                             backup_id: bid,
+                            scope: info.scope.to_string(),
                         });
                     }
                 }
@@ -1904,8 +1956,14 @@ pub async fn run_background_review(
                         continue;
                     }
                     let diff = build_unified_diff(&norm_ref, &old_ref, &safe_content);
+                    let scope_note = if info.scope == "project" {
+                        " [salinan proyek]"
+                    } else {
+                        ""
+                    };
                     let payload = serde_json::json!({
                         "skill": clean_name,
+                        "scope": info.scope,
                         "ref_path": norm_ref,
                         "path": target.to_string_lossy(),
                         "new_content": safe_content,
@@ -1918,7 +1976,7 @@ pub async fn run_background_review(
                         &cwd_str,
                         "overwrite_skill",
                         &format!("{clean_name}/{norm_ref}"),
-                        &format!("Referensi '{norm_ref}' pada skill '{clean_name}' ({rsn})"),
+                        &format!("Referensi '{norm_ref}' pada skill '{clean_name}'{scope_note} ({rsn})"),
                         &payload,
                     ) {
                         staged_ids.push(pid);
@@ -1937,6 +1995,7 @@ pub async fn run_background_review(
                             diff: Some(diff),
                             origin: IMPROVEMENT_SKILL_ORIGIN.to_string(),
                             backup_id: None,
+                            scope: info.scope.to_string(),
                         });
                     }
                 }
@@ -1975,6 +2034,7 @@ pub async fn run_background_review(
                         diff: None,
                         origin: IMPROVEMENT_SKILL_ORIGIN.to_string(),
                         backup_id: None,
+                        scope: "memory".to_string(),
                     });
                 }
             }
@@ -2112,8 +2172,14 @@ pub async fn run_background_review(
                     .to_string();
                 let diff = build_unified_diff(&rel_display, &old_raw, &new_md);
                 let rsn = short_reason(&reason, "tulis ulang isi skill");
+                let scope_note = if info.scope == "project" {
+                    " [salinan proyek]"
+                } else {
+                    ""
+                };
                 let payload = serde_json::json!({
                     "skill": clean_name,
+                    "scope": info.scope,
                     "path": info.path.to_string_lossy(),
                     "new_markdown": new_md,
                     "diff": diff,
@@ -2125,7 +2191,7 @@ pub async fn run_background_review(
                     &cwd_str,
                     "overwrite_skill",
                     &clean_name,
-                    &format!("Timpa skill '{clean_name}' ({rsn})"),
+                    &format!("Timpa skill '{clean_name}'{scope_note} ({rsn})"),
                     &payload,
                 ) {
                     staged_ids.push(pid);
@@ -2136,20 +2202,43 @@ pub async fn run_background_review(
     }
 
     let report_message = format_review_report(&applied, &staged_ids, &staged_kinds);
-    let run_id = store
-        .record_review_run_with_coverage(
+    let event_calls = call_usages.len().max(1);
+    let max_call_input_tokens = call_usages
+        .iter()
+        .map(|(_, u)| u.input_tokens)
+        .max()
+        .unwrap_or(in_tok);
+    let mut run_id: Option<i64> = None;
+    for (idx, (call_kind, cu)) in call_usages.iter().enumerate() {
+        let call_index = idx + 1;
+        let is_last = call_index == event_calls;
+        let row_report = if is_last {
+            report_message.as_deref().unwrap_or("")
+        } else {
+            ""
+        };
+        let row_delivered = if is_last { mark_delivered } else { true };
+        if let Ok(id) = store.record_review_call(
             session_id,
             &cwd_str,
             &model_name,
-            report_message.as_deref().unwrap_or(""),
-            mark_delivered,
-            in_tok,
-            out_tok,
-            cache_read,
-            cache_write,
+            row_report,
+            row_delivered,
+            cu.input_tokens,
+            cu.output_tokens,
+            cu.cache_read_tokens,
+            cu.cache_write_tokens,
             covered_msg_count,
-        )
-        .ok();
+            &event_id,
+            call_index,
+            event_calls,
+            call_kind,
+        ) {
+            if is_last {
+                run_id = Some(id);
+            }
+        }
+    }
     // Sinyal tertunda pada sesi ini sudah resmi ditindaklanjuti oleh review tuntas.
     let _ = store.clear_pending_review_signal(session_id);
 
@@ -2165,6 +2254,8 @@ pub async fn run_background_review(
         output_tokens: out_tok,
         cache_read_tokens: cache_read,
         cache_write_tokens: cache_write,
+        calls_count: event_calls,
+        max_call_input_tokens,
         model: model_name,
         run_id,
         backup_ids,
@@ -2182,16 +2273,21 @@ fn format_review_report(
     let mut parts: Vec<String> = Vec::new();
     let mut saw_memory_update = false;
     for ch in applied {
+        let project_suffix = if ch.scope == "project" {
+            " (salinan proyek)"
+        } else {
+            ""
+        };
         match ch.kind.as_str() {
             "create_skill" => {
-                parts.push(format!("Skill '{}' created", ch.target));
+                parts.push(format!("Skill '{}' created{project_suffix}", ch.target));
             }
             "patch_skill" => {
-                parts.push(format!("Skill '{}' patched", ch.target));
+                parts.push(format!("Skill '{}' patched{project_suffix}", ch.target));
             }
             "add_skill_reference" => {
                 let sname = ch.target.split('/').next().unwrap_or(&ch.target);
-                parts.push(format!("Skill '{sname}' patched"));
+                parts.push(format!("Skill '{sname}' patched{project_suffix}"));
             }
             "add_memory" => {
                 if !saw_memory_update {

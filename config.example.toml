@@ -71,6 +71,10 @@ total_secs = 600                                 # batas keras total 1 panggilan
 # turn_timeout_secs = 900                        # batas waktu keras 1 giliran agent (detik; default 900 = 15 menit)
 # stall_notice_secs = 180                        # kirim 1 peringatan macet bila giliran diam tanpa progres (detik; default 180)
 # poll_watchdog_secs = 300                       # watchdog OS-thread: keluar non-nol (restart systemd) bila polling macet (detik; default 300)
+# Catatan khusus uji (BUKAN pemakaian produksi normal):
+# Env `SELENCODE_TELEGRAM_API_BASE` (mis. `http://127.0.0.1:18081`) mengarahkan seluruh panggilan
+# Bot API (`getUpdates`, `getFile`, kirim pesan/berkas) DAN unduhan berkas ke server uji lokal.
+# Biarkan tidak diset pada pemakaian normal agar gateway terhubung ke https://api.telegram.org.
 
 # Server MCP eksternal (Fase 7) — opsional, boleh banyak. Tool-nya muncul
 # sebagai mcp__<name>__<tool> di registry mode eksekusi. Default: panggilan

@@ -68,6 +68,10 @@ Di mode interaktif tersedia perintah garis miring (tidak dikirim ke provider):
 
 Semua sesi tersimpan di SQLite `~/.local/share/selencode/selen.db`
 (override: env `SELENCODE_DB`) — pesan (versi teredaksi) + usage token.
+Untuk **pengujian lokal** gateway Telegram saja (bukan pemakaian produksi normal),
+env `SELENCODE_TELEGRAM_API_BASE` (mis. `http://127.0.0.1:18081`) mengarahkan semua
+endpoint Bot API dan unduhan berkas ke server Bot API palsu; bila tidak diset,
+gateway tetap terhubung ke `https://api.telegram.org`.
 Sesudah tiap giliran interaktif ditampilkan `token sesi ini: X in / Y out`,
 plus estimasi biaya bila provider di config mengisi `price_in`/`price_out`
 (per 1M token); tanpa harga, biaya tidak ditebak.

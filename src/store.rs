@@ -290,7 +290,7 @@ pub struct ReviewProposal {
     pub resolved_at: String,
 }
 
-/// Catatan satu kali jalan Selena Improvement (cooldown + laporan tertunda + telemetri cache).
+/// Catatan satu panggilan Selena Improvement (cooldown + laporan tertunda + telemetri cache + per-panggilan v0.5.27).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewRunRecord {
     pub id: i64,
@@ -304,6 +304,14 @@ pub struct ReviewRunRecord {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub covered_msg_count: usize,
+    /// ID peristiwa review untuk mengelompokkan panggilan multi-panggilan (mis. initial + retry).
+    pub event_id: String,
+    /// Nomor urut panggilan 1-based di dalam peristiwa review ini (`1`, `2`, ...).
+    pub call_index: usize,
+    /// Total panggilan provider dalam peristiwa review ini (`1` normal, `2` bila ada retry pagar mutu).
+    pub event_calls: usize,
+    /// Jenis panggilan: `"initial"` atau `"correction_retry"`.
+    pub call_kind: String,
     pub created_at: String,
 }
 
@@ -419,6 +427,10 @@ CREATE TABLE IF NOT EXISTS review_runs (id INTEGER PRIMARY KEY, session_id TEXT 
                     input_tokens INT NOT NULL DEFAULT 0, output_tokens INT NOT NULL DEFAULT 0,
                     cache_read_tokens INT NOT NULL DEFAULT 0, cache_write_tokens INT NOT NULL DEFAULT 0,
                     covered_msg_count INT NOT NULL DEFAULT 0,
+                    event_id TEXT NOT NULL DEFAULT '',
+                    call_index INT NOT NULL DEFAULT 1,
+                    event_calls INT NOT NULL DEFAULT 1,
+                    call_kind TEXT NOT NULL DEFAULT 'initial',
                     created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS review_backups (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
                     cwd TEXT NOT NULL, skill_name TEXT NOT NULL, file_path TEXT NOT NULL,
@@ -1700,12 +1712,50 @@ impl Store {
         cache_write_tokens: u64,
         covered_msg_count: usize,
     ) -> Result<i64> {
+        self.record_review_call(
+            session_id,
+            cwd,
+            model,
+            report_text,
+            delivered,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            covered_msg_count,
+            "",
+            1,
+            1,
+            "initial",
+        )
+    }
+
+    /// Catat SATU panggilan provider review secara individual di `review_runs` (v0.5.27 Masalah 2)
+    /// agar kepatuhan pagu `<= 5.000 token/panggilan` terbaca langsung per baris tanpa agregasi antar-panggilan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_review_call(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        model: &str,
+        report_text: &str,
+        delivered: bool,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        covered_msg_count: usize,
+        event_id: &str,
+        call_index: usize,
+        event_calls: usize,
+        call_kind: &str,
+    ) -> Result<i64> {
         let safe_report = crate::security::redact_secrets(report_text.trim());
         let del_int: i64 = if delivered || safe_report.is_empty() { 1 } else { 0 };
         let conn = self.conn.lock().expect("mutex store poisoned");
         conn.execute(
-            "INSERT INTO review_runs (session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, covered_msg_count, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO review_runs (session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, covered_msg_count, event_id, call_index, event_calls, call_kind, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 session_id,
                 cwd,
@@ -1717,6 +1767,10 @@ impl Store {
                 cache_read_tokens as i64,
                 cache_write_tokens as i64,
                 covered_msg_count as i64,
+                event_id,
+                call_index.max(1) as i64,
+                event_calls.max(1) as i64,
+                if call_kind.trim().is_empty() { "initial" } else { call_kind.trim() },
                 now()
             ],
         )?;
@@ -1882,7 +1936,7 @@ impl Store {
     pub fn list_recent_review_runs(&self, cwd: &str, limit: usize) -> Result<Vec<ReviewRunRecord>> {
         let conn = self.conn.lock().expect("mutex store poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, covered_msg_count, created_at \
+            "SELECT id, session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, covered_msg_count, event_id, call_index, event_calls, call_kind, created_at \
              FROM review_runs WHERE cwd = ?1 ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![cwd, limit as i64], |r| {
@@ -1898,7 +1952,15 @@ impl Store {
                 cache_read_tokens: r.get::<_, i64>(8).unwrap_or(0).max(0) as u64,
                 cache_write_tokens: r.get::<_, i64>(9).unwrap_or(0).max(0) as u64,
                 covered_msg_count: r.get::<_, i64>(10).unwrap_or(0).max(0) as usize,
-                created_at: r.get(11)?,
+                event_id: r.get::<_, String>(11).unwrap_or_default(),
+                call_index: r.get::<_, i64>(12).unwrap_or(1).max(1) as usize,
+                event_calls: r.get::<_, i64>(13).unwrap_or(1).max(1) as usize,
+                call_kind: r
+                    .get::<_, String>(14)
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "initial".to_string()),
+                created_at: r.get(15)?,
             })
         })?;
         let mut out = Vec::new();
@@ -3049,6 +3111,34 @@ fn migrate_review_schema(conn: &Connection) -> Result<()> {
             [],
         )
         .context("gagal migrasi kolom covered_msg_count pada tabel review_runs")?;
+    }
+    if !cols.iter().any(|c| c == "event_id") {
+        conn.execute(
+            "ALTER TABLE review_runs ADD COLUMN event_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .context("gagal migrasi kolom event_id pada tabel review_runs")?;
+    }
+    if !cols.iter().any(|c| c == "call_index") {
+        conn.execute(
+            "ALTER TABLE review_runs ADD COLUMN call_index INT NOT NULL DEFAULT 1",
+            [],
+        )
+        .context("gagal migrasi kolom call_index pada tabel review_runs")?;
+    }
+    if !cols.iter().any(|c| c == "event_calls") {
+        conn.execute(
+            "ALTER TABLE review_runs ADD COLUMN event_calls INT NOT NULL DEFAULT 1",
+            [],
+        )
+        .context("gagal migrasi kolom event_calls pada tabel review_runs")?;
+    }
+    if !cols.iter().any(|c| c == "call_kind") {
+        conn.execute(
+            "ALTER TABLE review_runs ADD COLUMN call_kind TEXT NOT NULL DEFAULT 'initial'",
+            [],
+        )
+        .context("gagal migrasi kolom call_kind pada tabel review_runs")?;
     }
     Ok(())
 }
