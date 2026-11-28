@@ -87,7 +87,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      # Ganti nama per platform agar aset rilis tidak saling menimpa.
+      # Ganti nama per platform agar aset rilis tidak saling menimpa & buat SHA256SUMS.
       - name: Siapkan aset rilis
         run: |
           mkdir -p dist
@@ -95,6 +95,8 @@ jobs:
           cp artifacts/selen-linux-x64/selen dist/selen-linux-x64
           cp artifacts/selen-windows-x64.exe/selen.exe dist/selen-windows-x64.exe
           chmod +x dist/selen-termux-arm64 dist/selen-linux-x64
+          (cd dist && sha256sum selen-termux-arm64 selen-linux-x64 selen-windows-x64.exe > SHA256SUMS)
+          cat dist/SHA256SUMS
       - name: Publikasikan GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
