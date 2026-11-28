@@ -670,25 +670,32 @@ async fn masalah3_telegram_api_base_env_routes_all_api_and_file_downloads_to_moc
     let updates = tg.get_updates(0, 1).await.unwrap();
     assert_eq!(updates.len(), 1);
     let msg = updates[0].message.as_ref().unwrap();
-    let doc = match classify_tg_message(msg) {
-        TgIngressClassification::Document { document, .. } => document,
+    let (file_id, file_name, mime_type) = match classify_tg_message(msg) {
+        TgIngressClassification::Document {
+            file_id,
+            file_name,
+            mime_type,
+            ..
+        } => (file_id, file_name, mime_type),
         other => panic!("harus terklasifikasi sebagai Document, dapat: {other:?}"),
     };
 
-    let fi = tg.get_file(&doc.file_id).await.unwrap();
+    let fi = tg.get_file(&file_id).await.unwrap();
     let fp = fi.file_path.as_deref().unwrap();
     let bytes = tg.download_file_bytes(fp).await.unwrap();
     assert_eq!(bytes, b"KODE_VERIFIKASI_V0527=LULUS_B2\n");
 
     let work_dir = temp_dir("m3-uploads");
-    let (saved_abs, saved_rel) = save_tg_document_bytes(
+    let saved_rel = save_tg_document_bytes(
         &work_dir,
         msg.message_id,
-        doc.file_name.as_deref(),
-        doc.mime_type.as_deref(),
+        file_name.as_deref(),
+        mime_type.as_deref(),
+        Some(fp),
         &bytes,
     )
     .unwrap();
+    let saved_abs = work_dir.join(&saved_rel);
     assert!(saved_abs.is_file());
     assert!(saved_rel.starts_with(".selencode/tg_uploads/tg_77_"));
     assert_eq!(

@@ -1791,7 +1791,6 @@ pub async fn run_background_review(
                                                             destructive_overwrite =
                                                                 new_l * 2 < old_l;
                                                             patched_body = Some(cand);
-                                                            is_append_only_patch = false;
                                                             repaired = true;
                                                             break;
                                                         }
