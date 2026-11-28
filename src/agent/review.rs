@@ -761,9 +761,11 @@ struct ReviewPlanResponse {
 #[serde(tag = "action", rename_all = "snake_case")]
 enum ReviewAction {
     CreateSkill {
+        #[serde(alias = "name")]
         skill: String,
         #[serde(default)]
         description: String,
+        #[serde(alias = "content")]
         body: String,
         #[serde(default)]
         tags: Vec<String>,
@@ -771,6 +773,7 @@ enum ReviewAction {
         reason: String,
     },
     PatchSkill {
+        #[serde(alias = "name")]
         skill: String,
         #[serde(default)]
         old_snippet: Option<String>,
@@ -782,6 +785,7 @@ enum ReviewAction {
         reason: String,
     },
     AddSkillReference {
+        #[serde(alias = "name")]
         skill: String,
         ref_path: String,
         content: String,
@@ -789,8 +793,10 @@ enum ReviewAction {
         reason: String,
     },
     AddMemory {
+        #[allow(dead_code)]
         #[serde(default = "default_general_cat")]
         category: String,
+        #[allow(dead_code)]
         #[serde(default = "default_project_scope")]
         scope: String,
         content: String,
