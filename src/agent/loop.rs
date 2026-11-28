@@ -7,10 +7,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::context::{
-    analyze_token_breakdown, auto_outline, build_folder_map, build_resume_snapshot,
-    build_resume_system_prompt, build_system_prompt, cap_dynamic_injection,
-    compact_messages_structured, estimate_tokens, expand_at_mentions, head_tail_truncate,
-    needs_compaction, proactive_prune_context_with_archive,
+    analyze_token_breakdown, auto_outline, build_folder_map,
+    build_resume_snapshot_with_read_status, build_resume_system_prompt, build_system_prompt,
+    cap_dynamic_injection, compact_messages_structured, estimate_tokens, expand_at_mentions,
+    head_tail_truncate, needs_compaction, proactive_prune_context_with_archive,
     prune_old_skill_results_with_archive, prune_old_tool_results_with_archive,
     prune_oversized_pending_tool_batch_with_archive, session_archive_dir, spillover_if_needed,
     spillover_with_preview,
@@ -1192,6 +1192,25 @@ async fn run_turn_inner(
         LoopGuard::new()
     };
     let mut dedup = ToolDedupCache::new();
+    // v0.5.32: hidrasi pelacak bacaan berkas dari SQLite + riwayat `messages` agar dedup `read_file`
+    // selamat dari `/resume` dan tetap mendeteksi perubahan berkas di disk (kontrol kesegaran).
+    let resume_read_statuses = if let Ok(mut tracker) = ctx.read_tracker.lock() {
+        if let (Some(store), Some(sid)) = (&ctx.store, &ctx.session_id) {
+            tracker.hydrate_from_store(store, sid);
+        }
+        tracker.hydrate_from_messages(&ctx.cwd, messages);
+        if lean_resume {
+            tracker.verify_freshness_for_resume(
+                &ctx.cwd,
+                ctx.store.as_deref(),
+                ctx.session_id.as_deref(),
+            )
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     let mut corrector = VerificationTracker::new(turn_checkpoint_id);
     let sid_for_archive = ctx
         .session_id
@@ -1280,6 +1299,9 @@ async fn run_turn_inner(
             };
         if pruned_now > 0 {
             dedup.clear_file_reads();
+            if let Ok(mut tracker) = ctx.read_tracker.lock() {
+                tracker.reset_generation();
+            }
         }
         // v0.5.17 Masalah 2 + v0.5.19 Masalah 2 (desain internal SelenCode):
         // Pemangkasan proaktif 3-pass berdasarkan tekanan token riil, hanya menyala saat melewati
@@ -1324,6 +1346,9 @@ async fn run_turn_inner(
                 if pres.pruned_count > 0 {
                     pruned_now += pres.pruned_count;
                     dedup.clear_file_reads();
+                    if let Ok(mut tracker) = ctx.read_tracker.lock() {
+                        tracker.reset_generation();
+                    }
                     let after_est =
                         analyze_token_breakdown(messages, &tools, registry.names().len())
                             .total_tokens();
@@ -1366,6 +1391,9 @@ async fn run_turn_inner(
             last_provider_prompt_tokens = 0;
             last_est_tokens_at_call = 0;
             dedup.clear_file_reads();
+            if let Ok(mut tracker) = ctx.read_tracker.lock() {
+                tracker.reset_generation();
+            }
         }
         // Provider dipindah ke task agar StreamEvent bisa dikonsumsi sambil jalan.
         // Bungkus dalam `AbortOnDrop` (v0.5.10 Perbaikan 1) agar saat giliran dibatalkan
@@ -1389,7 +1417,11 @@ async fn run_turn_inner(
             // resume padat tanpa folder_map/katalog skill penuh + ringkas riwayat pra-resume) tanpa mengubah DB!
             let mut snapshot = if lean_resume {
                 let fresh_sys = build_fresh_system_prompt(&tools, &active_toolsets, false, true);
-                build_resume_snapshot(messages, Some(&fresh_sys))
+                build_resume_snapshot_with_read_status(
+                    messages,
+                    Some(&fresh_sys),
+                    &resume_read_statuses,
+                )
             } else {
                 messages.clone()
             };
@@ -1485,6 +1517,9 @@ async fn run_turn_inner(
                                 proactive_prune_rearm_tokens = 0;
                             }
                             dedup.clear_file_reads();
+                            if let Ok(mut tracker) = ctx.read_tracker.lock() {
+                                tracker.reset_generation();
+                            }
                             let note = format!(
                                 "✦ Konteks melebihi batas provider — meringkas {} item & mencoba ulang otomatis ({overflow_compactions}/2)…",
                                 em.pruned_count
@@ -2163,6 +2198,10 @@ async fn run_turn_inner(
                                     }
                                 }
                                 green_verify_dedup_hits = 0;
+                            } else if call.name == "read_file" {
+                                if crate::tools::read_tracker::is_read_dedup_stub(&out_txt) {
+                                    last_step_deduped += 1;
+                                }
                             } else {
                                 dedup.record_success(&call.name, &call.args, &out_txt, &ctx.cwd);
                             }
@@ -2254,6 +2293,11 @@ async fn run_turn_inner(
                                             }
                                         }
                                         green_verify_dedup_hits = 0;
+                                    } else if call.name == "read_file" {
+                                        if crate::tools::read_tracker::is_read_dedup_stub(&out_txt)
+                                        {
+                                            last_step_deduped += 1;
+                                        }
                                     } else {
                                         dedup.record_success(
                                             &call.name,

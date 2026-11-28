@@ -216,7 +216,74 @@ pub fn skip_missed_jobs_on_startup(store: &Store) -> Result<usize> {
     Ok(skipped)
 }
 
+/// Deteksi metakarakter shell berbahaya di dalam satu perintah cron.
+/// Mengembalikan daftar label metakarakter yang ditemukan (kosong bila bersih).
+pub fn find_cron_shell_metacharacters(cmd: &str) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = Vec::new();
+    let checks: &[(&str, &'static str)] = &[
+        (";", "`;`"),
+        ("&", "`&`"),
+        ("|", "`|`"),
+        ("`", "`` ` ``"),
+        ("$(", "`$(`"),
+        ("${", "`${`"),
+        (">", "`>`"),
+        ("<", "`<`"),
+        ("\n", "newline (`\\n`)"),
+        ("\r", "carriage-return (`\\r`)"),
+        ("\0", "NUL (`\\0`)"),
+    ];
+    for &(needle, label) in checks {
+        if cmd.contains(needle) {
+            found.push(label);
+        }
+    }
+    found
+}
+
+/// Validasi pintu masuk untuk SATU perintah di allowlist cron (`allowed_shell`).
+/// Menolak perintah kosong, metakarakter shell (`;`, `&`, `|`, `` ` ``, `$(`, `${`, `>`, `<`, newline),
+/// serta perintah destruktif terlarang (`is_forbidden_command`).
+pub fn validate_cron_shell_command(raw: &str) -> Result<String> {
+    // Periksa newline / CR / NUL SEBELUM `trim()` agar newline di tepi string pun tidak lolos!
+    let pre_meta = find_cron_shell_metacharacters(raw);
+    if !pre_meta.is_empty() {
+        let preview: String = raw
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .chars()
+            .take(120)
+            .collect();
+        anyhow::bail!(
+            "perintah allowlist cron '{preview}' ditolak: mengandung metakarakter shell terlarang ({}) — \
+             hanya perintah tunggal polos tanpa chaining, subshell, redirect, atau newline yang diizinkan",
+            pre_meta.join(", ")
+        );
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("perintah allowlist cron tidak boleh kosong");
+    }
+    if is_forbidden_command(trimmed) {
+        anyhow::bail!(
+            "perintah allowlist cron '{trimmed}' ditolak demi keamanan (perintah destruktif/terlarang)"
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validasi pintu masuk untuk seluruh daftar `allowed_shell` cron (all-or-nothing).
+/// Bila satu pun perintah tidak valid, seluruh pembuatan job ditolak tanpa tersimpan sebagian.
+pub fn validate_cron_allowlist(commands: &[String]) -> Result<Vec<String>> {
+    let mut cleaned = Vec::with_capacity(commands.len());
+    for raw in commands {
+        cleaned.push(validate_cron_shell_command(raw)?);
+    }
+    Ok(cleaned)
+}
+
 /// Cek apakah perintah shell diizinkan oleh allowlist per job (cocok persis atau prefix token).
+/// (Lapisan kedua sisi-eksekusi — dipertahankan utuh berdampingan dengan validasi pintu masuk.)
 pub fn is_shell_command_allowlisted(command: &str, allowlist: &[String]) -> bool {
     let cmd = command.trim();
     if cmd.is_empty() || allowlist.is_empty() {

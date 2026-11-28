@@ -126,6 +126,19 @@ pub struct MemoryItem {
     pub updated_at: String,
 }
 
+/// Satu rekaman berkas yang telah dibaca dalam sesi untuk dedup `read_file` lintas resume (v0.5.32).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedReadFile {
+    pub dedup_key: String,
+    pub rel_path: String,
+    pub canonical_path: String,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
+    pub content_sha256: String,
+    pub mtime_ns: u128,
+    pub file_size: u64,
+}
+
 /// Satu langkah dalam Long-Horizon Task persisten lintas sesi (Tahap 5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LongTaskStep {
@@ -466,6 +479,19 @@ CREATE TABLE IF NOT EXISTS job_watches (id INTEGER PRIMARY KEY, label TEXT NOT N
 CREATE TABLE IF NOT EXISTS gateway_state (key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_read_files (
+                    session_id TEXT NOT NULL,
+                    dedup_key TEXT NOT NULL,
+                    rel_path TEXT NOT NULL,
+                    canonical_path TEXT NOT NULL,
+                    start_line INTEGER,
+                    end_line INTEGER,
+                    content_sha256 TEXT NOT NULL,
+                    mtime_ns TEXT NOT NULL DEFAULT '0',
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, dedup_key));
+CREATE INDEX IF NOT EXISTS idx_session_read_files_session ON session_read_files(session_id);
 ";
 
 fn now() -> String {
@@ -659,6 +685,10 @@ impl Store {
             );
             let _ = conn.execute(
                 "DELETE FROM review_proposals WHERE session_id = ?1",
+                rusqlite::params![session_id],
+            );
+            let _ = conn.execute(
+                "DELETE FROM session_read_files WHERE session_id = ?1",
                 rusqlite::params![session_id],
             );
             let n = conn.execute(
@@ -2068,7 +2098,10 @@ impl Store {
         if safe_prompt.is_empty() {
             anyhow::bail!("prompt job tidak boleh kosong");
         }
-        let shell_json = serde_json::to_string(allowed_shell)?;
+        // Validasi pintu masuk (v0.5.32): tolak metakarakter shell di allowlist sebelum INSERT
+        // agar tidak ada satu pun permukaan masuk yang dapat menyimpan entri berbahaya.
+        let validated_shell = crate::cron::validate_cron_allowlist(allowed_shell)?;
+        let shell_json = serde_json::to_string(&validated_shell)?;
         let ts = now();
         let conn = self.conn.lock().expect("mutex store poisoned");
         conn.execute(
@@ -2094,7 +2127,7 @@ impl Store {
             schedule_spec: schedule_spec.to_string(),
             prompt: safe_prompt,
             cwd: cwd.to_string(),
-            allowed_shell: allowed_shell.to_vec(),
+            allowed_shell: validated_shell,
             allow_write,
             enabled: true,
             chat_id,
@@ -2571,6 +2604,12 @@ impl Store {
         max_age_secs: u64,
         expires_at: &str,
     ) -> Result<crate::watch::JobWatchRecord> {
+        // Validasi pintu masuk store-level (v0.5.32): pastikan perintah shell watch tidak mengandung metakarakter.
+        let safe_target = if check_kind == "shell" {
+            crate::watch::validate_readonly_watch_command(check_target)?
+        } else {
+            check_target.to_string()
+        };
         let conn = self.conn.lock().expect("mutex store poisoned");
         let ts = now();
         conn.execute(
@@ -2584,7 +2623,7 @@ impl Store {
                 chat_id,
                 cwd,
                 check_kind,
-                check_target,
+                safe_target,
                 done_marker,
                 fail_marker,
                 interval_secs as i64,
@@ -2600,7 +2639,7 @@ impl Store {
             chat_id,
             cwd: cwd.to_string(),
             check_kind: check_kind.to_string(),
-            check_target: check_target.to_string(),
+            check_target: safe_target,
             done_marker: done_marker.to_string(),
             fail_marker: fail_marker.to_string(),
             interval_secs,
@@ -2716,6 +2755,79 @@ impl Store {
             )?,
         };
         Ok(n > 0)
+    }
+
+    // ---------- Pelacak Bacaan Berkas per Sesi (`session_read_files`, v0.5.32) ----------
+
+    pub fn upsert_session_read_file(&self, session_id: &str, entry: &PersistedReadFile) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        self.materialize_if_pending(&conn, session_id)?;
+        let ts = now();
+        conn.execute(
+            "INSERT INTO session_read_files \
+             (session_id, dedup_key, rel_path, canonical_path, start_line, end_line, content_sha256, mtime_ns, file_size, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(session_id, dedup_key) DO UPDATE SET \
+               rel_path = excluded.rel_path, \
+               canonical_path = excluded.canonical_path, \
+               start_line = excluded.start_line, \
+               end_line = excluded.end_line, \
+               content_sha256 = excluded.content_sha256, \
+               mtime_ns = excluded.mtime_ns, \
+               file_size = excluded.file_size, \
+               updated_at = excluded.updated_at",
+            rusqlite::params![
+                session_id,
+                entry.dedup_key,
+                entry.rel_path,
+                entry.canonical_path,
+                entry.start_line.map(|v| v as i64),
+                entry.end_line.map(|v| v as i64),
+                entry.content_sha256,
+                entry.mtime_ns.to_string(),
+                entry.file_size as i64,
+                ts,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_session_read_files(&self, session_id: &str) -> Result<Vec<PersistedReadFile>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT dedup_key, rel_path, canonical_path, start_line, end_line, content_sha256, mtime_ns, file_size \
+             FROM session_read_files WHERE session_id = ?1 ORDER BY updated_at ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id], |r| {
+            let start_line: Option<i64> = r.get(3)?;
+            let end_line: Option<i64> = r.get(4)?;
+            let mtime_str: String = r.get(6)?;
+            let file_size: i64 = r.get(7)?;
+            Ok(PersistedReadFile {
+                dedup_key: r.get(0)?,
+                rel_path: r.get(1)?,
+                canonical_path: r.get(2)?,
+                start_line: start_line.filter(|&v| v > 0).map(|v| v as usize),
+                end_line: end_line.filter(|&v| v > 0).map(|v| v as usize),
+                content_sha256: r.get(5)?,
+                mtime_ns: mtime_str.parse::<u128>().unwrap_or(0),
+                file_size: file_size.max(0) as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_session_read_file_path(&self, session_id: &str, canonical_path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "DELETE FROM session_read_files WHERE session_id = ?1 AND canonical_path = ?2",
+            rusqlite::params![session_id, canonical_path],
+        )?;
+        Ok(())
     }
 
     /// Ambil laporan watch terminal yang selesai saat sesi CLI tidak aktif, lalu tandai terkirim.

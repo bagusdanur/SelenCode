@@ -123,16 +123,18 @@ impl Tool for ManageCron {
                     .get("allow_write")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let allowed_shell: Vec<String> = args
+                let raw_allowed_shell: Vec<String> = args
                     .get("allowed_shell")
                     .and_then(|v| v.as_array())
                     .map(|arr| {
                         arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
-                            .filter(|s| !s.is_empty())
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .filter(|s| !s.trim().is_empty())
                             .collect()
                     })
                     .unwrap_or_default();
+                // Validasi pintu masuk tool `manage_cron` (v0.5.32): tolak metakarakter shell sebelum approval / INSERT.
+                let allowed_shell = crate::cron::validate_cron_allowlist(&raw_allowed_shell)?;
                 let chat_id = ctx.telegram_chat_id.unwrap_or(0);
                 let cwd_str = ctx.cwd.to_string_lossy().to_string();
 

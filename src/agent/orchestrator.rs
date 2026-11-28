@@ -238,6 +238,7 @@ fn child_ctx_for_role(parent_ctx: &Ctx) -> Ctx {
         api_max_retries: parent_ctx.api_max_retries,
         api_retry_base_delay_ms: parent_ctx.api_retry_base_delay_ms,
         web_cfg: parent_ctx.web_cfg.clone(),
+        read_tracker: Arc::new(Mutex::new(crate::tools::read_tracker::ReadFileTracker::new())),
     }
 }
 

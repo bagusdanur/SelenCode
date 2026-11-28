@@ -9,6 +9,7 @@ pub mod memory;
 pub mod orchestrate;
 pub mod outline;
 pub mod plan;
+pub mod read_tracker;
 pub mod retrieve;
 pub mod search;
 pub mod send_file;
@@ -103,6 +104,8 @@ pub struct Ctx {
     pub api_retry_base_delay_ms: u64,
     /// Konfigurasi riset web opsional (`[web]` untuk `fetch_url` & `web_search`, v0.5.28).
     pub web_cfg: crate::config::WebCfg,
+    /// Pelacak deduplikasi pembacaan berkas per sesi berbasis sidik SHA-256 (v0.5.32).
+    pub read_tracker: Arc<std::sync::Mutex<read_tracker::ReadFileTracker>>,
 }
 
 impl Ctx {
@@ -142,6 +145,7 @@ impl Ctx {
             api_max_retries: 3,
             api_retry_base_delay_ms: 2_000,
             web_cfg: crate::config::WebCfg::default(),
+            read_tracker: Arc::new(std::sync::Mutex::new(read_tracker::ReadFileTracker::new())),
         }
     }
     pub fn with_web_cfg(mut self, cfg: crate::config::WebCfg) -> Self {

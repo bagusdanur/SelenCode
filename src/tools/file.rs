@@ -729,7 +729,71 @@ impl Tool for ReadFile {
         }
         let bytes = std::fs::read(&p).map_err(|e| anyhow!("gagal membaca {rel}: {e}"))?;
         let text = String::from_utf8_lossy(&bytes);
-        format_sliced_text(rel, &text, &args, ctx)
+        let formatted = format_sliced_text(rel, &text, &args, ctx)?;
+
+        // Dedup pembacaan deterministik di lapisan tool (v0.5.32 — pola Hermes `file_tools.py` &
+        // `file_tools_read_tracking.py`): lacak sidik SHA-256 isi berkas per sesi (selamat dari resume).
+        let start_opt = args
+            .get("start")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.max(1) as usize);
+        let end_opt = args
+            .get("end")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let canon = super::read_tracker::canonical_key_path(&p);
+        let raw_sha256 = crate::update::sha256_hex(&bytes);
+        let rendered_sha256 = crate::update::sha256_hex(formatted.as_bytes());
+        let (mtime_ns, file_size) = super::read_tracker::file_mtime_and_size(&p);
+        let full_file = start_opt.is_none()
+            && end_opt.is_none()
+            && !formatted.contains("\n... [dipotong di ")
+            && !formatted.contains("\n... (hasil dipotong");
+
+        if let Ok(mut tracker) = ctx.read_tracker.lock() {
+            if let (Some(store), Some(sid)) = (&ctx.store, &ctx.session_id) {
+                tracker.hydrate_from_store(store, sid);
+            }
+            if let Some(stub) = tracker.check_dedup_or_invalidate(
+                &canon,
+                rel,
+                start_opt,
+                end_opt,
+                &raw_sha256,
+                &rendered_sha256,
+            ) {
+                return Ok(stub);
+            }
+            tracker.record_read(
+                canon.clone(),
+                rel.to_string(),
+                start_opt,
+                end_opt,
+                raw_sha256.clone(),
+                rendered_sha256,
+                mtime_ns,
+                file_size,
+                full_file,
+            );
+        }
+        if let (Some(store), Some(sid)) = (&ctx.store, &ctx.session_id) {
+            let dedup_key = super::read_tracker::make_dedup_key(&canon, start_opt, end_opt);
+            let _ = store.upsert_session_read_file(
+                sid,
+                &crate::store::PersistedReadFile {
+                    dedup_key,
+                    rel_path: rel.to_string(),
+                    canonical_path: canon,
+                    start_line: start_opt,
+                    end_line: end_opt,
+                    content_sha256: raw_sha256,
+                    mtime_ns,
+                    file_size,
+                },
+            );
+        }
+
+        Ok(formatted)
     }
 }
 
@@ -779,6 +843,13 @@ impl Tool for WriteFile {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&p, content)?;
+        let canon_written = super::read_tracker::canonical_key_path(&p);
+        if let Ok(mut tracker) = ctx.read_tracker.lock() {
+            tracker.invalidate_path(&canon_written);
+        }
+        if let (Some(store), Some(sid)) = (&ctx.store, &ctx.session_id) {
+            let _ = store.delete_session_read_file_path(sid, &canon_written);
+        }
         if let Ok(mut stack) = ctx.undo_stack.lock() {
             stack.record(super::undo::FileSnapshot {
                 path: p,
@@ -1196,6 +1267,13 @@ impl Tool for EditFile {
             return Ok(format!("Ditolak user — file {rel} TIDAK diubah."));
         }
         std::fs::write(&p, &working)?;
+        let canon_edited = super::read_tracker::canonical_key_path(&p);
+        if let Ok(mut tracker) = ctx.read_tracker.lock() {
+            tracker.invalidate_path(&canon_edited);
+        }
+        if let (Some(store), Some(sid)) = (&ctx.store, &ctx.session_id) {
+            let _ = store.delete_session_read_file_path(sid, &canon_edited);
+        }
         if let Ok(mut stack) = ctx.undo_stack.lock() {
             stack.record(super::undo::FileSnapshot {
                 path: p,

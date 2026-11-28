@@ -136,6 +136,8 @@ async fn main() -> Result<()> {
                 } => {
                     let parsed = selencode::cron::parse_schedule(&schedule)?;
                     let spec = parsed.canonical_spec();
+                    // Validasi pintu masuk CLI (v0.5.32): tolak metakarakter shell di `--allow-shell` sebelum simpan.
+                    let validated_shell = selencode::cron::validate_cron_allowlist(&allow_shell)?;
                     let next = selencode::cron::compute_next_run_after(&spec, chrono::Utc::now())?;
                     let cwd_dir = cwd.unwrap_or_else(|| {
                         std::env::current_dir()
@@ -150,7 +152,7 @@ async fn main() -> Result<()> {
                         &spec,
                         &prompt,
                         &cwd_dir,
-                        &allow_shell,
+                        &validated_shell,
                         allow_write,
                         target_chat,
                         &next,

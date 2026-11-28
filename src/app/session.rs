@@ -1153,6 +1153,9 @@ impl Session {
         if let Ok(mut plan) = self.ctx.plan_state.lock() {
             plan.clear();
         }
+        if let Ok(mut tracker) = self.ctx.read_tracker.lock() {
+            tracker.clear();
+        }
         Ok(new_id)
     }
 
@@ -1266,6 +1269,9 @@ impl Session {
             .unwrap_or(0);
         if let Ok(mut plan) = self.ctx.plan_state.lock() {
             plan.clear();
+        }
+        if let Ok(mut tracker) = self.ctx.read_tracker.lock() {
+            tracker.clear();
         }
 
         Ok(ResumedSessionData {
