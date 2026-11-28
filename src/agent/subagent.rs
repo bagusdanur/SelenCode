@@ -106,6 +106,7 @@ pub async fn run_subagent(
         tool_preview_length: parent_ctx.tool_preview_length,
         api_max_retries: parent_ctx.api_max_retries,
         api_retry_base_delay_ms: parent_ctx.api_retry_base_delay_ms,
+        web_cfg: parent_ctx.web_cfg.clone(),
     };
     let mut messages = vec![Message::text(
         Role::System,
@@ -177,6 +178,7 @@ pub async fn run_worktree_subagent(
         tool_preview_length: parent_ctx.tool_preview_length,
         api_max_retries: parent_ctx.api_max_retries,
         api_retry_base_delay_ms: parent_ctx.api_retry_base_delay_ms,
+        web_cfg: parent_ctx.web_cfg.clone(),
     };
 
     let mut messages = vec![Message::text(
