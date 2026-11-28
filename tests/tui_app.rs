@@ -436,7 +436,7 @@ fn render_mobile_help_rapi_dan_context_model_tampil() {
         .join("\n");
     assert!(joined.contains("/stop"), "/stop tampil di /help");
     assert!(joined.contains("kurangi popup izin"), "deskripsi /approve utuh");
-    assert!(joined.contains("self-improvement"), "deskripsi /skills utuh");
+    assert!(joined.contains("Selena improvement"), "deskripsi /skills utuh");
 
     // 2. Status bar mobile (50 kolom) menampilkan kapasitas konteks model AI (Gemini -> 1M).
     let mut a = App::new(
