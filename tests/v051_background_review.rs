@@ -79,6 +79,7 @@ fn write_sample_skill(cwd: &std::path::Path) -> PathBuf {
          name: raw-downloader\n\
          description: Panduan unduh gambar RAW pakai rawdl\n\
          version: 1.0.0\n\
+         origin: selena-improvement\n\
          tags: [rawdl, ops]\n\
          ---\n\
          # Raw Downloader\n\
@@ -243,10 +244,11 @@ async fn scenario1_correction_patches_skill_records_separate_usage_and_enforces_
     assert!(umems[0].contains("~/data/raws"));
     assert!(store.list_memories(&cwd_str, 10).unwrap().is_empty());
 
-    // Laporan tepat satu baris bergaya SelenCode/SelenCode!
+    // Laporan tepat satu baris bergaya Selena improvement!
     let report = outcome.report_message.as_deref().unwrap();
-    assert!(report.starts_with("💾 Self-improvement review:"));
-    assert!(report.contains("Skill 'raw-downloader' patched (tambah aturan folder kanonik)"));
+    assert!(report.starts_with("💾 Selena improvement:"));
+    assert!(report.contains("Skill 'raw-downloader' patched"), "{report}");
+    assert!(report.contains("Memory updated"), "{report}");
     assert!(!report.contains('\n'));
 
     // Laporan tertunda (mark_delivered=false) muncul sekali pada sesi CLI berikutnya!

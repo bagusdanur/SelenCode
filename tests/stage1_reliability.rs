@@ -4,7 +4,7 @@
 //! 3. Self-Correction Engine, LoopGuard, & Automatic Verification Gate end-to-end
 
 use async_trait::async_trait;
-use selencode::agent::corrector::{LoopGuard, LoopWarning, SelfCorrectState, MAX_REPAIR_ATTEMPTS};
+use selencode::agent::corrector::{LoopGuard, LoopWarning, VerificationTracker};
 use selencode::agent::run_turn;
 use selencode::providers::{
     AssistantReply, Message, Provider, StreamEvent, ToolCall, ToolSpec,
@@ -210,24 +210,19 @@ fn loop_guard_dan_self_correct_gate_berjalan_sesuai_batas() {
         }
     ));
 
-    // SelfCorrectState menghormati MAX_REPAIR_ATTEMPTS
-    let mut sc = SelfCorrectState::new(Some(1));
+    // VerificationTracker deterministik melacak edit & status verifikasi (0 panggilan LLM tambahan)
+    let mut sc = VerificationTracker::new(Some(1));
     sc.observe_tool("edit_file", &json!({"path": "src/lib.rs"}), "OK: src/lib.rs diedit.", false);
     assert!(sc.edited_code_file);
     assert!(!sc.verified_after_last_edit);
-    for _ in 0..MAX_REPAIR_ATTEMPTS {
-        assert!(sc.completion_gate(10).is_some());
-    }
-    assert!(
-        sc.completion_gate(10).is_none(),
-        "batas percobaan perbaikan harus menghentikan loop"
-    );
+    assert!(sc.honest_unverified_closing_note("Selesai.").is_some());
 
-    // Setelah verify_project LULUS -> gate mengembalikan None
-    let mut sc2 = SelfCorrectState::new(Some(2));
+    // Setelah verify_project LULUS -> tidak ada catatan peringatan penutup
+    let mut sc2 = VerificationTracker::new(Some(2));
     sc2.observe_tool("write_file", &json!({"path": "src/new.rs"}), "OK: ditulis.", false);
     sc2.observe_tool("verify_project", &json!({"scope": "check"}), "Verifikasi proyek [Rust]: LULUS ✅", false);
-    assert!(sc2.completion_gate(10).is_none());
+    assert!(sc2.verified_after_last_edit);
+    assert!(sc2.honest_unverified_closing_note("Selesai.").is_none());
 
     // Slash commands Tahap 1
     assert_eq!(parse_slash_command("/checkpoint"), SlashCommand::Checkpoint(None));
@@ -245,12 +240,12 @@ fn loop_guard_dan_self_correct_gate_berjalan_sesuai_batas() {
     );
 }
 
-/// Mock provider untuk menguji Self-Correction Verification Gate end-to-end:
+/// Mock provider untuk menguji pelacakan verifikasi penutup deterministik (v0.5.24):
 /// - Panggilan 0: edit file `app.rs`
-/// - Panggilan 1: mencoba langsung menjawab selesai TANPA verifikasi -> harus ditahan oleh gate!
-/// - Panggilan 2: menerima pesan `[Self-Correction Gate ...]`, lalu memanggil `git_status` / selesai terverifikasi.
+/// - Panggilan 1: menjawab selesai tanpa verifikasi -> TIDAK ada loop refleksi tambahan,
+///   jawaban akhir dikirim tepat 1x disertai catatan penutup jujur + checkpoint otomatis tersimpan!
 struct SelfCorrectMock {
-    calls: AtomicUsize,
+    calls: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -261,16 +256,16 @@ impl Provider for SelfCorrectMock {
         _tools: &[ToolSpec],
         tx: mpsc::Sender<StreamEvent>,
     ) -> anyhow::Result<AssistantReply> {
+        // v0.5.24: tidak boleh pernah menyuntikkan [Self-Correction Gate ...]
+        assert!(
+            !msgs.iter().any(|m| m.plain_text().contains("[Self-Correction Gate")),
+            "v0.5.24 menghapus loop refleksi Self-Correction Gate"
+        );
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         match n {
             0 => Ok(AssistantReply {
                 text: String::new(),
                 tool_calls: vec![
-                    ToolCall {
-                        id: "pre_v".into(),
-                        name: "run_shell".into(),
-                        args: json!({"command": "node -e \"process.exit(0)\""}),
-                    },
                     ToolCall {
                         id: "e1".into(),
                         name: "write_file".into(),
@@ -280,44 +275,10 @@ impl Provider for SelfCorrectMock {
                 finish_reason: Some("tool_calls".into()),
                 usage: None,
             }),
-            1 => {
-                // Coba berhenti sebelum verifikasi -> Self-Correction Gate akan memicu panggilan ke-2!
-                let _ = tx.send(StreamEvent::Token("Selesai tanpa cek.".into())).await;
-                Ok(AssistantReply {
-                    text: "Selesai tanpa cek.".into(),
-                    tool_calls: vec![],
-                    finish_reason: Some("stop".into()),
-                    usage: None,
-                })
-            }
-            2 => {
-                // Pastikan pesan Self-Correction Gate benar-benar disuntikkan!
-                let saw_gate = msgs
-                    .iter()
-                    .any(|m| m.plain_text().contains("[Self-Correction Gate"));
-                assert!(saw_gate, "Self-Correction Gate harus terkirim ke model");
-                Ok(AssistantReply {
-                    text: String::new(),
-                    tool_calls: vec![
-                        ToolCall {
-                            id: "v1".into(),
-                            name: "run_shell".into(),
-                            args: json!({"command": "node -e \"process.exit(0)\""}),
-                        },
-                        ToolCall {
-                            id: "v2".into(),
-                            name: "verify_project".into(),
-                            args: json!({"scope": "check"}),
-                        },
-                    ],
-                    finish_reason: Some("tool_calls".into()),
-                    usage: None,
-                })
-            }
             _ => {
-                let _ = tx.send(StreamEvent::Token("Sudah diverifikasi dan selesai.".into())).await;
+                let _ = tx.send(StreamEvent::Token("Selesai menulis app.rs.".into())).await;
                 Ok(AssistantReply {
-                    text: "Sudah diverifikasi dan selesai.".into(),
+                    text: "Selesai menulis app.rs.".into(),
                     tool_calls: vec![],
                     finish_reason: Some("stop".into()),
                     usage: None,
@@ -336,17 +297,27 @@ async fn self_correction_gate_end_to_end_menahan_klaim_selesai_sebelum_verifikas
     assert!(selencode::tools::read_only_registry().get("verify_project").is_none());
 
     let ctx = Ctx::new(cwd.clone(), true).with_self_correct(true);
+    let calls = Arc::new(AtomicUsize::new(0));
     let provider: Arc<dyn Provider> = Arc::new(SelfCorrectMock {
-        calls: AtomicUsize::new(0),
+        calls: calls.clone(),
     });
     let mut messages = Vec::new();
     let out = run_turn(provider, &reg, &ctx, &mut messages, "buat app.rs", 10)
         .await
         .unwrap();
 
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "harus tepat 2 panggilan (1 tool + 1 penutup), 0 putaran refleksi tambahan"
+    );
     assert!(
-        out.starts_with("Sudah diverifikasi dan selesai."),
-        "jawaban akhir harus dimulai dari respons terverifikasi: {out}"
+        out.starts_with("Selesai menulis app.rs."),
+        "jawaban akhir harus dikirim sekali apa adanya + catatan deterministik: {out}"
+    );
+    assert!(
+        out.contains("belum diverifikasi"),
+        "ringkasan penutup deterministik wajib mencatat status belum diverifikasi: {out}"
     );
     // Pastikan checkpoint otomatis giliran tersimpan karena app.rs diubah!
     let cps = ctx.undo_stack.lock().unwrap().list_checkpoints();

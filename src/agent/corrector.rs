@@ -1,13 +1,12 @@
-//! Self-Correction Engine & Loop/Stagnation Detector (Tahap 1).
+//! Pelacak Verifikasi Deterministik & Loop/Stagnation Detector.
 //!
-//! Menjaga keandalan eksekusi coding agent:
+//! Menjaga keandalan eksekusi coding agent tanpa loop refleksi penutup (v0.5.24):
 //! 1. `LoopGuard`: mendeteksi pemanggilan tool identik berulang (`>= 3x`) atau
 //!    kegagalan berulang tanpa kemajuan (`>= 4` error beruntun), lalu memberi
 //!    peringatan agar agent mengganti strategi atau berhenti jujur.
-//! 2. `SelfCorrectState`: melacak file yang diubah dalam giliran aktif, apakah
-//!    verifikasi sudah dijalankan sesudah edit terakhir, dan memicu siklus
-//!    verifikasi & perbaikan terbatas (`MAX_REPAIR_ATTEMPTS = 3`) sebelum
-//!    agent mengklaim selesai.
+//! 2. `VerificationTracker`: melacak file yang diubah dalam giliran aktif,
+//!    file tes yang disentuh, serta hasil perintah verifikasi terakhir untuk
+//!    catatan penutup deterministik (0 panggilan model tambahan).
 
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -18,8 +17,6 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 pub const MAX_IDENTICAL_CALLS: usize = 3;
 /// Batas error tool beruntun tanpa kemajuan sebelum peringatan stagnasi.
 pub const MAX_CONSECUTIVE_ERRORS: usize = 4;
-/// Batas siklus perbaikan/verifikasi otomatis default di struct (di runtime diatur `[guard]`, default 1).
-pub const MAX_REPAIR_ATTEMPTS: usize = 3;
 
 /// Kanonisasi nilai JSON (urutkan kunci objek secara alfabetis secara rekursif) agar
 /// `{"a":1,"b":2}` dan `{"b":2,"a":1}` menghasilkan fingerprint identik (Tahap 2).
@@ -1205,21 +1202,23 @@ fn cap_raw_verify_output(output: &str, max_chars: usize) -> String {
     format!("{head}\n… [dipotong tengah agar fokus ke error akhir] …\n{tail}")
 }
 
-/// State pelacakan self-correction & gerbang verifikasi dalam satu giliran eksekusi agent
-/// (Tahap 1 + Perbaikan 2 v0.5.8 + Perbaikan 2 v0.5.14: SWE-agent `review_on_submit` + Aider reflection).
-#[derive(Debug)]
-pub struct SelfCorrectState {
+/// Pelacak verifikasi deterministik dalam satu giliran eksekusi agent (v0.5.24).
+/// Melacak berkas diubah, berkas tes, perintah verifikasi mapan, exit code, & status lulus/gagal/basi
+/// untuk mencetak baris status penutup faktual — TANPA pernah memicu putaran refleksi model tambahan
+/// di dalam giliran (peran tinjauan pasca-tugas kini dipegang sepenuhnya oleh Selena improvement di latar).
+#[derive(Debug, Default)]
+pub struct VerificationTracker {
     pub edited_files: Vec<String>,
-    /// File baru yang dibuat via `write_file` sepanjang giliran ini (untuk daftar periksa sampah/repro SWE-agent).
+    /// File baru yang dibuat via `write_file` sepanjang giliran ini (untuk deteksi deterministik berkas sementara).
     pub created_files: Vec<String>,
-    /// Berkas tes yang ikut diubah pada giliran ini (Perbaikan 4 v0.5.15 — visibilitas permanen di ringkasan akhir).
+    /// Berkas tes yang ikut diubah pada giliran ini (visibilitas permanen di ringkasan akhir).
     pub edited_test_files: Vec<String>,
     pub edited_code_file: bool,
     pub verified_after_last_edit: bool,
     pub last_verify_passed: Option<bool>,
-    /// True bila minimal satu perintah verifikasi nyata pernah dijalankan pada giliran ini (v0.5.14).
+    /// True bila minimal satu perintah verifikasi nyata pernah dijalankan pada giliran ini.
     pub has_verification_run: bool,
-    /// Perintah verifikasi mapan untuk giliran ini (`run_shell` / `verify_project`, Perbaikan 3 v0.5.15).
+    /// Perintah verifikasi mapan untuk giliran ini (`run_shell` / `verify_project`).
     pub last_verify_cmd: Option<String>,
     /// Nomor langkah (1-based) saat perintah verifikasi mapan terakhir dijalankan.
     pub last_verify_step: Option<usize>,
@@ -1227,66 +1226,21 @@ pub struct SelfCorrectState {
     pub last_verify_exit_code: Option<i32>,
     /// Baris hasil kunci dari larian terakhir perintah verifikasi mapan.
     pub last_verify_key_line: Option<String>,
-    /// Keluaran mentah kegagalan verifikasi terakhir untuk umpan balik refleksi ala Aider.
+    /// Keluaran mentah kegagalan verifikasi terakhir untuk ringkasan status jujur penutup.
     pub last_verify_output: Option<String>,
-    /// Lingkup ketat v0.5.14: gerbang hanya hidup bila ada mutasi berkas DAN ada perintah verifikasi yang dijalankan.
-    pub strict_known_verify_only: bool,
-    pub repair_attempts: usize,
-    pub max_attempts: usize,
     pub checkpoint_id: Option<usize>,
-    /// True bila minimal satu perintah verifikasi nyata pernah LULUS penuh pada giliran ini (Masalah 1 v0.5.19).
+    /// True bila minimal satu perintah verifikasi nyata pernah LULUS penuh pada giliran ini.
     pub has_passed_green_verify: bool,
-    /// Jumlah berkas berbeda yang disentuh sejak verifikasi hijau terakhir (untuk mengizinkan
-    /// verifikasi inkremental terbatas pada edit kecil sesudah build+tes hijau — Masalah 1 v0.5.19).
+    /// Jumlah berkas berbeda yang disentuh sejak verifikasi hijau terakhir.
     pub edits_since_last_green_verify: usize,
-    /// True sesudah daftar periksa penutup SWE-agent (`review_on_submit`) dijalankan sekali.
-    pub checklist_checked: bool,
 }
 
-impl Default for SelfCorrectState {
-    fn default() -> Self {
-        Self {
-            edited_files: Vec::new(),
-            created_files: Vec::new(),
-            edited_test_files: Vec::new(),
-            edited_code_file: false,
-            verified_after_last_edit: false,
-            last_verify_passed: None,
-            has_verification_run: false,
-            last_verify_cmd: None,
-            last_verify_step: None,
-            last_verify_exit_code: None,
-            last_verify_key_line: None,
-            last_verify_output: None,
-            strict_known_verify_only: false,
-            repair_attempts: 0,
-            max_attempts: MAX_REPAIR_ATTEMPTS,
-            checkpoint_id: None,
-            has_passed_green_verify: false,
-            edits_since_last_green_verify: 0,
-            checklist_checked: false,
-        }
-    }
-}
-
-impl SelfCorrectState {
+impl VerificationTracker {
     pub fn new(checkpoint_id: Option<usize>) -> Self {
         Self {
             checkpoint_id,
             ..Self::default()
         }
-    }
-
-    pub fn with_max_attempts(mut self, max_attempts: usize) -> Self {
-        self.max_attempts = max_attempts;
-        self
-    }
-
-    /// Aktifkan lingkup ketat v0.5.14 (Perbaikan 2 #4): gerbang hanya menegakkan kasus verifikasi
-    /// yang benar-benar pernah dijalankan pada giliran ini (diam total pada tugas tanpa tes).
-    pub fn with_strict_known_verify_only(mut self, strict: bool) -> Self {
-        self.strict_known_verify_only = strict;
-        self
     }
 
     /// Perbarui state berdasarkan hasil eksekusi 1 tool (kompatibel API lama).
@@ -1512,161 +1466,9 @@ impl SelfCorrectState {
         }
     }
 
-    /// Evaluasi sebelum agent menyelesaikan giliran (pola SWE-agent `review_on_submit` + refleksi Aider):
-    /// - Pada mode ketat (`strict_known_verify_only`), gerbang hanya hidup bila ada mutasi berkas
-    ///   DAN ada perintah verifikasi yang benar-benar dijalankan pada giliran ini.
-    /// - Bila verifikasi terakhir lulus sesudah edit terakhir -> `None` (0 suntikan).
-    /// - Bila ada edit sesudah verifikasi terakhir ATAU verifikasi terakhir GAGAL -> tahan penutupan
-    ///   hingga `max_attempts` (bawaan 3), menyertakan perintah tercatat dan keluaran gagal mentah.
-    pub fn completion_gate(&mut self, remaining_steps: usize) -> Option<String> {
-        let cap = self.max_attempts;
-        let has_mutation = self.edited_code_file || !self.edited_files.is_empty();
-        if !has_mutation || remaining_steps < 2 || self.repair_attempts >= cap {
-            return None;
-        }
-        if self.strict_known_verify_only && !self.has_verification_run {
-            return None;
-        }
-        // Jika verifikasi sudah LULUS setelah edit terakhir, JANGAN ulangi!
-        if self.verified_after_last_edit && self.last_verify_passed == Some(true) {
-            return None;
-        }
-        let files = self.edited_files.join(", ");
-        let step_note = self
-            .last_verify_step
-            .map(|s| format!(" pada langkah {s}"))
-            .unwrap_or_default();
-
-        if !self.verified_after_last_edit {
-            self.repair_attempts += 1;
-            let attempt = self.repair_attempts;
-            if let Some(cmd) = self.last_verify_cmd.as_deref() {
-                if self.last_verify_passed == Some(true) && self.edits_since_last_green_verify <= 2 {
-                    return Some(format!(
-                        "[Self-Correction Gate {attempt}/{cap} — Verifikasi Inkremental] \
-                         Verifikasi sebelumnya (`{cmd}`{step_note}) sudah LULUS, lalu ada edit kecil pada ({files}). \
-                         Jalankan verifikasi inkremental/terbatas pada bagian yang berubah saja 1× (tidak perlu mengulang suite penuh yang tidak terdampak), lalu langsung tutup jawaban jika lulus."
-                    ));
-                }
-                let prev_status = match self.last_verify_passed {
-                    Some(false) => "GAGAL",
-                    Some(true) => "LULUS",
-                    None => "belum terkonfirmasi",
-                };
-                return Some(format!(
-                    "[Self-Correction Gate {attempt}/{cap} — Penutupan Ditahan] \
-                     Keadaan tercatat: perintah verifikasi terakhir `{cmd}` dijalankan{step_note} (status: {prev_status}), \
-                     dan setelah itu ada perubahan berkas ({files}) yang belum diverifikasi ulang. \
-                     Jalankan ulang `{cmd}` sekarang untuk membuktikan perubahanmu; bila masih gagal, perbaiki hingga lulus, lalu tutup kembali."
-                ));
-            }
-            return Some(format!(
-                "[Self-Correction Gate {attempt}/{cap}] Kamu baru saja mengubah file kode ({files}), \
-                 tetapi belum menjalankan verifikasi sesudah edit terakhir. \
-                 Jalankan 1 perintah verifikasi paling langsung (`verify_project` atau test yang sudah ada) SEKALI saja, lalu berhenti jika lulus."
-            ));
-        }
-        if self.last_verify_passed == Some(false) {
-            self.repair_attempts += 1;
-            let attempt = self.repair_attempts;
-            let cmd = self
-                .last_verify_cmd
-                .as_deref()
-                .unwrap_or("verifikasi terakhir");
-            let raw_block = self
-                .last_verify_output
-                .as_deref()
-                .map(|raw| format!("\n\nKeluaran kegagalan mentah dari `{cmd}`:\n{raw}"))
-                .unwrap_or_default();
-            return Some(format!(
-                "[Self-Correction Gate {attempt}/{cap} — Penutupan Ditahan] \
-                 Verifikasi terakhir `{cmd}`{step_note} pada perubahan ({files}) masih GAGAL.{raw_block}\n\n\
-                 Analisis keluaran kegagalan mentah di atas, perbaiki penyebabnya dengan perubahan terarah, \
-                 lalu jalankan ulang `{cmd}` untuk membuktikan hasil lulus sebelum menutup."
-            ));
-        }
-        None
-    }
-
-    /// Daftar periksa penutup tugas coding ala SWE-agent `review_on_submit` (Perbaikan 2 #4 v0.5.8):
-    /// (a) verifikasi terakhir (tes/repro/bukti) WAJIB dijalankan SETELAH perubahan terakhir;
-    /// (b) berkas sampah/repro sementara ciptaan sesi dibersihkan atau disebutkan eksplisit;
-    /// (c) jawaban akhir menyebut berkas yang diubah sebagai ringkasan perubahan.
-    pub fn completion_gate_with_checklist(
-        &mut self,
-        remaining_steps: usize,
-        final_reply: &str,
-        cwd: &Path,
-    ) -> Option<String> {
-        if let Some(base_gate) = self.completion_gate(remaining_steps) {
-            return Some(base_gate);
-        }
-        // Pada lingkup ketat v0.5.14, tugas coding tanpa perintah verifikasi diam total (0 suntikan).
-        if self.strict_known_verify_only && !self.has_verification_run {
-            return None;
-        }
-        if !self.edited_code_file || self.checklist_checked || remaining_steps < 2 {
-            return None;
-        }
-        // Cari berkas sampah/repro yang dibuat sesi ini, masih ada di disk, dan belum disebut di jawaban.
-        let lingering_scratch: Vec<String> = self
-            .created_files
-            .iter()
-            .filter(|rel| {
-                is_scratch_repro_file(rel)
-                    && cwd.join(rel).exists()
-                    && !final_reply.contains(rel.as_str())
-            })
-            .cloned()
-            .collect();
-        // Pada lingkup ketat v0.5.14: bila verifikasi sudah HIJAU setelah edit terakhir dan tidak ada
-        // berkas sampah repro tertinggal, langsung terima penutupan tanpa suntikan tambahan!
-        if self.strict_known_verify_only
-            && self.verified_after_last_edit
-            && self.last_verify_passed == Some(true)
-            && lingering_scratch.is_empty()
-        {
-            self.checklist_checked = true;
-            return None;
-        }
-        // Cek apakah jawaban akhir sudah menyebut minimal satu berkas kode yang diubah.
-        let mentions_edited = self.edited_files.iter().any(|f| {
-            let base = Path::new(f)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(f.as_str());
-            final_reply.contains(f.as_str()) || final_reply.contains(base)
-        });
-
-        if lingering_scratch.is_empty() && mentions_edited {
-            self.checklist_checked = true;
-            return None;
-        }
-        self.checklist_checked = true;
-        let mut items = Vec::new();
-        if !lingering_scratch.is_empty() {
-            items.push(format!(
-                "berkas sementara/repro masih tersisa ({}) — hapus jika tidak diperlukan atau sebutkan secara eksplisit",
-                lingering_scratch.join(", ")
-            ));
-        }
-        if !mentions_edited {
-            items.push(format!(
-                "sebutkan ringkasan perubahan beserta daftar berkas yang diubah ({})",
-                self.edited_files.join(", ")
-            ));
-        }
-        Some(format!(
-            "[Daftar Periksa Penutup] Sebelum menyatakan selesai: {}. \
-             Jangan menjalankan ulang tes yang sudah lulus bila tidak ada edit baru.",
-            items.join("; ")
-        ))
-    }
-
-    /// Catatan status jujur (pola terstruktur + Perbaikan 2 #3 v0.5.14): bila penutupan diterima
-    /// sesudah batas putaran refleksi tercapai sementara verifikasi terakhir masih GAGAL atau
-    /// belum dijalankan ulang sesudah edit terakhir, kembalikan blok status jujur untuk ditempel
-    /// pada ringkasan penutup agar tidak pernah menyamar sebagai sukses.
+    /// Catatan status jujur deterministik (v0.5.24 — tanpa putaran refleksi tambahan):
+    /// bila verifikasi terakhir masih GAGAL atau basi sesudah edit terakhir, kembalikan blok status
+    /// jujur untuk ditempel pada ringkasan penutup agar tidak pernah menyamar sebagai sukses.
     pub fn honest_unverified_closing_note(&self, final_reply: &str) -> Option<String> {
         let has_mutation = self.edited_code_file || !self.edited_files.is_empty();
         if !has_mutation || !self.has_verification_run {
@@ -1703,9 +1505,29 @@ impl SelfCorrectState {
             .map(|s| format!(" Ringkasan error terakhir: {s}"))
             .unwrap_or_default();
         Some(format!(
-            "\n\n[Status Verifikasi Akhir — GAGAL] Perintah `{cmd}` {status_desc} \
-             (putaran gerbang verifikasi: {}/{}).{snippet}",
-            self.repair_attempts, self.max_attempts
+            "\n\n[Status Verifikasi Akhir — GAGAL] Perintah `{cmd}` {status_desc}.{snippet}"
+        ))
+    }
+
+    /// Catatan deterministik bila berkas sementara/repro (`repro*`/`tmp_*`) ciptaan sesi
+    /// masih tertinggal di disk dan belum disebut pada jawaban akhir (0 putaran model tambahan).
+    pub fn closing_scratch_files_note(&self, cwd: &Path, final_reply: &str) -> Option<String> {
+        let lingering: Vec<String> = self
+            .created_files
+            .iter()
+            .filter(|rel| {
+                is_scratch_repro_file(rel)
+                    && cwd.join(rel).exists()
+                    && !final_reply.contains(rel.as_str())
+            })
+            .cloned()
+            .collect();
+        if lingering.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Catatan berkas sementara masih ada di disk: {}",
+            lingering.join(", ")
         ))
     }
 

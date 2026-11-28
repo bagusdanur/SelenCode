@@ -231,13 +231,13 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef {
         cmd: "/skills",
         args: "[auto / review / show / rm]",
-        desc: "daftar skill, auto self-improvement, & review",
+        desc: "daftar skill & Selena improvement",
         takes_args: true,
     },
     CommandDef {
         cmd: "/review",
-        args: "[pending / approve <id> / discard <id> / status]",
-        desc: "lihat & putuskan usulan staging background review",
+        args: "[pending / approve <id> / discard <id> / undo [id] / status]",
+        desc: "lihat, setujui, atau putar balik hasil Selena improvement",
         takes_args: true,
     },
     CommandDef {

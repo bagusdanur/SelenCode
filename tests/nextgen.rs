@@ -297,7 +297,7 @@ async fn autonomous_manage_skill_and_self_improvement_review() {
         .expect("harus menghasilkan catatan patch skill");
     assert_eq!(
         note,
-        "Self-improvement review: Skill 'ryukomik-comic-scraper' patched"
+        "💾 Selena improvement: Skill 'ryukomik-comic-scraper' patched"
     );
     let (_, patched_body) = load_skill(&cwd, "ryukomik-comic-scraper").unwrap();
     assert!(patched_body.contains(".ch-list a"));

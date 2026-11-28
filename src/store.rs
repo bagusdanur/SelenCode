@@ -263,7 +263,7 @@ pub struct ReviewProposal {
     pub resolved_at: String,
 }
 
-/// Catatan satu kali jalan Background Self-Improvement Review (cooldown + laporan tertunda CLI).
+/// Catatan satu kali jalan Selena Improvement (cooldown + laporan tertunda + telemetri cache).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewRunRecord {
     pub id: i64,
@@ -274,7 +274,24 @@ pub struct ReviewRunRecord {
     pub delivered: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub created_at: String,
+}
+
+/// Cadangan isi skill sebelum patch langsung Selena Improvement (untuk putar balik `/review undo`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewBackupRecord {
+    pub id: i64,
+    pub session_id: String,
+    pub cwd: String,
+    pub skill_name: String,
+    pub file_path: String,
+    pub previous_content: String,
+    pub diff: String,
+    pub reason: String,
+    pub created_at: String,
+    pub rolled_back: bool,
 }
 
 /// Definisi tugas terjadwal persisten (Bagian 3 v0.5.6 — berjalan selama gateway Telegram hidup).
@@ -372,7 +389,13 @@ CREATE TABLE IF NOT EXISTS review_runs (id INTEGER PRIMARY KEY, session_id TEXT 
                     report_text TEXT NOT NULL DEFAULT '',
                     delivered INTEGER NOT NULL DEFAULT 0,
                     input_tokens INT NOT NULL DEFAULT 0, output_tokens INT NOT NULL DEFAULT 0,
+                    cache_read_tokens INT NOT NULL DEFAULT 0, cache_write_tokens INT NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS review_backups (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                    cwd TEXT NOT NULL, skill_name TEXT NOT NULL, file_path TEXT NOT NULL,
+                    previous_content TEXT NOT NULL, diff TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+                    rolled_back INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS cron_jobs (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,
                     schedule_spec TEXT NOT NULL, prompt TEXT NOT NULL, cwd TEXT NOT NULL,
                     allowed_shell_json TEXT NOT NULL DEFAULT '[]',
@@ -504,6 +527,7 @@ impl Store {
         conn.execute_batch(SCHEMA).context("gagal membuat skema sesi")?;
         migrate_memories_schema(&conn)?;
         migrate_usage_schema(&conn)?;
+        migrate_review_schema(&conn)?;
         init_fts_schema(&conn);
         Ok(Self {
             conn: Mutex::new(conn),
@@ -1071,9 +1095,7 @@ impl Store {
         ))
     }
 
-    /// Catat biaya token Background Self-Improvement Review secara TERPISAH dari jalur utama (v0.5.1).
-    /// Memakai `session_id = "review:<orig_session_id>"` dan `kind = 'review'` agar query jalur utama
-    /// (`WHERE session_id = <orig_session_id>`) tidak pernah terkotori, namun tetap teraudit di tabel `usage`.
+    /// Catat biaya token Selena Improvement secara TERPISAH dari jalur utama (`kind = 'review'`).
     pub fn record_review_usage(
         &self,
         orig_session_id: &str,
@@ -1081,11 +1103,39 @@ impl Store {
         input_tokens: u64,
         output_tokens: u64,
     ) -> Result<()> {
+        self.record_review_usage_full(
+            orig_session_id,
+            model,
+            crate::providers::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        )
+    }
+
+    /// Catat biaya token Selena Improvement lengkap beserta `cache_read_tokens` & `cache_write_tokens` (v0.5.24).
+    pub fn record_review_usage_full(
+        &self,
+        orig_session_id: &str,
+        model: &str,
+        usage: crate::providers::Usage,
+    ) -> Result<()> {
         let review_sid = format!("review:{orig_session_id}");
         let conn = self.conn.lock().expect("mutex store poisoned");
         conn.execute(
-            "INSERT INTO usage (session_id, model, input_tokens, output_tokens, ts, kind) VALUES (?1, ?2, ?3, ?4, ?5, 'review')",
-            rusqlite::params![review_sid, model, input_tokens as i64, output_tokens as i64, now()],
+            "INSERT INTO usage (session_id, model, input_tokens, output_tokens, ts, kind, cache_read_tokens, cache_write_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'review', ?6, ?7)",
+            rusqlite::params![
+                review_sid,
+                model,
+                usage.input_tokens as i64,
+                usage.output_tokens as i64,
+                now(),
+                usage.cache_read_tokens as i64,
+                usage.cache_write_tokens as i64
+            ],
         )?;
         Ok(())
     }
@@ -1471,12 +1521,38 @@ impl Store {
         input_tokens: u64,
         output_tokens: u64,
     ) -> Result<i64> {
+        self.record_review_run_full(
+            session_id,
+            cwd,
+            model,
+            report_text,
+            delivered,
+            input_tokens,
+            output_tokens,
+            0,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_review_run_full(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        model: &str,
+        report_text: &str,
+        delivered: bool,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+    ) -> Result<i64> {
         let safe_report = crate::security::redact_secrets(report_text.trim());
         let del_int: i64 = if delivered || safe_report.is_empty() { 1 } else { 0 };
         let conn = self.conn.lock().expect("mutex store poisoned");
         conn.execute(
-            "INSERT INTO review_runs (session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO review_runs (session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 session_id,
                 cwd,
@@ -1485,10 +1561,145 @@ impl Store {
                 del_int,
                 input_tokens as i64,
                 output_tokens as i64,
+                cache_read_tokens as i64,
+                cache_write_tokens as i64,
                 now()
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Tandai satu baris `review_runs` sudah benar-benar terkirim ke permukaan pengguna (TUI/Telegram).
+    pub fn mark_review_run_delivered(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "UPDATE review_runs SET delivered = 1 WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Catat alasan terakhir Selena improvement dilewati agar selalu terlihat di `/doctor` & `/review status`.
+    pub fn set_last_review_skip(&self, reason: &str, detail: &str) -> Result<()> {
+        let payload = serde_json::json!({
+            "reason": reason,
+            "detail": detail,
+            "ts": now(),
+        })
+        .to_string();
+        self.set_gateway_state("last_review_skip", &payload)
+    }
+
+    /// Baca catatan alasan terakhir Selena improvement dilewati (`(reason, detail, ts)`).
+    pub fn get_last_review_skip(&self) -> Result<Option<(String, String, String)>> {
+        let Some((raw, ts)) = self.get_gateway_state("last_review_skip")? else {
+            return Ok(None);
+        };
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let r = v.get("reason").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let d = v.get("detail").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let t = v
+                .get("ts")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or(ts);
+            if !r.is_empty() {
+                return Ok(Some((r, d, t)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Simpan salinan isi skill sebelum patch langsung diterapkan oleh Selena improvement (untuk `/review undo`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_review_backup(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        skill_name: &str,
+        file_path: &str,
+        previous_content: &str,
+        diff: &str,
+        reason: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "INSERT INTO review_backups (session_id, cwd, skill_name, file_path, previous_content, diff, reason, created_at, rolled_back) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+            rusqlite::params![
+                session_id,
+                cwd,
+                skill_name,
+                file_path,
+                previous_content,
+                diff,
+                reason,
+                now()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_review_backups(&self, limit: usize) -> Result<Vec<ReviewBackupRecord>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, cwd, skill_name, file_path, previous_content, diff, reason, created_at, rolled_back \
+             FROM review_backups ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |r| {
+            Ok(ReviewBackupRecord {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                cwd: r.get(2)?,
+                skill_name: r.get(3)?,
+                file_path: r.get(4)?,
+                previous_content: r.get(5)?,
+                diff: r.get(6)?,
+                reason: r.get(7)?,
+                created_at: r.get(8)?,
+                rolled_back: r.get::<_, i64>(9).unwrap_or(0) != 0,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_review_backup(&self, id: i64) -> Result<Option<ReviewBackupRecord>> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, cwd, skill_name, file_path, previous_content, diff, reason, created_at, rolled_back \
+             FROM review_backups WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![id], |r| {
+            Ok(ReviewBackupRecord {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                cwd: r.get(2)?,
+                skill_name: r.get(3)?,
+                file_path: r.get(4)?,
+                previous_content: r.get(5)?,
+                diff: r.get(6)?,
+                reason: r.get(7)?,
+                created_at: r.get(8)?,
+                rolled_back: r.get::<_, i64>(9).unwrap_or(0) != 0,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn mark_review_backup_rolled_back(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let n = conn.execute(
+            "UPDATE review_backups SET rolled_back = 1 WHERE id = ?1 AND rolled_back = 0",
+            rusqlite::params![id],
+        )?;
+        Ok(n > 0)
     }
 
     /// Ambil semua laporan review latar yang belum sempat ditampilkan ke CLI/TUI dan tandai sudah terkirim.
@@ -1517,7 +1728,7 @@ impl Store {
     pub fn list_recent_review_runs(&self, cwd: &str, limit: usize) -> Result<Vec<ReviewRunRecord>> {
         let conn = self.conn.lock().expect("mutex store poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, created_at \
+            "SELECT id, session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at \
              FROM review_runs WHERE cwd = ?1 ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![cwd, limit as i64], |r| {
@@ -1530,7 +1741,9 @@ impl Store {
                 delivered: r.get::<_, i64>(5).unwrap_or(0) != 0,
                 input_tokens: r.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
                 output_tokens: r.get::<_, i64>(7).unwrap_or(0).max(0) as u64,
-                created_at: r.get(8)?,
+                cache_read_tokens: r.get::<_, i64>(8).unwrap_or(0).max(0) as u64,
+                cache_write_tokens: r.get::<_, i64>(9).unwrap_or(0).max(0) as u64,
+                created_at: r.get(10)?,
             })
         })?;
         let mut out = Vec::new();
@@ -2650,6 +2863,30 @@ fn migrate_usage_schema(conn: &Connection) -> Result<()> {
             [],
         )
         .context("gagal migrasi kolom cache_write_tokens pada tabel usage")?;
+    }
+    Ok(())
+}
+
+/// Migrasi aman tabel `review_runs` untuk menambahkan kolom telemetri cache (`cache_read_tokens` & `cache_write_tokens`).
+fn migrate_review_schema(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(review_runs)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !cols.iter().any(|c| c == "cache_read_tokens") {
+        conn.execute(
+            "ALTER TABLE review_runs ADD COLUMN cache_read_tokens INT NOT NULL DEFAULT 0",
+            [],
+        )
+        .context("gagal migrasi kolom cache_read_tokens pada tabel review_runs")?;
+    }
+    if !cols.iter().any(|c| c == "cache_write_tokens") {
+        conn.execute(
+            "ALTER TABLE review_runs ADD COLUMN cache_write_tokens INT NOT NULL DEFAULT 0",
+            [],
+        )
+        .context("gagal migrasi kolom cache_write_tokens pada tabel review_runs")?;
     }
     Ok(())
 }

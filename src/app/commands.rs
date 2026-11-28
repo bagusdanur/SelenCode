@@ -1419,9 +1419,14 @@ impl Session {
                         &s.summary,
                         selencode::skills::SKILL_INDEX_DESC_MAX_CHARS,
                     );
+                    let origin_badge = if s.is_improvement_skill() {
+                        " · [selena-improvement]"
+                    } else {
+                        ""
+                    };
                     let meta = match &s.version {
-                        Some(v) => format!("{} · {} · v{v}", s.scope, s.category),
-                        None => format!("{} · {}", s.scope, s.category),
+                        Some(v) => format!("{} · {} · v{v}{origin_badge}", s.scope, s.category),
+                        None => format!("{} · {}{origin_badge}", s.scope, s.category),
                     };
                     out.push_str(&format!("> {} | {meta} | {desc}\n", s.name));
                 }
@@ -1463,7 +1468,7 @@ impl Session {
                 "NONAKTIF (hanya buat skill saat diminta manual)"
             };
             return Ok(format!(
-                "# Auto Self-Improvement Skills\n\
+                "# Auto Selena Improvement Skills\n\
                  * status | {label} | tersimpan ke {}",
                 saved.display()
             ));
@@ -1472,14 +1477,14 @@ impl Session {
         if arg.eq_ignore_ascii_case("review") {
             if self.messages.is_empty() {
                 return Ok(
-                    "# Self-Improvement Review\n! Belum ada percakapan untuk ditinjau.".into(),
+                    "# Selena Improvement\n! Belum ada percakapan untuk ditinjau.".into(),
                 );
             }
             match run_self_improvement_review(self.provider.clone(), &self.ctx, &self.messages)
                 .await?
             {
                 Some(summary) => Ok(format!("# {summary}\n* tersimpan | .selencode/skills/ | siap dipakai di sesi berikutnya")),
-                None => Ok("# Self-Improvement Review\n! Belum ditemukan pola baru yang perlu disimpan atau di-patch sebagai skill.".into()),
+                None => Ok("# Selena Improvement\n! Belum ditemukan pola baru yang perlu disimpan atau di-patch sebagai skill.".into()),
             }
         } else if let Some(name) = arg.strip_prefix("show ").or_else(|| arg.strip_prefix("view ")) {
             let (info, content) = load_skill(&self.ctx.cwd, name.trim())?;
@@ -1565,28 +1570,42 @@ impl Session {
             return self.format_pending_review_menu(&cwd_str);
         }
         if matches!(lower.as_str(), "status" | "stats" | "info") {
-            let model_str = self
-                .cfg
-                .aux
-                .effective_review_model()
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| "(kosong — background review dilewati)".to_string());
+            let model_str = match self.cfg.aux.effective_review_model() {
+                Some(m) => format!("{m} (aux override)"),
+                None if !self.pcfg.model.trim().is_empty() && self.pcfg.model != "(belum diatur)" => {
+                    format!("{} (model utama sesi)", self.pcfg.model)
+                }
+                None => "(belum ada model)".to_string(),
+            };
             let runs = self.store.list_recent_review_runs(&cwd_str, 5).unwrap_or_default();
             let pending = self
                 .store
                 .list_review_proposals(Some(&cwd_str), Some("pending"), 20)
                 .unwrap_or_default();
+            let backups = self
+                .store
+                .list_review_backups(10)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|b| !b.rolled_back)
+                .count();
+            let skip_line = match self.store.get_last_review_skip().ok().flatten() {
+                Some((r, det, _)) => format!("> lewati terakhir | {r} | {det}\n"),
+                None => String::new(),
+            };
             let mut out = format!(
-                "# Status Background Self-Improvement Review\n\
-                 * aktif | {} | model aux: {model_str}\n\
-                 > batas | max_tokens={} · cooldown={} mnt · interval={} giliran · min_tool={}\n\
-                 > staging | {} usulan menunggu persetujuan\n",
+                "# Status Selena Improvement\n\
+                 * aktif | {} | model: {model_str}\n\
+                 > batas | max_tokens={} (<=5000/call) · cooldown={} mnt · interval={} giliran · min_tool={}\n\
+                 > staging | {} usulan menunggu persetujuan · {} cadangan patch siap `/review undo`\n\
+                 {skip_line}",
                 if self.cfg.review.enabled { "ya" } else { "nonaktif" },
                 self.cfg.review.max_tokens,
                 self.cfg.review.cooldown_mins,
                 self.cfg.review.turns_interval,
                 self.cfg.review.min_tool_calls,
-                pending.len()
+                pending.len(),
+                backups
             );
             if !runs.is_empty() {
                 out.push_str("---\n");
@@ -1597,16 +1616,48 @@ impl Session {
                         r.report_text
                     };
                     out.push_str(&format!(
-                        "> {} | {} ({} in / {} out) | {note}\n",
+                        "> {} | {} ({} in · {} cache / {} out) | {note}\n",
                         &r.created_at.chars().take(19).collect::<String>(),
                         r.model,
                         r.input_tokens,
+                        r.cache_read_tokens,
                         r.output_tokens
                     ));
                 }
             }
-            out.push_str("---\n! Lihat staging: /review pending   ·   Setujui: /review approve <id>   ·   Buang: /review discard <id>");
+            out.push_str("---\n! Staging: /review pending · Setujui: /review approve <id> · Buang: /review discard <id> · Putar balik patch: /review undo [id]");
             return Ok(out);
+        }
+        if matches!(lower.as_str(), "backups" | "history") {
+            let items = self.store.list_review_backups(10)?;
+            if items.is_empty() {
+                return Ok("# Cadangan Patch Selena Improvement (0)\n! Belum ada patch langsung yang tercatat.".into());
+            }
+            let mut out = format!("# Cadangan Patch Selena Improvement ({})\n", items.len());
+            for b in items {
+                let st = if b.rolled_back { "sudah diputar balik" } else { "aktif" };
+                out.push_str(&format!(
+                    "> #{} | {} ({st}) | {} — /review undo {}\n",
+                    b.id, b.skill_name, b.reason, b.id
+                ));
+            }
+            return Ok(out);
+        }
+        if lower == "undo" || lower == "rollback" {
+            let msg = selencode::agent::rollback_direct_review_patch(&self.store, None)?;
+            return Ok(format!("# Patch Diputar Balik\n* undo | {msg}"));
+        }
+        if let Some(rest) = lower
+            .strip_prefix("undo ")
+            .or_else(|| lower.strip_prefix("rollback "))
+        {
+            let id = rest
+                .trim()
+                .trim_start_matches('#')
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("ID cadangan tidak valid: '{rest}'. Contoh: /review undo 1"))?;
+            let msg = selencode::agent::rollback_direct_review_patch(&self.store, Some(id))?;
+            return Ok(format!("# Patch Diputar Balik\n* #{id} | {msg}"));
         }
         if let Some(rest) = lower
             .strip_prefix("approve ")
@@ -1635,11 +1686,12 @@ impl Session {
             let msg = selencode::agent::discard_staged_proposal(&self.store, id)?;
             return Ok(format!("# Usulan Review Dibuang\n> #{id} | {msg} | data utuh"));
         }
-        Ok("# Cara Pakai /review\n\
-            > /review pending | | lihat usulan hapus/timpa yang menunggu persetujuan\n\
+        Ok("# Cara Pakai /review (Selena Improvement)\n\
+            > /review pending | | lihat usulan staging yang menunggu persetujuan\n\
             > /review approve <id> | | terapkan usulan staging tertentu\n\
             > /review discard <id> | | buang usulan tanpa mengubah data asli\n\
-            > /review status | | lihat model aux, anggaran, & riwayat biaya token review"
+            > /review undo [id] | | putar balik patch langsung terakhir ke skill improvement\n\
+            > /review status | | lihat model efektif, cache, alasan lewati terakhir, & riwayat token"
             .to_string())
     }
 

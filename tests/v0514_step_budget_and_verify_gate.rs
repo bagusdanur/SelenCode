@@ -57,7 +57,6 @@ async fn p1_forced_small_budget_checkpoint_convergence_and_explicit_zero_edit_fa
     assert!(def_guard.enabled);
     assert!(def_guard.budget_warning_enabled);
     assert!((def_guard.budget_warning_ratio - 0.7).abs() < 1e-6);
-    assert_eq!(def_guard.max_self_correct_rounds, 3);
 
     let cfg_toml = r#"
 default_provider = "router"
@@ -68,7 +67,6 @@ model = "test"
 api_key_env = "TEST_KEY"
 [guard]
 enabled = true
-max_self_correct_rounds = 3
 budget_warning_enabled = true
 budget_warning_ratio = 0.7
 "#;
@@ -557,23 +555,15 @@ async fn p2_verification_gate_holds_red_feeds_raw_failure_and_stays_silent_on_gr
     .await
     .unwrap();
     let seen_gates = gates_a.lock().unwrap().clone();
-    assert_eq!(
-        seen_gates.len(),
-        2,
-        "harus ada tepat 2 penahanan gerbang (belum verif ulang + masih gagal): {seen_gates:?}"
+    assert!(
+        seen_gates.is_empty(),
+        "v0.5.24 menghapus loop refleksi penutup (0 suntikan [Self-Correction Gate]): {seen_gates:?}"
     );
     assert!(
-        seen_gates[0].contains("node test_hitung.js"),
-        "gerbang 1 harus menyebut perintah verifikasi tercatat: {}",
-        seen_gates[0]
+        ans_fix.contains("[Status Verifikasi Akhir — GAGAL]")
+            && ans_fix.contains("node test_hitung.js"),
+        "ketika model berhenti tanpa verifikasi ulang setelah edit, catatan penutup deterministik wajib jujur menyatakan belum terverifikasi/gagal: {ans_fix}"
     );
-    assert!(
-        seen_gates[1].contains("ASSERT_FAIL: expected 31500 got 34980"),
-        "gerbang 2 harus mengembalikan keluaran gagal MENTAH apa adanya: {}",
-        seen_gates[1]
-    );
-    assert!(ans_fix.contains("31500"));
-    assert!(!ans_fix.contains("[Status Verifikasi Akhir — GAGAL]"));
 
     // ---------------------------------------------------------------------
     // SKENARIO 2B: Kontrol HIJAU (edit benar + verifikasi lulus sesudah edit terakhir)
@@ -827,13 +817,13 @@ async fn p2_verification_gate_holds_red_feeds_raw_failure_and_stays_silent_on_gr
     .unwrap();
     assert_eq!(
         cap_hits.load(Ordering::SeqCst),
-        3,
-        "batas putaran gerbang refleksi wajib tepat 3 (max_self_correct_rounds=3)"
+        0,
+        "v0.5.24 menghapus loop refleksi penutup (0 putaran self-correction)"
     );
     assert!(
         ans_cap.contains("[Status Verifikasi Akhir — GAGAL]")
             && ans_cap.contains("node test_hitung.js"),
-        "sesudah batas 3 putaran, penutupan diterima tetapi WAJIB menyatakan status gagal jujur: {ans_cap}"
+        "penutupan langsung diterima 1x tetapi WAJIB menyatakan status gagal jujur secara deterministik: {ans_cap}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

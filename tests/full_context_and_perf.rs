@@ -9,7 +9,7 @@ use selencode::agent::context::{
     AuxCooldownState, STRUCTURED_SUMMARY_MARKER,
 };
 use selencode::agent::corrector::{
-    canonical_tool_fingerprint, LoopGuard, SelfCorrectState, ToolDedupCache,
+    canonical_tool_fingerprint, LoopGuard, ToolDedupCache, VerificationTracker,
 };
 use selencode::agent::plan::TurnMode;
 use selencode::agent::review::{run_self_improvement_review, AUTO_REVIEW_MIN_TOOLS};
@@ -164,11 +164,12 @@ fn tahap2_canonical_fingerprint_dedup_and_self_correct_rem() {
     dedup.invalidate_on_edit(Some("a.rs"));
     assert!(dedup.check_hit("run_shell", &sh_args, &dir).is_none());
 
-    // Rem Self-correction: maks 1 putaran!
-    let mut sc = SelfCorrectState::new(None).with_max_attempts(1);
+    // VerificationTracker deterministik (tanpa loop refleksi LLM tambahan):
+    let mut sc = VerificationTracker::new(None);
     sc.observe_tool("edit_file", &json!({"path": "a.rs"}), "ok", false);
-    assert!(sc.completion_gate(5).is_some()); // putaran 1/1
-    assert!(sc.completion_gate(5).is_none()); // putaran ke-2 ditahan!
+    assert!(sc.edited_code_file);
+    assert!(!sc.verified_after_last_edit);
+    assert!(sc.honest_unverified_closing_note("Sudah beres.").is_some());
 
     // LoopGuard: 2x gagal identik -> peringatan, dan 3x gagal tool sama (arg berbeda) pada guard penuh!
     let mut lg = LoopGuard::with_default_guards();

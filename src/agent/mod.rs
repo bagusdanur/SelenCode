@@ -10,8 +10,9 @@ pub mod run;
 
 pub use review::{
     apply_staged_proposal, check_review_eligibility, discard_staged_proposal,
-    is_session_substantive, run_background_review, run_self_improvement_review, BgReviewOutcome,
-    ReviewSkipReason,
+    has_recovered_failure, has_skill_activity, has_valuable_review_signal,
+    is_session_substantive, rollback_direct_review_patch, run_background_review,
+    run_self_improvement_review, BgReviewOutcome, ReviewSkipReason, FROZEN_REVIEW_SYSTEM_PROMPT,
 };
 pub use run::{
     build_output_truncation_closing_message, classify_required_skill_for_turn,

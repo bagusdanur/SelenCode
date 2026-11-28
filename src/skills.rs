@@ -23,6 +23,10 @@ use std::path::{Component, Path, PathBuf};
 
 /// Panjang maksimum deskripsi skill di indeks prompt / `skills_list` (disiplin token Tahap 2).
 pub const SKILL_INDEX_DESC_MAX_CHARS: usize = 60;
+/// Penanda asal frontmatter untuk skill yang dibuat/dikelola Selena improvement (v0.5.24).
+pub const IMPROVEMENT_SKILL_ORIGIN: &str = "selena-improvement";
+/// Nama subfolder fisik di dalam direktori skill pengguna untuk skill baru karya Selena improvement.
+pub const IMPROVEMENT_SKILLS_SUBDIR: &str = "improvement";
 
 /// Metadata frontmatter YAML hasil parsing `SKILL.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +35,12 @@ pub struct SkillFrontmatter {
     pub description: String,
     pub version: Option<String>,
     pub tags: Vec<String>,
+    /// Penanda asal penulisan (mis. `"selena-improvement"` untuk skill karya review; `None` = karya pengguna/bawaan).
+    pub origin: Option<String>,
+    /// ID sesi sumber saat skill dibuat/dipelajari oleh Selena improvement (opsional).
+    pub source_session: Option<String>,
+    /// Tanggal pembelajaran (YYYY-MM-DD, opsional).
+    pub learned_at: Option<String>,
 }
 
 /// Informasi 1 skill yang terindeks dari disk.
@@ -49,6 +59,31 @@ pub struct SkillInfo {
     pub dir: PathBuf,
     /// `"project"` (prioritas #1) atau `"user"` (prioritas #2).
     pub scope: &'static str,
+    /// Penanda asal penulisan (`Some("selena-improvement")` untuk skill karya Selena improvement).
+    pub origin: Option<String>,
+    /// Sesi asal pembelajaran (bila ada).
+    pub source_session: Option<String>,
+    /// Tanggal pembelajaran (bila ada).
+    pub learned_at: Option<String>,
+}
+
+impl SkillInfo {
+    /// True bila skill ini berasal dari Selena improvement (frontmatter `origin: selena-improvement`
+    /// atau berada di dalam subfolder fisik `skills/improvement/`).
+    pub fn is_improvement_skill(&self) -> bool {
+        if self
+            .origin
+            .as_deref()
+            .map(|o| o.eq_ignore_ascii_case(IMPROVEMENT_SKILL_ORIGIN))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.category == IMPROVEMENT_SKILLS_SUBDIR
+            || self
+                .category
+                .starts_with(&format!("{IMPROVEMENT_SKILLS_SUBDIR}/"))
+    }
 }
 
 /// Hasil pemindaian skill beserta daftar peringatan folder/frontmatter yang dilewati.
@@ -128,6 +163,9 @@ pub fn parse_skill_frontmatter(raw: &str) -> Result<SkillFrontmatter> {
     let mut description: Option<String> = None;
     let mut version: Option<String> = None;
     let mut tags: Vec<String> = Vec::new();
+    let mut origin: Option<String> = None;
+    let mut source_session: Option<String> = None;
+    let mut learned_at: Option<String> = None;
     let mut in_tags_list = false;
 
     for raw_line in fm_lines {
@@ -195,6 +233,24 @@ pub fn parse_skill_frontmatter(raw: &str) -> Result<SkillFrontmatter> {
                     }
                 }
             }
+            "origin" => {
+                let o = unquote_yaml(val);
+                if !o.is_empty() {
+                    origin = Some(o);
+                }
+            }
+            "source_session" | "session" => {
+                let s = unquote_yaml(val);
+                if !s.is_empty() {
+                    source_session = Some(s);
+                }
+            }
+            "learned_at" | "date" => {
+                let d = unquote_yaml(val);
+                if !d.is_empty() {
+                    learned_at = Some(d);
+                }
+            }
             _ => {
                 // Abaikan field tambahan opsional agar forward-compatible.
             }
@@ -210,6 +266,9 @@ pub fn parse_skill_frontmatter(raw: &str) -> Result<SkillFrontmatter> {
         description,
         version,
         tags,
+        origin,
+        source_session,
+        learned_at,
     })
 }
 
@@ -260,9 +319,12 @@ fn infer_category(root: &Path, skill_dir: &Path) -> String {
 }
 
 /// Pindai satu akar direktori skill secara rekursif (maks kedalaman 3 untuk kategori).
-fn scan_skills_root(
+/// Bila `skip_top_subdir` diisi (mis. `Some("improvement")`), subfolder itu dilewati pada pass ini
+/// agar dapat dipindai pada pass prioritas lebih rendah.
+fn scan_skills_root_filtered(
     root: &Path,
     scope: &'static str,
+    skip_top_subdir: Option<&str>,
     seen_in_scope: &mut HashSet<String>,
     out: &mut Vec<SkillInfo>,
     warnings: &mut Vec<String>,
@@ -270,14 +332,35 @@ fn scan_skills_root(
     if !root.is_dir() {
         return;
     }
-    scan_dir_recursive(root, root, 0, scope, seen_in_scope, out, warnings);
+    scan_dir_recursive_filtered(
+        root,
+        root,
+        0,
+        scope,
+        skip_top_subdir,
+        seen_in_scope,
+        out,
+        warnings,
+    );
 }
 
-fn scan_dir_recursive(
+fn scan_skills_root(
+    root: &Path,
+    scope: &'static str,
+    seen_in_scope: &mut HashSet<String>,
+    out: &mut Vec<SkillInfo>,
+    warnings: &mut Vec<String>,
+) {
+    scan_skills_root_filtered(root, scope, None, seen_in_scope, out, warnings);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_dir_recursive_filtered(
     root: &Path,
     dir: &Path,
     depth: usize,
     scope: &'static str,
+    skip_top_subdir: Option<&str>,
     seen_in_scope: &mut HashSet<String>,
     out: &mut Vec<SkillInfo>,
     warnings: &mut Vec<String>,
@@ -296,6 +379,9 @@ fn scan_dir_recursive(
             // Jangan turun ke folder referensi internal milik sebuah skill.
             if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
                 if matches!(fname, "references" | "templates" | "scripts" | ".git") {
+                    continue;
+                }
+                if depth == 0 && skip_top_subdir == Some(fname) {
                     continue;
                 }
             }
@@ -323,6 +409,9 @@ fn scan_dir_recursive(
                                 path: skill_md,
                                 dir: p,
                                 scope,
+                                origin: fm.origin,
+                                source_session: fm.source_session,
+                                learned_at: fm.learned_at,
                             });
                         }
                         Err(e) => {
@@ -343,7 +432,16 @@ fn scan_dir_recursive(
                 // Mungkin folder kategori yang berisi subfolder skill.
                 let before = out.len();
                 let before_w = warnings.len();
-                scan_dir_recursive(root, &p, depth + 1, scope, seen_in_scope, out, warnings);
+                scan_dir_recursive_filtered(
+                    root,
+                    &p,
+                    depth + 1,
+                    scope,
+                    None,
+                    seen_in_scope,
+                    out,
+                    warnings,
+                );
                 // Bila folder langsung di dalam root tidak punya SKILL.md dan tidak berisi subfolder skill
                 // maupun file .md lain, catat peringatan ringan (bukan crash!).
                 if depth == 0 && out.len() == before && warnings.len() == before_w {
@@ -373,26 +471,43 @@ fn scan_dir_recursive(
             let Ok(raw) = std::fs::read_to_string(&p) else {
                 continue;
             };
-            let (name, summary, version, tags) = if raw.trim_start().starts_with("---") {
-                match parse_skill_frontmatter(&raw) {
-                    Ok(fm) => (fm.name, fm.description, fm.version, fm.tags),
-                    Err(e) => {
-                        warnings.push(format!(
-                            "skill frontmatter rusak di {} dilewati: {e}",
-                            p.display()
-                        ));
-                        continue;
+            let (name, summary, version, tags, origin, source_session, learned_at) =
+                if raw.trim_start().starts_with("---") {
+                    match parse_skill_frontmatter(&raw) {
+                        Ok(fm) => (
+                            fm.name,
+                            fm.description,
+                            fm.version,
+                            fm.tags,
+                            fm.origin,
+                            fm.source_session,
+                            fm.learned_at,
+                        ),
+                        Err(e) => {
+                            warnings.push(format!(
+                                "skill frontmatter rusak di {} dilewati: {e}",
+                                p.display()
+                            ));
+                            continue;
+                        }
                     }
-                }
-            } else {
-                let desc = raw
-                    .lines()
-                    .map(|l| l.trim().trim_start_matches(['#', '>']).trim())
-                    .find(|l| !l.is_empty() && *l != "---")
-                    .unwrap_or("(tanpa deskripsi)")
-                    .to_string();
-                (stem.to_ascii_lowercase(), desc, None, Vec::new())
-            };
+                } else {
+                    let desc = raw
+                        .lines()
+                        .map(|l| l.trim().trim_start_matches(['#', '>']).trim())
+                        .find(|l| !l.is_empty() && *l != "---")
+                        .unwrap_or("(tanpa deskripsi)")
+                        .to_string();
+                    (
+                        stem.to_ascii_lowercase(),
+                        desc,
+                        None,
+                        Vec::new(),
+                        None,
+                        None,
+                        None,
+                    )
+                };
             if !seen_in_scope.insert(name.clone()) {
                 warnings.push(format!(
                     "skill duplikat `{name}` di {} ({scope}) dilewati",
@@ -409,6 +524,9 @@ fn scan_dir_recursive(
                 dir: p.parent().unwrap_or(root).to_path_buf(),
                 path: p,
                 scope,
+                origin,
+                source_session,
+                learned_at,
             });
         }
     }
@@ -435,11 +553,13 @@ pub fn scan_skills_in_dirs(project_root: &Path, user_root: Option<&Path>) -> Ski
     }
 
     if let Some(u_dir) = user_root {
+        // Prioritas #2: skill pengguna & bawaan di luar subfolder `improvement/`.
         let mut user_seen = HashSet::new();
         let mut user_skills = Vec::new();
-        scan_skills_root(
+        scan_skills_root_filtered(
             u_dir,
             "user",
+            Some(IMPROVEMENT_SKILLS_SUBDIR),
             &mut user_seen,
             &mut user_skills,
             &mut res.warnings,
@@ -447,6 +567,29 @@ pub fn scan_skills_in_dirs(project_root: &Path, user_root: Option<&Path>) -> Ski
         for s in user_skills {
             if seen_names.insert(s.name.clone()) {
                 res.skills.push(s);
+            }
+        }
+
+        // Prioritas #3 (lebih rendah dari skill pengguna): skill karya Selena improvement di `skills/improvement/`.
+        // Bila ada nama kembar dengan skill proyek atau skill pengguna, skill pengguna SELALU menang dimuat.
+        let imp_dir = u_dir.join(IMPROVEMENT_SKILLS_SUBDIR);
+        if imp_dir.is_dir() {
+            let mut imp_seen = HashSet::new();
+            let mut imp_skills = Vec::new();
+            scan_dir_recursive_filtered(
+                u_dir,
+                &imp_dir,
+                1,
+                "user",
+                None,
+                &mut imp_seen,
+                &mut imp_skills,
+                &mut res.warnings,
+            );
+            for s in imp_skills {
+                if seen_names.insert(s.name.clone()) {
+                    res.skills.push(s);
+                }
             }
         }
     }
@@ -704,6 +847,57 @@ pub fn render_skill_markdown(
     out.push_str(&safe_body);
     out.push('\n');
     Ok(out)
+}
+
+/// Render file `SKILL.md` lengkap dengan metadata provenans Selena improvement
+/// (`origin`, `source_session`, `learned_at`) di frontmatter YAML.
+#[allow(clippy::too_many_arguments)]
+pub fn render_skill_markdown_with_origin(
+    name: &str,
+    description: &str,
+    body: &str,
+    version: Option<&str>,
+    tags: &[String],
+    origin: Option<&str>,
+    source_session: Option<&str>,
+    learned_at: Option<&str>,
+) -> Result<String> {
+    let base = render_skill_markdown(name, description, body, version, tags)?;
+    let has_meta = origin.map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || source_session.map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || learned_at.map(|s| !s.trim().is_empty()).unwrap_or(false);
+    if !has_meta {
+        return Ok(base);
+    }
+    let mut extra = String::new();
+    if let Some(o) = origin.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        extra.push_str(&format!("origin: {o}\n"));
+    }
+    if let Some(ss) = source_session.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        extra.push_str(&format!("source_session: {ss}\n"));
+    }
+    if let Some(la) = learned_at.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        extra.push_str(&format!("learned_at: {la}\n"));
+    }
+    if let Some(idx) = base.find("\n---\n") {
+        let mut out = String::with_capacity(base.len() + extra.len());
+        out.push_str(&base[..idx + 1]);
+        out.push_str(&extra);
+        out.push_str(&base[idx + 1..]);
+        Ok(out)
+    } else {
+        Ok(base)
+    }
+}
+
+/// Path target `SKILL.md` untuk skill BARU karya Selena improvement:
+/// `<user_skills_dir>/improvement/<nama>/SKILL.md` (lintas sesi, terpisah dari skill pengguna).
+pub fn improvement_skill_file_path(user_root: &Path, name: &str) -> Result<PathBuf> {
+    let clean = sanitize_skill_name(name)?;
+    Ok(user_root
+        .join(IMPROVEMENT_SKILLS_SUBDIR)
+        .join(clean)
+        .join("SKILL.md"))
 }
 
 /// Tentukan path target `SKILL.md` untuk skill proyek baru (`<proyek>/.selencode/skills/[<cat>/]<name>/SKILL.md`).

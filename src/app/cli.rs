@@ -54,9 +54,9 @@ pub enum Commands {
     },
     /// Cek kesehatan instalasi, provider, SQLite, Git, LSP, Sandbox, & Telegram
     Doctor,
-    /// Kelola usulan Background Self-Improvement Review (`selen review pending|approve <id>|discard <id>|status`)
+    /// Kelola usulan Selena Improvement (`selen review pending|approve <id>|discard <id>|undo [id]|status`)
     Review {
-        /// Subperintah: pending, approve <id>, discard <id>, status
+        /// Subperintah: pending, approve <id>, discard <id>, undo [id], status
         args: Vec<String>,
     },
     /// Kelola tugas terjadwal (`selen cron add|list|remove|pause|resume`) — berjalan selama gateway Telegram hidup

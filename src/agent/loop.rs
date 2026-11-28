@@ -22,7 +22,7 @@ use crate::tool_display::{
 use super::corrector::{
     can_run_tool_batch_in_parallel, detect_tooling_config_error_hint,
     is_dedup_passed_verify_output, is_vendor_or_dependency_path, is_verification_shell_cmd,
-    LoopGuard, SelfCorrectState, ToolDedupCache,
+    LoopGuard, ToolDedupCache, VerificationTracker,
 };
 use super::plan::{is_read_only, TurnMode, PLAN_NOTE};
 use super::ui::UiEvent;
@@ -1192,14 +1192,7 @@ async fn run_turn_inner(
         LoopGuard::new()
     };
     let mut dedup = ToolDedupCache::new();
-    let sc_max = if ctx.guard.enabled {
-        ctx.guard.max_self_correct_rounds
-    } else {
-        super::corrector::MAX_REPAIR_ATTEMPTS
-    };
-    let mut corrector = SelfCorrectState::new(turn_checkpoint_id)
-        .with_max_attempts(sc_max)
-        .with_strict_known_verify_only(true);
+    let mut corrector = VerificationTracker::new(turn_checkpoint_id);
     let sid_for_archive = ctx
         .session_id
         .clone()
@@ -1843,36 +1836,10 @@ async fn run_turn_inner(
         }
 
         if reply.tool_calls.is_empty() {
-            // Self-Correction Gate (Tahap 1) + Daftar Periksa Penutup ala SWE-agent (Perbaikan 2 #4 v0.5.8):
-            // verifikasi terakhir WAJIB sesudah edit terakhir, berkas sampah/repro dicek, & ringkasan menyebut file diubah.
-            if ctx.self_correct && mode == TurnMode::Execute {
-                let rem_for_gate = if has_step_cap {
-                    max_steps.saturating_sub(step + 1)
-                } else {
-                    usize::MAX
-                };
-                if let Some(gate_msg) = corrector.completion_gate_with_checklist(
-                    rem_for_gate,
-                    &last_text,
-                    &ctx.cwd,
-                ) {
-                    let info = format!(
-                        "✦ Self-correction ({}/{}): memeriksa verifikasi & daftar periksa penutup…",
-                        corrector.repair_attempts.max(1),
-                        corrector.max_attempts.max(1)
-                    );
-                    match &ui {
-                        Some(tx) => {
-                            let _ = tx.send(UiEvent::Info(info)).await;
-                        }
-                        None => eprintln!("[selen] {info}"),
-                    }
-                    messages.push(Message::text(Role::User, gate_msg));
-                    continue;
-                }
-                // Perbaikan 2 #3 (v0.5.14) + Perbaikan 3 #2 & Perbaikan 4 (v0.5.15):
-                // tempelkan baris faktual penutup secara programatis (status gagal jujur sesudah batas,
-                // kutipan hasil perintah verifikasi mapan / "belum diverifikasi", & catatan berkas tes diubah).
+            // Gerbang verifikasi deterministik (v0.5.24 — putaran refleksi self-correction DIHAPUS):
+            // tempelkan baris status faktual penutup secara programatis tanpa pernah memicu putaran
+            // model tambahan di dalam giliran yang sama. Jawaban akhir dikirim tepat satu kali.
+            if mode == TurnMode::Execute {
                 let mut footer_lines: Vec<String> = Vec::new();
                 if let Some(honest_note) = corrector.honest_unverified_closing_note(&last_text) {
                     footer_lines.push(honest_note.trim().to_string());
@@ -1887,6 +1854,10 @@ async fn run_turn_inner(
                     if !last_text.contains(&test_line) {
                         footer_lines.push(test_line);
                     }
+                }
+                if let Some(scratch_line) = corrector.closing_scratch_files_note(&ctx.cwd, &last_text)
+                {
+                    footer_lines.push(scratch_line);
                 }
                 if !footer_lines.is_empty() {
                     let footer = format!("\n\n{}", footer_lines.join("\n"));
@@ -2502,7 +2473,7 @@ async fn run_turn_inner(
                         .next()
                         .unwrap_or(&content)
                         .trim_end_matches('.');
-                    let note = format!("✦ Self-improvement review: {short}");
+                    let note = format!("💾 Selena improvement: {short}");
                     match &ui {
                         Some(tx) => {
                             let _ = tx.send(UiEvent::Info(note)).await;

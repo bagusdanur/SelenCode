@@ -478,15 +478,17 @@ async fn p3_verification_state_bound_to_established_cmd_not_overwritten_by_probe
     .unwrap();
 
     let seen_gates = gates.lock().unwrap().clone();
-    assert_eq!(
-        seen_gates.len(),
-        1,
-        "probe `node -e` exit 0 TIDAK boleh menimpa keadaan gagal `node uji.js`: {seen_gates:?}"
-    );
-    assert!(seen_gates[0].contains("node uji.js"));
     assert!(
-        ans.contains("Verifikasi: `node uji.js` — exit code 0 (LULUS) — PASS_UJI: 31500"),
-        "ringkasan penutup wajib mengutip perintah mapan + exit code + baris hasil kuncinya: {ans}"
+        seen_gates.is_empty(),
+        "v0.5.24 menghapus loop refleksi penutup (0 suntikan [Self-Correction Gate]): {seen_gates:?}"
+    );
+    assert!(
+        ans.contains("[Status Verifikasi Akhir — GAGAL]") && ans.contains("node uji.js"),
+        "probe `node -e` exit 0 TIDAK boleh menimpa keadaan gagal `node uji.js` pada ringkasan penutup deterministik: {ans}"
+    );
+    assert!(
+        !ans.contains("Verifikasi: `node -e"),
+        "probe `node -e` tidak boleh tercatat sebagai perintah verifikasi utama: {ans}"
     );
 
     // 3. Tugas perubahan TANPA verifikasi: gerbang diam, tapi ringkasan menyatakan "belum diverifikasi"

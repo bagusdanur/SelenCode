@@ -310,16 +310,12 @@ impl SkillsCfg {
     }
 }
 
-/// Konfigurasi dedup panggilan tool, loop guard, checkpoint anggaran langkah,
-/// & batas putaran gerbang verifikasi/Self-correction (`[guard]`).
+/// Konfigurasi dedup panggilan tool, loop guard, & checkpoint anggaran langkah (`[guard]`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GuardCfg {
-    /// Aktifkan dedup + loop guard + checkpoint langkah + gerbang verifikasi (set `false` untuk debug).
+    /// Aktifkan dedup + loop guard + checkpoint langkah + pelacak verifikasi deterministik (set `false` untuk debug).
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Batas maksimum putaran gerbang verifikasi/refleksi per giliran (default: 3, pola Aider `max_reflections`).
-    #[serde(default = "default_max_self_correct_rounds")]
-    pub max_self_correct_rounds: usize,
     /// Aktifkan checkpoint kesadaran anggaran langkah & pemicu konvergensi belum-ada-edit (default: true, v0.5.14).
     #[serde(default = "default_true")]
     pub budget_warning_enabled: bool,
@@ -330,10 +326,6 @@ pub struct GuardCfg {
     /// menyuntikkan satu notice konvergensi keras (default: 20 langkah, v0.5.15).
     #[serde(default = "default_no_edit_convergence_steps")]
     pub no_edit_convergence_steps: usize,
-}
-
-fn default_max_self_correct_rounds() -> usize {
-    3
 }
 
 fn default_budget_warning_ratio() -> f64 {
@@ -348,7 +340,6 @@ impl Default for GuardCfg {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_self_correct_rounds: default_max_self_correct_rounds(),
             budget_warning_enabled: true,
             budget_warning_ratio: default_budget_warning_ratio(),
             no_edit_convergence_steps: default_no_edit_convergence_steps(),
@@ -402,22 +393,22 @@ impl AuxCfg {
     }
 }
 
-/// Konfigurasi Background Self-Improvement Review (`[review]`, v0.5.1).
+/// Konfigurasi Selena Improvement — review belajar latar pasca-tugas (`[review]`, v0.5.24).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewCfg {
-    /// Aktifkan background self-improvement review (default: true; tetap butuh `[aux]` model terisi).
+    /// Aktifkan Selena improvement (default: true; memakai `[aux]` bila diisi atau model utama sesi secara bawaan).
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Batas anggaran total token per 1 kali jalan background review (default konservatif: 6.000).
+    /// Batas anggaran total token per 1 kali jalan review (default: 6.000; tiap panggilan tetap dibatasi <= 5.000 token).
     #[serde(default = "default_review_max_tokens")]
     pub max_tokens: u64,
-    /// Cooldown minimum per sesi dalam menit (default: 30 menit).
+    /// Cooldown minimum per sesi dalam menit (default: 10 menit).
     #[serde(default = "default_review_cooldown_mins")]
     pub cooldown_mins: u64,
-    /// Picu review berkala setiap N giliran tuntas dalam sesi panjang (default: 15).
+    /// Picu review berkala setiap N giliran tuntas dalam sesi panjang (default: 5; sinyal bernilai tinggi dapat memicu lebih awal).
     #[serde(default = "default_review_turns_interval")]
     pub turns_interval: usize,
-    /// Jumlah panggilan tool minimum agar sesi dianggap substantif (default: 5).
+    /// Jumlah panggilan tool minimum agar sesi dianggap substantif (default: 4; juga terpenuhi bila ada koreksi pengguna atau kegagalan terpulihkan).
     #[serde(default = "default_review_min_tool_calls")]
     pub min_tool_calls: usize,
 }
@@ -426,13 +417,13 @@ fn default_review_max_tokens() -> u64 {
     6_000
 }
 fn default_review_cooldown_mins() -> u64 {
-    30
+    10
 }
 fn default_review_turns_interval() -> usize {
-    15
+    5
 }
 fn default_review_min_tool_calls() -> usize {
-    5
+    4
 }
 
 impl Default for ReviewCfg {
@@ -1148,7 +1139,6 @@ pub fn validate_toml_keys(val: &toml::Value) -> Vec<ConfigWarning> {
             "guard",
             &[
                 "enabled",
-                "max_self_correct_rounds",
                 "budget_warning_enabled",
                 "budget_warning_ratio",
                 "no_edit_convergence_steps",

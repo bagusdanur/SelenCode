@@ -446,12 +446,21 @@ pub(crate) async fn interactive_plain(
                         println!("[{}]", s.usage_line());
                         s.turns_since_review += 1;
                         if let Some(job) = s.prepare_bg_review_job(false) {
+                            let store_bg = s.store.clone();
                             tokio::spawn(async move {
-                                let _ = tokio::time::timeout(
-                                    std::time::Duration::from_secs(20),
+                                if let Ok(Ok(Some(outcome))) = tokio::time::timeout(
+                                    std::time::Duration::from_secs(25),
                                     job.run(false),
                                 )
-                                .await;
+                                .await
+                                {
+                                    if let Some(msg) = outcome.report_message {
+                                        eprintln!("\n{msg}");
+                                        if let Some(rid) = outcome.run_id {
+                                            let _ = store_bg.mark_review_run_delivered(rid);
+                                        }
+                                    }
+                                }
                             });
                         }
                     }

@@ -1,4 +1,4 @@
-use super::{make_aux_review_provider, make_routed_provider};
+use super::{make_review_provider, make_routed_provider};
 use anyhow::Result;
 use selencode::agent::context::{
     compact_messages, estimate_tokens, format_context_compact, infer_model_context_limit,
@@ -1041,14 +1041,23 @@ impl Session {
         Ok(new_id)
     }
 
-    /// Siapkan pekerjaan Background Self-Improvement Review bila memenuhi pemicu & syarat (v0.5.1):
+    /// Siapkan pekerjaan Selena Improvement (v0.5.24) bila memenuhi pemicu bernilai & pagar anggaran:
     /// - `end_of_session = true`: dipicu saat sesi berakhir (`/exit`, `/new`, `selen run` selesai).
-    /// - `end_of_session = false`: dipicu setiap `cfg.review.turns_interval` (default 15) giliran tuntas.
-    /// - Mengembalikan `None` bila `[aux]` review/compression model kosong, sesi trivial, atau masih cooldown.
+    /// - `end_of_session = false`: dipicu sesudah giliran selesai bila mencapai `cfg.review.turns_interval`
+    ///   ATAU muncul sinyal bernilai tinggi (koreksi pengguna, kegagalan terpulihkan, atau pemakaian skill).
+    /// - Memakai `[aux] review_model` / `compression_model` bila terisi, atau model utama sesi secara bawaan.
     pub(crate) fn prepare_bg_review_job(&mut self, end_of_session: bool) -> Option<BgReviewJob> {
+        if self.needs_setup {
+            return None;
+        }
         if !end_of_session {
             let interval = self.cfg.review.turns_interval;
-            if interval == 0 || self.turns_since_review < interval {
+            let periodic_due = interval > 0 && self.turns_since_review >= interval;
+            let signal_due = selencode::agent::has_valuable_review_signal(
+                &self.messages,
+                self.cfg.review.min_tool_calls,
+            );
+            if !periodic_due && !signal_due {
                 return None;
             }
         }
@@ -1062,10 +1071,15 @@ impl Session {
         {
             return None;
         }
-        let aux_prov = make_aux_review_provider(&self.cfg, &self.provider_name, &self.pcfg)?;
+        let rev_prov = make_review_provider(
+            &self.cfg,
+            &self.provider_name,
+            &self.pcfg,
+            self.provider.clone(),
+        )?;
         self.turns_since_review = 0;
         Some(BgReviewJob {
-            provider: aux_prov,
+            provider: rev_prov,
             cfg: self.cfg.clone(),
             store: self.store.clone(),
             cwd: self.ctx.cwd.clone(),

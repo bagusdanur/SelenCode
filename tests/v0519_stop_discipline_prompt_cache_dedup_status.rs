@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use selencode::agent::corrector::{
     is_dedup_passed_verify_output, is_same_or_broader_verify_cmd, is_verification_shell_cmd,
-    SelfCorrectState, ToolDedupCache,
+    ToolDedupCache, VerificationTracker,
 };
 use selencode::agent::{run_turn_ui, UiEvent};
 use selencode::config::ToolBudgetCfg;
@@ -111,9 +111,9 @@ fn m1_compound_svelte_verify_and_incremental_verify_after_small_edit() {
         "node -e \"console.log('ok')\""
     ));
 
-    // Alur SelfCorrectState:
+    // Alur VerificationTracker:
     // 1. Tulis aplikasi & jalankan suite penuh -> HIJAU
-    let mut sc = SelfCorrectState::new(None).with_strict_known_verify_only(true);
+    let mut sc = VerificationTracker::new(None).with_strict_known_verify_only(true);
     sc.observe_tool_at_step(
         "write_file",
         &json!({"path": "src/routes/+page.svelte"}),
@@ -131,9 +131,9 @@ fn m1_compound_svelte_verify_and_incremental_verify_after_small_edit() {
     assert!(sc.has_passed_green_verify);
     assert_eq!(sc.last_verify_passed, Some(true));
     assert_eq!(sc.edits_since_last_green_verify, 0);
-    assert!(sc.completion_gate(10).is_none());
+    assert!(sc.honest_unverified_closing_note("Selesai.").is_none());
 
-    // 2. Edit kecil (1 berkas) sesudah hijau -> gerbang meminta verifikasi INKREMENTAL, bukan suite penuh
+    // 2. Edit kecil (1 berkas) sesudah hijau -> status berubah menjadi belum diverifikasi ulang
     sc.observe_tool_at_step(
         "edit_file",
         &json!({"path": "src/lib/format.ts"}),
@@ -143,12 +143,9 @@ fn m1_compound_svelte_verify_and_incremental_verify_after_small_edit() {
     );
     assert_eq!(sc.edits_since_last_green_verify, 1);
     assert!(!sc.verified_after_last_edit);
-    let gate_msg = sc
-        .completion_gate(10)
-        .expect("edit baru sesudah hijau harus tetap memicu verifikasi inkremental");
     assert!(
-        gate_msg.contains("Verifikasi Inkremental"),
-        "gerbang harus mengarahkan ke verifikasi inkremental terbatas, dapat: {gate_msg}"
+        sc.honest_unverified_closing_note("Selesai.").is_some(),
+        "edit baru sesudah hijau harus tercatat belum diverifikasi pada catatan penutup"
     );
 
     // 3. Probe `node -e` tetap DITOLAK sebagai verifikasi
@@ -175,7 +172,7 @@ fn m1_compound_svelte_verify_and_incremental_verify_after_small_edit() {
     assert!(sc.verified_after_last_edit);
     assert_eq!(sc.last_verify_passed, Some(true));
     assert_eq!(sc.edits_since_last_green_verify, 0);
-    assert!(sc.completion_gate(10).is_none());
+    assert!(sc.honest_unverified_closing_note("Selesai.").is_none());
 }
 
 #[tokio::test]
@@ -770,9 +767,9 @@ async fn m2_prefix_stability_across_long_session_and_rearm_hysteresis() {
 #[tokio::test]
 async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gagal() {
     let cwd = temp_dir("m3-dedup-status");
-    // 1. Unit level: ToolDedupCache + SelfCorrectState
+    // 1. Unit level: ToolDedupCache + VerificationTracker
     let mut dedup = ToolDedupCache::new();
-    let mut sc = SelfCorrectState::new(None).with_strict_known_verify_only(true);
+    let mut sc = VerificationTracker::new(None).with_strict_known_verify_only(true);
     let verify_args = json!({"command": "npm test"});
     let pass_out = "exit code: 0\n15 passed";
 
@@ -795,7 +792,6 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
         "dedup verifikasi yang sudah lulus WAJIB mempertahankan status LULUS"
     );
     assert!(sc.verified_after_last_edit);
-    assert!(sc.completion_gate(10).is_none());
     assert!(sc
         .honest_unverified_closing_note("Selesai memperbaiki src/app.ts.")
         .is_none());
@@ -931,8 +927,8 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
         "output akhir tidak boleh memuat GAGAL: {out}"
     );
 
-    // 3. Pagar non-regresi: kegagalan verifikasi NYATA tetap ditahan gerbang & dilaporkan GAGAL!
-    let mut sc_fail = SelfCorrectState::new(None).with_strict_known_verify_only(true);
+    // 3. Pagar non-regresi: kegagalan verifikasi NYATA tetap dilaporkan jujur sebagai GAGAL!
+    let mut sc_fail = VerificationTracker::new(None).with_strict_known_verify_only(true);
     sc_fail.observe_tool_at_step("edit_file", &json!({"path": "src/bug.ts"}), "ok", false, 1);
     sc_fail.observe_tool_at_step(
         "run_shell",
@@ -943,8 +939,8 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
     );
     assert_eq!(sc_fail.last_verify_passed, Some(false));
     assert!(
-        sc_fail.completion_gate(10).is_some(),
-        "verifikasi gagal nyata WAJIB tetap ditahan oleh Self-Correction Gate"
+        sc_fail.honest_unverified_closing_note("Selesai.").is_some(),
+        "verifikasi gagal nyata WAJIB memicu catatan penutup jujur"
     );
     let fail_line = sc_fail.closing_verification_summary_line(true).unwrap();
     assert!(

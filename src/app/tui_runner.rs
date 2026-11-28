@@ -56,9 +56,12 @@ async fn tui_worker(
     interrupt_pending: Arc<AtomicBool>,
 ) {
     let active_turn = Arc::new(AtomicBool::new(false));
+    let bg_review_cancel = Arc::new(tokio::sync::Notify::new());
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             TuiCommand::Prompt(prompt) | TuiCommand::InterruptPrompt(prompt) => {
+                // Prioritas latar (3.5 #5): giliran live baru segera membatalkan review latar yang sedang jalan.
+                bg_review_cancel.notify_waiters();
                 let cwd_str = s.ctx.cwd.to_string_lossy().to_string();
                 let _ = s.store.record_prompt_history(&cwd_str, &prompt);
                 let _ = s.store.set_cli_last_session(&cwd_str, &s.session_id);
@@ -99,15 +102,24 @@ async fn tui_worker(
                     if let Some(job) = s.prepare_bg_review_job(false) {
                         let ui_bg = ui_tx.clone();
                         let active_bg = active_turn.clone();
+                        let cancel_bg = bg_review_cancel.clone();
+                        let store_bg = s.store.clone();
                         tokio::spawn(async move {
                             if active_bg.load(Ordering::SeqCst) {
                                 return;
                             }
-                            if let Ok(Ok(Some(outcome))) =
-                                tokio::time::timeout(Duration::from_secs(20), job.run(true)).await
-                            {
-                                if let Some(msg) = outcome.report_message {
-                                    let _ = ui_bg.send(UiEvent::Info(msg)).await;
+                            let outcome = tokio::select! {
+                                res = tokio::time::timeout(Duration::from_secs(25), job.run(false)) => match res {
+                                    Ok(Ok(Some(o))) => o,
+                                    _ => return,
+                                },
+                                _ = cancel_bg.notified() => return,
+                            };
+                            if let Some(msg) = outcome.report_message {
+                                if ui_bg.send(UiEvent::Info(msg)).await.is_ok() {
+                                    if let Some(rid) = outcome.run_id {
+                                        let _ = store_bg.mark_review_run_delivered(rid);
+                                    }
                                 }
                             }
                         });
@@ -643,15 +655,24 @@ async fn tui_worker(
                 if let Some(job) = s.prepare_bg_review_job(true) {
                     let ui_bg = ui_tx.clone();
                     let active_bg = active_turn.clone();
+                    let cancel_bg = bg_review_cancel.clone();
+                    let store_bg = s.store.clone();
                     tokio::spawn(async move {
                         if active_bg.load(Ordering::SeqCst) {
                             return;
                         }
-                        if let Ok(Ok(Some(outcome))) =
-                            tokio::time::timeout(Duration::from_secs(20), job.run(true)).await
-                        {
-                            if let Some(msg) = outcome.report_message {
-                                let _ = ui_bg.send(UiEvent::Info(msg)).await;
+                        let outcome = tokio::select! {
+                            res = tokio::time::timeout(Duration::from_secs(25), job.run(false)) => match res {
+                                Ok(Ok(Some(o))) => o,
+                                _ => return,
+                            },
+                            _ = cancel_bg.notified() => return,
+                        };
+                        if let Some(msg) = outcome.report_message {
+                            if ui_bg.send(UiEvent::Info(msg)).await.is_ok() {
+                                if let Some(rid) = outcome.run_id {
+                                    let _ = store_bg.mark_review_run_delivered(rid);
+                                }
                             }
                         }
                     });

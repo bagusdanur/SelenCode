@@ -231,9 +231,36 @@ pub(crate) fn make_routed_provider(
     Ok(Arc::new(router))
 }
 
-/// Bangun provider khusus Background Self-Improvement Review memakai `[aux] review_model`
-/// (atau fallback `[aux] compression_model`). Mengembalikan `None` bila keduanya kosong —
-/// TIDAK pernah diam-diam memakai model utama yang mahal.
+/// Bangun provider untuk Selena Improvement (v0.5.24):
+/// - Bila `[aux] review_model` atau `[aux] compression_model` diisi -> pakai model aux override tersebut.
+/// - Bila keduanya kosong -> pakai provider & model utama sesi itu sendiri (seperti fork latar pada
+///   model utama agar awalan prompt beku mengenai cache awalan provider, tetap dalam pagu anggaran).
+pub(crate) fn make_review_provider(
+    cfg: &Config,
+    primary_name: &str,
+    primary_cfg: &ProviderCfg,
+    primary_provider: Arc<dyn Provider>,
+) -> Option<Arc<dyn Provider>> {
+    if let Some(aux) = make_aux_review_provider(cfg, primary_name, primary_cfg) {
+        return Some(aux);
+    }
+    if primary_cfg.model.trim().is_empty() || primary_cfg.model == "(belum diatur)" {
+        return None;
+    }
+    // Bangun handle provider baru pada model utama dengan batas output konservatif bila tersedia,
+    // atau gunakan `primary_provider` sesi langsung.
+    if let Ok((n, p, k)) = cfg.resolve_provider(Some(primary_name)) {
+        let mut rev_cfg = cfg.clone();
+        rev_cfg.agent.max_output_tokens = (cfg.review.max_tokens.min(1200).max(256)) as u32;
+        if let Ok(prov) = make_provider(&rev_cfg, &n, &p, &k) {
+            return Some(prov);
+        }
+    }
+    Some(primary_provider)
+}
+
+/// Bangun provider khusus Selena Improvement memakai `[aux] review_model`
+/// (atau fallback `[aux] compression_model`). Mengembalikan `None` bila keduanya kosong.
 pub(crate) fn make_aux_review_provider(
     cfg: &Config,
     primary_name: &str,

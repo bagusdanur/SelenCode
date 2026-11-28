@@ -1,6 +1,6 @@
 //! Tes Fase 3 — Advanced Verification Engine (targeted test selection, pembedaan status, & evidence gate).
 
-use selencode::agent::corrector::SelfCorrectState;
+use selencode::agent::corrector::VerificationTracker;
 use selencode::tools::verify::{classify_step_output, detect_targeted_plan, ProjectKind, VerifyStatus};
 use serde_json::json;
 use std::path::PathBuf;
@@ -90,7 +90,7 @@ fn targeted_plan_selects_relevant_tests_for_rust_python_and_go() {
 
 #[test]
 fn corrector_rejects_no_tests_and_timeout_as_passing_evidence() {
-    let mut st = SelfCorrectState::new(Some(1));
+    let mut st = VerificationTracker::new(Some(1));
     st.observe_tool("edit_file", &json!({"path": "src/lib.rs"}), "OK", false);
     assert!(!st.verified_after_last_edit);
 
@@ -112,7 +112,7 @@ fn corrector_rejects_no_tests_and_timeout_as_passing_evidence() {
     );
     assert_eq!(st.last_verify_passed, Some(false));
 
-    // Verifikasi nyata LULUS -> barulah completion_gate mengizinkan selesai!
+    // Verifikasi nyata LULUS -> status terverifikasi bersih tanpa peringatan penutup!
     st.observe_tool(
         "verify_project",
         &json!({"scope": "targeted"}),
@@ -120,5 +120,6 @@ fn corrector_rejects_no_tests_and_timeout_as_passing_evidence() {
         false,
     );
     assert_eq!(st.last_verify_passed, Some(true));
-    assert!(st.completion_gate(5).is_none());
+    assert!(st.verified_after_last_edit);
+    assert!(st.honest_unverified_closing_note("Selesai.").is_none());
 }

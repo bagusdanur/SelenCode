@@ -45,7 +45,6 @@ max_parallel_subagents = 3                       # batas subagent delegate berja
 # Penjaga loop, kesadaran anggaran langkah, & gerbang verifikasi sebelum menutup (v0.5.14/v0.5.15).
 [guard]
 enabled = true
-max_self_correct_rounds = 3                      # batas total putaran gerbang verifikasi/refleksi per giliran
 budget_warning_enabled = true                    # aktifkan checkpoint sisa langkah & pemicu konvergensi belum-ada-edit
 budget_warning_ratio = 0.7                       # rasio checkpoint internal untuk subagent/cron berpagu
 no_edit_convergence_steps = 20                   # ambang langkah tanpa edit untuk notice konvergensi di giliran utama tanpa pagu

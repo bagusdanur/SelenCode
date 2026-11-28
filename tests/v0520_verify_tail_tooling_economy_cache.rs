@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use selencode::agent::context::{compaction_threshold_tokens, needs_compaction};
 use selencode::agent::corrector::{
     detect_tooling_config_error_hint, is_setup_or_scaffold_shell_cmd, is_vendor_or_dependency_path,
-    is_verification_shell_cmd, SelfCorrectState, ToolDedupCache,
+    is_verification_shell_cmd, ToolDedupCache, VerificationTracker,
 };
 use selencode::agent::{run_turn_ui, UiEvent};
 use selencode::config::ToolBudgetCfg;
@@ -244,9 +244,9 @@ async fn m1_scaffold_command_never_tracked_and_green_verify_closes_with_zero_tai
     );
 
     // 3. Pagar non-regresi: jika ada edit sesudah verifikasi hijau TANPA verifikasi ulang,
-    //    gerbang WAJIB tetap menahan penutupan; jika verifikasi berurutan (`npm run check` lalu
-    //    `npm test` lalu `npm run build`), perintah verifikasi terakhir ikut terlacak akurat!
-    let mut sc = SelfCorrectState::new(None).with_strict_known_verify_only(true);
+    //    tracker tetap mencatat belum diverifikasi; jika verifikasi berurutan (`npm run check` lalu
+    //    `npm run build`), perintah verifikasi terakhir ikut terlacak akurat!
+    let mut sc = VerificationTracker::new(None).with_strict_known_verify_only(true);
     sc.observe_tool_at_step(
         "run_shell",
         &json!({"command": "npx sv create . --add vitest"}),
@@ -256,7 +256,7 @@ async fn m1_scaffold_command_never_tracked_and_green_verify_closes_with_zero_tai
     );
     assert!(
         !sc.has_verification_run && sc.last_verify_cmd.is_none(),
-        "perintah scaffold tidak boleh pernah dicatat di SelfCorrectState"
+        "perintah scaffold tidak boleh pernah dicatat di VerificationTracker"
     );
     sc.observe_tool_at_step(
         "write_file",
@@ -281,7 +281,7 @@ async fn m1_scaffold_command_never_tracked_and_green_verify_closes_with_zero_tai
     );
     assert_eq!(sc.last_verify_cmd.as_deref(), Some("npm run build"));
     assert_eq!(sc.last_verify_passed, Some(true));
-    // Edit baru tanpa verifikasi ulang -> WAJIB tetap ditahan gerbang!
+    // Edit baru tanpa verifikasi ulang -> WAJIB tercatat belum diverifikasi!
     sc.observe_tool_at_step(
         "edit_file",
         &json!({"path": "src/app.ts"}),
@@ -290,8 +290,8 @@ async fn m1_scaffold_command_never_tracked_and_green_verify_closes_with_zero_tai
         5,
     );
     assert!(
-        sc.completion_gate(10).is_some(),
-        "edit yang belum diverifikasi tetap wajib ditahan gerbang verifikasi"
+        !sc.verified_after_last_edit && sc.honest_unverified_closing_note("Selesai.").is_some(),
+        "edit yang belum diverifikasi tetap wajib tercatat belum terverifikasi pada penutup deterministik"
     );
 }
 

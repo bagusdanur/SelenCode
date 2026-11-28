@@ -575,9 +575,7 @@ pub fn detect_escalation_needed(msgs: &[Message]) -> bool {
         for b in &m.content {
             match b {
                 crate::providers::Block::Text(t) => {
-                    if t.contains("[Self-Correction Gate")
-                        || t.contains("[Self-Correction / Deteksi")
-                    {
+                    if t.contains("[Self-Correction / Deteksi") {
                         return true;
                     }
                 }

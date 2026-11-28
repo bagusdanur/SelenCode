@@ -12,7 +12,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use selencode::agent::context::{build_folder_map, build_system_prompt};
-use selencode::agent::corrector::SelfCorrectState;
+use selencode::agent::corrector::VerificationTracker;
 use selencode::agent::run_turn_counted;
 use selencode::config::ContextCfg;
 use selencode::providers::{
@@ -272,27 +272,30 @@ async fn perbaikan2_max_steps_closing_summary_model_and_template_fallback() {
 fn perbaikan2_swe_agent_coding_closing_checklist() {
     let dir = temp_dir("p2-swe");
     std::fs::write(dir.join("repro_bug.js"), "console.log('repro');").unwrap();
-    let mut st = SelfCorrectState::new(None).with_max_attempts(1);
+    let mut st = VerificationTracker::new(None);
 
     // Edit file kode + buat skrip repro sementara
     st.observe_tool("edit_file", &json!({"path": "pricing.js"}), "OK: pricing.js diedit.", false);
     st.observe_tool("write_file", &json!({"path": "repro_bug.js"}), "OK: repro_bug.js ditulis.", false);
 
-    // (a) Belum diverifikasi sesudah edit terakhir -> gate menolak selesai
-    let g1 = st.completion_gate_with_checklist(4, "Selesai.", &dir);
-    assert!(g1.as_deref().unwrap().contains("belum menjalankan verifikasi"));
+    // (a) Belum diverifikasi sesudah edit terakhir -> catatan deterministik jujur (0 panggilan LLM)
+    assert!(!st.verified_after_last_edit);
+    assert!(st.honest_unverified_closing_note("Selesai.").is_some());
 
     // Jalankan verifikasi sesudah edit terakhir
     st.observe_tool("run_shell", &json!({"command": "node --check pricing.js"}), "exit code: 0\nOK", false);
+    assert!(st.verified_after_last_edit);
+    assert!(st.honest_unverified_closing_note("Selesai.").is_none());
 
-    // (b) & (c) Sudah terverifikasi, tetapi repro_bug.js masih ada & jawaban belum menyebut pricing.js -> checklist memicu 1x
-    let g2 = st.completion_gate_with_checklist(4, "Sudah beres semua.", &dir);
-    let msg2 = g2.expect("checklist penutup harus mengingatkan berkas repro & daftar file diubah");
-    assert!(msg2.contains("repro_bug.js"));
-    assert!(msg2.contains("pricing.js"));
+    // (b) Berkas repro sementara masih ada -> catatan penutup deterministik menyebutnya!
+    let scratch_note = st
+        .closing_scratch_files_note(&dir)
+        .expect("catatan penutup deterministik harus menyebut berkas repro yang masih tersisa");
+    assert!(scratch_note.contains("repro_bug.js"));
 
-    // Sesudah checklist dicek sekali -> tidak mengulang lagi (anti-loop)
-    assert!(st.completion_gate_with_checklist(4, "Perubahan pada pricing.js lulus; repro_bug.js dihapus.", &dir).is_none());
+    // Sesudah berkas repro dihapus -> tidak ada catatan berkas sementara lagi
+    let _ = std::fs::remove_file(dir.join("repro_bug.js"));
+    assert!(st.closing_scratch_files_note(&dir).is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

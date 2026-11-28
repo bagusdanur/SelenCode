@@ -1002,7 +1002,15 @@ async fn handle_telegram_chat_message(
         }
         SlashCommand::New => {
             if let Some(job) = s.prepare_bg_review_job(true) {
-                spawn_telegram_bg_review(tg.clone(), chat_id, busy_chats.clone(), job);
+                spawn_telegram_bg_review(
+                    tg.clone(),
+                    chat_id,
+                    busy_chats.clone(),
+                    gen_counter.clone(),
+                    my_gen,
+                    s.store.clone(),
+                    job,
+                );
             }
             let sid = s.reset_session()?;
             let _ = s
@@ -1371,7 +1379,7 @@ async fn handle_telegram_chat_message(
                             )
                             .await;
                         }
-                        UiEvent::Info(info) if info.contains("Self-improvement") => {
+                        UiEvent::Info(info) if info.contains("Selena improvement") => {
                             notes.push(info);
                         }
                         _ => {}
@@ -1665,27 +1673,41 @@ async fn handle_telegram_chat_message(
         );
     }
 
-    // Background Self-Improvement Review (v0.5.1): picu di latar setiap 15 giliran tuntas
-    // (tidak pernah memblokir giliran aktif; laporan dikirim sebagai pesan baru Telegram).
+    // Selena Improvement (v0.5.24): picu di latar sesudah penutup terkirim
+    // (tidak pernah memblokir giliran aktif; dibatalkan bila giliran live baru masuk).
     s.turns_since_review += 1;
     if let Some(job) = s.prepare_bg_review_job(false) {
-        spawn_telegram_bg_review(tg.clone(), chat_id, busy_chats.clone(), job);
+        spawn_telegram_bg_review(
+            tg.clone(),
+            chat_id,
+            busy_chats.clone(),
+            gen_counter.clone(),
+            my_gen,
+            s.store.clone(),
+            job,
+        );
     }
     Ok(())
 }
 
-/// Jalankan Background Self-Improvement Review di latar untuk chat Telegram (v0.5.1).
-/// Menunggu sampai giliran aktif tidak sibuk, lalu mengirim TEPAT SATU pesan baru bila ada hasil.
+/// Jalankan Selena Improvement di latar untuk chat Telegram (v0.5.24).
+/// Tidak pernah memblokir giliran baru; dibatalkan segera bila user mengirim pesan baru (`gen_counter` naik).
+/// Menandai `delivered = 1` HANYA sesudah pesan Telegram benar-benar terkirim.
 fn spawn_telegram_bg_review(
     tg: TelegramClient,
     chat_id: i64,
     busy_chats: Arc<std::sync::Mutex<HashSet<i64>>>,
+    gen_counter: Arc<AtomicU64>,
+    expected_gen: u64,
+    store: Arc<selencode::store::Store>,
     job: super::session::BgReviewJob,
 ) {
     tokio::spawn(async move {
-        // Beri jeda singkat agar flag busy giliran selesai dilepas, dan pastikan tidak jalan
-        // bersamaan dengan giliran aktif.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Beri jeda singkat agar flag busy giliran selesai dilepas, dan cek apakah giliran baru sudah masuk.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if gen_counter.load(Ordering::SeqCst) != expected_gen {
+            return;
+        }
         if busy_chats
             .lock()
             .map(|set| set.contains(&chat_id))
@@ -1693,16 +1715,32 @@ fn spawn_telegram_bg_review(
         {
             return;
         }
-        let Ok(Ok(Some(outcome))) = tokio::time::timeout(Duration::from_secs(30), job.run(true)).await
-        else {
-            return;
+        // Prioritas latar (3.5 #5): batalkan bila giliran live baru mulai saat review berjalan.
+        let run_fut = tokio::time::timeout(Duration::from_secs(30), job.run(false));
+        let cancel_poll = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if gen_counter.load(Ordering::SeqCst) != expected_gen {
+                    break;
+                }
+            }
         };
+        let outcome = tokio::select! {
+            res = run_fut => match res {
+                Ok(Ok(Some(o))) => o,
+                _ => return,
+            },
+            _ = cancel_poll => return,
+        };
+        if gen_counter.load(Ordering::SeqCst) != expected_gen {
+            return;
+        }
         let Some(report) = outcome.report_message else {
             return;
         };
         let html = escape_telegram_html(&report);
-        if outcome.staged_ids.is_empty() {
-            let _ = tg.send_html_message(chat_id, &html, &report).await;
+        let sent_ok = if outcome.staged_ids.is_empty() {
+            tg.send_html_message(chat_id, &html, &report).await.is_ok()
         } else {
             let rows: Vec<Vec<(String, String)>> = outcome
                 .staged_ids
@@ -1715,9 +1753,14 @@ fn spawn_telegram_bg_review(
                     ]
                 })
                 .collect();
-            let _ = tg
-                .send_html_message_with_keyboard(chat_id, &html, &report, rows)
-                .await;
+            tg.send_html_message_with_keyboard(chat_id, &html, &report, rows)
+                .await
+                .is_ok()
+        };
+        if sent_ok {
+            if let Some(rid) = outcome.run_id {
+                let _ = store.mark_review_run_delivered(rid);
+            }
         }
     });
 }

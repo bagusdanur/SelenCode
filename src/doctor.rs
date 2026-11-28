@@ -195,6 +195,59 @@ pub fn run_doctor(
         detail: steps_detail,
     });
 
+    // 2d. Selena Improvement — review belajar pasca-tugas (v0.5.24)
+    let cwd_str_rev = cwd.to_string_lossy().to_string();
+    let rev_runs = store.list_recent_review_runs(&cwd_str_rev, 5).unwrap_or_default();
+    let rev_pending = store
+        .list_review_proposals(Some(&cwd_str_rev), Some("pending"), 20)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let last_skip = store.get_last_review_skip().ok().flatten();
+    let (rev_status, rev_detail) = if !cfg.review.enabled {
+        (
+            CheckStatus::Warn,
+            "NONAKTIF oleh config ([review] enabled = false)".to_string(),
+        )
+    } else if let Some(aux_m) = cfg.aux.effective_review_model() {
+        let mut d = format!(
+            "aktif (model aux override: {aux_m} · max_tokens={} · cooldown={}m · interval={} giliran · {} run terakhir · {} staging)",
+            cfg.review.max_tokens,
+            cfg.review.cooldown_mins,
+            cfg.review.turns_interval,
+            rev_runs.len(),
+            rev_pending
+        );
+        if let Some((r, det, _)) = &last_skip {
+            d.push_str(&format!(" · lewati terakhir: {r} ({det})"));
+        }
+        (CheckStatus::Ok, d)
+    } else if !pcfg.model.trim().is_empty() && pcfg.model != "(belum diatur)" {
+        let cache_sum: u64 = rev_runs.iter().map(|r| r.cache_read_tokens).sum();
+        let mut d = format!(
+            "aktif (model utama sesi: {} · cache_read={} · max_tokens={} · cooldown={}m · {} run terakhir · {} staging)",
+            pcfg.model,
+            cache_sum,
+            cfg.review.max_tokens,
+            cfg.review.cooldown_mins,
+            rev_runs.len(),
+            rev_pending
+        );
+        if let Some((r, det, _)) = &last_skip {
+            d.push_str(&format!(" · lewati terakhir: {r} ({det})"));
+        }
+        (CheckStatus::Ok, d)
+    } else {
+        (
+            CheckStatus::Warn,
+            "menunggu model — belum ada provider utama maupun [aux] review_model".to_string(),
+        )
+    };
+    checks.push(DoctorCheck {
+        name: "Selena Improvement".into(),
+        status: rev_status,
+        detail: rev_detail,
+    });
+
     // 3. SQLite Store & Memori Persisten (v0.5.9: satu sumber kebenaran di user_memory)
     let cwd_str = cwd.to_string_lossy().to_string();
     let sess_cnt = store.list_sessions(&cwd_str, 50).map(|v| v.len()).unwrap_or(0);
