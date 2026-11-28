@@ -1441,7 +1441,7 @@ async fn handle_telegram_chat_message(
     }
     let s: &mut Session = &mut *s_guard;
 
-    // Sinkronkan otomatis bila user mengganti router AI / model dari terminal TUI!
+    // Sinkronkan otomatis bila user mengganti router AI / model / sandbox dari terminal TUI atau callback!
     if provider_override.is_none() {
         let target_prov = latest_cfg.default_provider.clone();
         let target_model = latest_cfg
@@ -1454,6 +1454,12 @@ async fn handle_telegram_chat_message(
         {
             s.cfg = latest_cfg.clone();
             let _ = s.switch_provider(&target_prov);
+        }
+    }
+    if let Some(sb_mode) = selencode::sandbox::SandboxMode::parse(&latest_cfg.sandbox.mode) {
+        if sb_mode != s.ctx.sandbox.mode() {
+            s.ctx.sandbox.set_mode(sb_mode);
+            s.cfg.sandbox.mode = sb_mode.as_str().to_string();
         }
     }
 

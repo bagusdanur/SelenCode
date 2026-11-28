@@ -243,10 +243,11 @@ pub fn parse_callback_model(data: &str) -> Option<TgModelCallback> {
     }
 }
 
-/// Callback inline `/resume` & `/sessions` (`res:s:<1based>`, `res:new`, `res:x`).
+/// Callback inline `/resume` & `/sessions` (`res:i:<id_prefix>`, `res:s:<1based>`, `res:new`, `res:x`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TgResumeCallback {
     Select(usize),
+    SelectId(String),
     NewSession,
     Close,
 }
@@ -265,6 +266,13 @@ pub fn parse_callback_resume(data: &str) -> Option<TgResumeCallback> {
                 return None;
             }
             Some(TgResumeCallback::Select(idx))
+        }
+        "i" => {
+            let id_pref = parts.next()?.trim();
+            if parts.next().is_some() || id_pref.is_empty() || id_pref.len() > 36 {
+                return None;
+            }
+            Some(TgResumeCallback::SelectId(id_pref.to_string()))
         }
         _ => None,
     }
@@ -681,7 +689,12 @@ pub fn build_tg_resume_picker_card(cwd: &str, items: &[TgResumeItem]) -> TgInlin
                 clip_tg_btn_label(&item.title, 24),
                 item.msg_count
             );
-            rows.push(vec![(btn, format!("res:s:{}", item.num))]);
+            let cb = if !item.id_short.trim().is_empty() {
+                format!("res:i:{}", item.id_short.trim())
+            } else {
+                format!("res:s:{}", item.num)
+            };
+            rows.push(vec![(btn, cb)]);
             plain.push_str(&format!(
                 "\n#{} {} ({} msg · {})",
                 item.num, item.title, item.msg_count, item.model
@@ -1081,6 +1094,8 @@ pub const TELEGRAM_BOT_COMMANDS: &[(&str, &str)] = &[
     ("provider", "Kelola provider AI & API key"),
     ("approve", "Atur mode persetujuan (ask/edits/auto)"),
     ("sandbox", "Atur mode & isolasi Security Sandbox v2"),
+    ("plan", "Mode rencana baca-saja dengan tombol setuju"),
+    ("cd", "Lihat atau pindah folder kerja aktif"),
     ("verify", "Jalankan cek build, test, & lint proyek"),
     ("worktree", "Isolasi refactor lewat Git Worktree"),
     ("checkpoint", "Simpan checkpoint untuk rollback aman"),

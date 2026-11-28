@@ -8,7 +8,8 @@
 use selencode::repl::{lookup_saved_model, SavedModelLookup};
 use selencode::telegram::{
     build_tg_approve_picker_card, build_tg_model_picker_card, build_tg_provider_picker_card,
-    parse_callback_model, TgModelCallback, TgModelEntry, TgModelProviderItem,
+    build_tg_resume_picker_card, parse_callback_model, parse_callback_resume, TgModelCallback,
+    TgModelEntry, TgModelProviderItem, TgResumeCallback, TgResumeItem, TELEGRAM_BOT_COMMANDS,
 };
 
 #[test]
@@ -139,4 +140,25 @@ fn ollama_model_ber_titik_dua_dan_approve_picker_tepat_satu_centang() {
             "harus tepat 1 tombol bertanda ✓ untuk mode '{mode_label}', dapat {checked_count}"
         );
     }
+
+    // 3. Tombol `/resume` Telegram mengikat prefix ID sesi (`res:i:<short>`) agar kebal pergeseran indeks
+    let rcard = build_tg_resume_picker_card(
+        "/tmp/proj",
+        &[TgResumeItem {
+            num: 1,
+            id_short: "db2b54ae-f".to_string(),
+            title: "Perbaikan auth".to_string(),
+            msg_count: 10,
+            model: "gpt-4.1".to_string(),
+            is_active: true,
+        }],
+    );
+    assert_eq!(
+        parse_callback_resume(&rcard.rows[0][0].1),
+        Some(TgResumeCallback::SelectId("db2b54ae-f".to_string()))
+    );
+
+    // 4. Menu `/` Telegram memuat `/plan` dan `/cd`
+    assert!(TELEGRAM_BOT_COMMANDS.iter().any(|(cmd, _)| *cmd == "plan"));
+    assert!(TELEGRAM_BOT_COMMANDS.iter().any(|(cmd, _)| *cmd == "cd"));
 }

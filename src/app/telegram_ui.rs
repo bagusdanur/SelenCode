@@ -20,13 +20,13 @@ use selencode::telegram::{
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// State ringan bersama antar callback inline Telegram & task chat per-`chat_id`.
 #[derive(Default)]
 pub(crate) struct TgUiSharedState {
-    /// Cache daftar ID model katalog API terakhir per `(chat_id, provider_idx)`.
-    remote_catalogs: Mutex<HashMap<(i64, usize), Vec<String>>>,
+    /// Cache daftar ID model katalog API terakhir per `(chat_id, provider_idx)` dengan TTL 60 detik.
+    remote_catalogs: Mutex<HashMap<(i64, usize), (Instant, Vec<String>)>>,
     /// Chat yang mengaktifkan `/plan` untuk giliran pesan berikutnya.
     plan_next_chats: Mutex<HashSet<i64>>,
     /// Teks rencana hasil giliran `/plan` yang menunggu tombol `pln:run` / `pln:x`.
@@ -38,7 +38,7 @@ pub(crate) struct TgUiSharedState {
 impl TgUiSharedState {
     pub(crate) fn set_remote_catalog(&self, chat_id: i64, prov_idx: usize, ids: Vec<String>) {
         if let Ok(mut g) = self.remote_catalogs.lock() {
-            g.insert((chat_id, prov_idx), ids);
+            g.insert((chat_id, prov_idx), (Instant::now(), ids));
         }
     }
 
@@ -46,7 +46,20 @@ impl TgUiSharedState {
         self.remote_catalogs
             .lock()
             .ok()
-            .and_then(|g| g.get(&(chat_id, prov_idx)).cloned())
+            .and_then(|g| g.get(&(chat_id, prov_idx)).map(|(_, ids)| ids.clone()))
+    }
+
+    pub(crate) fn get_fresh_remote_catalog(
+        &self,
+        chat_id: i64,
+        prov_idx: usize,
+        ttl: Duration,
+    ) -> Option<Vec<String>> {
+        self.remote_catalogs.lock().ok().and_then(|g| {
+            g.get(&(chat_id, prov_idx))
+                .filter(|(ts, _)| ts.elapsed() <= ttl)
+                .map(|(_, ids)| ids.clone())
+        })
     }
 
     pub(crate) fn set_plan_next(&self, chat_id: i64, enabled: bool) {
@@ -395,7 +408,7 @@ pub(crate) async fn handle_tg_model_callback(
             let cached_ids = if page > 0 {
                 tg_ui.get_remote_catalog(chat_id, provider_idx)
             } else {
-                None
+                tg_ui.get_fresh_remote_catalog(chat_id, provider_idx, Duration::from_secs(60))
             };
             let remote_ids = if let Some(ids) = cached_ids {
                 let _ = tg.answer_callback_query(&cb.id, None).await;
@@ -731,6 +744,56 @@ pub(crate) async fn handle_tg_resume_callback(
                     );
                     let _ = tg
                         .answer_callback_query(&cb.id, Some(&format!("✓ Sesi #{num} dimuat")))
+                        .await;
+                    if let Some(mid) = msg_id {
+                        let _ = tg
+                            .edit_html_message_with_keyboard(chat_id, mid, &html, &plain, Vec::new())
+                            .await;
+                    } else {
+                        let _ = tg.send_html_message(chat_id, &html, &plain).await;
+                    }
+                }
+                Err(e) => {
+                    let _ = tg
+                        .answer_callback_query(&cb.id, Some(&format!("Gagal: {e}")))
+                        .await;
+                }
+            }
+        }
+        TgResumeCallback::SelectId(id_prefix) => {
+            let live = { sessions.lock().await.get(&chat_id).cloned() };
+            let Some(s_arc) = live else {
+                let _ = tg
+                    .answer_callback_query(&cb.id, Some(&format!("Ketik /resume {id_prefix}.")))
+                    .await;
+                return;
+            };
+            let Ok(mut s) = s_arc.try_lock() else {
+                let _ = tg
+                    .answer_callback_query(&cb.id, Some("Tunggu giliran aktif selesai dulu."))
+                    .await;
+                return;
+            };
+            match s.resume_by_target(&id_prefix) {
+                Ok(data) => {
+                    let _ = s.store.set_telegram_chat_session(chat_id, &data.session_id);
+                    let short: String = data.session_id.chars().take(10).collect();
+                    let ctx_s = format_context_tokens_exact(data.context_limit);
+                    let html = format!(
+                        "<b>Melanjutkan Sesi</b>\n\n\
+                         • <b>Judul:</b> {}\n\
+                         • <b>Sesi:</b> <code>{short}</code> ({} pesan)\n\
+                         • <b>Model:</b> <code>{}</code> ({ctx_s})",
+                        escape_telegram_html(&data.title),
+                        data.total_messages,
+                        escape_telegram_html(&data.model),
+                    );
+                    let plain = format!(
+                        "Melanjutkan Sesi: {} ({short}) — {} pesan · {}",
+                        data.title, data.total_messages, data.model
+                    );
+                    let _ = tg
+                        .answer_callback_query(&cb.id, Some(&format!("✓ Sesi {short} dimuat")))
                         .await;
                     if let Some(mid) = msg_id {
                         let _ = tg

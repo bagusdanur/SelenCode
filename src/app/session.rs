@@ -558,6 +558,7 @@ impl Session {
                     p.models = list;
                     p.model = chosen.clone();
                 }
+                self.cfg.default_provider = self.provider_name.clone();
                 let saved_path = config::save(&self.cfg)?;
                 let pname = self.provider_name.clone();
                 self.switch_provider(&pname)?;
@@ -578,6 +579,7 @@ impl Session {
                     p.push_model_unique(&model);
                     p.model = model.clone();
                 }
+                self.cfg.default_provider = self.provider_name.clone();
                 let saved_path = config::save(&self.cfg)?;
                 let pname = self.provider_name.clone();
                 self.switch_provider(&pname)?;
