@@ -231,6 +231,12 @@ impl BgManager {
                 _ = stop_rx => {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
+                    if let Some(h) = out_handle {
+                        h.abort();
+                    }
+                    if let Some(h) = err_handle {
+                        h.abort();
+                    }
                     if let Ok(mut st) = state_bg.lock() {
                         *st = JobState::Stopped;
                     }

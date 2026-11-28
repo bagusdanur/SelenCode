@@ -18,7 +18,6 @@ use crate::sandbox::SandboxController;
 use crate::security::redact_secrets;
 use anyhow::{anyhow, Result};
 use std::path::Path;
-use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
 pub struct HookEngine {
@@ -140,6 +139,10 @@ async fn run_single_hook(
     cwd: &Path,
     sandbox: &SandboxController,
 ) -> (bool, String) {
+    // Jangan patahkan tool baca-saja saat sandbox dalam mode `read-only` hanya karena shell hook aktif.
+    if sandbox.mode() == crate::sandbox::SandboxMode::ReadOnly {
+        return (true, "hook dilewati saat sandbox mode read-only".to_string());
+    }
     let mut cmd = match sandbox.prepare_shell_command(&format!("hook:{event}"), &hook.command, cwd) {
         Ok(c) => c,
         Err(e) => return (false, format!("sandbox menolak hook: {e}")),
@@ -152,24 +155,12 @@ async fn run_single_hook(
             "SELENCODE_TOOL_IS_ERROR",
             if tool_is_error { "1" } else { "0" },
         );
-    let timeout = Duration::from_secs(hook.timeout_secs.clamp(1, 120));
-    match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(Ok(out)) => {
-            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.trim().is_empty() {
-                if !combined.is_empty() {
-                    combined.push('\n');
-                }
-                combined.push_str(&stderr);
-            }
+    let timeout_secs = hook.timeout_secs.clamp(1, 120);
+    match crate::tools::run_timed(&mut cmd, timeout_secs).await {
+        Ok((code, combined)) => {
             let safe: String = redact_secrets(&combined).chars().take(500).collect();
-            (out.status.success(), safe)
+            (code == Some(0), safe)
         }
-        Ok(Err(e)) => (false, format!("gagal menjalankan hook: {e}")),
-        Err(_) => (
-            false,
-            format!("hook timeout setelah {} detik", timeout.as_secs()),
-        ),
+        Err(e) => (false, format!("gagal menjalankan hook: {e}")),
     }
 }

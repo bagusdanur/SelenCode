@@ -132,10 +132,11 @@ impl Tool for Delegate {
         let active_provider = self
             .provider
             .read()
-            .expect("shared provider lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone();
 
         if mode == "work" {
+            ctx.sandbox.check_write_allowed("delegate_work", "worktree")?;
             if !is_git_repo(&ctx.cwd) {
                 return Err(anyhow!(
                     "delegate mode='work' ditolak: folder '{}' bukan repositori Git — pekerja terisolasi membutuhkan Git worktree.",

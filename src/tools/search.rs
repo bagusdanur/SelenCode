@@ -100,6 +100,7 @@ impl Tool for SearchText {
             .map_err(|e| anyhow!("regex tidak valid: {e}"))?;
 
         let sub = str_arg(&args, "path").unwrap_or(".");
+        let cwd_norm = crate::security::normalize_sandbox_path(&ctx.cwd);
         let root = resolve_in_sandbox(&ctx.cwd, std::path::Path::new(sub))?;
         let glob_filter = compile_path_glob(str_arg(&args, "glob"))?;
 
@@ -114,7 +115,11 @@ impl Tool for SearchText {
             if is_secret_file(p) {
                 continue;
             }
-            let rel = p.strip_prefix(&ctx.cwd).unwrap_or(p);
+            let ep = crate::security::strip_windows_verbatim(p);
+            let rel = ep
+                .strip_prefix(&cwd_norm)
+                .or_else(|_| ep.strip_prefix(&ctx.cwd))
+                .unwrap_or(ep.as_path());
             if !path_matches_glob(rel, &glob_filter) {
                 continue;
             }

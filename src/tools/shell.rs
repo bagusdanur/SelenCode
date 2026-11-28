@@ -18,7 +18,9 @@ pub struct RunShell {
 }
 
 /// Perintah baca-saja / cek versi bawaan yang aman berjalan tanpa mengganggu
-/// user dengan popup approval berulang (tetap menolak chaining/redirect!).
+/// user dengan popup approval berulang (tetap menolak chaining/redirect/flag berbahaya!).
+/// `cargo check`/`cargo test` SENGAJA tidak dimasukkan agar kode repo (`build.rs`/proc-macro/test)
+/// tidak pernah berjalan tanpa persetujuan.
 const SAFE_READONLY_CMDS: &[&str] = &[
     "ls",
     "dir",
@@ -30,8 +32,6 @@ const SAFE_READONLY_CMDS: &[&str] = &[
     "git log",
     "git branch",
     "git show",
-    "cargo check",
-    "cargo test",
     "rustc --version",
     "cargo --version",
     "node -v",
@@ -39,6 +39,50 @@ const SAFE_READONLY_CMDS: &[&str] = &[
     "python --version",
     "python3 --version",
 ];
+
+/// Tolak flag/argumen berbahaya pada perintah baca-saja bawaan (seperti `git diff --no-index`,
+/// `git diff --output=...`, `git branch -D`, `..`, atau ekspansi env `%VAR%`/`$VAR`).
+fn has_dangerous_readonly_args(c: &str) -> bool {
+    if c.contains('$') || c.contains('%') {
+        return true;
+    }
+    let tokens: Vec<&str> = c.split_whitespace().collect();
+    for tok in &tokens {
+        let low = tok.to_ascii_lowercase();
+        if low == ".."
+            || low.starts_with("../")
+            || low.contains("/../")
+            || low.contains(r"\..\")
+            || low == "--output"
+            || low.starts_with("--output=")
+            || low == "--no-index"
+            || low == "--ext-diff"
+            || low == "--textconv"
+            || low == "--config"
+            || low.starts_with("--config=")
+            || low == "-c"
+            || low == "--exec"
+            || low.starts_with("--exec=")
+            || low == "--upload-pack"
+            || low.starts_with("--upload-pack=")
+        {
+            return true;
+        }
+    }
+    if tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case("git") && tokens[1].eq_ignore_ascii_case("branch") {
+        for tok in &tokens[2..] {
+            if matches!(
+                *tok,
+                "-d" | "-D" | "-f" | "-m" | "-M" | "-c" | "-C" | "--delete" | "--force" | "--move" | "--copy" | "--set-upstream-to"
+            ) || tok.starts_with("--delete=")
+                || tok.starts_with("--move=")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 fn matches_prefix(c: &str, entry: &str) -> bool {
     let a = entry.trim();
@@ -68,8 +112,10 @@ impl RunShell {
         if c.contains([';', '|', '&', '`', '>', '<', '\n', '\r']) || c.contains("$(") {
             return false;
         }
-        self.allowlist.iter().any(|a| matches_prefix(c, a))
-            || SAFE_READONLY_CMDS.iter().any(|a| matches_prefix(c, a))
+        if self.allowlist.iter().any(|a| matches_prefix(c, a)) {
+            return true;
+        }
+        SAFE_READONLY_CMDS.iter().any(|a| matches_prefix(c, a)) && !has_dangerous_readonly_args(c)
     }
 }
 
@@ -106,6 +152,10 @@ impl Tool for RunShell {
                 "perintah ditolak demi keamanan (pola terlarang, tidak bisa di-approve): {command}"
             ));
         }
+        // Cek batas sandbox lebih dulu sebelum minta approval agar tombol `[a]` tidak bocor saat ditolak sandbox.
+        let mut cmd = ctx
+            .sandbox
+            .prepare_shell_command("run_shell", &command, &ctx.cwd)?;
         if self.needs_approval(&args)
             && !ctx
                 .approver
@@ -115,10 +165,6 @@ impl Tool for RunShell {
                 "Ditolak user — perintah TIDAK dijalankan: {command}"
             ));
         }
-
-        let mut cmd = ctx
-            .sandbox
-            .prepare_shell_command("run_shell", &command, &ctx.cwd)?;
 
         let (code, output) = run_timed(&mut cmd, self.timeout_secs)
             .await

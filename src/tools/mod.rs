@@ -291,13 +291,13 @@ pub(crate) async fn run_timed(
     let mut child = cmd.spawn()?;
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let out_task = tokio::spawn(async move {
+    let mut out_task = tokio::spawn(async move {
         match stdout_pipe {
             Some(r) => read_bounded_pipe(r, MAX_RUN_TIMED_PIPE_BYTES).await,
             None => Vec::new(),
         }
     });
-    let err_task = tokio::spawn(async move {
+    let mut err_task = tokio::spawn(async move {
         match stderr_pipe {
             Some(r) => read_bounded_pipe(r, MAX_RUN_TIMED_PIPE_BYTES).await,
             None => Vec::new(),
@@ -317,8 +317,22 @@ pub(crate) async fn run_timed(
             anyhow::bail!("timeout setelah {timeout_secs} detik");
         }
     };
-    let stdout_bytes = out_task.await.unwrap_or_default();
-    let stderr_bytes = err_task.await.unwrap_or_default();
+    // Beri jeda drain singkat (2 detik) agar proses cucu yang mewarisi stdout/stderr
+    // tidak pernah membuat `run_timed` hang permanen sesudah shell induk selesai.
+    let stdout_bytes = match tokio::time::timeout(Duration::from_secs(2), &mut out_task).await {
+        Ok(Ok(b)) => b,
+        _ => {
+            out_task.abort();
+            Vec::new()
+        }
+    };
+    let stderr_bytes = match tokio::time::timeout(Duration::from_secs(2), &mut err_task).await {
+        Ok(Ok(b)) => b,
+        _ => {
+            err_task.abort();
+            Vec::new()
+        }
+    };
     let mut s = String::from_utf8_lossy(&stdout_bytes).into_owned();
     s.push_str(&String::from_utf8_lossy(&stderr_bytes));
     Ok((status.code(), s))

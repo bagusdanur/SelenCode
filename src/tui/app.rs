@@ -719,8 +719,12 @@ pub fn extract_at_query(input: &str) -> Option<(usize, String)> {
     if input.contains('\n') || input.trim_start().starts_with('/') {
         return None;
     }
-    let last_ws = input.rfind(char::is_whitespace);
-    let token_start = last_ws.map(|i| i + 1).unwrap_or(0);
+    let token_start = input
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| c.is_whitespace())
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
     let token = &input[token_start..];
     let rest = token.strip_prefix('@')?;
     Some((token_start, rest.to_string()))

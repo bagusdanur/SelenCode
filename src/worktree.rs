@@ -46,21 +46,55 @@ pub struct ApplyWorktreeReport {
     pub deleted_files: Vec<String>,
 }
 
-fn run_git(cwd: &Path, args: &[&str]) -> Result<(bool, String)> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
+fn run_git_raw(cwd: &Path, args: &[&str]) -> Result<(bool, String, String)> {
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.pager=cat",
+    ])
+    .args(args)
+    .current_dir(cwd)
+    .stdin(std::process::Stdio::null())
+    .env("GIT_TERMINAL_PROMPT", "0");
+    crate::sandbox::scrub_std_command(&mut cmd);
+    let out = cmd
         .output()
         .with_context(|| format!("gagal menjalankan `git {}`", args.join(" ")))?;
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+fn run_git(cwd: &Path, args: &[&str]) -> Result<(bool, String)> {
+    let (ok, mut text, stderr) = run_git_raw(cwd, args)?;
     if !stderr.trim().is_empty() {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
         text.push_str(&stderr);
     }
-    Ok((out.status.success(), text))
+    Ok((ok, text))
+}
+
+fn run_git_stdout(cwd: &Path, args: &[&str]) -> Result<(bool, String)> {
+    let (ok, stdout, _) = run_git_raw(cwd, args)?;
+    Ok((ok, stdout))
+}
+
+fn is_safe_git_ref(r: &str) -> bool {
+    r == "HEAD"
+        || (r.len() >= 7
+            && r.len() <= 64
+            && !r.starts_with('-')
+            && r.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Cek apakah `cwd` berada dalam repository Git yang valid dan memiliki minimal 1 commit.
@@ -208,11 +242,16 @@ fn parse_porcelain_paths(status_out: &str) -> (Vec<String>, Vec<String>) {
     let mut modified_or_new = Vec::new();
     let mut deleted = Vec::new();
     for raw in status_out.lines() {
-        if raw.len() < 4 {
+        let Some(code) = raw.get(..2) else {
+            continue;
+        };
+        let Some(rest) = raw.get(3..) else {
+            continue;
+        };
+        if !code.is_ascii() {
             continue;
         }
-        let code = &raw[..2];
-        let path_part = raw[3..].trim();
+        let path_part = rest.trim();
         let rel = path_part
             .rsplit(" -> ")
             .next()
@@ -241,15 +280,16 @@ pub fn preview_diff(cwd: &Path, id: &str) -> Result<WorktreeDiffPreview> {
     // P1.1: hitung diff terhadap `base_commit` ASLI saat worktree dibuat agar
     // perubahan yang SUDAH DI-COMMIT di branch worktree maupun yang belum di-commit
     // semuanya terdeteksi konsisten pada preview & apply!
-    let base_ref = if wt.base_commit.trim().is_empty() {
-        "HEAD"
+    let base_ref = if is_safe_git_ref(wt.base_commit.trim()) {
+        wt.base_commit.trim()
     } else {
-        wt.base_commit.as_str()
+        "HEAD"
     };
-    let (_, wt_status) = run_git(&wt.path, &["status", "--porcelain"])?;
+    let (_, wt_status) = run_git_stdout(&wt.path, &["status", "--porcelain", "-uall"])?;
     let (mut changed_files, mut deleted_files) = parse_porcelain_paths(&wt_status);
 
-    let (ok_nm, nm_out) = run_git(&wt.path, &["diff", "--name-status", base_ref])?;
+    let (ok_nm, nm_out) =
+        run_git_stdout(&wt.path, &["diff", "--no-renames", "--name-status", base_ref, "--"])?;
     if ok_nm {
         for line in nm_out.lines() {
             let mut parts = line.splitn(2, '\t');
@@ -273,7 +313,7 @@ pub fn preview_diff(cwd: &Path, id: &str) -> Result<WorktreeDiffPreview> {
     }
 
     // Cek perubahan pengguna yang belum di-commit di workspace utama.
-    let (_, main_status) = run_git(cwd, &["status", "--porcelain"])?;
+    let (_, main_status) = run_git_stdout(cwd, &["status", "--porcelain", "-uall"])?;
     let (main_mod, main_del) = parse_porcelain_paths(&main_status);
     let main_dirty: HashSet<String> = main_mod.into_iter().chain(main_del).collect();
 
@@ -284,7 +324,10 @@ pub fn preview_diff(cwd: &Path, id: &str) -> Result<WorktreeDiffPreview> {
         }
     }
 
-    let (_, mut raw_diff) = run_git(&wt.path, &["diff", base_ref])?;
+    let (_, mut raw_diff) = run_git_stdout(
+        &wt.path,
+        &["diff", "--no-ext-diff", "--no-textconv", base_ref, "--"],
+    )?;
     // Sertakan isi berkas baru (untracked) sebagai unified diff agar preview menampilkan perubahan lengkap!
     for rel in &changed_files {
         let marker_a = format!("+++ b/{rel}");
@@ -377,7 +420,7 @@ pub fn apply_worktree_to_main(
 
     let cp_id = undo_stack
         .lock()
-        .expect("undo_stack poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .begin_checkpoint(format!("apply worktree {}", wt.id));
 
     let apply_res: Result<(Vec<String>, Vec<String>)> = (|| {
@@ -444,8 +487,12 @@ pub fn discard_worktree(cwd: &Path, id: &str) -> Result<()> {
     let path_str = wt.path.to_string_lossy().to_string();
     let (ok, out) = run_git(cwd, &["worktree", "remove", "--force", &path_str])?;
     if !ok {
-        // Fallback: bersihkan folder + prune worktree metadata bila folder sudah hilang.
-        let _ = std::fs::remove_dir_all(&wt.path);
+        // Fallback: bersihkan folder HANYA jika benar-benar di dalam `.selencode/worktrees/`.
+        let root_norm = crate::security::normalize_sandbox_path(&worktrees_root(cwd));
+        let wt_norm = crate::security::normalize_sandbox_path(&wt.path);
+        if wt_norm.starts_with(&root_norm) && wt_norm != root_norm {
+            let _ = std::fs::remove_dir_all(&wt.path);
+        }
         let _ = run_git(cwd, &["worktree", "prune"]);
         if wt.path.exists() {
             return Err(anyhow!(

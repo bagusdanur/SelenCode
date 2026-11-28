@@ -201,6 +201,13 @@ pub fn is_sensitive_env_key(key: &str) -> bool {
         "DATABASE_URL",
         "REDIS_URL",
         "SELENCODE_ROUTER_KEY",
+        "SSH_AUTH_SOCK",
+        "MYSQL_PWD",
+        "SENTRY_DSN",
+        "SLACK_WEBHOOK",
+        "MISTRAL_",
+        "XAI_",
+        "HF_",
     ];
     sensitive_parts.iter().any(|p| up.contains(p))
         || (up.starts_with("SELENCODE_") && (up.ends_with("_KEY") || up.ends_with("_TOKEN")))
@@ -214,6 +221,20 @@ pub fn sensitive_env_keys_present() -> Vec<String> {
             is_sensitive_env_key(&s).then_some(s)
         })
         .collect()
+}
+
+/// Hapus seluruh env var sensitif dari `tokio::process::Command` (untuk `git`, `pdftotext`, `lsp`, `chrome`, dll.).
+pub fn scrub_tokio_command(cmd: &mut tokio::process::Command) {
+    for k in sensitive_env_keys_present() {
+        cmd.env_remove(k);
+    }
+}
+
+/// Hapus seluruh env var sensitif dari `std::process::Command`.
+pub fn scrub_std_command(cmd: &mut std::process::Command) {
+    for k in sensitive_env_keys_present() {
+        cmd.env_remove(k);
+    }
 }
 
 /// Satu entri audit log persisten (JSONL) — seluruh teks sudah teredaksi!
@@ -445,7 +466,11 @@ impl SandboxController {
             ));
         }
 
-        let st = self.inner.lock().expect("sandbox state poisoned").clone();
+        let st = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if st.mode == SandboxMode::ReadOnly {
             self.record_audit(action, cmd_clean, false, "eksekusi shell diblokir mode read-only");
             return Err(anyhow!(
@@ -497,6 +522,9 @@ impl SandboxController {
             let mut c = tokio::process::Command::new(bwrap_path);
             c.args(["--ro-bind", "/", "/"])
                 .args(["--dev", "/dev"])
+                .arg("--unshare-pid")
+                .arg("--unshare-ipc")
+                .arg("--unshare-uts")
                 .args(["--proc", "/proc"])
                 .args(["--tmpfs", "/tmp"])
                 .arg("--bind")
@@ -506,6 +534,19 @@ impl SandboxController {
                 .arg(&cwd_can)
                 .arg("--die-with-parent")
                 .arg("--new-session");
+            // Sembunyikan direktori kredensial sensitif milik user di host (kecuali bila memang sedang bekerja di dalamnya).
+            if let Some(home) = dirs::home_dir() {
+                for secret_dir in [
+                    home.join(".ssh"),
+                    home.join(".aws"),
+                    home.join(".gnupg"),
+                    home.join(".config").join("selencode"),
+                ] {
+                    if secret_dir.is_dir() && !cwd_can.starts_with(&secret_dir) {
+                        c.arg("--tmpfs").arg(&secret_dir);
+                    }
+                }
+            }
             if !st.allow_network {
                 c.arg("--unshare-net");
             }
@@ -584,21 +625,35 @@ impl SandboxController {
             }
         }
         if let Ok(line) = serde_json::to_string(&entry) {
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.audit_path)
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).append(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            if let Ok(mut f) = opts.open(&self.audit_path) {
                 let _ = writeln!(f, "{line}");
             }
         }
     }
 
-    /// Baca `limit` entri audit log terakhir (terbaru dulu).
+    /// Baca `limit` entri audit log terakhir (terbaru dulu), terikat maks 512 KB dari ekor berkas.
     pub fn recent_audit_entries(&self, limit: usize) -> Vec<AuditEntry> {
-        let Ok(text) = std::fs::read_to_string(&self.audit_path) else {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(&self.audit_path) else {
             return Vec::new();
         };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        const MAX_TAIL: u64 = 512 * 1024;
+        if len > MAX_TAIL {
+            let _ = f.seek(SeekFrom::Start(len - MAX_TAIL));
+        }
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_err() {
+            return Vec::new();
+        }
+        let text = String::from_utf8_lossy(&buf);
         let mut parsed: Vec<AuditEntry> = text
             .lines()
             .filter_map(|l| serde_json::from_str::<AuditEntry>(l).ok())
@@ -610,7 +665,11 @@ impl SandboxController {
 
     /// Format kartu status Moonlit untuk perintah `/sandbox`.
     pub fn format_status_card(&self) -> String {
-        let st = self.inner.lock().expect("sandbox state poisoned").clone();
+        let st = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let scrubbed_count = sensitive_env_keys_present().len();
         let scrub_label = if st.scrub_env {
             format!("aktif ({scrubbed_count} env sensitif disaring dari subprocess)")

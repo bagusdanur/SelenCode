@@ -97,12 +97,17 @@ impl Tool for ListFiles {
         }
     }
     async fn run(&self, args: Value, ctx: &Ctx) -> Result<String> {
+        let cwd_norm = crate::security::normalize_sandbox_path(&ctx.cwd);
         let root = resolve_in_sandbox(&ctx.cwd, std::path::Path::new(&path_arg(&args)))?;
         let glob_filter = super::search::compile_path_glob(str_arg(&args, "glob"))?;
         let mut out = Vec::new();
         for e in ignore::WalkBuilder::new(&root).require_git(false).build().flatten() {
             if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                let rel = e.path().strip_prefix(&ctx.cwd).unwrap_or(e.path());
+                let ep = crate::security::strip_windows_verbatim(e.path());
+                let rel = ep
+                    .strip_prefix(&cwd_norm)
+                    .or_else(|_| ep.strip_prefix(&ctx.cwd))
+                    .unwrap_or(ep.as_path());
                 if !super::search::path_matches_glob(rel, &glob_filter) {
                     continue;
                 }
@@ -468,12 +473,18 @@ pub fn extract_pdf_text_bytes(bytes: &[u8]) -> Result<String> {
         return Err(anyhow!("berkas bukan PDF valid (header %PDF tidak ditemukan)"));
     }
     const MAX_STREAM_DECOMP_BYTES: u64 = 4 * 1024 * 1024;
+    const MAX_TOTAL_DECOMP_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_EXTRACTED_TEXT_BYTES: usize = 1024 * 1024;
     let mut extracted = String::new();
     let mut pos = 0usize;
     let mut stream_count = 0usize;
+    let mut total_decomp = 0usize;
 
     while let Some(st_idx) = find_subslice(bytes, b"stream", pos) {
-        if stream_count >= 512 {
+        if stream_count >= 512
+            || total_decomp >= MAX_TOTAL_DECOMP_BYTES
+            || extracted.len() >= MAX_EXTRACTED_TEXT_BYTES
+        {
             break;
         }
         // Cek header kamus tepat sebelum `stream` (maks 512 byte ke belakang).
@@ -500,17 +511,20 @@ pub fn extract_pdf_text_bytes(bytes: &[u8]) -> Result<String> {
         let is_flate = find_subslice(dict_slice, b"FlateDecode", 0).is_some()
             || (raw_stream.len() >= 2 && raw_stream[0] == 0x78 && matches!(raw_stream[1], 0x01 | 0x5E | 0x9C | 0xDA));
 
+        let remaining_budget = (MAX_TOTAL_DECOMP_BYTES - total_decomp) as u64;
+        let stream_cap = MAX_STREAM_DECOMP_BYTES.min(remaining_budget);
         let decoded: Vec<u8> = if is_flate {
-            let mut dec = flate2::read::ZlibDecoder::new(raw_stream).take(MAX_STREAM_DECOMP_BYTES);
+            let mut dec = flate2::read::ZlibDecoder::new(raw_stream).take(stream_cap);
             let mut buf = Vec::new();
             if dec.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
                 buf
             } else {
-                raw_stream.to_vec()
+                raw_stream[..raw_stream.len().min(stream_cap as usize)].to_vec()
             }
         } else {
-            raw_stream.to_vec()
+            raw_stream[..raw_stream.len().min(stream_cap as usize)].to_vec()
         };
+        total_decomp = total_decomp.saturating_add(decoded.len());
 
         if find_subslice(&decoded, b"BT", 0).is_some() {
             let before_len = extracted.len();
@@ -530,7 +544,9 @@ async fn try_pdftotext_fallback(path: &std::path::Path) -> Option<String> {
         .arg("UTF-8")
         .arg(path)
         .arg("-")
+        .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
+    crate::sandbox::scrub_tokio_command(&mut cmd);
     let (code, out) = super::run_timed(&mut cmd, 10).await.ok()?;
     if code == Some(0) && !out.trim().is_empty() {
         Some(out.trim().to_string())
@@ -548,16 +564,19 @@ fn format_sliced_text(
     let has_range = args.get("start").is_some() || args.get("end").is_some();
     let lines: Vec<&str> = text.lines().collect();
     let start = args.get("start").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
-    let end = args
-        .get("end")
-        .and_then(|v| v.as_u64())
-        .map(|e| e as usize)
-        .unwrap_or(lines.len())
-        .min(lines.len());
+    let raw_end = args.get("end").and_then(|v| v.as_u64()).map(|e| e as usize);
+    if let Some(e) = raw_end {
+        if e < start && !lines.is_empty() {
+            return Err(anyhow!("rentang baris tidak valid: end={e} < start={start}"));
+        }
+    }
+    let end = raw_end.unwrap_or(lines.len()).min(lines.len());
     if start > lines.len() && !lines.is_empty() {
         return Err(anyhow!("start={start} melebihi jumlah baris {}", lines.len()));
     }
-    let slice = &lines[(start - 1).min(lines.len())..end];
+    let start_idx = (start - 1).min(lines.len());
+    let end_idx = end.max(start_idx);
+    let slice = &lines[start_idx..end_idx];
     let default_line_cap = if ctx.tool_budget.file_read_default_lines > 0 {
         ctx.tool_budget.file_read_default_lines.min(MAX_READ_LINES)
     } else {
@@ -962,7 +981,7 @@ pub fn fuzzy_find_and_replace(
         let mut out = String::with_capacity(content.len() + repl_body.len());
         out.push_str(&content[..span_start]);
         out.push_str(&repl_body);
-        if had_trailing_nl && !repl_body.ends_with('\n') {
+        if !repl_body.is_empty() && had_trailing_nl && !repl_body.ends_with('\n') {
             out.push_str(nl);
         }
         out.push_str(&content[span_end..]);

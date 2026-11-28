@@ -4,20 +4,80 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Buang prefiks verbatim Windows (`\\?\C:\...` -> `C:\...`, `\\?\UNC\srv\sh` -> `\\srv\sh`)
+/// agar `strip_prefix`, `starts_with`, `cmd.exe`, dan SQLite `cwd` selalu konsisten lintas OS.
+pub fn strip_windows_verbatim(p: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p.to_path_buf()
+}
+
+/// Normalisasi path sandbox (kanonisasi bila ada + buang prefiks verbatim Windows + bersihkan `.`/`..`).
+pub fn normalize_sandbox_path(p: &Path) -> PathBuf {
+    let base = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    normalize(&strip_windows_verbatim(&base))
+}
+
 /// Apakah nama file termasuk rahasia (tidak boleh dibaca/dikirim ke provider)?
+/// Tahan terhadap perbedaan huruf besar/kecil (Windows/macOS), NTFS Alternate Data Stream (`:`),
+/// dan melindungi file config/database/audit milik SelenCode sendiri.
 pub fn is_secret_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+    let Some(raw_name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
+    // Tolak NTFS Alternate Data Streams (mis. `.env::$DATA`, `server.key:stream`)
+    let base_name = raw_name.split(':').next().unwrap_or(raw_name);
+    let trimmed = base_name.trim_end_matches(['.', ' ']);
+    let name = trimmed.to_ascii_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    // Jika file memiliki ADS (`:` selain drive letter — di sini sudah file_name), blokir bila dasarnya rahasia
+    // atau mengandung `::$data`.
+    if raw_name.contains(':') {
+        let lower_raw = raw_name.to_ascii_lowercase();
+        if lower_raw.contains("::$data") {
+            return true;
+        }
+    }
     name == ".env"
         || name.starts_with(".env.")
         || name.ends_with(".key")
         || name.ends_with(".pem")
+        || name.ends_with(".p12")
+        || name.ends_with(".pfx")
         || name == "id_rsa"
         || name.starts_with("id_rsa.")
         || name.starts_with("id_rsa_")
         || name == "id_ed25519"
         || name.starts_with("id_ed25519.")
+        || name == ".netrc"
+        || name == ".npmrc"
+        || name == ".pypirc"
+        || name == "selencode.toml"
+        || name == "selen.db"
+        || name == "selen.db-wal"
+        || name == "selen.db-shm"
+        || name == "selencode.db"
+        || name == "selencode.db-wal"
+        || name == "selencode.db-shm"
+        || name == "audit.jsonl"
+        || name == "audit.log"
+        || (name == "config.toml"
+            && path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|p| p.eq_ignore_ascii_case("selencode"))
+                .unwrap_or(false))
 }
 
 /// Normalisasi leksikal (tanpa menyentuh FS): buang `.`, proses `..` dengan pop.
@@ -36,13 +96,15 @@ fn normalize(p: &Path) -> PathBuf {
 }
 
 /// Selesaikan path relatif terhadap cwd project dan PASTIKAN tetap di dalamnya.
-/// Menolak `..` keluar, path absolut di luar cwd, dan target symlink yang keluar.
+/// Menolak `..` keluar, path absolut di luar cwd, dangling symlink keluar, dan
+/// mengembalikan path kanonis agar symlink ke `.env` selalu tertangkap `is_secret_file`.
 pub fn resolve_in_sandbox(cwd: &Path, path: &Path) -> Result<PathBuf> {
-    let cwd_abs = normalize(&cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()));
-    let joined = if path.is_absolute() {
-        normalize(path)
+    let cwd_abs = normalize_sandbox_path(cwd);
+    let clean_req = strip_windows_verbatim(path);
+    let joined = if clean_req.is_absolute() {
+        normalize(&clean_req)
     } else {
-        normalize(&cwd_abs.join(path))
+        normalize(&cwd_abs.join(&clean_req))
     };
     if !joined.starts_with(&cwd_abs) {
         return Err(anyhow!(
@@ -51,22 +113,99 @@ pub fn resolve_in_sandbox(cwd: &Path, path: &Path) -> Result<PathBuf> {
             cwd_abs.display()
         ));
     }
-    // Bila target (atau induk terdekatnya) ada di FS, cek symlink tidak kabur keluar.
+    // Cek semua komponen yang ada di FS (termasuk dangling symlink via `symlink_metadata`)
+    // agar tidak bisa menulis lewat symlink putus keluar workspace atau membaca symlink -> `.env`.
     let mut probe = joined.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
     loop {
-        if probe.exists() {
-            if let Ok(real) = probe.canonicalize() {
-                if !real.starts_with(&cwd_abs) {
-                    return Err(anyhow!(
-                        "path '{}' ditolak: symlink mengarah keluar folder project",
-                        path.display()
-                    ));
+        match std::fs::symlink_metadata(&probe) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    // Symlink yang ada (termasuk dangling!): wajib terkanonisasi DAN tetap dalam cwd_abs.
+                    let real = match probe.canonicalize() {
+                        Ok(r) => normalize(&strip_windows_verbatim(&r)),
+                        Err(_) => {
+                            // Dangling symlink -> cek target read_link secara eksplisit (fail-closed!)
+                            let target = std::fs::read_link(&probe).map_err(|_| {
+                                anyhow!(
+                                    "path '{}' ditolak: symlink tidak dapat diverifikasi di dalam sandbox",
+                                    path.display()
+                                )
+                            })?;
+                            let resolved_link = if target.is_absolute() {
+                                normalize(&strip_windows_verbatim(&target))
+                            } else {
+                                let parent = probe.parent().unwrap_or(&cwd_abs);
+                                let parent_real = parent
+                                    .canonicalize()
+                                    .map(|r| normalize(&strip_windows_verbatim(&r)))
+                                    .unwrap_or_else(|_| parent.to_path_buf());
+                                normalize(&parent_real.join(&target))
+                            };
+                            if !resolved_link.starts_with(&cwd_abs) {
+                                return Err(anyhow!(
+                                    "path '{}' ditolak: symlink mengarah keluar folder project",
+                                    path.display()
+                                ));
+                            }
+                            resolved_link
+                        }
+                    };
+                    if !real.starts_with(&cwd_abs) {
+                        return Err(anyhow!(
+                            "path '{}' ditolak: symlink mengarah keluar folder project",
+                            path.display()
+                        ));
+                    }
+                    let mut final_path = real;
+                    for seg in tail.into_iter().rev() {
+                        final_path.push(seg);
+                    }
+                    let final_norm = normalize(&final_path);
+                    if !final_norm.starts_with(&cwd_abs) {
+                        return Err(anyhow!(
+                            "path '{}' ditolak: symlink mengarah keluar folder project",
+                            path.display()
+                        ));
+                    }
+                    return Ok(final_norm);
+                } else {
+                    let real = probe.canonicalize().map_err(|e| {
+                        anyhow!(
+                            "path '{}' ditolak: gagal memverifikasi path kanonis ({e})",
+                            path.display()
+                        )
+                    })?;
+                    let real_norm = normalize(&strip_windows_verbatim(&real));
+                    if !real_norm.starts_with(&cwd_abs) {
+                        return Err(anyhow!(
+                            "path '{}' ditolak: symlink mengarah keluar folder project",
+                            path.display()
+                        ));
+                    }
+                    let mut final_path = real_norm;
+                    for seg in tail.into_iter().rev() {
+                        final_path.push(seg);
+                    }
+                    let final_norm = normalize(&final_path);
+                    if !final_norm.starts_with(&cwd_abs) {
+                        return Err(anyhow!(
+                            "path '{}' ditolak: di luar folder project ({})",
+                            path.display(),
+                            cwd_abs.display()
+                        ));
+                    }
+                    return Ok(final_norm);
                 }
             }
-            break;
-        }
-        if !probe.pop() {
-            break;
+            Err(_) => {
+                if let Some(name) = probe.file_name() {
+                    tail.push(name.to_os_string());
+                }
+                if !probe.pop() {
+                    break;
+                }
+            }
         }
     }
     Ok(joined)
@@ -135,12 +274,17 @@ impl ApprovalPolicy {
 }
 
 /// Ekstrak kategori ringkas dari judul approval (mis. `"edit_file src/a.rs"` -> `"edit_file"`,
-/// `"run_shell: cargo build"` -> `"run_shell"`, `"mcp: fs/read"` -> `"mcp:fs"`).
+/// `"run_shell: cargo build"` -> `"run_shell"`, `"mcp: fs/read"` -> `"mcp:fs/read"`).
 pub fn tool_category_from_title(title: &str) -> String {
     let t = title.trim();
     if let Some(rest) = t.strip_prefix("mcp:") {
-        let server = rest.trim().split('/').next().unwrap_or("mcp").trim();
-        return format!("mcp:{server}");
+        let target = rest
+            .trim()
+            .split_whitespace()
+            .next()
+            .unwrap_or("mcp")
+            .trim();
+        return format!("mcp:{target}");
     }
     t.split(|c: char| c.is_whitespace() || c == ':')
         .next()
@@ -292,53 +436,119 @@ impl Approver {
 // ---------- Fase 2: perintah terlarang + redaksi rahasia ----------
 
 /// Perintah yang SELALU ditolak walau user menyetujui (Blueprint Bagian 6):
-/// pola destruktif tingkat sistem. Pengecekan token-based agar tahan diselipkan
-/// di tengah rantai perintah (`;`, `&&`, `|`).
+/// pola destruktif tingkat sistem (Unix & Windows). Pengecekan token-based dengan normalisasi
+/// tanda kutip/escape agar tahan diselipkan di tengah rantai perintah (`;`, `&&`, `|`).
 pub fn is_forbidden_command(command: &str) -> bool {
     let lower = command.to_lowercase();
-    // Fork bomb: :(){ :|:& };:
+    // Fork bomb: :(){ :|:& };: atau variasi nama fungsi lain f(){ f|f& };f
     let squashed: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
-    if squashed.contains(":(){") {
+    if squashed.contains(":(){") || (squashed.contains("(){") && squashed.contains("|") && squashed.contains("&};")) {
         return true;
     }
-    // Tulis langsung ke disk mentah.
-    if lower.contains("/dev/sd") {
+    // Tulis langsung ke disk mentah (Unix & Windows physical drive).
+    if lower.contains("/dev/sd")
+        || lower.contains("/dev/nvme")
+        || lower.contains("/dev/vd")
+        || lower.contains("/dev/mmcblk")
+        || lower.contains(r"\\.\physicaldrive")
+    {
         return true;
     }
-    let tokens: Vec<&str> = lower
-        .split(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '|')
+    let tokens: Vec<String> = lower
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '`' | '\n' | '\r')
+        })
+        .map(|t| {
+            t.trim_matches(|c: char| matches!(c, '\'' | '"' | '\\'))
+                .replace('\\', "")
+                .to_string()
+        })
         .filter(|t| !t.is_empty())
         .collect();
     let has_word = |w: &str| {
-        tokens
-            .iter()
-            .any(|t| *t == w || t.ends_with(&format!("/{w}")))
+        tokens.iter().any(|t| {
+            t == w
+                || t == &format!("{w}.exe")
+                || t.ends_with(&format!("/{w}"))
+                || t.ends_with(&format!("/{w}.exe"))
+        })
     };
     if tokens.iter().any(|t| t.starts_with("mkfs")) {
         return true;
     }
-    if has_word("shutdown") || has_word("reboot") || has_word("poweroff") || has_word("halt") {
+    if has_word("shutdown")
+        || has_word("reboot")
+        || has_word("poweroff")
+        || has_word("halt")
+        || has_word("diskpart")
+    {
         return true;
     }
     // dd if=... (baca/timpa perangkat mentah)
     if has_word("dd") && lower.contains("if=") {
         return true;
     }
-    // rm rekursif+paksa ke / atau ~
+    // rm rekursif+paksa ke /, /*, /., //, ~, atau $HOME
     if has_word("rm") {
-        let combined_rf = tokens
-            .iter()
-            .any(|t| t.starts_with('-') && !t.starts_with("--") && t.contains('r') && t.contains('f'));
-        let separate_rf = tokens.contains(&"-r") && tokens.contains(&"-f");
+        let combined_rf = tokens.iter().any(|t| {
+            t.starts_with('-') && !t.starts_with("--") && t.contains('r') && t.contains('f')
+        });
+        let has_r = tokens.iter().any(|t| t == "-r" || t == "--recursive");
+        let has_f = tokens.iter().any(|t| t == "-f" || t == "--force");
         let danger_target = tokens.iter().any(|t| {
             matches!(
-                *t,
-                "/" | "/*" | "~" | "~/" | "~/*" | "$home" | "$home/" | "$home/*"
+                t.as_str(),
+                "/" | "/*"
+                    | "/."
+                    | "//"
+                    | "~"
+                    | "~/"
+                    | "~/*"
+                    | "$home"
+                    | "$home/"
+                    | "$home/*"
+                    | "${home}"
+                    | "${home}/"
+                    | "${home}/*"
             )
         });
-        if (combined_rf || separate_rf) && danger_target {
+        if (combined_rf || (has_r && has_f)) && danger_target {
             return true;
         }
+    }
+    // Perintah destruktif Windows (`rd /s /q C:\`, `rmdir /s /q`, `del /f /s /q`, `format C:`, PowerShell `Remove-Item -Recurse -Force`)
+    if has_word("format")
+        && tokens
+            .iter()
+            .any(|t| t.len() == 2 && t.ends_with(':') && t.as_bytes()[0].is_ascii_alphabetic())
+    {
+        return true;
+    }
+    let has_win_root = tokens.iter().any(|t| {
+        let s = t.as_str();
+        matches!(s, "c:" | "c:/" | "c:/*" | "d:" | "d:/" | "/" | "/*")
+            || (s.len() <= 4 && s.as_bytes().get(1) == Some(&b':'))
+    });
+    if (has_word("rd") || has_word("rmdir"))
+        && tokens.iter().any(|t| t == "/s")
+        && tokens.iter().any(|t| t == "/q")
+        && has_win_root
+    {
+        return true;
+    }
+    if has_word("del")
+        && tokens.iter().any(|t| t == "/s")
+        && tokens.iter().any(|t| t == "/f" || t == "/q")
+        && has_win_root
+    {
+        return true;
+    }
+    if (has_word("remove-item") || has_word("ri"))
+        && tokens.iter().any(|t| t == "-recurse" || t == "-r")
+        && tokens.iter().any(|t| t == "-force" || t == "-fo")
+        && (has_win_root || tokens.iter().any(|t| matches!(t.as_str(), "~" | "$home")))
+    {
+        return true;
     }
     false
 }
@@ -348,28 +558,37 @@ fn secret_regexes() -> &'static Vec<(regex::Regex, &'static str)> {
     static RES: OnceLock<Vec<(regex::Regex, &'static str)>> = OnceLock::new();
     RES.get_or_init(|| {
         let pats: Vec<(&str, &'static str)> = vec![
-            // Blok private key (multiline)
+            // Blok private key (multiline — termasuk yang terpotong tanpa baris END)
             (
-                r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+                r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)",
                 "[REDACTED]",
             ),
-            // Header Authorization: Bearer ...
-            (r"(?i)(authorization:\s*bearer\s+)\S+", "${1}[REDACTED]"),
+            // Header Authorization: Bearer / Basic ...
+            (r"(?i)(authorization:\s*(?:bearer|basic)\s+)\S+", "${1}[REDACTED]"),
             // Bearer token lepas
             (r"(?i)(bearer\s+)[A-Za-z0-9._\-]{16,}", "${1}[REDACTED]"),
-            // Token bergaya OpenAI / GitHub / AWS
+            // Kredensial dalam URL (`scheme://user:pass@host`)
+            (r"(?i)([a-z][a-z0-9+\-.]*://[^/\s:@]+:)([^/\s@]+)(@)", "${1}[REDACTED]${3}"),
+            // Token bergaya OpenAI / GitHub / AWS / Google Gemini / Slack / GitLab / Square / Telegram
             (r"sk-[A-Za-z0-9_\-]{8,}", "[REDACTED]"),
-            (r"ghp_[A-Za-z0-9]{16,}", "[REDACTED]"),
+            (r"gh[pousr]_[A-Za-z0-9]{16,}", "[REDACTED]"),
             (r"github_pat_[A-Za-z0-9_]{16,}", "[REDACTED]"),
-            (r"AKIA[0-9A-Z]{16}", "[REDACTED]"),
-            // NAME=VALUE dengan nama mengandung KEY/TOKEN/SECRET/PASSWORD (nilai >= 8)
+            (r"(?:AKIA|ASIA)[0-9A-Z]{16}", "[REDACTED]"),
+            (r"AIzaSy[A-Za-z0-9_\-]{20,}", "[REDACTED]"),
+            (r"xox[baprs]-[A-Za-z0-9\-]{10,}", "[REDACTED]"),
+            (r"glpat-[A-Za-z0-9_\-]{16,}", "[REDACTED]"),
+            (r"sq0csp-[A-Za-z0-9_\-]{16,}", "[REDACTED]"),
+            (r"\b\d{8,10}:[A-Za-z0-9_\-]{30,}\b", "[REDACTED]"),
+            // JWT 3-bagian (eyJ...)
+            (r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b", "[REDACTED]"),
+            // NAME=VALUE dengan nama mengandung KEY/TOKEN/SECRET/PASSWORD/PASSWD (nilai >= 8)
             (
-                r#"(?i)([A-Za-z0-9_.\-]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_.\-]*\s*=\s*["']?)([^\s"']{8,})"#,
+                r#"(?i)([A-Za-z0-9_.\-]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Za-z0-9_.\-]*\s*=\s*["']?)([^\s"']{8,})"#,
                 "${1}[REDACTED]",
             ),
-            // Gaya JSON: "api_key": "value"
+            // Gaya JSON/YAML: "api_key": "value" atau api_key: value
             (
-                r#"(?i)([A-Za-z0-9_.\-]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_.\-]*["']?\s*:\s*["'])([^"']{8,})"#,
+                r#"(?i)([A-Za-z0-9_.\-]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Za-z0-9_.\-]*["']?\s*:\s*["'])([^"']{8,})"#,
                 "${1}[REDACTED]",
             ),
         ];

@@ -547,6 +547,16 @@ pub fn detect_targeted_plan(cwd: &Path, scope: &str, changed_files: &[String]) -
         return detect_project_plan(cwd, scope);
     }
 
+    // Validasi token target agar nama file/paket dari LLM atau repo tidak pernah menyisipkan metakarakter shell.
+    let is_safe_token = |s: &str| -> bool {
+        !s.is_empty()
+            && s.len() <= 160
+            && !s.starts_with('-')
+            && !s.contains("..")
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
+    };
+
     // Rust: cocokkan file `tests/<name>.rs` atau `src/<stem>.rs` -> `tests/*<stem>*.rs`
     if cwd.join("Cargo.toml").exists() {
         let mut targeted_tests: Vec<String> = Vec::new();
@@ -554,7 +564,10 @@ pub fn detect_targeted_plan(cwd: &Path, scope: &str, changed_files: &[String]) -
             let rel = raw.replace('\\', "/");
             if let Some(rest) = rel.strip_prefix("tests/") {
                 if let Some(stem) = rest.strip_suffix(".rs") {
-                    if !stem.contains('/') && !targeted_tests.iter().any(|t| t == stem) {
+                    if !stem.contains('/')
+                        && is_safe_token(stem)
+                        && !targeted_tests.iter().any(|t| t == stem)
+                    {
                         targeted_tests.push(stem.to_string());
                     }
                 }
@@ -563,12 +576,13 @@ pub fn detect_targeted_plan(cwd: &Path, scope: &str, changed_files: &[String]) -
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_ascii_lowercase())
             {
-                if stem.len() >= 3 {
+                if stem.len() >= 3 && is_safe_token(&stem) {
                     if let Ok(entries) = std::fs::read_dir(cwd.join("tests")) {
                         for ent in entries.flatten() {
                             let fname = ent.file_name().to_string_lossy().to_string();
                             if let Some(tstem) = fname.strip_suffix(".rs") {
-                                if tstem.to_ascii_lowercase().contains(&stem)
+                                if is_safe_token(tstem)
+                                    && tstem.to_ascii_lowercase().contains(&stem)
                                     && !targeted_tests.iter().any(|t| t == tstem)
                                 {
                                     targeted_tests.push(tstem.to_string());
@@ -613,7 +627,7 @@ pub fn detect_targeted_plan(cwd: &Path, scope: &str, changed_files: &[String]) -
         let mut py_targets: Vec<String> = Vec::new();
         for raw in changed_files {
             let rel = raw.replace('\\', "/");
-            if !rel.ends_with(".py") {
+            if !rel.ends_with(".py") || !is_safe_token(&rel) {
                 continue;
             }
             let fname = Path::new(&rel)
@@ -625,9 +639,11 @@ pub fn detect_targeted_plan(cwd: &Path, scope: &str, changed_files: &[String]) -
                     py_targets.push(rel);
                 }
             } else if let Some(stem) = Path::new(&rel).file_stem().and_then(|s| s.to_str()) {
-                for cand in [format!("tests/test_{stem}.py"), format!("test_{stem}.py")] {
-                    if cwd.join(&cand).is_file() && !py_targets.contains(&cand) {
-                        py_targets.push(cand);
+                if is_safe_token(stem) {
+                    for cand in [format!("tests/test_{stem}.py"), format!("test_{stem}.py")] {
+                        if cwd.join(&cand).is_file() && !py_targets.contains(&cand) {
+                            py_targets.push(cand);
+                        }
                     }
                 }
             }
@@ -648,13 +664,16 @@ pub fn detect_targeted_plan(cwd: &Path, scope: &str, changed_files: &[String]) -
         let mut go_pkgs: Vec<String> = Vec::new();
         for raw in changed_files {
             let rel = raw.replace('\\', "/");
-            if !rel.ends_with(".go") {
+            if !rel.ends_with(".go") || !is_safe_token(&rel) {
                 continue;
             }
             let dir = Path::new(&rel)
                 .parent()
                 .and_then(|p| p.to_str())
                 .unwrap_or("");
+            if !dir.is_empty() && (!is_safe_token(dir) || !cwd.join(dir).is_dir()) {
+                continue;
+            }
             let pkg = if dir.is_empty() {
                 ".".to_string()
             } else {

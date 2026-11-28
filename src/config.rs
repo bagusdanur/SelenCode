@@ -811,9 +811,17 @@ impl TelegramCfg {
     }
 
     /// Cek apakah pengirim / chat termasuk whitelist `allowed_users`.
+    /// Untuk grup chat (`chat_id < 0`), WAJIB memverifikasi `user_id` pengirim ada di `allowed_users`
+    /// agar anggota asing di dalam grup tidak pernah lolos hanya karena ID grup tercatat.
     pub fn is_allowed(&self, user_id: i64, chat_id: i64) -> bool {
-        !self.allowed_users.is_empty()
-            && (self.allowed_users.contains(&user_id) || self.allowed_users.contains(&chat_id))
+        if self.allowed_users.is_empty() {
+            return false;
+        }
+        if chat_id < 0 {
+            self.allowed_users.contains(&user_id)
+        } else {
+            self.allowed_users.contains(&user_id) || self.allowed_users.contains(&chat_id)
+        }
     }
 }
 
@@ -1006,6 +1014,80 @@ pub fn candidate_paths() -> Vec<PathBuf> {
     v
 }
 
+/// Saring field sensitif keamanan dari `./selencode.toml` lokal proyek yang belum dipercaya
+/// agar repo tak tepercaya tidak dapat memicu RCE startup (`mcp_servers`, `hooks`), membajak
+/// whitelist Telegram, melonggarkan sandbox/approval, atau mengalihkan `base_url` memakai API key global.
+/// Mengembalikan `(toml_tersaring, daftar_kunci_yang_diblokir)`.
+pub fn sanitize_untrusted_local_toml(
+    local_val: toml::Value,
+    global_val: Option<&toml::Value>,
+) -> (toml::Value, Vec<String>) {
+    let mut blocked = Vec::new();
+    let toml::Value::Table(mut tbl) = local_val else {
+        return (local_val, blocked);
+    };
+    for forbidden_top in ["mcp_servers", "hooks", "sandbox", "telegram"] {
+        if tbl.remove(forbidden_top).is_some() {
+            blocked.push(forbidden_top.to_string());
+        }
+    }
+    if let Some(toml::Value::Table(agent_tbl)) = tbl.get_mut("agent") {
+        if agent_tbl.remove("approval").is_some() {
+            blocked.push("agent.approval".to_string());
+        }
+    }
+    if let Some(toml::Value::Table(shell_tbl)) = tbl.get_mut("shell") {
+        if shell_tbl.remove("allowlist").is_some() {
+            blocked.push("shell.allowlist".to_string());
+        }
+    }
+    if let Some(toml::Value::Table(web_tbl)) = tbl.get_mut("web") {
+        if web_tbl.remove("headless_browser").is_some() {
+            blocked.push("web.headless_browser".to_string());
+        }
+        if web_tbl.remove("searxng_url").is_some() {
+            blocked.push("web.searxng_url".to_string());
+        }
+    }
+    // Cegah repo lokal membajak `base_url` provider yang kredensialnya berasal dari config global!
+    if let (
+        Some(toml::Value::Table(local_provs)),
+        Some(global_provs),
+    ) = (
+        tbl.get_mut("providers"),
+        global_val.and_then(|g| g.get("providers")).and_then(|v| v.as_table()),
+    ) {
+        for (pname, pval) in local_provs.iter_mut() {
+            let global_has_cred = global_provs
+                .get(pname)
+                .and_then(|gp| gp.as_table())
+                .map(|gt| {
+                    gt.get("api_key").is_some()
+                        || gt
+                            .get("api_key_env")
+                            .and_then(|v| v.as_str())
+                            .map(|s| !s.trim().is_empty())
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if global_has_cred {
+                if let Some(ptbl) = pval.as_table_mut() {
+                    if ptbl.remove("base_url").is_some() {
+                        blocked.push(format!("providers.{pname}.base_url"));
+                    }
+                }
+            }
+        }
+    }
+    (toml::Value::Table(tbl), blocked)
+}
+
+fn local_config_explicitly_trusted() -> bool {
+    std::env::var("SELENCODE_TRUST_LOCAL_CONFIG")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 /// Gabungkan 2 nilai TOML (`base` = global, `overlay` = lokal `./selencode.toml`) secara rekursif:
 /// - Key di `overlay` menimpa key yang sama di `base`, tetapi key milik global yang TIDAK ada di
 ///   `overlay` (mis. `[telegram]`, `[providers.*]` lain, `api_key`) tetap dipertahankan!
@@ -1138,6 +1220,7 @@ pub fn validate_toml_keys(val: &toml::Value) -> Vec<ConfigWarning> {
         "context",
         "display",
         "timeouts",
+        "web",
     ];
     check_allowed_keys("", root, TOP_KEYS, &mut warnings);
 
@@ -1177,6 +1260,7 @@ pub fn validate_toml_keys(val: &toml::Value) -> Vec<ConfigWarning> {
                 "turn_timeout_secs",
                 "stall_notice_secs",
                 "poll_watchdog_secs",
+                "voice_transcription",
             ],
         ),
         (
@@ -1239,6 +1323,17 @@ pub fn validate_toml_keys(val: &toml::Value) -> Vec<ConfigWarning> {
         ("memory", &["max_memory_chars", "max_profile_chars"]),
         ("context", &["folder_map", "folder_map_max_tokens"]),
         ("display", &["tool_preview_length"]),
+        (
+            "web",
+            &[
+                "extract_backend",
+                "search_backend",
+                "searxng_url",
+                "api_key_env",
+                "max_extract_chars",
+                "headless_browser",
+            ],
+        ),
     ];
     for (sec, keys) in sections {
         if let Some(tbl) = root.get(*sec).and_then(|v| v.as_table()) {
@@ -1399,12 +1494,29 @@ fn load_merged_config() -> Result<Option<Config>> {
                 .with_context(|| format!("config {} tidak valid", local_p.display()))?;
             emit_config_warnings_once(&gp.display().to_string(), &validate_toml_keys(&g_val));
             emit_config_warnings_once(&local_p.display().to_string(), &validate_toml_keys(&l_val));
-            let explicit_steps = extract_explicit_max_steps(&l_val)
+            let (l_val_safe, blocked_keys) = if local_config_explicitly_trusted() {
+                (l_val, Vec::new())
+            } else {
+                sanitize_untrusted_local_toml(l_val, Some(&g_val))
+            };
+            if !blocked_keys.is_empty() {
+                let sec_warns: Vec<ConfigWarning> = blocked_keys
+                    .into_iter()
+                    .map(|k| ConfigWarning {
+                        message: format!(
+                            "`{k}` di ./selencode.toml diabaikan demi keamanan workspace (set SELENCODE_TRUST_LOCAL_CONFIG=1 bila repo dipercaya)"
+                        ),
+                        key_path: format!("security_blocked.{k}"),
+                    })
+                    .collect();
+                emit_config_warnings_once(&local_p.display().to_string(), &sec_warns);
+            }
+            let explicit_steps = extract_explicit_max_steps(&l_val_safe)
                 .map(|v| (v, local_p.display().to_string()))
                 .or_else(|| {
                     extract_explicit_max_steps(&g_val).map(|v| (v, gp.display().to_string()))
                 });
-            let merged = merge_toml_values(g_val, l_val);
+            let merged = merge_toml_values(g_val, l_val_safe);
             let mut cfg: Config = merged.try_into().with_context(|| {
                 format!(
                     "gagal menggabungkan config {} + {}",
@@ -1416,7 +1528,37 @@ fn load_merged_config() -> Result<Option<Config>> {
             Ok(Some(cfg))
         }
         (true, false) => Ok(Some(load_from(&global_p.unwrap())?)),
-        (false, true) => Ok(Some(load_from(&local_p)?)),
+        (false, true) => {
+            let l_txt = std::fs::read_to_string(&local_p)
+                .with_context(|| format!("gagal membaca config {}", local_p.display()))?;
+            let l_val: toml::Value = toml::from_str(&l_txt)
+                .with_context(|| format!("config {} tidak valid", local_p.display()))?;
+            let path_label = local_p.display().to_string();
+            emit_config_warnings_once(&path_label, &validate_toml_keys(&l_val));
+            let (l_val_safe, blocked_keys) = if local_config_explicitly_trusted() {
+                (l_val, Vec::new())
+            } else {
+                sanitize_untrusted_local_toml(l_val, None)
+            };
+            if !blocked_keys.is_empty() {
+                let sec_warns: Vec<ConfigWarning> = blocked_keys
+                    .into_iter()
+                    .map(|k| ConfigWarning {
+                        message: format!(
+                            "`{k}` di ./selencode.toml diabaikan demi keamanan workspace (set SELENCODE_TRUST_LOCAL_CONFIG=1 bila repo dipercaya)"
+                        ),
+                        key_path: format!("security_blocked.{k}"),
+                    })
+                    .collect();
+                emit_config_warnings_once(&path_label, &sec_warns);
+            }
+            let explicit_steps = extract_explicit_max_steps(&l_val_safe).map(|v| (v, path_label));
+            let mut cfg: Config = l_val_safe
+                .try_into()
+                .with_context(|| format!("config {} tidak valid", local_p.display()))?;
+            apply_max_steps_policy(&mut cfg, explicit_steps, true);
+            Ok(Some(cfg))
+        }
         (false, false) => Ok(None),
     }
 }
@@ -1478,33 +1620,69 @@ pub fn active_config_path() -> PathBuf {
 
 /// Simpan config secara persisten ke lokasi global (`%APPDATA%\selencode\config.toml` di Windows /
 /// `~/.config/selencode/config.toml` di Unix) agar tidak hilang saat berpindah folder.
-/// Bila `./selencode.toml` lokal juga ada di folder saat ini, ikut disinkronkan agar tidak menimpa
-/// pengaturan router AI / model / Telegram terbaru.
+/// TIDAK PERNAH menyalin kredensial global (`api_key`, `bot_token`) ke `./selencode.toml` lokal
+/// agar rahasia pengguna tidak pernah bocor ke repositori Git.
 pub fn save(cfg: &Config) -> Result<PathBuf> {
-    let local = local_config_path();
     if let Some(global) = global_config_path() {
         save_to(cfg, &global)?;
-        if local.exists() && !same_canonical_path(&global, &local) {
-            let _ = save_to(cfg, &local);
-        }
         return Ok(global);
     }
+    let local = local_config_path();
     save_to(cfg, &local)?;
     Ok(local)
 }
 
 pub fn save_to(cfg: &Config, path: &std::path::Path) -> Result<()> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("gagal membuat folder config {}", parent.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
     }
     let text = toml::to_string_pretty(cfg).context("gagal memformat config TOML")?;
-    std::fs::write(path, text)
-        .with_context(|| format!("gagal menyimpan config {}", path.display()))?;
+    // Tulis secara atomik via file sementara dengan izin 0o600 sejak pembuatan (anti-TOCTOU).
+    let tmp_name = format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config.toml"),
+        uuid::Uuid::new_v4().simple()
+    );
+    let tmp_path = path.with_file_name(tmp_name);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
-    if cfg.providers.values().any(|p| p.api_key.is_some()) || cfg.telegram.bot_token.is_some() {
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let write_res: Result<()> = (|| {
+        let mut f = opts
+            .open(&tmp_path)
+            .with_context(|| format!("gagal membuat file sementara {}", tmp_path.display()))?;
+        f.write_all(text.as_bytes())
+            .with_context(|| format!("gagal menulis config {}", tmp_path.display()))?;
+        let _ = f.sync_all();
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    if let Err(_rename_err) = std::fs::rename(&tmp_path, path) {
+        // Fallback Windows bila target sedang terbuka oleh pembaca lain: timpa langsung lalu hapus tmp.
+        std::fs::write(path, &text)
+            .with_context(|| format!("gagal menyimpan config {}", path.display()))?;
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }

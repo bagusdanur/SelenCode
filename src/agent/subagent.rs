@@ -141,11 +141,27 @@ pub async fn run_worktree_subagent(
         .collect();
     let wt = create_isolated_worktree(&parent_ctx.cwd, &label)?;
     let reg = worker_registry(shell_cfg);
+    // Keamanan: pekerja worktree hanya mendapat auto-edit (`write_file`/`edit_file`) di dalam worktree
+    // terisolasi agar pohon utama aman; `run_shell` tetap wajib melewati persetujuan `parent_ctx.approver`
+    // (kecuali sesi induk memang sudah AutoAll)!
+    let worker_approver = if parent_ctx.approver.auto_yes() {
+        Arc::new(Approver::new(true))
+    } else {
+        let edit_policy = Arc::new(Mutex::new(crate::security::ApprovalPolicy::new(
+            crate::security::ApprovalMode::AutoEdits,
+        )));
+        match &*parent_ctx.approver {
+            Approver::Channel { tx, .. } => {
+                Arc::new(Approver::channel_with_policy(edit_policy, tx.clone()))
+            }
+            Approver::Stdin { .. } => {
+                Arc::new(Approver::stdin_with_policy(edit_policy))
+            }
+        }
+    };
     let wt_ctx = Ctx {
         cwd: wt.path.clone(),
-        // Di dalam worktree terisolasi, pekerja boleh menulis/edit/shell tanpa mengganggu pohon utama;
-        // file rahasia & perintah terlarang tetap diblokir keras oleh sandbox/security!
-        approver: Arc::new(Approver::new(true)),
+        approver: worker_approver,
         context_limit_tokens: parent_ctx.context_limit_tokens,
         store: None,
         session_id: None,

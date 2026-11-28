@@ -76,9 +76,38 @@ pub fn validate_send_file_target(
 
     if is_secret_file(&resolved) {
         return Err(anyhow!(
-            "berkas '{}' ditolak: file rahasia (.env/*.key/*.pem/id_rsa) dilarang dikirim ke chat",
+            "berkas '{}' ditolak: file rahasia/konfigurasi/database dilarang dikirim ke chat",
             trimmed
         ));
+    }
+    // Lindungi file internal SelenCode (memori, database, config, audit) dari eksfiltrasi via data_root.
+    if let Some(droot) = data_root {
+        let droot_norm = crate::security::normalize_sandbox_path(droot);
+        let res_norm = crate::security::normalize_sandbox_path(&resolved);
+        if let Ok(rel_data) = res_norm.strip_prefix(&droot_norm) {
+            let rel_low = rel_data.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+            let fname_low = resolved
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if rel_low.starts_with("memory/")
+                || matches!(
+                    fname_low.as_str(),
+                    "memory.md" | "profile.md" | "config.toml" | "selencode.toml"
+                )
+                || fname_low.ends_with(".db")
+                || fname_low.ends_with(".db-wal")
+                || fname_low.ends_with(".db-shm")
+                || fname_low.ends_with(".sqlite")
+                || fname_low.ends_with(".sqlite3")
+            {
+                return Err(anyhow!(
+                    "berkas '{}' ditolak: berkas internal/memori/database SelenCode dilarang dikirim ke chat",
+                    trimmed
+                ));
+            }
+        }
     }
     if !resolved.is_file() {
         return Err(anyhow!(
@@ -143,6 +172,10 @@ impl Tool for SendFile {
         }
     }
 
+    fn needs_approval(&self, _args: &Value) -> bool {
+        true
+    }
+
     async fn run(&self, args: Value, ctx: &Ctx) -> Result<String> {
         let raw_path = str_arg(&args, "path")
             .ok_or_else(|| anyhow!("argumen 'path' wajib diisi"))?;
@@ -166,6 +199,16 @@ impl Tool for SendFile {
             .and_then(|n| n.to_str())
             .unwrap_or("berkas")
             .to_string();
+        if !ctx
+            .approver
+            .ask(
+                &format!("send_file: {file_name}"),
+                &format!("Kirim berkas {} ({:.1} KB) ke chat Telegram", canonical.display(), size as f64 / 1024.0),
+            )
+            .await
+        {
+            return Ok(format!("Ditolak user — berkas '{file_name}' TIDAK dikirim."));
+        }
         if is_image {
             sender
                 .client

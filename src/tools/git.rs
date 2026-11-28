@@ -7,17 +7,41 @@ use serde_json::{json, Value};
 const GIT_TIMEOUT: u64 = 30;
 
 /// Jalankan git dengan argumen terpisah (BUKAN string shell — aman dari
-/// injeksi lewat argumen seperti pesan commit).
-async fn git_cmd(ctx: &Ctx, args: &[&str]) -> Result<(Option<i32>, String)> {
+/// injeksi lewat argumen seperti pesan commit), env sensitif di-scrub, serta
+/// menonaktifkan hook/fsmonitor/diff.external repo tak tepercaya.
+async fn git_cmd_with_opts(
+    ctx: &Ctx,
+    args: &[&str],
+    disable_repo_hooks: bool,
+) -> Result<(Option<i32>, String)> {
     let mut cmd = tokio::process::Command::new("git");
+    if disable_repo_hooks {
+        cmd.args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "diff.external=",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.pager=cat",
+        ]);
+    }
     cmd.args(args)
         .current_dir(&ctx.cwd)
         .stdin(std::process::Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0")
         .kill_on_drop(true);
+    if ctx.sandbox.scrub_env_enabled() {
+        crate::sandbox::scrub_tokio_command(&mut cmd);
+    }
     run_timed(&mut cmd, GIT_TIMEOUT)
         .await
         .map_err(|e| anyhow!("git {}: {e}", args.first().copied().unwrap_or("")))
+}
+
+async fn git_cmd(ctx: &Ctx, args: &[&str]) -> Result<(Option<i32>, String)> {
+    git_cmd_with_opts(ctx, args, true).await
 }
 
 /// Pastikan cwd berada di dalam repo git; error jelas bila bukan.
@@ -69,8 +93,9 @@ impl Tool for GitDiff {
     }
     async fn run(&self, _args: Value, ctx: &Ctx) -> Result<String> {
         ensure_repo(ctx).await?;
-        let (_c1, unstaged) = git_cmd(ctx, &["diff"]).await?;
-        let (_c2, staged) = git_cmd(ctx, &["diff", "--staged"]).await?;
+        let (_c1, unstaged) = git_cmd(ctx, &["diff", "--no-ext-diff", "--no-textconv"]).await?;
+        let (_c2, staged) =
+            git_cmd(ctx, &["diff", "--staged", "--no-ext-diff", "--no-textconv"]).await?;
         if unstaged.trim().is_empty() && staged.trim().is_empty() {
             return Ok("Tidak ada perubahan (diff kosong).".into());
         }

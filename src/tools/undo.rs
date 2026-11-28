@@ -208,14 +208,18 @@ impl UndoStack {
                     if let Some(parent) = snap.path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    std::fs::write(&snap.path, old_bytes)
-                        .with_context(|| format!("gagal memulihkan {}", snap.rel))?;
+                    if let Err(e) = std::fs::write(&snap.path, old_bytes) {
+                        self.undo.push(snap);
+                        return Err(e).with_context(|| "gagal memulihkan file saat rollback");
+                    }
                     format!("{} (dipulihkan)", snap.rel)
                 }
                 None => {
                     if snap.path.exists() {
-                        std::fs::remove_file(&snap.path)
-                            .with_context(|| format!("gagal menghapus file baru {}", snap.rel))?;
+                        if let Err(e) = std::fs::remove_file(&snap.path) {
+                            self.undo.push(snap);
+                            return Err(e).with_context(|| "gagal menghapus file baru saat rollback");
+                        }
                     }
                     format!("{} (file baru dihapus)", snap.rel)
                 }
@@ -239,25 +243,48 @@ impl UndoStack {
         let Some(snap) = self.undo.pop() else {
             return Ok(None);
         };
+        let current_disk = std::fs::read(&snap.path).ok();
+        let modified_externally = match &current_disk {
+            Some(bytes) => bytes != &snap.after,
+            None => !snap.after.is_empty(),
+        };
+        if modified_externally {
+            let rel = snap.rel.clone();
+            self.undo.push(snap);
+            return Err(anyhow!(
+                "undo '{rel}' ditolak: berkas telah diubah di luar SelenCode (cegah menimpa edit manual)"
+            ));
+        }
         let msg = match &snap.before {
             Some(old_bytes) => {
                 if let Some(parent) = snap.path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                std::fs::write(&snap.path, old_bytes)
-                    .with_context(|| format!("gagal memulihkan {}", snap.rel))?;
+                if let Err(e) = std::fs::write(&snap.path, old_bytes) {
+                    let rel = snap.rel.clone();
+                    self.undo.push(snap);
+                    return Err(e).with_context(|| format!("gagal memulihkan {rel}"));
+                }
                 format!("dipulihkan ke isi sebelumnya ({} byte)", old_bytes.len())
             }
             None => {
                 if snap.path.exists() {
-                    std::fs::remove_file(&snap.path)
-                        .with_context(|| format!("gagal menghapus file baru {}", snap.rel))?;
+                    if let Err(e) = std::fs::remove_file(&snap.path) {
+                        let rel = snap.rel.clone();
+                        self.undo.push(snap);
+                        return Err(e).with_context(|| format!("gagal menghapus file baru {rel}"));
+                    }
                 }
                 "file baru dihapus kembali".to_string()
             }
         };
         let rel = snap.rel.clone();
         self.redo.push(snap);
+        for cp in &mut self.checkpoints {
+            if cp.undo_mark > self.undo.len() {
+                cp.undo_mark = self.undo.len();
+            }
+        }
         Ok(Some(format!("{rel} — {msg}")))
     }
 

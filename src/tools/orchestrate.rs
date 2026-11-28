@@ -124,6 +124,7 @@ impl Tool for Orchestrate {
             token_budget: args
                 .get("token_budget")
                 .and_then(|v| v.as_u64())
+                .map(|n| n.clamp(1_000, 500_000))
                 .unwrap_or(120_000),
             max_parallel_researchers: self.max_parallel_researchers,
         };
@@ -131,7 +132,7 @@ impl Tool for Orchestrate {
         let active_provider = self
             .provider
             .read()
-            .expect("shared provider lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone();
         let report = run_orchestration(
             active_provider,
