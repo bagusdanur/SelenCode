@@ -215,7 +215,10 @@ fn loop_guard_dan_self_correct_gate_berjalan_sesuai_batas() {
     sc.observe_tool("edit_file", &json!({"path": "src/lib.rs"}), "OK: src/lib.rs diedit.", false);
     assert!(sc.edited_code_file);
     assert!(!sc.verified_after_last_edit);
-    assert!(sc.honest_unverified_closing_note("Selesai.").is_some());
+    assert!(sc
+        .closing_verification_summary_line(true)
+        .unwrap()
+        .contains("belum diverifikasi"));
 
     // Setelah verify_project LULUS -> tidak ada catatan peringatan penutup
     let mut sc2 = VerificationTracker::new(Some(2));

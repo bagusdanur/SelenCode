@@ -280,7 +280,10 @@ fn perbaikan2_swe_agent_coding_closing_checklist() {
 
     // (a) Belum diverifikasi sesudah edit terakhir -> catatan deterministik jujur (0 panggilan LLM)
     assert!(!st.verified_after_last_edit);
-    assert!(st.honest_unverified_closing_note("Selesai.").is_some());
+    assert!(st
+        .closing_verification_summary_line(true)
+        .unwrap()
+        .contains("belum diverifikasi"));
 
     // Jalankan verifikasi sesudah edit terakhir
     st.observe_tool("run_shell", &json!({"command": "node --check pricing.js"}), "exit code: 0\nOK", false);

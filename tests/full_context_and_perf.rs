@@ -169,7 +169,10 @@ fn tahap2_canonical_fingerprint_dedup_and_self_correct_rem() {
     sc.observe_tool("edit_file", &json!({"path": "a.rs"}), "ok", false);
     assert!(sc.edited_code_file);
     assert!(!sc.verified_after_last_edit);
-    assert!(sc.honest_unverified_closing_note("Sudah beres.").is_some());
+    assert!(sc
+        .closing_verification_summary_line(true)
+        .unwrap()
+        .contains("belum diverifikasi"));
 
     // LoopGuard: 2x gagal identik -> peringatan, dan 3x gagal tool sama (arg berbeda) pada guard penuh!
     let mut lg = LoopGuard::with_default_guards();
