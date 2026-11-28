@@ -246,7 +246,7 @@ async fn m1_scaffold_command_never_tracked_and_green_verify_closes_with_zero_tai
     // 3. Pagar non-regresi: jika ada edit sesudah verifikasi hijau TANPA verifikasi ulang,
     //    tracker tetap mencatat belum diverifikasi; jika verifikasi berurutan (`npm run check` lalu
     //    `npm run build`), perintah verifikasi terakhir ikut terlacak akurat!
-    let mut sc = VerificationTracker::new(None).with_strict_known_verify_only(true);
+    let mut sc = VerificationTracker::new(None);
     sc.observe_tool_at_step(
         "run_shell",
         &json!({"command": "npx sv create . --add vitest"}),

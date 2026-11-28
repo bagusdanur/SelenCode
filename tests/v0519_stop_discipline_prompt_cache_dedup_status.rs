@@ -113,7 +113,7 @@ fn m1_compound_svelte_verify_and_incremental_verify_after_small_edit() {
 
     // Alur VerificationTracker:
     // 1. Tulis aplikasi & jalankan suite penuh -> HIJAU
-    let mut sc = VerificationTracker::new(None).with_strict_known_verify_only(true);
+    let mut sc = VerificationTracker::new(None);
     sc.observe_tool_at_step(
         "write_file",
         &json!({"path": "src/routes/+page.svelte"}),
@@ -769,7 +769,7 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
     let cwd = temp_dir("m3-dedup-status");
     // 1. Unit level: ToolDedupCache + VerificationTracker
     let mut dedup = ToolDedupCache::new();
-    let mut sc = VerificationTracker::new(None).with_strict_known_verify_only(true);
+    let mut sc = VerificationTracker::new(None);
     let verify_args = json!({"command": "npm test"});
     let pass_out = "exit code: 0\n15 passed";
 
@@ -928,7 +928,7 @@ async fn m3_dedup_on_passed_verify_preserves_lulus_status_and_never_reports_gaga
     );
 
     // 3. Pagar non-regresi: kegagalan verifikasi NYATA tetap dilaporkan jujur sebagai GAGAL!
-    let mut sc_fail = VerificationTracker::new(None).with_strict_known_verify_only(true);
+    let mut sc_fail = VerificationTracker::new(None);
     sc_fail.observe_tool_at_step("edit_file", &json!({"path": "src/bug.ts"}), "ok", false, 1);
     sc_fail.observe_tool_at_step(
         "run_shell",
