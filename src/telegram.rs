@@ -1083,11 +1083,33 @@ pub struct TgPhotoSize {
     pub file_size: Option<u64>,
 }
 
+/// Batas maksimum unduhan berkas/dokumen Telegram (`getFile` Bot API: 20 MB, v0.5.26).
+pub const TG_DOCUMENT_MAX_BYTES: u64 = 20 * 1024 * 1024;
+/// Caption bawaan saat pengguna mengirim foto tanpa teks.
+pub const DEFAULT_TG_PHOTO_CAPTION: &str =
+    "Analisis gambar ini dan jelaskan hal penting atau error yang terlihat.";
+/// Caption bawaan saat pengguna mengirim dokumen/berkas tanpa teks (v0.5.26).
+pub const DEFAULT_TG_DOCUMENT_CAPTION: &str =
+    "Periksa berkas yang dikirim ini, baca isinya bila perlu, dan jelaskan atau kerjakan hal penting di dalamnya.";
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TgDocument {
+    pub file_id: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TgFileInfo {
     pub file_id: String,
     #[serde(default)]
     pub file_path: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1102,6 +1124,328 @@ pub struct TgMessage {
     pub caption: Option<String>,
     #[serde(default)]
     pub photo: Vec<TgPhotoSize>,
+    #[serde(default)]
+    pub document: Option<TgDocument>,
+    #[serde(default)]
+    pub voice: Option<Value>,
+    #[serde(default)]
+    pub audio: Option<Value>,
+    #[serde(default)]
+    pub video: Option<Value>,
+    #[serde(default)]
+    pub video_note: Option<Value>,
+    #[serde(default)]
+    pub sticker: Option<Value>,
+    #[serde(default)]
+    pub animation: Option<Value>,
+    #[serde(default)]
+    pub location: Option<Value>,
+    #[serde(default)]
+    pub contact: Option<Value>,
+}
+
+/// Hasil klasifikasi pesan masuk Telegram (v0.5.26): memisahkan teks, foto, dokumen,
+/// dan jenis pesan yang belum didukung (tidak lagi dibuang diam-diam).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TgIngressClassification {
+    Text(String),
+    Photo {
+        file_id: String,
+        message_id: i64,
+        caption: String,
+    },
+    Document {
+        file_id: String,
+        message_id: i64,
+        file_name: Option<String>,
+        mime_type: Option<String>,
+        file_size: Option<u64>,
+        caption: String,
+    },
+    Unsupported {
+        kind: &'static str,
+        reply: String,
+    },
+    Ignore,
+}
+
+/// Cek apakah dokumen Telegram adalah berkas gambar (mis. screenshot dikirim sebagai file
+/// agar tidak terkompres).
+pub fn is_tg_image_document(mime_type: Option<&str>, file_name: Option<&str>) -> bool {
+    if let Some(m) = mime_type {
+        if m.trim().to_ascii_lowercase().starts_with("image/") {
+            return true;
+        }
+    }
+    if let Some(fname) = file_name {
+        let low = fname.trim().to_ascii_lowercase();
+        if low.ends_with(".png")
+            || low.ends_with(".jpg")
+            || low.ends_with(".jpeg")
+            || low.ends_with(".webp")
+            || low.ends_with(".gif")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn mime_to_default_ext(mime_type: Option<&str>) -> &'static str {
+    let Some(raw) = mime_type else {
+        return "bin";
+    };
+    let low = raw
+        .split(';')
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .to_ascii_lowercase();
+    match low.as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "application/pdf" => "pdf",
+        "application/zip" | "application/x-zip-compressed" => "zip",
+        "application/gzip" | "application/x-gzip" => "gz",
+        "application/json" => "json",
+        "application/xml" | "text/xml" => "xml",
+        "text/plain" => "txt",
+        "text/markdown" => "md",
+        "text/csv" => "csv",
+        "text/html" => "html",
+        "text/css" => "css",
+        "text/javascript" | "application/javascript" => "js",
+        "text/x-python" | "application/x-python-code" => "py",
+        "text/x-rust" => "rs",
+        "application/x-yaml" | "text/yaml" => "yaml",
+        "application/toml" => "toml",
+        _ if low.starts_with("text/") => "txt",
+        _ => "bin",
+    }
+}
+
+/// Bangun path relatif aman di dalam `.selencode/tg_uploads/` untuk dokumen masuk Telegram (v0.5.26):
+/// - Membuang seluruh pemisah path (`/`, `\`), komponen traversal (`..`), prefix drive (`C:`),
+///   karakter kontrol, spasi (diganti `_` agar kompatibel parser `@path`), dan titik pembuka.
+/// - Menolak nama file rahasia (mis. `.env` / `id_rsa`) dengan nama bawaan aman.
+/// - Diawali `tg_<message_id>_` agar unik dan tidak pernah bertabrakan.
+/// - Untuk `image/*` tanpa ekstensi gambar, menambahkan ekstensi dari MIME agar terbaca sebagai gambar.
+pub fn sanitize_tg_document_rel_path(
+    message_id: i64,
+    file_name: Option<&str>,
+    mime_type: Option<&str>,
+    tg_file_path: Option<&str>,
+) -> String {
+    let raw_candidate = file_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| tg_file_path.map(str::trim).filter(|s| !s.is_empty()));
+
+    let mut base = String::new();
+    if let Some(raw) = raw_candidate {
+        // Ambil segmen terakhir sesudah memisahkan baik `/` maupun `\`.
+        let last_seg = raw
+            .rsplit(['/', '\\'])
+            .find(|seg| !seg.trim().is_empty())
+            .unwrap_or("");
+        // Buang prefix drive Windows bila ada (mis. `C:foo.txt`).
+        let no_drive = last_seg.rsplit(':').next().unwrap_or(last_seg);
+        for ch in no_drive.chars() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                base.push(ch);
+            } else if ch.is_whitespace() {
+                base.push('_');
+            } else {
+                base.push('_');
+            }
+        }
+        // Runtuhkan urutan `..` dan buang titik/underscore pembuka agar tidak ada traversal atau dotfiles.
+        while base.contains("..") {
+            base = base.replace("..", "_");
+        }
+        base = base
+            .trim_matches(|c: char| c == '.' || c == '_' || c == '-')
+            .to_string();
+    }
+
+    // Potong panjang maksimum agar aman di semua filesystem (Android/Termux/Windows/Linux).
+    if base.chars().count() > 96 {
+        let ext_keep = base
+            .rsplit_once('.')
+            .map(|(_, e)| e.chars().take(12).collect::<String>())
+            .filter(|e| !e.is_empty());
+        let stem: String = base.chars().take(80).collect();
+        base = match ext_keep {
+            Some(e) => format!("{stem}.{e}"),
+            None => stem,
+        };
+    }
+
+    let is_unsafe_or_empty = base.is_empty()
+        || crate::security::is_secret_file(std::path::Path::new(&base))
+        || base.eq_ignore_ascii_case("env");
+    if is_unsafe_or_empty {
+        let ext = mime_to_default_ext(mime_type);
+        base = format!("document.{ext}");
+    } else if is_tg_image_document(mime_type, None) && !is_tg_image_document(None, Some(&base)) {
+        // Pastikan dokumen `image/*` tanpa ekstensi gambar tetap punya ekstensi agar `extract_at_images` mengenalinya.
+        let ext = mime_to_default_ext(mime_type);
+        base = format!("{base}.{ext}");
+    }
+
+    format!(".selencode/tg_uploads/tg_{message_id}_{base}")
+}
+
+/// Simpan byte dokumen masuk Telegram secara aman ke `<cwd>/.selencode/tg_uploads/` (v0.5.26):
+/// - Menegakkan pagu keras `TG_DOCUMENT_MAX_BYTES` (20 MB) sebelum menulis apa pun.
+/// - Memverifikasi target akhir berada ketat di dalam `<cwd>/.selencode/tg_uploads/` (anti-traversal).
+pub fn save_tg_document_bytes(
+    cwd: &std::path::Path,
+    message_id: i64,
+    file_name: Option<&str>,
+    mime_type: Option<&str>,
+    tg_file_path: Option<&str>,
+    bytes: &[u8],
+) -> Result<String> {
+    if bytes.len() as u64 > TG_DOCUMENT_MAX_BYTES {
+        anyhow::bail!(
+            "{}",
+            format_tg_document_too_large_reply(file_name, bytes.len() as u64)
+        );
+    }
+    let rel = sanitize_tg_document_rel_path(message_id, file_name, mime_type, tg_file_path);
+    let uploads_dir = cwd.join(".selencode").join("tg_uploads");
+    std::fs::create_dir_all(&uploads_dir)?;
+    let full = cwd.join(&rel);
+    // Verifikasi berlapis: induk berkas harus persis `uploads_dir` (tanpa komponen parent traversal).
+    if full.parent() != Some(uploads_dir.as_path()) {
+        anyhow::bail!("path simpan dokumen keluar dari .selencode/tg_uploads/");
+    }
+    std::fs::write(&full, bytes)?;
+    Ok(rel)
+}
+
+/// Pesan satu baris saat ukuran dokumen melebihi batas 20 MB Bot API Telegram.
+pub fn format_tg_document_too_large_reply(file_name: Option<&str>, size_bytes: u64) -> String {
+    let mb = (size_bytes as f64) / (1024.0 * 1024.0);
+    match file_name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => format!(
+            "Berkas '{name}' ({mb:.1} MB) melebihi batas unduhan Telegram 20 MB — perkecil atau pecah berkas lalu kirim ulang."
+        ),
+        None => format!(
+            "Berkas ({mb:.1} MB) melebihi batas unduhan Telegram 20 MB — perkecil atau pecah berkas lalu kirim ulang."
+        ),
+    }
+}
+
+/// Susun teks giliran untuk agent sesudah dokumen tersimpan di `.selencode/tg_uploads/`:
+/// - Dokumen gambar (`image/*`): diperlakukan sejajar jalur foto (`@<path> <caption>`) agar dibaca
+///   sebagai masukan gambar (`Block::Image`).
+/// - Dokumen lain: menyertakan nama asli + path relatif + arahan membaca dengan tool baca biasa
+///   (berkas adalah DATA, tidak pernah dijalankan otomatis oleh gateway).
+pub fn format_tg_document_turn_prompt(
+    orig_name: &str,
+    rel_path: &str,
+    mime_type: Option<&str>,
+    size_bytes: usize,
+    caption: &str,
+) -> String {
+    let clean_caption = caption.trim();
+    let eff_caption = if clean_caption.is_empty() {
+        DEFAULT_TG_DOCUMENT_CAPTION
+    } else {
+        clean_caption
+    };
+    if is_tg_image_document(mime_type, Some(rel_path)) {
+        if size_bytes <= 6 * 1024 * 1024 {
+            return format!("@{rel_path} {eff_caption}");
+        }
+        return format!(
+            "@{rel_path} [berkas gambar diterima: {orig_name} — tersimpan di `{rel_path}`] {eff_caption}"
+        );
+    }
+    format!(
+        "[berkas diterima: {orig_name} — tersimpan di `{rel_path}` — baca isinya memakai tool `read_file` atau tool baca yang sesuai sebelum menjawab] {eff_caption}"
+    )
+}
+
+/// Pesan balasan satu baris untuk jenis pesan masuk Telegram yang belum didukung (v0.5.26).
+pub fn format_unsupported_tg_message_reply(kind: &str) -> String {
+    format!(
+        "Maaf, pesan {kind} belum didukung di SelenCode Telegram — saat ini yang didukung: teks, foto, dan dokumen/berkas (maks 20 MB)."
+    )
+}
+
+/// Klasifikasikan `TgMessage` masuk secara deterministik (teks / foto / dokumen / belum didukung).
+pub fn classify_tg_message(msg: &TgMessage) -> TgIngressClassification {
+    if let Some(raw_text) = msg.text.as_deref() {
+        let trimmed = raw_text.trim();
+        if trimmed.is_empty() {
+            return TgIngressClassification::Ignore;
+        }
+        return TgIngressClassification::Text(trimmed.to_string());
+    }
+    if let Some(best_photo) = msg.photo.last() {
+        let caption = msg
+            .caption
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_TG_PHOTO_CAPTION)
+            .to_string();
+        return TgIngressClassification::Photo {
+            file_id: best_photo.file_id.clone(),
+            message_id: msg.message_id,
+            caption,
+        };
+    }
+    if let Some(doc) = &msg.document {
+        let caption = msg
+            .caption
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_TG_DOCUMENT_CAPTION)
+            .to_string();
+        return TgIngressClassification::Document {
+            file_id: doc.file_id.clone(),
+            message_id: msg.message_id,
+            file_name: doc.file_name.clone(),
+            mime_type: doc.mime_type.clone(),
+            file_size: doc.file_size,
+            caption,
+        };
+    }
+    let unsupported_kind = if msg.voice.is_some() {
+        Some("suara")
+    } else if msg.audio.is_some() {
+        Some("audio")
+    } else if msg.video.is_some() {
+        Some("video")
+    } else if msg.video_note.is_some() {
+        Some("video bulat")
+    } else if msg.sticker.is_some() {
+        Some("stiker")
+    } else if msg.animation.is_some() {
+        Some("GIF/animasi")
+    } else if msg.location.is_some() {
+        Some("lokasi")
+    } else if msg.contact.is_some() {
+        Some("kontak")
+    } else if msg.from.is_some() {
+        Some("jenis ini")
+    } else {
+        None
+    };
+    match unsupported_kind {
+        Some(kind) => TgIngressClassification::Unsupported {
+            kind,
+            reply: format_unsupported_tg_message_reply(kind),
+        },
+        None => TgIngressClassification::Ignore,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

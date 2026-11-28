@@ -14,9 +14,11 @@ use selencode::repl::{
 };
 use selencode::security::{ApprovalMode, ApprovalRequest};
 use selencode::telegram::{
-    escape_telegram_html, format_telegram_progress_html, markdown_to_telegram_html,
-    parse_callback_review, TelegramClient, TgApprovalHub, TgAskHub, TypingLoopGuard,
-    TELEGRAM_BOT_COMMANDS,
+    classify_tg_message, escape_telegram_html, format_telegram_progress_html,
+    format_tg_document_too_large_reply, format_tg_document_turn_prompt,
+    markdown_to_telegram_html, parse_callback_review, save_tg_document_bytes, TelegramClient,
+    TgApprovalHub, TgAskHub, TgIngressClassification, TypingLoopGuard, TELEGRAM_BOT_COMMANDS,
+    TG_DOCUMENT_MAX_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -29,6 +31,15 @@ enum IncomingTgPayload {
     Photo {
         file_id: String,
         message_id: i64,
+        caption: String,
+        cwd: PathBuf,
+    },
+    Document {
+        file_id: String,
+        message_id: i64,
+        file_name: Option<String>,
+        mime_type: Option<String>,
+        file_size: Option<u64>,
         caption: String,
         cwd: PathBuf,
     },
@@ -449,45 +460,99 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 .and_then(|u| u.username.clone().or_else(|| Some(u.first_name.clone())))
                 .unwrap_or_else(|| user_id.to_string());
 
-            // Tentukan payload ringan (unduh foto dijalankan di dalam task chat agar loop polling tidak macet!).
-            let (payload, display_text) = if let Some(raw_text) = msg.text.clone() {
-                let norm = normalize_tg_command(&raw_text);
-                if norm.is_empty() {
+            // Tentukan payload ringan (unduh foto/dokumen dijalankan di dalam task chat agar loop polling tidak macet!).
+            let (payload, display_text) = match classify_tg_message(&msg) {
+                TgIngressClassification::Text(raw_text) => {
+                    let norm = normalize_tg_command(&raw_text);
+                    if norm.is_empty() {
+                        continue;
+                    }
+                    (IncomingTgPayload::Text(norm.clone()), norm)
+                }
+                TgIngressClassification::Photo {
+                    file_id,
+                    message_id,
+                    caption,
+                } => {
+                    if !latest_cfg.telegram.is_allowed(user_id, chat_id) {
+                        let _ = tg
+                            .send_message(
+                                chat_id,
+                                &format!(
+                                    "Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode."
+                                ),
+                            )
+                            .await;
+                        continue;
+                    }
+                    let label = format!("[foto] {caption}");
+                    (
+                        IncomingTgPayload::Photo {
+                            file_id,
+                            message_id,
+                            caption,
+                            cwd: cwd.clone(),
+                        },
+                        label,
+                    )
+                }
+                TgIngressClassification::Document {
+                    file_id,
+                    message_id,
+                    file_name,
+                    mime_type,
+                    file_size,
+                    caption,
+                } => {
+                    if !latest_cfg.telegram.is_allowed(user_id, chat_id) {
+                        let _ = tg
+                            .send_message(
+                                chat_id,
+                                &format!(
+                                    "Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode."
+                                ),
+                            )
+                            .await;
+                        continue;
+                    }
+                    // Pagu 20 MB Bot API: tolak segera sebelum unduh & tanpa giliran agent.
+                    if let Some(sz) = file_size.filter(|&sz| sz > TG_DOCUMENT_MAX_BYTES) {
+                        let notice =
+                            format_tg_document_too_large_reply(file_name.as_deref(), sz);
+                        let _ = tg.send_message(chat_id, &notice).await;
+                        continue;
+                    }
+                    let shown = file_name.as_deref().unwrap_or("berkas");
+                    let label = format!("[dokumen: {shown}] {caption}");
+                    (
+                        IncomingTgPayload::Document {
+                            file_id,
+                            message_id,
+                            file_name,
+                            mime_type,
+                            file_size,
+                            caption,
+                            cwd: cwd.clone(),
+                        },
+                        label,
+                    )
+                }
+                TgIngressClassification::Unsupported { reply, .. } => {
+                    if !latest_cfg.telegram.is_allowed(user_id, chat_id) {
+                        let _ = tg
+                            .send_message(
+                                chat_id,
+                                &format!(
+                                    "Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode."
+                                ),
+                            )
+                            .await;
+                    } else {
+                        let _ = tg.send_message(chat_id, &reply).await;
+                    }
                     continue;
                 }
-                (IncomingTgPayload::Text(norm.clone()), norm)
-            } else if !msg.photo.is_empty() {
-                if !latest_cfg.telegram.is_allowed(user_id, chat_id) {
-                    let _ = tg
-                        .send_message(
-                            chat_id,
-                            &format!(
-                                "Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode."
-                            ),
-                        )
-                        .await;
-                    continue;
-                }
-                let best_photo = msg.photo.last().unwrap();
-                let caption = msg
-                    .caption
-                    .as_deref()
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("Analisis gambar ini dan jelaskan hal penting atau error yang terlihat.")
-                    .to_string();
-                let label = format!("[foto] {caption}");
-                (
-                    IncomingTgPayload::Photo {
-                        file_id: best_photo.file_id.clone(),
-                        message_id: msg.message_id,
-                        caption,
-                        cwd: cwd.clone(),
-                    },
-                    label,
-                )
-            } else {
-                continue;
+                TgIngressClassification::Ignore => continue,
             };
 
             // `/id` selalu dijawab agar pemilik bisa langsung tahu ID untuk whitelist.
@@ -735,7 +800,7 @@ async fn handle_telegram_chat_message(
 ) -> Result<()> {
     let is_slash_cmd = match &payload {
         IncomingTgPayload::Text(t) => t.trim().starts_with('/'),
-        IncomingTgPayload::Photo { .. } => false,
+        IncomingTgPayload::Photo { .. } | IncomingTgPayload::Document { .. } => false,
     };
 
     // Pengawal abort-on-drop untuk task per-giliran agar tidak ada satu pun task yang pernah ter-detach yatim.
@@ -763,6 +828,7 @@ async fn handle_telegram_chat_message(
     if !is_slash_cmd {
         let initial_html = match &payload {
             IncomingTgPayload::Photo { .. } => "<i>Mengunduh foto...</i>",
+            IncomingTgPayload::Document { .. } => "<i>Mengunduh berkas...</i>",
             IncomingTgPayload::Text(_) => "<i>Memproses permintaan...</i>",
         };
         if let Ok(mid) = tg
@@ -776,7 +842,7 @@ async fn handle_telegram_chat_message(
         }
     }
 
-    // Unduh foto di dalam task chat ini agar loop polling Telegram tidak pernah terblokir.
+    // Unduh foto/dokumen di dalam task chat ini agar loop polling Telegram tidak pernah terblokir.
     let text = match payload {
         IncomingTgPayload::Text(t) => t,
         IncomingTgPayload::Photo {
@@ -806,6 +872,89 @@ async fn handle_telegram_chat_message(
             match attached_path {
                 Some(rel) => format!("@{rel} {caption}"),
                 None => caption,
+            }
+        }
+        IncomingTgPayload::Document {
+            file_id,
+            message_id,
+            file_name,
+            mime_type,
+            file_size,
+            caption,
+            cwd,
+        } => {
+            let doc_res: std::result::Result<(String, usize), String> = async {
+                if let Some(sz) = file_size.filter(|&sz| sz > TG_DOCUMENT_MAX_BYTES) {
+                    return Err(format_tg_document_too_large_reply(file_name.as_deref(), sz));
+                }
+                let fi = tg
+                    .get_file(&file_id)
+                    .await
+                    .map_err(|e| format!("Gagal mengambil info berkas dari Telegram: {e}"))?;
+                if let Some(sz) = fi.file_size.filter(|&sz| sz > TG_DOCUMENT_MAX_BYTES) {
+                    return Err(format_tg_document_too_large_reply(file_name.as_deref(), sz));
+                }
+                let Some(fp) = fi.file_path else {
+                    return Err(
+                        "Gagal mengunduh berkas: Telegram tidak mengembalikan lokasi file."
+                            .to_string(),
+                    );
+                };
+                let bytes = tg
+                    .download_file_bytes(&fp)
+                    .await
+                    .map_err(|e| format!("Gagal mengunduh berkas dari Telegram: {e}"))?;
+                let rel = save_tg_document_bytes(
+                    &cwd,
+                    message_id,
+                    file_name.as_deref(),
+                    mime_type.as_deref(),
+                    Some(&fp),
+                    &bytes,
+                )
+                .map_err(|e| format!("{e}"))?;
+                Ok((rel, bytes.len()))
+            }
+            .await;
+
+            match doc_res {
+                Ok((rel, size_bytes)) => {
+                    let orig_display = file_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("berkas");
+                    format_tg_document_turn_prompt(
+                        orig_display,
+                        &rel,
+                        mime_type.as_deref(),
+                        size_bytes,
+                        &caption,
+                    )
+                }
+                Err(err_msg) => {
+                    typing_init_guard.abort_now();
+                    if let Some(mid) = progress_msg_id.take() {
+                        if let Ok(mut map) = active_progress.lock() {
+                            map.remove(&chat_id);
+                        }
+                        if tg
+                            .edit_html_message(
+                                chat_id,
+                                mid,
+                                &escape_telegram_html(&err_msg),
+                                &err_msg,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            let _ = tg.send_message(chat_id, &err_msg).await;
+                        }
+                    } else {
+                        let _ = tg.send_message(chat_id, &err_msg).await;
+                    }
+                    return Ok(());
+                }
             }
         }
     };
