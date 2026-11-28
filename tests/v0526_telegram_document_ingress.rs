@@ -175,10 +175,17 @@ async fn kriteria2_and_3_text_document_read_by_agent_and_image_document_loaded_a
                     usage: None,
                 })
             } else {
-                // Pastikan hasil read_file benar-benar berisi teks dokumen yang diunggah!
-                let saw_file_body = msgs
-                    .iter()
-                    .any(|m| m.plain_text().contains("Total transaksi: 42"));
+                // Pastikan hasil read_file (`Block::ToolResult`) benar-benar berisi teks dokumen yang diunggah!
+                let saw_file_body = msgs.iter().any(|m| {
+                    m.content.iter().any(|b| match b {
+                        Block::ToolResult {
+                            content,
+                            is_error: false,
+                            ..
+                        } => content.contains("Total transaksi: 42"),
+                        _ => false,
+                    })
+                });
                 assert!(saw_file_body, "agent harus menerima isi dokumen lewat read_file");
                 let ans = "Total transaksi di catatan bulanan.txt adalah 42.".to_string();
                 let _ = tx.send(StreamEvent::Token(ans.clone())).await;
