@@ -50,6 +50,7 @@ impl AnthropicProvider {
         let client = reqwest::Client::builder()
             .connect_timeout(timeouts.connect)
             .tcp_keepalive(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -296,12 +297,13 @@ impl AnthropicStreamParser {
     }
 }
 
-/// Terapkan Prompt Caching terstruktur (`system_and_3`, Tahap 3) pada body request Anthropic:
-/// - Tandai blok `system` sebagai ephemeral cache breakpoint.
-/// - Tandai skema tool terakhir (bila ada) sebagai cache breakpoint.
-/// - Tandai hingga 3 pesan non-system terakhir dengan `cache_control: {"type": "ephemeral"}`.
+/// Terapkan Prompt Caching terstruktur pada body request Anthropic (maks 4 breakpoint sesuai API):
+/// - Tandai blok `system` sebagai ephemeral cache breakpoint (1).
+/// - Tandai skema tool terakhir bila ada (1).
+/// - Tandai sisa kuota (`4 - used`, maks 3) pada pesan non-system terakhir agar tidak pernah HTTP 400.
 pub fn apply_prompt_caching(body: &mut Value) {
     let ephem = json!({"type": "ephemeral"});
+    let mut used = 0usize;
     if let Some(sys_str) = body.get("system").and_then(|v| v.as_str()).map(|s| s.to_string()) {
         if !sys_str.is_empty() {
             body["system"] = json!([{
@@ -309,20 +311,25 @@ pub fn apply_prompt_caching(body: &mut Value) {
                 "text": sys_str,
                 "cache_control": ephem
             }]);
+            used += 1;
         }
     }
     if let Some(tools) = body.get_mut("tools").and_then(|v| v.as_array_mut()) {
         if let Some(last_tool) = tools.last_mut().and_then(|v| v.as_object_mut()) {
             last_tool.insert("cache_control".into(), json!({"type": "ephemeral"}));
+            used += 1;
         }
     }
-    if let Some(msgs) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
-        let len = msgs.len();
-        let start = len.saturating_sub(3);
-        for m in &mut msgs[start..] {
-            if let Some(blocks) = m.get_mut("content").and_then(|v| v.as_array_mut()) {
-                if let Some(last_blk) = blocks.last_mut().and_then(|v| v.as_object_mut()) {
-                    last_blk.insert("cache_control".into(), json!({"type": "ephemeral"}));
+    let msg_budget = 4usize.saturating_sub(used);
+    if msg_budget > 0 {
+        if let Some(msgs) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
+            let len = msgs.len();
+            let start = len.saturating_sub(msg_budget);
+            for m in &mut msgs[start..] {
+                if let Some(blocks) = m.get_mut("content").and_then(|v| v.as_array_mut()) {
+                    if let Some(last_blk) = blocks.last_mut().and_then(|v| v.as_object_mut()) {
+                        last_blk.insert("cache_control".into(), json!({"type": "ephemeral"}));
+                    }
                 }
             }
         }
@@ -374,14 +381,13 @@ impl Provider for AnthropicProvider {
                 .ok()
                 .and_then(|r| r.ok())
                 .unwrap_or_default();
-            return Err(anyhow!(
-                "Anthropic membalas {st}: {}",
-                txt.chars().take(500).collect::<String>()
-            ));
+            let safe = crate::security::redact_secrets(&txt.chars().take(500).collect::<String>());
+            return Err(anyhow!("Anthropic membalas {st}: {safe}"));
         }
 
+        const MAX_SSE_LINE_BYTES: usize = 4 * 1024 * 1024;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         let mut parser = AnthropicStreamParser::new();
         'stream: loop {
             let rem_total = req_deadline.saturating_duration_since(Instant::now());
@@ -412,9 +418,13 @@ impl Provider for AnthropicProvider {
                 break 'stream;
             };
             let chunk = chunk.context("stream Anthropic terputus")?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line: String = buf.drain(..=pos).collect();
+            if buf.len().saturating_add(chunk.len()) > MAX_SSE_LINE_BYTES {
+                return Err(anyhow!("stream Anthropic melebihi batas buffer SSE (4 MB)"));
+            }
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let raw_line: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&raw_line);
                 let Some(data) = line.trim().strip_prefix("data:") else {
                     continue;
                 };
@@ -426,10 +436,25 @@ impl Provider for AnthropicProvider {
                     continue;
                 };
                 if v["type"].as_str() == Some("message_stop") {
+                    buf.clear();
                     break 'stream;
                 }
                 if let Some(tok) = parser.handle_event(&v) {
                     let _ = tx.send(StreamEvent::Token(tok)).await;
+                }
+            }
+        }
+        // Tangani baris terakhir tanpa '\n' penutup saat EOF.
+        if !buf.is_empty() {
+            let tail = String::from_utf8_lossy(&buf);
+            if let Some(data) = tail.trim().strip_prefix("data:") {
+                let data = data.trim();
+                if !data.is_empty() {
+                    if let Ok(v) = serde_json::from_str::<Value>(data) {
+                        if let Some(tok) = parser.handle_event(&v) {
+                            let _ = tx.send(StreamEvent::Token(tok)).await;
+                        }
+                    }
                 }
             }
         }
@@ -469,6 +494,7 @@ pub async fn fetch_models_with_context(
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let base = if base_url.trim().is_empty() {
@@ -487,10 +513,8 @@ pub async fn fetch_models_with_context(
     if !resp.status().is_success() {
         let st = resp.status();
         let txt = resp.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "endpoint Anthropic /v1/models membalas {st}: {}",
-            txt.chars().take(300).collect::<String>()
-        ));
+        let safe = crate::security::redact_secrets(&txt.chars().take(300).collect::<String>());
+        return Err(anyhow!("endpoint Anthropic /v1/models membalas {st}: {safe}"));
     }
     let v: Value = resp
         .json()

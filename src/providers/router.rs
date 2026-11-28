@@ -241,6 +241,24 @@ pub fn is_timeout_error(err: &str) -> bool {
     )
 }
 
+/// Cek apakah kode status HTTP 3-digit muncul sebagai token status utuh (bukan bagian dari `400ms`, `4000`, dll.).
+fn contains_http_status(haystack: &str, code: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let needle = code.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = haystack[start..].find(code) {
+        let idx = start + rel;
+        let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+        let after_idx = idx + needle.len();
+        let after_ok = after_idx >= bytes.len() || !bytes[after_idx].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
+}
+
 /// Klasifikasi ketat error yang LAYAK memicu fallback ke model/provider cadangan (v0.5.6 Bagian 1):
 /// - HANYA: HTTP 429 (kuota/rate limit), HTTP 5xx provider, timeout/koneksi putus,
 ///   penolakan kredensial/kuota upstream (401/403), dan model tidak ditemukan/mati (404).
@@ -249,24 +267,22 @@ pub fn is_timeout_error(err: &str) -> bool {
 pub fn is_fallback_eligible_error(err: &str) -> bool {
     let low = err.to_ascii_lowercase();
     // 1. Tolak tegas HTTP 400 / format rusak / konteks melebihi batas / pembatalan lokal.
-    //    Catatan: jangan menolak `"invalid_request"` sebelum mengecek 404/model_not_found/401/403,
-    //    karena gateway OpenAI-compatible (termasuk 9Router) membungkus 404 model mati di dalam
-    //    `{"type":"invalid_request_error","code":"model_not_found"}`.
-    if contains_any(
-        &low,
-        &[
-            "400",
-            "bad request",
-            "malformed",
-            "context_length_exceeded",
-            "maximum context length",
-            "ditolak user",
-            "dibatalkan",
-            "cancelled",
-            "canceled",
-            "approval",
-        ],
-    ) {
+    if contains_http_status(&low, "400")
+        || contains_any(
+            &low,
+            &[
+                "bad request",
+                "malformed",
+                "context_length_exceeded",
+                "maximum context length",
+                "ditolak user",
+                "dibatalkan",
+                "cancelled",
+                "canceled",
+                "approval",
+            ],
+        )
+    {
         return false;
     }
     if is_retryable_error(&low) {

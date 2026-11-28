@@ -105,6 +105,22 @@ impl TgUiSharedState {
             .ok()
             .and_then(|g| g.get(&chat_id).and_then(|v| v.get(idx).cloned()))
     }
+
+    /// Bersihkan seluruh cache UI idle milik `chat_id` saat sesi dikeluarkan dari RAM gateway.
+    pub(crate) fn evict_chat(&self, chat_id: i64) {
+        if let Ok(mut g) = self.remote_catalogs.lock() {
+            g.retain(|&(cid, _), _| cid != chat_id);
+        }
+        if let Ok(mut g) = self.plan_next_chats.lock() {
+            g.remove(&chat_id);
+        }
+        if let Ok(mut g) = self.pending_plans.lock() {
+            g.remove(&chat_id);
+        }
+        if let Ok(mut g) = self.last_skills_list.lock() {
+            g.remove(&chat_id);
+        }
+    }
 }
 
 /// Daftar nama provider terurut deterministik (dipakai konsisten antara render tombol & callback `mdl:`).
@@ -248,7 +264,7 @@ pub(crate) fn tg_build_resume_picker(s: &Session) -> Result<TgInlineCard> {
 pub(crate) fn tg_build_approve_picker(s: &Session) -> TgInlineCard {
     let policy = s.ctx.approver.policy();
     let (mode_lbl, mut cats) = {
-        let p = policy.lock().expect("approval policy poisoned");
+        let p = policy.lock().unwrap_or_else(|e| e.into_inner());
         let cats: Vec<String> = p.session_allowed.iter().cloned().collect();
         (p.mode.label().to_string(), cats)
     };
@@ -269,11 +285,12 @@ pub(crate) fn tg_build_sandbox_picker(s: &Session) -> TgInlineCard {
     )
 }
 
-/// Bangun kartu daftar `/cron` dengan tombol toggle & hapus langsung.
-pub(crate) fn tg_build_cron_picker(store: &Store) -> Result<TgInlineCard> {
+/// Bangun kartu daftar `/cron` milik `chat_id` (atau job global `chat_id == 0`) dengan tombol toggle & hapus.
+pub(crate) fn tg_build_cron_picker(store: &Store, chat_id: i64) -> Result<TgInlineCard> {
     let jobs = store.list_cron_jobs()?;
     let items: Vec<TgCronItem> = jobs
         .into_iter()
+        .filter(|j| j.chat_id == chat_id || j.chat_id == 0)
         .map(|j| TgCronItem {
             id: j.id,
             name: j.name,
@@ -472,8 +489,9 @@ pub(crate) async fn handle_tg_model_callback(
                         ids
                     }
                     Ok(Err(e)) => {
+                        let safe = tg.sanitize_error(&e.to_string());
                         let _ = tg
-                            .send_message(chat_id, &format!("Gagal tarik katalog {view_name}: {e}"))
+                            .send_message(chat_id, &format!("Gagal tarik katalog {view_name}: {safe}"))
                             .await;
                         return;
                     }
@@ -933,7 +951,7 @@ pub(crate) async fn handle_tg_cron_callback(
         TgCronCallback::Toggle(id) => {
             let id_s = id.to_string();
             match st.get_cron_job(&id_s) {
-                Ok(Some(job)) => {
+                Ok(Some(job)) if job.chat_id == chat_id || job.chat_id == 0 => {
                     let next_en = !job.enabled;
                     let next_run = if next_en {
                         selencode::cron::compute_next_run_after(
@@ -951,20 +969,27 @@ pub(crate) async fn handle_tg_cron_callback(
                         format!("⏸ Cron #{id} dijeda")
                     }
                 }
+                Ok(Some(_)) => "Ditolak: jadwal milik chat lain.".to_string(),
                 _ => format!("Cron #{id} tidak ditemukan"),
             }
         }
         TgCronCallback::Delete(id) => {
             let id_s = id.to_string();
-            match st.remove_cron_job(&id_s) {
-                Ok(true) => format!("🗑 Cron #{id} dihapus"),
+            match st.get_cron_job(&id_s) {
+                Ok(Some(job)) if job.chat_id == chat_id || job.chat_id == 0 => {
+                    match st.remove_cron_job(&id_s) {
+                        Ok(true) => format!("🗑 Cron #{id} dihapus"),
+                        _ => format!("Cron #{id} tidak ditemukan"),
+                    }
+                }
+                Ok(Some(_)) => "Ditolak: jadwal milik chat lain.".to_string(),
                 _ => format!("Cron #{id} tidak ditemukan"),
             }
         }
         TgCronCallback::Close => unreachable!(),
     };
     let _ = tg.answer_callback_query(&cb.id, Some(&toast)).await;
-    if let Ok(card) = tg_build_cron_picker(st) {
+    if let Ok(card) = tg_build_cron_picker(st, chat_id) {
         send_or_edit_card(tg, chat_id, msg_id, card).await;
     }
 }

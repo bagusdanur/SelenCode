@@ -18,41 +18,72 @@ const MAX_BATCH_URLS: usize = 4;
 const USER_AGENT: &str = "SelenCode/0.5 (fetch_url)";
 
 /// Apakah IP ini tujuan terlarang (SSRF): privat, loopback, link-local,
-/// unspecified, multicast, broadcast, CGNAT (100.64/10).
+/// unspecified, multicast, broadcast, CGNAT (100.64/10), 0.0.0.0/8, 192.0.0.0/24,
+/// 198.18.0.0/15, 240.0.0.0/4, IPv4-mapped/compatible, NAT64 (64:ff9b::/96), fec0::/10.
 pub fn is_forbidden_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_multicast()
                 || v4.is_broadcast()
-                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1])) // CGNAT
-                || *v4 == Ipv4Addr::new(192, 0, 0, 0)
+                || o[0] == 0 // 0.0.0.0/8 ("this network", routes locally on Linux)
+                || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT 100.64.0.0/10
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 benchmark
+                || o[0] >= 240 // 240.0.0.0/4 reserved
         }
         IpAddr::V6(v6) => {
             let segs = v6.segments();
-            let mapped_forbidden = if segs[0..5] == [0, 0, 0, 0, 0] && segs[5] == 0xffff {
-                let v4 = Ipv4Addr::new(
+            let extract_v4 = || {
+                Ipv4Addr::new(
                     (segs[6] >> 8) as u8,
                     segs[6] as u8,
                     (segs[7] >> 8) as u8,
                     segs[7] as u8,
-                );
-                is_forbidden_ip(&IpAddr::V4(v4))
-            } else {
-                false
+                )
             };
+            // IPv4-mapped (::ffff:0:0/96), IPv4-compatible (::/96), atau NAT64 (64:ff9b::/96)
+            let embedded_v4_forbidden =
+                (segs[0..5] == [0, 0, 0, 0, 0] && (segs[5] == 0xffff || segs[5] == 0))
+                    || (segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2..6] == [0, 0, 0, 0]);
+            let mapped_forbidden =
+                embedded_v4_forbidden && is_forbidden_ip(&IpAddr::V4(extract_v4()));
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || (segs[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
                 || (segs[0] & 0xffc0) == 0xfe80 // link local fe80::/10
+                || (segs[0] & 0xffc0) == 0xfec0 // deprecated site-local fec0::/10
                 || *v6 == Ipv6Addr::LOCALHOST
                 || mapped_forbidden
         }
     }
+}
+
+/// Baca body respons HTTP secara terikat memori (maks `max_bytes`, cegah OOM DoS).
+async fn read_response_text_bounded(mut resp: reqwest::Response, max_bytes: usize) -> Result<String> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > max_bytes.saturating_mul(2) {
+            return Err(anyhow!("respons HTTP terlalu besar ({len} byte)"));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        let rem = max_bytes.saturating_sub(buf.len());
+        if rem == 0 {
+            break;
+        }
+        let take = chunk.len().min(rem);
+        buf.extend_from_slice(&chunk[..take]);
+        if buf.len() >= max_bytes {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Validasi URL untuk fetch_url: skema http/https saja, host bukan IP
@@ -598,10 +629,10 @@ async fn try_fast_path_extract(
             let stars = meta["stargazers_count"].as_u64().unwrap_or(0);
             let lang = meta["language"].as_str().unwrap_or("-");
             let license = meta["license"]["spdx_id"].as_str().unwrap_or("-");
-            let pushed = meta["pushed_at"]
+            let pushed: String = meta["pushed_at"]
                 .as_str()
-                .map(|s| &s[..s.len().min(10)])
-                .unwrap_or("?");
+                .map(|s| s.chars().take(10).collect())
+                .unwrap_or_else(|| "?".to_string());
             let readme_url = check_url_allowed(&format!("{api}/readme")).await?;
             let readme = fetch_checked_http(
                 client,
@@ -664,8 +695,9 @@ async fn try_fast_path_extract(
             Ok(format!("# GitHub File: {owner}/{repo}@{git_ref}/{file_path}\n\n{body}"))
         }
         WebFastPath::Wikipedia { lang, title } => {
+            let enc_title = percent_encode_query(title);
             let api = format!(
-                "https://{lang}.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&format=json&formatversion=2&titles={title}"
+                "https://{lang}.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&format=json&formatversion=2&titles={enc_title}"
             );
             let data = fetch_json_checked(client, &api).await?;
             let page = data["query"]["pages"]
@@ -746,7 +778,7 @@ async fn try_optional_extract_backend(
             if !resp.status().is_success() {
                 return None;
             }
-            let text = resp.text().await.ok()?;
+            let text = read_response_text_bounded(resp, MAX_RAW).await.ok()?;
             let trimmed = text.trim();
             if trimmed.len() > 80 {
                 Some(trimmed.to_string())
@@ -768,7 +800,8 @@ async fn try_optional_extract_backend(
             if !resp.status().is_success() {
                 return None;
             }
-            let v: Value = resp.json().await.ok()?;
+            let raw = read_response_text_bounded(resp, MAX_RAW).await.ok()?;
+            let v: Value = serde_json::from_str(&raw).ok()?;
             v["data"]["markdown"]
                 .as_str()
                 .map(str::trim)
@@ -840,7 +873,7 @@ pub fn find_headless_chrome_binary() -> Option<String> {
 }
 
 /// Render halaman SPA via browser lokal headless (`--headless=new --dump-dom`, batas waktu 15 detik).
-/// WAJIB hanya dipanggil SESUDAH URL lulus `check_url_allowed` (anti-SSRF).
+/// WAJIB hanya dipanggil bila `ctx.web_cfg.headless_browser == true` DAN URL lulus `check_url_allowed`.
 async fn fetch_via_headless_chrome(url: &str) -> Option<String> {
     let bin = find_headless_chrome_binary()?;
     let mut cmd = tokio::process::Command::new(&bin);
@@ -848,21 +881,18 @@ async fn fetch_via_headless_chrome(url: &str) -> Option<String> {
         .arg("--disable-gpu")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
+        .arg("--disable-extensions")
+        .arg("--disable-background-networking")
         .arg("--virtual-time-budget=4500")
         .arg("--dump-dom")
         .arg(url)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let out = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output())
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() || out.stdout.is_empty() {
+    crate::sandbox::scrub_tokio_command(&mut cmd);
+    let (code, dom) = super::run_timed(&mut cmd, 15).await.ok()?;
+    if code != Some(0) || dom.trim().is_empty() {
         return None;
     }
-    let dom = String::from_utf8_lossy(&out.stdout).into_owned();
     let md = html_to_markdown(&dom);
     if md.trim().chars().count() > 60 {
         Some(md)
@@ -878,9 +908,11 @@ async fn fetch_single_url_markdown(
     want_raw: bool,
     js_render: bool,
 ) -> Result<String> {
+    // Keamanan SSRF: headless Chrome HANYA boleh dipakai bila diizinkan eksplisit di `[web] headless_browser = true`!
+    let allow_headless = ctx.web_cfg.headless_browser;
     let url_str = url.to_string();
     if !want_raw {
-        if js_render {
+        if js_render && allow_headless {
             if let Some(rendered) = fetch_via_headless_chrome(&url_str).await {
                 return Ok(rendered);
             }
@@ -916,7 +948,7 @@ async fn fetch_single_url_markdown(
     let is_html = content_type.to_lowercase().contains("html")
         || body.trim_start().starts_with('<');
     if is_html {
-        if (js_render || ctx.web_cfg.headless_browser) && detect_spa_shell(&body) {
+        if allow_headless && detect_spa_shell(&body) {
             if let Some(rendered) = fetch_via_headless_chrome(&url_str).await {
                 return Ok(rendered);
             }
@@ -981,20 +1013,31 @@ impl Tool for FetchUrl {
         } else {
             format!("fetch_url ({} URL)", validated.len())
         };
-        let approval_detail = validated
+        let js_render = args
+            .get("js_render")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            && ctx.web_cfg.headless_browser;
+        let mut approval_detail = validated
             .iter()
             .map(|u| u.as_str())
             .collect::<Vec<_>>()
             .join("\n");
+        if js_render {
+            approval_detail.push_str("\n[Mode: headless Chrome JS render aktif]");
+        }
         if !ctx.approver.ask(&approval_title, &approval_detail).await {
             return Ok("Ditolak user — URL tidak di-fetch.".into());
         }
 
+        // Validasi ulang DNS pasca-approval untuk memperkecil celah DNS rebinding TOCTOU.
+        let mut revalidated: Vec<reqwest::Url> = Vec::with_capacity(raw_urls.len());
+        for raw in &raw_urls {
+            revalidated.push(check_url_allowed(raw).await?);
+        }
+        let mut validated = revalidated;
+
         let want_raw = args.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
-        let js_render = args
-            .get("js_render")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         let base_budget = args
             .get("max_chars")
             .and_then(|v| v.as_u64())
@@ -1201,6 +1244,7 @@ impl Tool for WebSearch {
         }
 
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
             .build()?;
         let enc_q = percent_encode_query(query);
@@ -1294,6 +1338,16 @@ impl Tool for WebSearch {
                             "{}/search?q={enc_q}&format=json",
                             base.trim_end_matches('/')
                         );
+                        // Blokir alamat metadata cloud (169.254.169.254 / link-local) pada searxng_url.
+                        if let Ok(parsed_sx) = reqwest::Url::parse(&url) {
+                            let host_ok = parsed_sx
+                                .host_str()
+                                .map(|h| !h.contains("169.254.169.254") && !h.eq_ignore_ascii_case("metadata.google.internal"))
+                                .unwrap_or(false);
+                            if !host_ok {
+                                return Err(anyhow!("searxng_url ditolak demi keamanan (SSRF metadata)"));
+                            }
+                        }
                         let resp = client
                             .get(&url)
                             .header("user-agent", USER_AGENT)
@@ -1301,7 +1355,8 @@ impl Tool for WebSearch {
                             .await
                             .map_err(|e| anyhow!("SearXNG gagal: {e}"))?;
                         if resp.status().is_success() {
-                            let data: Value = resp.json().await?;
+                            let raw = read_response_text_bounded(resp, MAX_RAW).await?;
+                            let data: Value = serde_json::from_str(&raw)?;
                             let items: Vec<(String, String, String)> = data["results"]
                                 .as_array()
                                 .into_iter()
@@ -1334,7 +1389,8 @@ impl Tool for WebSearch {
                                 .await
                                 .map_err(|e| anyhow!("Tavily gagal: {e}"))?;
                             if resp.status().is_success() {
-                                let data: Value = resp.json().await?;
+                                let raw = read_response_text_bounded(resp, MAX_RAW).await?;
+                                let data: Value = serde_json::from_str(&raw)?;
                                 let items: Vec<(String, String, String)> = data["results"]
                                     .as_array()
                                     .into_iter()
@@ -1366,7 +1422,8 @@ impl Tool for WebSearch {
                                 .await
                                 .map_err(|e| anyhow!("Brave Search gagal: {e}"))?;
                             if resp.status().is_success() {
-                                let data: Value = resp.json().await?;
+                                let raw = read_response_text_bounded(resp, MAX_RAW).await?;
+                                let data: Value = serde_json::from_str(&raw)?;
                                 let items: Vec<(String, String, String)> = data["web"]["results"]
                                     .as_array()
                                     .into_iter()
@@ -1401,7 +1458,8 @@ impl Tool for WebSearch {
                                 .await
                                 .map_err(|e| anyhow!("Firecrawl Search gagal: {e}"))?;
                             if resp.status().is_success() {
-                                let data: Value = resp.json().await?;
+                                let raw = read_response_text_bounded(resp, MAX_RAW).await?;
+                                let data: Value = serde_json::from_str(&raw)?;
                                 let items: Vec<(String, String, String)> = data["data"]
                                     .as_array()
                                     .into_iter()

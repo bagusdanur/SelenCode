@@ -19,7 +19,6 @@ use crate::skills::{
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 const MAX_STAGED_FILE_BYTES: u64 = 256 * 1024;
 const MAX_STAGED_FILES: usize = 64;
@@ -214,6 +213,24 @@ fn is_direct_skill_md_url(source: &str) -> bool {
         && (without_query.ends_with("/skill.md") || without_query.ends_with(".md"))
 }
 
+/// Penjaga RAII agar folder staging sementara selalu bersih bila terjadi error di tengah jalan.
+struct StagingDirGuard(Option<PathBuf>);
+impl StagingDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+    fn disarm(&mut self) -> PathBuf {
+        self.0.take().unwrap_or_default()
+    }
+}
+impl Drop for StagingDirGuard {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+}
+
 /// Unduh / clone skill dari URL `SKILL.md` langsung atau URL repositori Git ke area staging sementara.
 pub async fn stage_skill_from_source(source: &str) -> Result<StagedSkill> {
     let trimmed = source.trim();
@@ -225,53 +242,112 @@ pub async fn stage_skill_from_source(source: &str) -> Result<StagedSkill> {
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::create_dir_all(&staging_root)?;
+    let mut guard = StagingDirGuard::new(staging_root.clone());
 
     if is_direct_skill_md_url(trimmed) {
+        // Anti-SSRF sebelum menyentuh jaringan!
+        let valid_url = crate::tools::web::check_url_allowed(trimmed).await?;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        let resp = client
-            .get(trimmed)
+        let mut resp = client
+            .get(valid_url)
             .send()
             .await
             .with_context(|| format!("gagal mengunduh '{trimmed}'"))?;
         if !resp.status().is_success() {
-            let _ = std::fs::remove_dir_all(&staging_root);
             return Err(anyhow!(
                 "gagal mengunduh '{}': HTTP {}",
                 trimmed,
                 resp.status()
             ));
         }
-        let body = resp.text().await?;
-        if body.len() as u64 > MAX_STAGED_FILE_BYTES {
-            let _ = std::fs::remove_dir_all(&staging_root);
-            return Err(anyhow!("file SKILL.md melebihi batas 256 KB"));
+        if let Some(cl) = resp.content_length() {
+            if cl > MAX_STAGED_FILE_BYTES {
+                return Err(anyhow!("file SKILL.md melebihi batas 256 KB"));
+            }
         }
+        let mut body_bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if (body_bytes.len() + chunk.len()) as u64 > MAX_STAGED_FILE_BYTES {
+                return Err(anyhow!("file SKILL.md melebihi batas 256 KB"));
+            }
+            body_bytes.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
         let skill_dir = staging_root.join("skill");
         std::fs::create_dir_all(&skill_dir)?;
         std::fs::write(skill_dir.join("SKILL.md"), body)?;
-        return validate_staged_skill_dir(staging_root, skill_dir, trimmed);
+        let root_owned = guard.disarm();
+        return validate_staged_skill_dir(root_owned, skill_dir, trimmed);
     }
 
     // Mode Git clone shallow (`--depth 1`) ke staging.
     let (repo_url, branch, subpath) = parse_git_source(trimmed);
+    // Tolak injeksi opsi CLI git (argumen diawali '-') & skema non-http(s) berbahaya (`ext::`, `ssh://`, `git://`, `file://`).
+    if repo_url.trim().starts_with('-') {
+        return Err(anyhow!("URL repositori ditolak: tidak boleh diawali '-'"));
+    }
+    if let Some(br) = &branch {
+        if br.trim().starts_with('-')
+            || br.contains("..")
+            || !br
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
+        {
+            return Err(anyhow!("nama branch '{br}' tidak valid"));
+        }
+    }
+    let low_url = repo_url.trim().to_ascii_lowercase();
+    let is_remote_http = low_url.starts_with("https://") || low_url.starts_with("http://");
+    let is_existing_local_dir = !repo_url.contains("://") && Path::new(&repo_url).is_dir();
+    if is_remote_http {
+        // Cek SSRF untuk URL remote Git!
+        crate::tools::web::check_url_allowed(&repo_url).await?;
+    } else if !is_existing_local_dir {
+        return Err(anyhow!(
+            "skema sumber '{repo_url}' ditolak: gunakan URL https:// atau path direktori lokal valid"
+        ));
+    }
+
     let clone_dir = staging_root.join("repo");
-    let mut cmd = Command::new("git");
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args([
+        "-c",
+        "core.symlinks=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+    ]);
+    if is_remote_http {
+        cmd.args(["-c", "protocol.file.allow=never"]);
+    }
     cmd.arg("clone").arg("--depth").arg("1");
     if let Some(br) = &branch {
         cmd.arg("--branch").arg(br);
     }
-    cmd.arg(&repo_url).arg(&clone_dir);
-    let out = cmd
-        .output()
+    // Pemisah `--` mencegah injeksi flag ke `git clone`.
+    cmd.arg("--")
+        .arg(&repo_url)
+        .arg(&clone_dir)
+        .stdin(std::process::Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true);
+    crate::sandbox::scrub_tokio_command(&mut cmd);
+    let (code, output) = crate::tools::run_timed(&mut cmd, 60)
+        .await
         .with_context(|| format!("gagal menjalankan `git clone` untuk '{repo_url}'"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let _ = std::fs::remove_dir_all(&staging_root);
-        return Err(anyhow!("git clone gagal untuk '{}': {}", trimmed, err.trim()));
+    if code != Some(0) {
+        return Err(anyhow!(
+            "git clone gagal untuk '{}': {}",
+            trimmed,
+            crate::security::redact_secrets(output.trim())
+        ));
     }
 
+    let clone_canon = crate::security::normalize_sandbox_path(&clone_dir);
     let skill_dir = if let Some(sub) = subpath {
         // Tolak path traversal pada subpath URL!
         let rel = Path::new(&sub);
@@ -280,12 +356,22 @@ pub async fn stage_skill_from_source(source: &str) -> Result<StagedSkill> {
                 .components()
                 .any(|c| !matches!(c, Component::Normal(_)))
         {
-            let _ = std::fs::remove_dir_all(&staging_root);
             return Err(anyhow!("subpath '{sub}' ditolak: terdeteksi path traversal"));
         }
-        clone_dir.join(rel)
+        let joined = clone_dir.join(rel);
+        if std::fs::symlink_metadata(&joined)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(anyhow!("subpath '{sub}' ditolak: symlink tidak diizinkan"));
+        }
+        let joined_canon = crate::security::normalize_sandbox_path(&joined);
+        if !joined_canon.starts_with(&clone_canon) {
+            return Err(anyhow!("subpath '{sub}' ditolak: keluar dari repositori staging"));
+        }
+        joined
     } else if clone_dir.join("SKILL.md").is_file() {
-        clone_dir
+        clone_dir.clone()
     } else {
         // Cari tepat 1 folder skill bila SKILL.md berada 1–2 tingkat di dalam repo.
         let mut found = Vec::new();
@@ -293,7 +379,6 @@ pub async fn stage_skill_from_source(source: &str) -> Result<StagedSkill> {
         if found.len() == 1 {
             found.remove(0)
         } else if found.is_empty() {
-            let _ = std::fs::remove_dir_all(&staging_root);
             return Err(anyhow!(
                 "tidak ditemukan `SKILL.md` pada repositori '{trimmed}'"
             ));
@@ -304,7 +389,6 @@ pub async fn stage_skill_from_source(source: &str) -> Result<StagedSkill> {
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .take(8)
                 .collect();
-            let _ = std::fs::remove_dir_all(&staging_root);
             return Err(anyhow!(
                 "repositori memuat {} skill ({}). Tentukan subpath dengan `#<path>` (mis. `{}#{}`).",
                 found.len(),
@@ -315,7 +399,14 @@ pub async fn stage_skill_from_source(source: &str) -> Result<StagedSkill> {
         }
     };
 
-    validate_staged_skill_dir(staging_root, skill_dir, trimmed)
+    // Pastikan `skill_dir` bukan symlink dan berada di dalam `clone_canon`.
+    let skill_canon = crate::security::normalize_sandbox_path(&skill_dir);
+    if !skill_canon.starts_with(&clone_canon) {
+        return Err(anyhow!("folder skill berada di luar repositori staging"));
+    }
+
+    let root_owned = guard.disarm();
+    validate_staged_skill_dir(root_owned, skill_dir, trimmed)
 }
 
 fn find_skill_md_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -330,8 +421,19 @@ fn find_skill_md_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         if entry.file_name() == ".git" {
             continue;
         }
-        if p.is_dir() {
-            if p.join("SKILL.md").is_file() {
+        // Tolak symlink saat memindai folder skill!
+        let Ok(meta) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            let skill_md = p.join("SKILL.md");
+            let md_ok = std::fs::symlink_metadata(&skill_md)
+                .map(|m| m.is_file() && !m.file_type().is_symlink())
+                .unwrap_or(false);
+            if md_ok {
                 out.push(p);
             } else {
                 find_skill_md_dirs(&p, depth + 1, out);
@@ -361,6 +463,12 @@ pub fn format_install_approval_summary(staged: &StagedSkill, rename: Option<&str
             ""
         };
         out.push_str(&format!("  - {} ({} byte){tag}\n", f.rel_path, f.bytes));
+    }
+    if let Ok(md_body) = std::fs::read_to_string(staged.skill_dir.join("SKILL.md")) {
+        let preview: String = md_body.trim().chars().take(400).collect();
+        if !preview.is_empty() {
+            out.push_str(&format!("\nCuplikan SKILL.md:\n{preview}\n"));
+        }
     }
     if !scripts.is_empty() {
         out.push_str(

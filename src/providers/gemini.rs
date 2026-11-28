@@ -51,6 +51,7 @@ impl GeminiProvider {
         let client = reqwest::Client::builder()
             .connect_timeout(timeouts.connect)
             .tcp_keepalive(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -102,12 +103,13 @@ pub fn build_request(msgs: &[Message], tools: &[ToolSpec]) -> Value {
                             content,
                             is_error,
                         } => {
-                            // id di sini = nama fungsi (lihat catatan di atas).
+                            // id di sini = nama fungsi (atau `nama#N` bila ada panggilan paralel duplikat).
+                            let fn_name = id.split('#').next().unwrap_or(id);
                             let mut resp = json!({"result": content});
                             if *is_error {
                                 resp = json!({"result": content, "error": true});
                             }
-                            parts.push(json!({"functionResponse": {"name": id, "response": resp}}));
+                            parts.push(json!({"functionResponse": {"name": fn_name, "response": resp}}));
                         }
                         Block::ToolUse { .. } => {}
                     }
@@ -212,9 +214,14 @@ impl GeminiStreamParser {
                     let name = fc["name"].as_str().unwrap_or_default().to_string();
                     if !name.is_empty() {
                         let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
-                        // id = nama fungsi (Gemini tidak punya id call).
+                        let existing_same = self.tool_calls.iter().filter(|c| c.name == name).count();
+                        let call_id = if existing_same == 0 {
+                            name.clone()
+                        } else {
+                            format!("{name}#{existing_same}")
+                        };
                         self.tool_calls.push(ToolCall {
-                            id: name.clone(),
+                            id: call_id,
                             name,
                             args,
                         });
@@ -295,14 +302,13 @@ impl Provider for GeminiProvider {
                 .ok()
                 .and_then(|r| r.ok())
                 .unwrap_or_default();
-            return Err(anyhow!(
-                "Gemini membalas {st}: {}",
-                txt.chars().take(500).collect::<String>()
-            ));
+            let safe = crate::security::redact_secrets(&txt.chars().take(500).collect::<String>());
+            return Err(anyhow!("Gemini membalas {st}: {safe}"));
         }
 
+        const MAX_SSE_LINE_BYTES: usize = 4 * 1024 * 1024;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         let mut parser = GeminiStreamParser::new();
         loop {
             let rem_total = req_deadline.saturating_duration_since(Instant::now());
@@ -333,9 +339,13 @@ impl Provider for GeminiProvider {
                 break;
             };
             let chunk = chunk.context("stream Gemini terputus")?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line: String = buf.drain(..=pos).collect();
+            if buf.len().saturating_add(chunk.len()) > MAX_SSE_LINE_BYTES {
+                return Err(anyhow!("stream Gemini melebihi batas buffer SSE (4 MB)"));
+            }
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let raw_line: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&raw_line);
                 let Some(data) = line.trim().strip_prefix("data:") else {
                     continue;
                 };
@@ -351,7 +361,8 @@ impl Provider for GeminiProvider {
                 }
             }
         }
-        let tail = buf.trim();
+        let tail_str = String::from_utf8_lossy(&buf);
+        let tail = tail_str.trim();
         if let Some(data) = tail.strip_prefix("data:") {
             let data = data.trim();
             if !data.is_empty() {
@@ -410,6 +421,7 @@ pub async fn fetch_models_with_context(
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let base = if base_url.trim().is_empty() {
@@ -427,10 +439,8 @@ pub async fn fetch_models_with_context(
     if !resp.status().is_success() {
         let st = resp.status();
         let txt = resp.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "endpoint Gemini /v1beta/models membalas {st}: {}",
-            txt.chars().take(300).collect::<String>()
-        ));
+        let safe = crate::security::redact_secrets(&txt.chars().take(300).collect::<String>());
+        return Err(anyhow!("endpoint Gemini /v1beta/models membalas {st}: {safe}"));
     }
     let v: Value = resp
         .json()

@@ -425,13 +425,39 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
 
     let mut poll_err_streak: u32 = 0;
     let mut last_session_gc = Instant::now();
+    // Anti-flood DoS: maks 1 balasan penolakan per 60 detik per chat_id asing (pagu 512 entri).
+    let mut unauth_reply_cooldown: HashMap<i64, Instant> = HashMap::new();
+    let should_reply_unauth = |map: &mut HashMap<i64, Instant>, cid: i64| -> bool {
+        let now = Instant::now();
+        if let Some(prev) = map.get(&cid) {
+            if prev.elapsed() < Duration::from_secs(60) {
+                return false;
+            }
+        }
+        if map.len() >= 512 {
+            map.retain(|_, ts| ts.elapsed() < Duration::from_secs(60));
+            if map.len() >= 512 {
+                map.clear();
+            }
+        }
+        map.insert(cid, now);
+        true
+    };
     loop {
         health_clock.mark_loop_heartbeat();
 
         // Pembersihan berkala sesi chat idle dari RAM (Perbaikan 1 #5 v0.5.10 — anti-kebocoran memori).
         if last_session_gc.elapsed() >= Duration::from_secs(300) {
             last_session_gc = Instant::now();
-            evict_idle_gateway_sessions(&sessions, &session_last_used, &busy_chats).await;
+            evict_idle_gateway_sessions(
+                &sessions,
+                &session_last_used,
+                &busy_chats,
+                &cancel_tokens,
+                &chat_gens,
+                &tg_ui,
+            )
+            .await;
         }
 
         let updates = tokio::select! {
@@ -644,8 +670,9 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                                             }
                                         }
                                         if let Err(e) = res {
+                                            let safe = tg_c.sanitize_error(&e.to_string());
                                             let _ = tg_c
-                                                .send_long_markdown(chat_id, &format!("Error: {e}"))
+                                                .send_long_markdown(chat_id, &format!("Error: {safe}"))
                                                 .await;
                                         }
                                     });
@@ -663,9 +690,19 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     }
                     if let Some((prop_id, approve)) = cb.data.as_deref().and_then(parse_callback_review) {
                         let chat_cwd = resolve_chat_cwd(&sessions, chat_id, &cwd).await;
+                        let cwd_str = chat_cwd.to_string_lossy().to_string();
                         let res_msg = match selencode::store::Store::open() {
                             Ok(st) => {
-                                if approve {
+                                // Anti-IDOR: pastikan proposal milik workspace aktif chat ini.
+                                let owns_prop = st
+                                    .list_review_proposals(Some(&cwd_str), Some("pending"), 50)
+                                    .map(|list| list.iter().any(|p| p.id == prop_id))
+                                    .unwrap_or(false);
+                                if !owns_prop {
+                                    Err(anyhow::anyhow!(
+                                        "usulan #{prop_id} bukan milik workspace aktif atau sudah diproses"
+                                    ))
+                                } else if approve {
                                     selencode::agent::apply_staged_proposal(&st, &chat_cwd, prop_id)
                                 } else {
                                     selencode::agent::discard_staged_proposal(&st, prop_id)
@@ -723,14 +760,16 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     caption,
                 } => {
                     if !latest_cfg.telegram.is_allowed(user_id, chat_id) {
-                        let _ = tg
-                            .send_message(
-                                chat_id,
-                                &format!(
-                                    "Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode."
-                                ),
-                            )
-                            .await;
+                        if should_reply_unauth(&mut unauth_reply_cooldown, chat_id) {
+                            let _ = tg
+                                .send_message(
+                                    chat_id,
+                                    &format!(
+                                        "Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode."
+                                    ),
+                                )
+                                .await;
+                        }
                         continue;
                     }
                     let label = format!("[foto] {caption}");
@@ -753,14 +792,16 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                     caption,
                 } => {
                     if !latest_cfg.telegram.is_allowed(user_id, chat_id) {
-                        let _ = tg
-                            .send_message(
-                                chat_id,
-                                &format!(
-                                    "Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode."
-                                ),
-                            )
-                            .await;
+                        if should_reply_unauth(&mut unauth_reply_cooldown, chat_id) {
+                            let _ = tg
+                                .send_message(
+                                    chat_id,
+                                    &format!(
+                                        "Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode."
+                                    ),
+                                )
+                                .await;
+                        }
                         continue;
                     }
                     // Pagu 20 MB Bot API: tolak segera sebelum unduh & tanpa giliran agent.
@@ -787,14 +828,16 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 }
                 TgIngressClassification::Unsupported { reply, .. } => {
                     if !latest_cfg.telegram.is_allowed(user_id, chat_id) {
-                        let _ = tg
-                            .send_message(
-                                chat_id,
-                                &format!(
-                                    "Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode."
-                                ),
-                            )
-                            .await;
+                        if should_reply_unauth(&mut unauth_reply_cooldown, chat_id) {
+                            let _ = tg
+                                .send_message(
+                                    chat_id,
+                                    &format!(
+                                        "Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode."
+                                    ),
+                                )
+                                .await;
+                        }
                         continue;
                     }
                     if latest_cfg.telegram.voice_transcription {
@@ -830,36 +873,39 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                 TgIngressClassification::Ignore => continue,
             };
 
-            // `/id` selalu dijawab agar pemilik bisa langsung tahu ID untuk whitelist.
+            // `/id` selalu dijawab (dibatasi cooldown untuk user non-whitelist agar tahan flood DoS).
             if display_text.eq_ignore_ascii_case("/id") {
-                let allowed_note = if latest_cfg.telegram.is_allowed(user_id, chat_id) {
-                    "Status: sudah ada di whitelist."
-                } else {
-                    "Status: belum di whitelist. Jalankan di SelenCode:\n/telegram allow <USER_ID>"
-                };
-                let _ = tg
-                    .send_message(
-                        chat_id,
-                        &format!(
-                            "Info ID Telegram:\nUser ID: {user_id}\nChat ID: {chat_id}\n{allowed_note}"
-                        ),
-                    )
-                    .await;
+                let allowed = latest_cfg.telegram.is_allowed(user_id, chat_id);
+                if allowed || should_reply_unauth(&mut unauth_reply_cooldown, chat_id) {
+                    let allowed_note = if allowed {
+                        "Status: sudah ada di whitelist."
+                    } else {
+                        "Status: belum di whitelist."
+                    };
+                    let _ = tg
+                        .send_message(
+                            chat_id,
+                            &format!(
+                                "Info ID Telegram:\nUser ID: {user_id}\nChat ID: {chat_id}\n{allowed_note}"
+                            ),
+                        )
+                        .await;
+                }
                 continue;
             }
 
             if !latest_cfg.telegram.is_allowed(user_id, chat_id) {
                 println!("[telegram] ditolak dari {sender_name} (user={user_id}, chat={chat_id})");
-                let _ = tg
-                    .send_message(
-                        chat_id,
-                        &format!(
-                            "Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode.\n\
-                             Tambahkan dari terminal SelenCode:\n\
-                             /telegram allow {user_id}"
-                        ),
-                    )
-                    .await;
+                if should_reply_unauth(&mut unauth_reply_cooldown, chat_id) {
+                    let _ = tg
+                        .send_message(
+                            chat_id,
+                            &format!(
+                                "Akses ditolak — User ID {user_id} belum ada di whitelist SelenCode."
+                            ),
+                        )
+                        .await;
+                }
                 continue;
             }
 
@@ -986,10 +1032,11 @@ pub(crate) async fn run_telegram_gateway(cli: Cli) -> Result<()> {
                         );
                     }
                     Err(e) => {
-                        eprintln!("[telegram] error ({chat_id}): {e}");
+                        let safe = tg_clone.sanitize_error(&e.to_string());
+                        eprintln!("[telegram] error ({chat_id}): {safe}");
                         let _ = tokio::time::timeout(
                             Duration::from_secs(15),
-                            tg_clone.send_long_markdown(chat_id, &format!("Error: {e}")),
+                            tg_clone.send_long_markdown(chat_id, &format!("Error: {safe}")),
                         )
                         .await;
                     }
@@ -1027,6 +1074,9 @@ async fn evict_idle_gateway_sessions(
     sessions: &Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Session>>>>>,
     session_last_used: &Arc<std::sync::Mutex<HashMap<i64, Instant>>>,
     busy_chats: &Arc<std::sync::Mutex<HashSet<i64>>>,
+    cancel_tokens: &Arc<std::sync::Mutex<HashMap<i64, Arc<tokio::sync::Notify>>>>,
+    chat_gens: &Arc<std::sync::Mutex<HashMap<i64, Arc<AtomicU64>>>>,
+    tg_ui: &Arc<TgUiSharedState>,
 ) {
     let busy: HashSet<i64> = busy_chats
         .lock()
@@ -1070,6 +1120,13 @@ async fn evict_idle_gateway_sessions(
     for cid in to_remove {
         map.remove(&cid);
         used.remove(&cid);
+        if let Ok(mut ct) = cancel_tokens.lock() {
+            ct.remove(&cid);
+        }
+        if let Ok(mut cg) = chat_gens.lock() {
+            cg.remove(&cid);
+        }
+        tg_ui.evict_chat(cid);
     }
 }
 
@@ -1153,17 +1210,25 @@ async fn handle_telegram_chat_message(
             let mut attached_path: Option<String> = None;
             if let Ok(fi) = tg.get_file(&file_id).await {
                 if let Some(fp) = fi.file_path {
-                    if let Ok(bytes) = tg.download_file_bytes(&fp).await {
-                        if bytes.len() <= 6 * 1024 * 1024 {
-                            let ext = fp.rsplit('.').next().unwrap_or("jpg");
-                            let rel = format!(".selencode/tg_uploads/tg_{message_id}.{ext}");
-                            let full = live_cwd.join(&rel);
-                            if let Some(parent) = full.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            if std::fs::write(&full, &bytes).is_ok() {
-                                attached_path = Some(rel);
-                            }
+                    if let Ok(bytes) = tg.download_file_bytes_limited(&fp, 6 * 1024 * 1024).await {
+                        let base_name = fp.rsplit('/').next().unwrap_or(&fp);
+                        let raw_ext = base_name
+                            .rsplit_once('.')
+                            .map(|(_, e)| e)
+                            .unwrap_or("jpg");
+                        let ext: String = raw_ext
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric())
+                            .take(8)
+                            .collect();
+                        let ext = if ext.is_empty() { "jpg" } else { ext.as_str() };
+                        let rel = format!(".selencode/tg_uploads/tg_{message_id}.{ext}");
+                        let full = live_cwd.join(&rel);
+                        if let Some(parent) = full.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if std::fs::write(&full, &bytes).is_ok() {
+                            attached_path = Some(rel);
                         }
                     }
                 }
@@ -1750,7 +1815,7 @@ async fn handle_telegram_chat_message(
                 })
                 .unwrap_or(true);
             if is_list {
-                let card = tg_build_cron_picker(&s.store)?;
+                let card = tg_build_cron_picker(&s.store, chat_id)?;
                 tg.send_html_message_with_keyboard(chat_id, &card.html, &card.plain, card.rows)
                     .await?;
             } else {
@@ -1846,27 +1911,68 @@ async fn handle_telegram_chat_message(
             let (card, resume_prompt) = s.handle_task(arg.as_deref())?;
             tg.send_menu_markup(chat_id, &card).await?;
             if let Some(prompt) = resume_prompt {
-                let res = run_turn_counted(
-                    s.provider.clone(),
-                    &s.registry,
-                    &s.ctx,
-                    &mut s.messages,
-                    &prompt,
-                    0,
-                )
-                .await?;
-                let reply_text = if res.0.trim().is_empty() {
-                    "(task dilanjutkan tanpa ringkasan teks)".to_string()
-                } else {
-                    res.0
+                let task_typing =
+                    TypingLoopGuard::spawn_for_client(tg.clone(), chat_id, Duration::from_secs(4));
+                let task_timeout = latest_cfg.telegram.turn_timeout_secs;
+                let task_res = tokio::select! {
+                    r = run_turn_counted(
+                        s.provider.clone(),
+                        &s.registry,
+                        &s.ctx,
+                        &mut s.messages,
+                        &prompt,
+                        0,
+                    ) => Some(r),
+                    _ = cancel.notified() => None,
+                    _ = async {
+                        if task_timeout > 0 {
+                            tokio::time::sleep(Duration::from_secs(task_timeout)).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => Some(Err(anyhow::anyhow!("batas waktu giliran ({task_timeout} detik) tercapai"))),
                 };
-                tg.send_long_markdown(chat_id, &reply_text).await?;
+                task_typing.stop_and_join(Duration::from_secs(2)).await;
+                match task_res {
+                    None => {
+                        tg.send_message(chat_id, "Lanjutan task dibatalkan.").await?;
+                    }
+                    Some(Ok(res)) => {
+                        let reply_text = if res.0.trim().is_empty() {
+                            "(task dilanjutkan tanpa ringkasan teks)".to_string()
+                        } else {
+                            res.0
+                        };
+                        tg.send_long_markdown(chat_id, &reply_text).await?;
+                    }
+                    Some(Err(e)) => {
+                        let safe = tg.sanitize_error(&e.to_string());
+                        tg.send_long_markdown(chat_id, &format!("Error: {safe}"))
+                            .await?;
+                    }
+                }
             }
             return Ok(());
         }
         SlashCommand::Telegram(arg) => {
-            let reply = s.handle_telegram(arg.as_deref()).await?;
-            tg.send_menu_markup(chat_id, &reply).await?;
+            // Keamanan: mutasi token bot & whitelist `/telegram` HANYA diizinkan dari terminal lokal
+            // agar token bot tidak pernah masuk riwayat chat Telegram & mencegah takeover dari chat.
+            let act = selencode::telegram::parse_telegram_action(arg.as_deref());
+            match act {
+                selencode::telegram::TelegramAction::Status
+                | selencode::telegram::TelegramAction::Test
+                | selencode::telegram::TelegramAction::Usage => {
+                    let reply = s.handle_telegram(arg.as_deref()).await?;
+                    tg.send_menu_markup(chat_id, &reply).await?;
+                }
+                _ => {
+                    tg.send_message(
+                        chat_id,
+                        "Demi keamanan, perubahan token bot/whitelist/approval lewat `/telegram setup|allow|rm|off|approve` hanya boleh dijalankan dari terminal lokal (bukan dari chat Telegram). Gunakan `/approve` untuk mengatur mode izin sesi.",
+                    )
+                    .await?;
+                }
+            }
             return Ok(());
         }
         SlashCommand::Sessions => {
@@ -1931,6 +2037,16 @@ async fn handle_telegram_chat_message(
             return Ok(());
         }
         SlashCommand::InlineShell(cmd) => {
+            if !s
+                .ctx
+                .approver
+                .ask(&format!("inline_shell: {cmd}"), &format!("Jalankan `!{cmd}` di {}", s.ctx.cwd.display()))
+                .await
+            {
+                tg.send_message(chat_id, &format!("Ditolak user — `!{cmd}` TIDAK dijalankan."))
+                    .await?;
+                return Ok(());
+            }
             let reply = s.handle_inline_shell(&cmd).await?;
             tg.send_menu_markup(chat_id, &reply).await?;
             return Ok(());

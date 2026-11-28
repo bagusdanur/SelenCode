@@ -671,7 +671,7 @@ pub fn detect_targeted_plan(cwd: &Path, scope: &str, changed_files: &[String]) -
                 .parent()
                 .and_then(|p| p.to_str())
                 .unwrap_or("");
-            if !dir.is_empty() && (!is_safe_token(dir) || !cwd.join(dir).is_dir()) {
+            if !dir.is_empty() && !is_safe_token(dir) {
                 continue;
             }
             let pkg = if dir.is_empty() {

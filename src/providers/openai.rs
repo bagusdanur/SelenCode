@@ -44,6 +44,7 @@ impl OpenAiProvider {
         let client = reqwest::Client::builder()
             .connect_timeout(timeouts.connect)
             .tcp_keepalive(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -100,6 +101,7 @@ pub async fn fetch_models_with_context(
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let url = format!("{}/models", base_url.trim_end_matches('/'));
@@ -112,10 +114,8 @@ pub async fn fetch_models_with_context(
     if !resp.status().is_success() {
         let st = resp.status();
         let txt = resp.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "endpoint /models membalas {st}: {}",
-            txt.chars().take(300).collect::<String>()
-        ));
+        let safe = crate::security::redact_secrets(&txt.chars().take(300).collect::<String>());
+        return Err(anyhow!("endpoint /models membalas {st}: {safe}"));
     }
     let v: Value = resp.json().await.context("respons /models bukan JSON valid")?;
     Ok(parse_openai_models_response(&v))
@@ -431,14 +431,13 @@ impl Provider for OpenAiProvider {
                 .ok()
                 .and_then(|r| r.ok())
                 .unwrap_or_default();
-            return Err(anyhow!(
-                "provider membalas {st}: {}",
-                txt.chars().take(500).collect::<String>()
-            ));
+            let safe = crate::security::redact_secrets(&txt.chars().take(500).collect::<String>());
+            return Err(anyhow!("provider membalas {st}: {safe}"));
         }
 
+        const MAX_SSE_LINE_BYTES: usize = 4 * 1024 * 1024;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         let mut text = String::new();
         let mut calls: BTreeMap<u64, PartialCall> = BTreeMap::new();
         let mut finish_reason: Option<String> = None;
@@ -473,10 +472,14 @@ impl Provider for OpenAiProvider {
                 break 'stream;
             };
             let chunk = chunk.context("stream provider terputus")?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line: String = buf.drain(..=pos).collect();
-                let line = line.trim();
+            if buf.len().saturating_add(chunk.len()) > MAX_SSE_LINE_BYTES {
+                return Err(anyhow!("stream provider melebihi batas buffer SSE (4 MB)"));
+            }
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let raw_line: Vec<u8> = buf.drain(..=pos).collect();
+                let line_str = String::from_utf8_lossy(&raw_line);
+                let line = line_str.trim();
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
@@ -529,7 +532,8 @@ impl Provider for OpenAiProvider {
             }
         }
         // Tangani baris terakhir tanpa '\n' penutup bila stream langsung EOF.
-        let tail = buf.trim();
+        let tail_str = String::from_utf8_lossy(&buf);
+        let tail = tail_str.trim();
         if let Some(data) = tail.strip_prefix("data:") {
             let data = data.trim();
             if !data.is_empty() && data != "[DONE]" {

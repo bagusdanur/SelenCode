@@ -288,6 +288,9 @@ pub fn expand_env_header(raw: &str) -> String {
     out
 }
 
+/// Batas aman ukuran pesan MCP (8 MiB) untuk mencegah OOM DoS dari server MCP nakal.
+const MAX_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Parse respons HTTP MCP: mendukung JSON langsung MAUPUN format SSE (`data: {...}`).
 pub fn parse_http_or_sse_jsonrpc(body: &str) -> Result<Value> {
     let trimmed = body.trim();
@@ -298,6 +301,7 @@ pub fn parse_http_or_sse_jsonrpc(body: &str) -> Result<Value> {
         return Ok(serde_json::from_str(trimmed)?);
     }
     // Format SSE: ambil event JSON-RPC terakhir yang punya `result` atau `error`.
+    let mut last_result_or_err: Option<Value> = None;
     let mut last_valid: Option<Value> = None;
     for line in trimmed.lines() {
         let l = line.trim();
@@ -308,13 +312,16 @@ pub fn parse_http_or_sse_jsonrpc(body: &str) -> Result<Value> {
             }
             if let Ok(v) = serde_json::from_str::<Value>(p) {
                 if v.get("result").is_some() || v.get("error").is_some() {
-                    return Ok(v);
+                    last_result_or_err = Some(v);
+                } else {
+                    last_valid = Some(v);
                 }
-                last_valid = Some(v);
             }
         }
     }
-    last_valid.ok_or_else(|| anyhow!("respons HTTP/SSE MCP bukan JSON-RPC 2.0 valid"))
+    last_result_or_err
+        .or(last_valid)
+        .ok_or_else(|| anyhow!("respons HTTP/SSE MCP bukan JSON-RPC 2.0 valid"))
 }
 
 pub struct McpClient {
@@ -356,9 +363,25 @@ fn spawn_transport(cfg: &McpServerCfg) -> Result<(Transport, tokio::process::Chi
 }
 
 fn spawn_reader_task(inner: Arc<Inner>, stdout: tokio::process::ChildStdout) {
+    use tokio::io::AsyncReadExt;
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut reader = BufReader::new(stdout);
+        let mut raw_buf: Vec<u8> = Vec::new();
+        loop {
+            raw_buf.clear();
+            let mut limited = (&mut reader).take((MAX_MCP_MESSAGE_BYTES + 1) as u64);
+            let n = match limited.read_until(b'\n', &mut raw_buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if n > MAX_MCP_MESSAGE_BYTES {
+                eprintln!(
+                    "[mcp] pesan stdio server '{}' melebihi batas {} byte — koneksi diputus",
+                    inner.server_name, MAX_MCP_MESSAGE_BYTES
+                );
+                break;
+            }
+            let line = String::from_utf8_lossy(&raw_buf);
             let Ok(msg) = decode_message(&line) else {
                 continue;
             };
@@ -420,9 +443,22 @@ impl McpClient {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
+            // Tolak endpoint HTTP ke metadata cloud (169.254.169.254) dan matikan redirect otomatis
+            // agar header secret (`Authorization`) tidak pernah bocor ke host lain.
+            if let Ok(parsed_u) = reqwest::Url::parse(url) {
+                if !matches!(parsed_u.scheme(), "http" | "https") {
+                    return Err(anyhow!("URL server MCP '{}' harus http:// atau https://", cfg.name));
+                }
+                if let Some(h) = parsed_u.host_str() {
+                    if h.contains("169.254.169.254") || h.eq_ignore_ascii_case("metadata.google.internal") {
+                        return Err(anyhow!("URL server MCP '{}' ditolak (alamat metadata cloud)", cfg.name));
+                    }
+                }
+            }
             let http_client = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| anyhow!("gagal membuat HTTP client MCP '{}': {e}", cfg.name))?;
             Arc::new(Inner {
@@ -635,11 +671,11 @@ impl McpClient {
         for (k, v) in &http.headers {
             req = req.header(k, expand_env_header(v));
         }
-        let resp = req.json(msg).send().await.map_err(|e| {
+        let mut resp = req.json(msg).send().await.map_err(|e| {
+            let safe_err = crate::security::redact_secrets(&e.without_url().to_string());
             anyhow!(
-                "gagal menghubungi server MCP HTTP '{}' ({}): {e}",
-                self.inner.server_name,
-                http.url
+                "gagal menghubungi server MCP HTTP '{}': {safe_err}",
+                self.inner.server_name
             )
         })?;
         if let Some(sid) = resp
@@ -652,13 +688,28 @@ impl McpClient {
             }
         }
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        // Baca body terikat memori (maks 8 MiB).
+        let mut body_bytes = Vec::new();
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            if body_bytes.len().saturating_add(chunk.len()) > MAX_MCP_MESSAGE_BYTES {
+                return Err(anyhow!(
+                    "respons server MCP HTTP '{}' melebihi batas 8 MiB",
+                    self.inner.server_name
+                ));
+            }
+            body_bytes.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
         if !status.is_success() {
+            if status.as_u16() == 404 || status.as_u16() == 410 {
+                self.inner.dead.store(true, Ordering::SeqCst);
+            }
+            let safe_body =
+                crate::security::redact_secrets(&body.chars().take(300).collect::<String>());
             return Err(anyhow!(
-                "server MCP HTTP '{}' menolak (HTTP {}): {}",
+                "server MCP HTTP '{}' menolak (HTTP {}): {safe_body}",
                 self.inner.server_name,
-                status,
-                body.chars().take(300).collect::<String>()
+                status
             ));
         }
         if !expect_result || body.trim().is_empty() {
@@ -780,11 +831,13 @@ fn parse_tool_list(result: &Value) -> Vec<McpToolInfo> {
         .iter()
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?.to_string();
-            let description = t
+            let description: String = t
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
-                .to_string();
+                .chars()
+                .take(2000)
+                .collect();
             let input_schema = t
                 .get("inputSchema")
                 .cloned()

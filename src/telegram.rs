@@ -2735,6 +2735,7 @@ pub fn resolve_telegram_api_urls(
 pub struct TelegramClient {
     api_http: reqwest::Client,
     poll_http: reqwest::Client,
+    upload_http: reqwest::Client,
     token: String,
     base_url: String,
     file_base_url: String,
@@ -2779,13 +2780,28 @@ impl TelegramClient {
             .http1_only()
             .build()
             .context("gagal membuat HTTP polling client Telegram")?;
+        let upload_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(120))
+            .tcp_keepalive(Duration::from_secs(15))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .http1_only()
+            .build()
+            .context("gagal membuat HTTP upload client Telegram")?;
         Ok(Self {
             api_http,
             poll_http,
+            upload_http,
             base_url: base_url.trim_end_matches('/').to_string(),
             file_base_url: file_base_url.trim_end_matches('/').to_string(),
             token: bot_token.trim().to_string(),
         })
+    }
+
+    /// Bersihkan teks error dari token bot Telegram maupun pola API key/secret umum sebelum dikirim ke chat/log.
+    pub fn sanitize_error(&self, err_text: &str) -> String {
+        let step1 = crate::security::redact_secrets(err_text);
+        redact_tg_token(&step1, &self.token)
     }
 
     /// URL dasar panggilan metode Bot API (`<origin>/bot<token>`).
@@ -2886,23 +2902,51 @@ impl TelegramClient {
         self.post_json("getFile", json!({ "file_id": file_id })).await
     }
 
-    /// Unduh byte mentah file Telegram berdasarkan `file_path` dari `getFile`.
-    /// Menghormati `file_base_url` (otomatis mengikuti `SELENCODE_TELEGRAM_API_BASE` saat diuji).
-    pub async fn download_file_bytes(&self, file_path: &str) -> Result<Vec<u8>> {
+    /// Unduh byte mentah file Telegram dengan batas ukuran keras (cek `Content-Length` + stream cap)
+    /// agar unduhan raksasa tidak pernah menghabiskan RAM gateway.
+    pub async fn download_file_bytes_limited(
+        &self,
+        file_path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
         let rel = file_path.trim_start_matches('/');
         let url = format!("{}/{rel}", self.file_base_url);
-        let resp = self.api_http.get(&url).send().await.map_err(|e| {
+        let mut resp = self.api_http.get(&url).send().await.map_err(|e| {
             let clean = redact_tg_token(&e.without_url().to_string(), &self.token);
             anyhow!("gagal mengunduh file Telegram: {clean}")
         })?;
         if !resp.status().is_success() {
             return Err(anyhow!("unduh file Telegram ditolak (HTTP {})", resp.status()));
         }
-        let bytes = resp.bytes().await.map_err(|e| {
+        if let Some(cl) = resp.content_length() {
+            if cl as usize > max_bytes {
+                return Err(anyhow!(
+                    "berkas Telegram melebihi batas ukuran unduhan ({} byte > {} byte)",
+                    cl,
+                    max_bytes
+                ));
+            }
+        }
+        let mut out = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
             let clean = redact_tg_token(&e.without_url().to_string(), &self.token);
             anyhow!("gagal membaca byte file Telegram: {clean}")
-        })?;
-        Ok(bytes.to_vec())
+        })? {
+            if out.len().saturating_add(chunk.len()) > max_bytes {
+                return Err(anyhow!(
+                    "berkas Telegram melebihi batas ukuran unduhan ({max_bytes} byte)"
+                ));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
+    /// Unduh byte mentah file Telegram berdasarkan `file_path` dari `getFile` (terikat maks `TG_DOCUMENT_MAX_BYTES`).
+    /// Menghormati `file_base_url` (otomatis mengikuti `SELENCODE_TELEGRAM_API_BASE` saat diuji).
+    pub async fn download_file_bytes(&self, file_path: &str) -> Result<Vec<u8>> {
+        self.download_file_bytes_limited(file_path, TG_DOCUMENT_MAX_BYTES as usize)
+            .await
     }
 
     pub async fn get_updates(&self, offset: i64, timeout_secs: u64) -> Result<Vec<TgUpdate>> {
@@ -3472,13 +3516,13 @@ impl TelegramClient {
             form = form.text("caption", short_cap);
         }
         let url = format!("{}/{method}", self.base_url);
-        let upload_http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(120))
-            .http1_only()
-            .build()
-            .context("gagal membuat HTTP upload client Telegram")?;
-        let resp = upload_http.post(&url).multipart(form).send().await.map_err(|e| {
+        let resp = self
+            .upload_http
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| {
             let clean = redact_tg_token(&e.without_url().to_string(), &self.token);
             anyhow!("gagal mengirim {method} ke Telegram: {clean}")
         })?;
@@ -3609,6 +3653,10 @@ impl TgApprovalHub {
     pub fn expire_approval_now(&self, id: u64) -> Option<PendingTgApproval> {
         let item = self.pending.lock().ok().and_then(|mut m| m.remove(&id))?;
         if let Ok(mut exp) = self.expired_ids.lock() {
+            if exp.len() >= 1000 {
+                let min_keep = id.saturating_sub(500);
+                exp.retain(|&old_id| old_id >= min_keep);
+            }
             exp.insert(id);
         }
         Some(item)
