@@ -539,16 +539,16 @@ pub fn build_tg_model_picker_card(
     }
 
     let mut footer = Vec::new();
+    let back_label = if total_providers > 1 {
+        format!("◀ Provider ({total_providers})")
+    } else {
+        "◀ Provider".to_string()
+    };
+    footer.push((back_label, "mdl:p:0".to_string()));
     if matches!(viewing_provider_kind, "openai" | "gemini" | "anthropic") {
         footer.push((
             "📡 Katalog API".to_string(),
             format!("mdl:c:{viewing_provider_idx}:0"),
-        ));
-    }
-    if total_providers > 1 {
-        footer.push((
-            format!("🔄 Provider ({total_providers})"),
-            "mdl:p:0".to_string(),
         ));
     }
     footer.push(("✕ Tutup".to_string(), "mdl:x".to_string()));

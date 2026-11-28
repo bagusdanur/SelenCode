@@ -518,6 +518,43 @@ pub fn parse_model_action(arg: &str) -> ModelAction {
     ModelAction::SwitchOrModel(arg.to_string())
 }
 
+/// Hasil pencocokan target nama model terhadap daftar model tersimpan milik provider (`v0.5.31`).
+/// Mencegah typo seperti `/model azaz` membuat & mengaktifkan model palsu secara diam-diam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedModelLookup {
+    /// Cocok persis (case-insensitive) pada indeks 0-based.
+    Exact(usize),
+    /// Cocok unik lewat potongan nama (substring) pada indeks 0-based.
+    UniqueSubstring(usize),
+    /// Cocok beberapa model (indeks 0-based).
+    Ambiguous(Vec<usize>),
+    /// Tidak cocok dengan model mana pun di daftar tersimpan.
+    NotFound,
+}
+
+/// Cari `target` di dalam daftar `models` tersimpan (exact case-insensitive, lalu substring).
+pub fn lookup_saved_model(models: &[String], target: &str) -> SavedModelLookup {
+    let needle_raw = target.trim();
+    if needle_raw.is_empty() {
+        return SavedModelLookup::NotFound;
+    }
+    if let Some(i) = models.iter().position(|m| m.eq_ignore_ascii_case(needle_raw)) {
+        return SavedModelLookup::Exact(i);
+    }
+    let needle = needle_raw.to_ascii_lowercase();
+    let matches: Vec<usize> = models
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.to_ascii_lowercase().contains(&needle))
+        .map(|(i, _)| i)
+        .collect();
+    match matches.len() {
+        0 => SavedModelLookup::NotFound,
+        1 => SavedModelLookup::UniqueSubstring(matches[0]),
+        _ => SavedModelLookup::Ambiguous(matches),
+    }
+}
+
 /// Spesifikasi kunci API dari `/provider add` / `/provider preset`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeySpec {

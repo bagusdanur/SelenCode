@@ -1468,20 +1468,16 @@ async fn handle_telegram_chat_message(
             return Ok(());
         }
         SlashCommand::Model(None) => {
-            let names = tg_sorted_providers(&s.cfg);
-            let active_pidx = names
-                .iter()
-                .position(|n| n == &s.provider_name)
-                .unwrap_or(0);
-            if let Some(card) = tg_build_model_picker_for_provider(
-                &s.cfg,
-                &s.provider_name,
-                &s.pcfg.model,
-                s.ctx.context_limit_tokens,
-                active_pidx,
-                0,
-                &s.model_context_cache,
-            ) {
+            // Alur rapi 2-tahap (v0.5.31): tampilkan daftar Provider terlebih dahulu ->
+            // tap provider untuk membuka isi model-model di dalamnya.
+            if !s.cfg.providers.is_empty() {
+                let card = tg_build_provider_picker(
+                    &s.cfg,
+                    &s.provider_name,
+                    &s.pcfg.model,
+                    s.ctx.context_limit_tokens,
+                    0,
+                );
                 tg.send_html_message_with_keyboard(chat_id, &card.html, &card.plain, card.rows)
                     .await?;
             } else {

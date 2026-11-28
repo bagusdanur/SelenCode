@@ -12,8 +12,8 @@ use selencode::providers::openai::fetch_models_with_context;
 use selencode::providers::router::RouterTelemetry;
 use selencode::providers::{Block, Message, Provider, Role, UnconfiguredProvider};
 use selencode::repl::{
-    classify_key_spec, parse_model_action, parse_provider_action, KeySpec, ModelAction,
-    ProviderAction,
+    classify_key_spec, lookup_saved_model, parse_model_action, parse_provider_action, KeySpec,
+    ModelAction, ProviderAction, SavedModelLookup,
 };
 use selencode::security::{ApprovalMode, ApprovalPolicy, ApprovalRequest, Approver};
 use selencode::store::Store;
@@ -720,10 +720,30 @@ impl Session {
                         }
                         list[idx - 1].clone()
                     } else {
-                        model.clone()
+                        match lookup_saved_model(&list, &model) {
+                            SavedModelLookup::Exact(i) | SavedModelLookup::UniqueSubstring(i) => {
+                                list[i].clone()
+                            }
+                            SavedModelLookup::Ambiguous(idxs) => {
+                                let preview: Vec<String> = idxs
+                                    .iter()
+                                    .take(5)
+                                    .map(|&i| format!("#{} {}", i + 1, list[i]))
+                                    .collect();
+                                anyhow::bail!(
+                                    "potongan '{model}' cocok {} model di '{provider}': {}. Pilih lebih spesifik atau pakai nomor.",
+                                    idxs.len(),
+                                    preview.join(", ")
+                                );
+                            }
+                            SavedModelLookup::NotFound => {
+                                anyhow::bail!(
+                                    "model '{model}' tidak ada di daftar tersimpan provider '{provider}'.\nCek daftar lewat `/model`, intip API lewat `/models`, atau tambah manual dengan `/model add {model}`."
+                                );
+                            }
+                        }
                     };
                     p.models = list;
-                    p.push_model_unique(&resolved);
                     p.model = resolved.clone();
                     resolved
                 } else {
@@ -747,85 +767,62 @@ impl Session {
                     self.switch_provider(&target)?;
                     return Ok(self.models_menu());
                 }
-                // 2. Cek kecocokan di daftar model tersimpan provider aktif (exact atau substring).
+                // 2. Cocokkan di daftar model tersimpan provider aktif (exact atau substring unik).
+                // Tidak pernah diam-diam membuat/berpindah ke model fiktif bila target tidak ada!
                 let list = self.pcfg.effective_models();
-                let needle = target.to_ascii_lowercase();
-                let exact = list.iter().position(|m| m.eq_ignore_ascii_case(&target));
-                let matches: Vec<(usize, &String)> = if let Some(i) = exact {
-                    vec![(i + 1, &list[i])]
-                } else {
-                    list.iter()
-                        .enumerate()
-                        .filter(|(_, m)| m.to_ascii_lowercase().contains(&needle))
-                        .map(|(i, m)| (i + 1, m))
-                        .collect()
-                };
-                if matches.len() == 1 {
-                    let (idx, chosen) = (matches[0].0, matches[0].1.clone());
-                    if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
-                        p.models = list;
-                        p.model = chosen;
+                match lookup_saved_model(&list, &target) {
+                    SavedModelLookup::Exact(i) | SavedModelLookup::UniqueSubstring(i) => {
+                        let idx = i + 1;
+                        let chosen = list[i].clone();
+                        if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
+                            p.models = list;
+                            p.model = chosen;
+                        }
+                        let saved_path = config::save(&self.cfg)?;
+                        let pname = self.provider_name.clone();
+                        self.switch_provider(&pname)?;
+                        let ctx_s = format_context_tokens_exact(self.ctx.context_limit_tokens);
+                        Ok(format!(
+                            "# Model Dipilih (#{idx})\n\
+                             * model | {} | aktif di {} ({})\n\
+                             > konteks | {ctx_s} | tersimpan ({})",
+                            self.pcfg.model,
+                            self.provider_name,
+                            self.pcfg.kind,
+                            saved_path.display()
+                        ))
                     }
-                    let saved_path = config::save(&self.cfg)?;
-                    let pname = self.provider_name.clone();
-                    self.switch_provider(&pname)?;
-                    let ctx_s = format_context_tokens_exact(self.ctx.context_limit_tokens);
-                    return Ok(format!(
-                        "# Model Dipilih (#{idx})\n\
-                         * model | {} | aktif di {} ({})\n\
-                         > konteks | {ctx_s} | tersimpan ({})",
-                        self.pcfg.model,
-                        self.provider_name,
-                        self.pcfg.kind,
-                        saved_path.display()
-                    ));
-                }
-                if matches.len() > 1 {
-                    let mut out = format!(
-                        "# Ditemukan {} Model Cocok \"{target}\"\n",
-                        matches.len()
-                    );
-                    for (idx, m) in matches.iter().take(25) {
-                        let active = **m == self.pcfg.model;
-                        let mark = if active { "*" } else { ">" };
-                        let m_ctx = format_context_compact(self.model_context_for(m));
-                        let note = if active {
-                            format!("✓ aktif · ctx {m_ctx}")
-                        } else {
-                            format!("ctx {m_ctx}")
-                        };
-                        out.push_str(&format!("{mark} #{idx} | {m} | {note}\n"));
+                    SavedModelLookup::Ambiguous(idxs) => {
+                        let mut out = format!(
+                            "# Ditemukan {} Model Cocok \"{target}\"\n",
+                            idxs.len()
+                        );
+                        for i in idxs.iter().take(25) {
+                            let m = &list[*i];
+                            let idx = i + 1;
+                            let active = *m == self.pcfg.model;
+                            let mark = if active { "*" } else { ">" };
+                            let m_ctx = format_context_compact(self.model_context_for(m));
+                            let note = if active {
+                                format!("✓ aktif · ctx {m_ctx}")
+                            } else {
+                                format!("ctx {m_ctx}")
+                            };
+                            out.push_str(&format!("{mark} #{idx} | {m} | {note}\n"));
+                        }
+                        out.push_str("---\n");
+                        out.push_str("! Pilih cepat dengan nomor: /model <nomor>   (mis. /model 2)");
+                        Ok(out)
                     }
-                    out.push_str("---\n");
-                    out.push_str("! Pilih cepat dengan nomor: /model <nomor>   (mis. /model 2)");
-                    return Ok(out);
+                    SavedModelLookup::NotFound => {
+                        anyhow::bail!(
+                            "model atau provider '{target}' belum ada di daftar tersimpan provider '{}'.\n\
+                             Ketik `/model` untuk memilih lewat tombol, `/models {target}` untuk cari di katalog API, \
+                             atau `/model add {target}` bila memang ingin menambahkannya secara manual.",
+                            self.provider_name
+                        );
+                    }
                 }
-                // 3. Tidak cocok di daftar -> pasang sebagai model manual baru & simpan!
-                if let Some(p) = self.cfg.providers.get_mut(&self.provider_name) {
-                    p.models = list;
-                    p.push_model_unique(&target);
-                    p.model = target.clone();
-                }
-                let saved_path = config::save(&self.cfg)?;
-                let pname = self.provider_name.clone();
-                self.switch_provider(&pname)?;
-                let pos = self
-                    .pcfg
-                    .effective_models()
-                    .iter()
-                    .position(|m| m == &self.pcfg.model)
-                    .map(|i| i + 1)
-                    .unwrap_or(1);
-                let ctx_s = format_context_tokens_exact(self.ctx.context_limit_tokens);
-                Ok(format!(
-                    "# Model Manual Dipasang (#{pos})\n\
-                     * model | {} | aktif di {} ({})\n\
-                     > konteks | {ctx_s} | tersimpan ({})",
-                    self.pcfg.model,
-                    self.provider_name,
-                    self.pcfg.kind,
-                    saved_path.display()
-                ))
             }
         }
     }
