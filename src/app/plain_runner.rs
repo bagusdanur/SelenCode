@@ -136,6 +136,9 @@ pub(crate) async fn interactive_plain(
     if plan_next {
         println!("Mode plan aktif untuk giliran pertama (--plan).");
     }
+    // Penjaga anti-tembak ganda (Masalah 1 v0.5.25): lacak task review latar terakhir agar penutupan
+    // REPL (`/exit` / EOF / `/new`) menunggu task yang sudah berjalan alih-alih memicu review ke-2.
+    let mut pending_bg_review: Option<tokio::task::JoinHandle<()>> = None;
     let stdin = std::io::stdin();
     loop {
         print!("\n> ");
@@ -312,16 +315,23 @@ pub(crate) async fn interactive_plain(
                 println!("Perintah /details hanya berlaku pada mode TUI.");
             }
             SlashCommand::New => {
+                if let Some(h) = pending_bg_review.take() {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), h).await;
+                }
                 if let Some(job) = s.prepare_bg_review_job(true) {
+                    let store_bg = s.store.clone();
                     tokio::spawn(async move {
                         if let Ok(Ok(Some(outcome))) = tokio::time::timeout(
                             std::time::Duration::from_secs(20),
-                            job.run(true),
+                            job.run(false),
                         )
                         .await
                         {
                             if let Some(msg) = outcome.report_message {
                                 eprintln!("\n{msg}");
+                                if let Some(rid) = outcome.run_id {
+                                    let _ = store_bg.mark_review_run_delivered(rid);
+                                }
                             }
                         }
                     });
@@ -447,7 +457,7 @@ pub(crate) async fn interactive_plain(
                         s.turns_since_review += 1;
                         if let Some(job) = s.prepare_bg_review_job(false) {
                             let store_bg = s.store.clone();
-                            tokio::spawn(async move {
+                            pending_bg_review = Some(tokio::spawn(async move {
                                 if let Ok(Ok(Some(outcome))) = tokio::time::timeout(
                                     std::time::Duration::from_secs(25),
                                     job.run(false),
@@ -461,7 +471,7 @@ pub(crate) async fn interactive_plain(
                                         }
                                     }
                                 }
-                            });
+                            }));
                         }
                     }
                     Err(e) => eprintln!("[error] {e}"),
@@ -470,16 +480,23 @@ pub(crate) async fn interactive_plain(
         }
     }
     // Akhir sesi REPL polos (`/exit` atau EOF): jalankan 1 putaran polling watch bila ada pantauan aktif,
-    // lalu jalankan background review bila substantif.
+    // tunggu task review latar yang sudah berjalan (anti-tembak ganda), lalu jalankan 1x review penutup
+    // hanya bila snapshot sesi belum tercakup.
     for rep in s.poll_cli_watches_on_close(true).await {
         println!("{rep}");
     }
+    if let Some(h) = pending_bg_review.take() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(25), h).await;
+    }
     if let Some(job) = s.prepare_bg_review_job(true) {
         if let Ok(Ok(Some(outcome))) =
-            tokio::time::timeout(std::time::Duration::from_secs(15), job.run(true)).await
+            tokio::time::timeout(std::time::Duration::from_secs(20), job.run(false)).await
         {
             if let Some(msg) = outcome.report_message {
                 println!("\n{msg}");
+                if let Some(rid) = outcome.run_id {
+                    let _ = s.store.mark_review_run_delivered(rid);
+                }
             }
         }
     }

@@ -803,10 +803,168 @@ pub fn is_setup_or_scaffold_shell_cmd(cmd: &str) -> bool {
     false
 }
 
+/// Apakah perintah `curl` / `wget` menargetkan server lokal (`127.0.0.1`, `localhost`, `[::1]`,
+/// `0.0.0.0`) untuk memverifikasi preview/API proyek lokal (Masalah 7 v0.5.25)?
+/// Fetch ke URL eksternal (publik) selalu dikembalikan `false`.
+pub fn is_local_http_verification_cmd(part: &str) -> bool {
+    let trimmed = part.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Izinkan pipeline seperti `curl -s http://127.0.0.1:4173 | grep -i title` — ambil tahap pertama.
+    let stage = trimmed.split('|').next().unwrap_or(trimmed).trim();
+    let toks = normalize_verify_cmd_tokens(stage);
+    let clean: Vec<String> = toks
+        .into_iter()
+        .skip_while(|t| t.contains('=') && !t.starts_with('-'))
+        .collect();
+    if clean.len() < 2 {
+        return false;
+    }
+    if !matches!(clean[0].as_str(), "curl" | "wget") {
+        return false;
+    }
+    let mut saw_local = false;
+    let mut saw_external = false;
+    let mut skip_flag_arg = false;
+    for tok in clean.iter().skip(1) {
+        if skip_flag_arg {
+            skip_flag_arg = false;
+            continue;
+        }
+        if matches!(
+            tok.as_str(),
+            "-x" | "--request"
+                | "-h"
+                | "--header"
+                | "-d"
+                | "--data"
+                | "--data-raw"
+                | "--data-binary"
+                | "-o"
+                | "--output"
+                | "-w"
+                | "--write-out"
+                | "-u"
+                | "--user"
+                | "-a"
+                | "--user-agent"
+                | "-m"
+                | "--max-time"
+                | "--connect-timeout"
+                | "-b"
+                | "--cookie"
+                | "-c"
+                | "--cookie-jar"
+                | "-e"
+                | "--referer"
+                | "-t"
+                | "--tries"
+                | "--timeout"
+        ) {
+            skip_flag_arg = true;
+            continue;
+        }
+        if tok.starts_with('-') {
+            continue;
+        }
+        let candidate = tok.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')' | ','));
+        if candidate.is_empty() {
+            continue;
+        }
+        let is_url_like = candidate.starts_with("http://")
+            || candidate.starts_with("https://")
+            || candidate.starts_with("localhost")
+            || candidate.starts_with("127.0.0.1")
+            || candidate.starts_with("[::1]")
+            || candidate.starts_with("0.0.0.0")
+            || (candidate.contains('.') && !candidate.starts_with('/'));
+        if !is_url_like {
+            continue;
+        }
+        let host_part = candidate
+            .strip_prefix("http://")
+            .or_else(|| candidate.strip_prefix("https://"))
+            .unwrap_or(candidate);
+        let host_only = host_part
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("")
+            .rsplit('@')
+            .next()
+            .unwrap_or("");
+        let is_local_host = host_only == "localhost"
+            || host_only.starts_with("localhost:")
+            || host_only == "127.0.0.1"
+            || host_only.starts_with("127.0.0.1:")
+            || host_only == "[::1]"
+            || host_only.starts_with("[::1]:")
+            || host_only == "::1"
+            || host_only == "0.0.0.0"
+            || host_only.starts_with("0.0.0.0:");
+        if is_local_host {
+            saw_local = true;
+        } else {
+            saw_external = true;
+        }
+    }
+    saw_local && !saw_external
+}
+
+/// Cek apakah keluaran `curl`/`wget` menunjukkan kode HTTP gagal (`4xx`/`5xx`) atau error koneksi
+/// meskipun proses keluar dengan exit code 0 (mis. `curl -i` atau `curl -w "%{http_code}"`).
+fn local_http_output_indicates_error(output: &str) -> bool {
+    let mut non_exit_lines: Vec<&str> = Vec::new();
+    for line in output.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("exit code:") {
+            continue;
+        }
+        non_exit_lines.push(t);
+        let up = t.to_ascii_uppercase();
+        if up.starts_with("HTTP/1.0 ")
+            || up.starts_with("HTTP/1.1 ")
+            || up.starts_with("HTTP/2 ")
+            || up.starts_with("HTTP/3 ")
+        {
+            if let Some(code_str) = up.split_whitespace().nth(1) {
+                if let Ok(code) = code_str.parse::<u16>() {
+                    if code >= 400 {
+                        return true;
+                    }
+                }
+            }
+        }
+        let low = t.to_ascii_lowercase();
+        if low.starts_with("curl: (")
+            || low.contains("connection refused")
+            || low.contains("failed to connect")
+            || low.contains("error 404")
+            || low.contains("error 500")
+            || low.contains("error 502")
+            || low.contains("error 503")
+        {
+            return true;
+        }
+    }
+    // Format `curl -s -o /dev/null -w "%{http_code}" ...` -> satu baris kode status 3 digit.
+    if non_exit_lines.len() == 1 && non_exit_lines[0].len() == 3 {
+        if let Ok(code) = non_exit_lines[0].parse::<u16>() {
+            if code >= 400 || code < 200 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn is_single_verification_shell_cmd(part: &str) -> bool {
     let trimmed = part.trim();
     if trimmed.is_empty() || is_setup_or_scaffold_shell_cmd(trimmed) {
         return false;
+    }
+    if is_local_http_verification_cmd(trimmed) {
+        return true;
     }
     let toks = normalize_verify_cmd_tokens(trimmed);
     let clean_toks: Vec<String> = toks
@@ -1007,6 +1165,12 @@ fn verify_runner_family(tokens: &[String]) -> Option<&'static str> {
     }
     if tokens.len() >= 2 && tokens[0] == "node" && tokens[1] == "--test" {
         return Some("node_test");
+    }
+    if tokens.len() >= 2 && matches!(tokens[0].as_str(), "curl" | "wget") {
+        let joined = tokens.join(" ");
+        if is_local_http_verification_cmd(&joined) {
+            return Some("local_http");
+        }
     }
     None
 }
@@ -1437,7 +1601,13 @@ impl VerificationTracker {
                 };
                 if should_update {
                     let ec = parse_exit_code(output);
-                    let ok = !is_error && (ec == Some(0) || output.starts_with("exit code: 0"));
+                    let is_local_http = split_compound_shell_commands(&cmd)
+                        .into_iter()
+                        .any(is_local_http_verification_cmd);
+                    let http_ok = !is_local_http || !local_http_output_indicates_error(output);
+                    let ok = !is_error
+                        && (ec == Some(0) || output.starts_with("exit code: 0"))
+                        && http_ok;
                     if self.last_verify_cmd.is_none()
                         || established_is_stale_non_verify
                         || !ok

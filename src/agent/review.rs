@@ -12,7 +12,7 @@
 
 use crate::agent::context::{analyze_token_breakdown, prune_old_tool_results};
 use crate::config::Config;
-use crate::providers::{Block, Message, Provider, Role, StreamEvent, Usage};
+use crate::providers::{Block, Message, Provider, Role, StreamEvent, ToolSpec, Usage};
 use crate::security::{is_secret_file, redact_secrets};
 use crate::skills::{
     format_skills_index, improvement_skill_file_path, list_skills, parse_skill_frontmatter,
@@ -39,42 +39,73 @@ const MAX_DIGEST_BYTES: usize = 6 * 1024;
 const MAX_REF_FILE_BYTES: usize = 4 * 1024;
 
 /// Awalan system prompt BEKU (byte-identik lintas seluruh review & sesi) agar panggilan Selena
-/// improvement mengenai prefix prompt cache provider. Seluruh digest sesi ditaruh di ekor (pesan User).
+/// improvement mengenai prefix prompt cache provider (di atas ambang 2.048 token implicit caching
+/// Gemini 3 Flash / 2.5 Pro serta 1.024 token OpenAI/Anthropic). Seluruh digest sesi ditaruh di
+/// ekor (pesan User) agar awalan tidak pernah berubah antar-review.
 pub const FROZEN_REVIEW_SYSTEM_PROMPT: &str = "\
 Kamu adalah modul Selena Improvement milik SelenCode (tinjauan belajar pasca-tugas di latar).\n\
-Tugasmu: tinjau transkrip sesi yang telah selesai, indeks skill & isi skill relevan, serta catatan memory saat ini.\n\
-Keluarkan HANYA satu objek JSON valid tanpa teks pembuka/penutup:\n\
+Tugasmu: tinjau transkrip sesi yang telah selesai, indeks skill & isi skill relevan yang baru dibaca segar, serta catatan memory saat ini, lalu putuskan secara disiplin apakah ada pelajaran prosedural lintas-sesi atau fakta penting yang layak disimpan.\n\
+Keluarkan HANYA satu objek JSON valid tanpa teks pembuka, tanpa markdown fence, dan tanpa teks penutup:\n\
 {\"actions\": [...]}\n\
 \n\
-SINYAL YANG MEWAJIBKAN TINDAKAN:\n\
-1. Koreksi pengguna atas gaya, format, path, atau alur kerja (sinyal kelas-satu).\n\
-2. Teknik, perintah, atau workaround non-trivial yang terbukti berhasil sesudah percobaan/kegagalan yang dipulihkan di sesi ini.\n\
-3. Skill yang dimuat sesi ini ternyata salah, kurang, atau usang dibandingkan kenyataan sesi.\n\
+1. SINYAL YANG MEWAJIBKAN TINDAKAN\n\
+- Koreksi eksplisit pengguna atas gaya, format, path, perintah, flag, atau alur kerja (SINYAL KELAS-SATU — wajib diprioritaskan dan tidak boleh diabaikan).\n\
+- Teknik, perintah, urutan kerja, atau workaround non-trivial yang terbukti berhasil sesudah percobaan/kegagalan yang dipulihkan di dalam sesi ini.\n\
+- Skill yang dimuat pada sesi ini ternyata memuat langkah yang salah, bertentangan, kurang, atau usang dibandingkan kenyataan eksekusi sesi.\n\
+- Kelas teknik/prosedur baru yang kuat, berulang, dan bernilai lintas-sesi walau tidak ada skill lama yang relevan secara topik.\n\
 \n\
-URUTAN PREFERENSI TINDAKAN:\n\
-(1) Tambal skill yang sedang dimuat pada sesi ini (`patch_skill`).\n\
-(2) Tambal skill payung yang sudah ada (`patch_skill`).\n\
-(3) Tambah berkas pendukung pada skill yang ada (`add_skill_reference`: `references/`, `templates/`, `scripts/`).\n\
-(4) Buat skill payung kelas-baru (`create_skill`) untuk prosedur lintas-sesi yang benar-benar dapat dipakai ulang.\n\
-(5) Simpan fakta preferensi/prosedur sempit ke memory (`add_memory`) bila memang preferensi/fakta tetap.\n\
+2. URUTAN PREFERENSI TINDAKAN (PERHATIKAN RELEVANSI TOPIK)\n\
+(1) Tambal skill yang sedang dimuat pada sesi ini (`patch_skill`) — HANYA JIKA skill termuat tersebut benar-benar RELEVAN secara topik dengan pelajaran ini. DILARANG memaksakan pelajaran topik berbeda ke skill yang kebetulan terbuka.\n\
+(2) Tambal skill payung yang sudah ada di katalog (`patch_skill`) — HANYA JIKA skill tersebut relevan secara topik dengan pelajaran ini.\n\
+(3) Tambah berkas pendukung pada skill yang relevan (`add_skill_reference`: `references/`, `templates/`, `scripts/`) untuk rincian rujukan yang terlalu panjang untuk SKILL.md utama.\n\
+(4) Buat skill payung kelas-baru (`create_skill`) — ini adalah PILIHAN WAJIB DAN TEPAT apabila pelajaran membentuk kelas teknik/prosedur BARU yang dapat dipakai ulang lintas sesi dan TIDAK ADA skill yang relevan secara topik di katalog (meskipun di katalog sudah ada skill lain seperti `systematic-debugging` atau skill topik berbeda).\n\
+(5) Simpan fakta preferensi atau konvensi sempit 1 baris ke memory (`add_memory`) hanya untuk preferensi/fakta tetap yang bukan prosedur multi-langkah.\n\
 \n\
-BENTUK PELAJARAN (WAJIB):\n\
-- Tulis prosedur + jebakan sebagai aturan imperatif yang dapat digeneralisasi + satu klausa mekanisme sebabnya (BUKAN narasi kejadian sesi).\n\
-- DILARANG mencantumkan nomor PR, ID tiket, tanggal insiden, atau kutipan mentah percakapan sebagai isi aturan.\n\
+3. BENTUK LAPISAN PELAJARAN & ATURAN SUNTINGAN DI TEMPAT (WAJIB)\n\
+- Tulis prosedur + jebakan sebagai aturan imperatif yang dapat digeneralisasi + satu klausa mekanisme sebabnya (BUKAN narasi kronologis kejadian sesi).\n\
+- DILARANG mencantumkan nomor PR, ID tiket, tanggal insiden, nama sesi, atau kutipan mentah percakapan sebagai isi aturan.\n\
 - Pelajaran yang sama muncul dua kali = perkuat/perjelas satu aturan yang sudah ada, JANGAN gandakan.\n\
-- Perbaiki kalimat keliru langsung di tempatnya (`old_snippet` -> `new_snippet`), JANGAN tempel 'UPDATE:' di bawahnya.\n\
+- ATURAN KERAS KOREKSI (ANTI-KONTRADIKSI): apabila sebuah skill sudah memiliki baris/aturan yang keliru, WAJIB ganti kalimat keliru itu LANGSUNG DI TEMPATNYA menggunakan `old_snippet` (salin persis karakter demi karakter dari blok SKILL.md yang baru dibaca) dan `new_snippet` (aturan terkoreksi yang bersih).\n\
+- DILARANG KERAS membiarkan aturan lama yang keliru tetap tertulis di berkas lalu menempelkan kalimat koreksi, 'UPDATE:', 'Catatan:', atau bantahan di bagian bawah berkas — berkas skill tidak boleh pernah berkontradiksi dengan dirinya sendiri.\n\
+- Untuk koreksi yang mengganti beberapa nomor langkah sekaligus (mis. langkah 2 dan 3), masukkan seluruh blok langkah keliru ke dalam `old_snippet` dan tulis versi bersih yang sudah diperbaiki di `new_snippet`.\n\
+- Gunakan `append_section` HANYA untuk menambahkan topik/seksi baru yang benar-benar belum ada sebelumnya dan TIDAK bertentangan dengan satu pun baris yang sudah tertulis di SKILL.md.\n\
 \n\
-DAFTAR JANGAN-TANGKAP (DILARANG DISIMPAN):\n\
-- Kegagalan tergantung lingkungan (binary belum terpasang, kredensial belum diatur, paket hilang, path mismatch pasca-migrasi).\n\
-- Klaim negatif tentang tool ('tool X rusak/tidak jalan') yang dapat mengeras menjadi penolakan permanen.\n\
-- Error sesaat yang sudah pulih (pelajarannya adalah pola ulang/retry-nya, bukan kegagalan sesaatnya).\n\
-- Narasi tugas sekali jalan yang tidak membentuk kelas prosedur berulang.\n\
+4. DAFTAR JANGAN-TANGKAP (DILARANG DISIMPAN)\n\
+- Kegagalan tergantung lingkungan sementara (binary belum terpasang, kredensial belum diatur, paket hilang di mesin uji, path mismatch pasca-migrasi mesin).\n\
+- Klaim negatif mutlak tentang tool ('tool X rusak/tidak jalan') yang dapat mengeras menjadi penolakan permanen pada sesi-sesi berikutnya.\n\
+- Error sesaat yang sudah pulih tanpa prosedur khusus (bila ada pola retry/flag khusus yang benar-benar diperlukan, tangkap pola pemulihannya, BUKAN keluhan error sesaatnya).\n\
+- Narasi tugas sekali jalan yang spesifik satu berkas/satu kasus dan tidak membentuk kelas prosedur berulang.\n\
 - Kegagalan yang TIDAK terselesaikan (jangan pernah menulis percobaan gagal sebagai workflow andal).\n\
-- Rahasia, token, password, API key, atau data sensitif apa pun.\n\
+- Rahasia, token, password, API key, cookie, kredensial, atau data pribadi sensitif apa pun.\n\
+- Sesi tanya-jawab biasa, edit trivial tanpa pola berulang, atau pekerjaan bersih tanpa jebakan baru.\n\
 \n\
-JENIS AKSI JSON YANG DIDUKUNG:\n\
-1. {\"action\":\"patch_skill\",\"skill\":\"<nama-kebab>\",\"old_snippet\":\"<potongan lama persis dari SKILL.md yang baru dibaca>\",\"new_snippet\":\"<potongan baru>\",\"append_section\":\"<opsional jika menambah seksi baru>\",\"reason\":\"<alasan <=60 char>\"}\n\
-2. {\"action\":\"create_skill\",\"skill\":\"<nama-kebab>\",\"description\":\"<ringkasan 1 baris <=80 char>\",\"body\":\"<markdown prosedur konkret>\",\"tags\":[\"tag1\"],\"reason\":\"<alasan <=60 char>\"}\n\
+5. CONTOH TERAPAN RESMI (IKUTI POLA INI PERSIS)\n\
+\n\
+Contoh A — Koreksi aturan keliru pada skill termuat (BENAR vs SALAH):\n\
+Misal SKILL.md `deploy-worker` memuat:\n\
+  1. Jalankan tes lokal dulu.\n\
+  2. Kirim berkas ke `/tmp/staging` memakai `rsync -a`.\n\
+  3. Restart layanan dengan `service worker restart`.\n\
+Lalu pengguna mengoreksi: \"Salah! Jangan pernah ke `/tmp/staging`, folder kanonik adalah `/var/lib/worker/releases` dan restart wajib pakai `systemctl reload worker` agar koneksi aktif tidak putus.\"\n\
+SALAH (DITOLAK — menimbulkan kontradiksi karena nomor 2-3 keliru masih utuh):\n\
+{\"actions\":[{\"action\":\"patch_skill\",\"skill\":\"deploy-worker\",\"append_section\":\"Catatan: gunakan /var/lib/worker/releases dan systemctl reload worker.\",\"reason\":\"koreksi deploy\"}]}\n\
+BENAR (WAJIB — salin persis teks keliru ke `old_snippet` dan ganti di tempatnya):\n\
+{\"actions\":[{\"action\":\"patch_skill\",\"skill\":\"deploy-worker\",\"old_snippet\":\"2. Kirim berkas ke `/tmp/staging` memakai `rsync -a`.\\n3. Restart layanan dengan `service worker restart`.\",\"new_snippet\":\"2. Kirim berkas ke folder kanonik `/var/lib/worker/releases` memakai `rsync -a` karena `/tmp/staging` dibersihkan saat reboot.\\n3. Muat ulang layanan dengan `systemctl reload worker` agar koneksi aktif tidak terputus.\",\"reason\":\"ganti path staging & perintah reload di tempatnya\"}]}\n\
+\n\
+Contoh B — Teknik kelas-baru tanpa skill relevan di katalog (`create_skill`):\n\
+Misal di katalog hanya ada `systematic-debugging` dan `test-driven-development` (tidak ada skill terkait SQLite WAL/migrasi). Sesi ini mengungkap prosedur non-trivial migrasi SQLite produksi dengan `PRAGMA busy_timeout=5000`, `.backup`, dan `PRAGMA integrity_check` sesudah pulih dari `database is locked`.\n\
+Jangan paksakan ke `systematic-debugging`; buat skill baru:\n\
+{\"actions\":[{\"action\":\"create_skill\",\"skill\":\"sqlite-safe-migration\",\"description\":\"Migrasi skema SQLite aman tanpa lock dengan backup dan integrity check\",\"body\":\"# SQLite Safe Migration\\n\\n1. Setel `PRAGMA busy_timeout = 5000;` sebelum migrasi karena koneksi bersamaan langsung gagal bila timeout 0.\\n2. Buat salinan konsisten memakai `.backup` sebelum DDL agar rollback instan tersedia.\\n3. Jalankan `PRAGMA integrity_check;` sesudah migrasi untuk memastikan indeks DB utuh.\",\"tags\":[\"sqlite\",\"migration\"],\"reason\":\"prosedur migrasi SQLite aman lintas sesi\"}]}\n\
+\n\
+Contoh C — Tambah berkas referensi pada skill relevan (`add_skill_reference`):\n\
+{\"actions\":[{\"action\":\"add_skill_reference\",\"skill\":\"api-gateway\",\"ref_path\":\"references/error-codes.md\",\"content\":\"# Kode Error Gateway\\n\\n- `429`: baca header `Retry-After` lalu backoff eksponensial.\\n- `502`: ulangi maks 2x hanya untuk request idempoten.\",\"reason\":\"tabel mitigasi error gateway\"}]}\n\
+\n\
+Contoh D — Tanpa pelajaran tahan lama / masuk daftar jangan-tangkap:\n\
+{\"actions\":[]}\n\
+\n\
+6. SKEMA AKSI JSON YANG DIDUKUNG\n\
+1. {\"action\":\"patch_skill\",\"skill\":\"<nama-kebab>\",\"old_snippet\":\"<salinan persis teks lama dari SKILL.md>\",\"new_snippet\":\"<teks pengganti bersih>\",\"append_section\":\"<opsional HANYA untuk seksi baru non-koreksi>\",\"reason\":\"<alasan <=60 char>\"}\n\
+2. {\"action\":\"create_skill\",\"skill\":\"<nama-kebab>\",\"description\":\"<ringkasan 1 baris <=80 char>\",\"body\":\"<markdown prosedur imperatif konkret>\",\"tags\":[\"tag1\",\"tag2\"],\"reason\":\"<alasan <=60 char>\"}\n\
 3. {\"action\":\"add_skill_reference\",\"skill\":\"<nama-kebab>\",\"ref_path\":\"references/<topik>.md\",\"content\":\"<markdown singkat>\",\"reason\":\"<alasan <=60 char>\"}\n\
 4. {\"action\":\"add_memory\",\"category\":\"arch|commands|conventions|decisions|issues|tasks|general\",\"scope\":\"project|global\",\"content\":\"<fakta sempit & konkret tanpa rahasia>\",\"reason\":\"<alasan <=60 char>\"}\n\
 5. {\"action\":\"delete_memory\",\"memory_id\":123,\"reason\":\"<alasan>\"}\n\
@@ -244,6 +275,10 @@ pub enum ReviewSkipReason {
     CooldownActive,
     TrivialSession,
     BudgetExceeded,
+    /// Snapshot `(session_id, messages.len())` sudah pernah ditinjau tuntas (anti-tembak ganda, Masalah 1 v0.5.25).
+    AlreadyReviewed,
+    /// Bahkan digest minimal sesudah pemangkasan tetap melampaui pagu total request <= 5.000 token (Masalah 3 v0.5.25).
+    DigestOverBudget,
 }
 
 impl ReviewSkipReason {
@@ -254,6 +289,8 @@ impl ReviewSkipReason {
             Self::CooldownActive => "cooldown_active",
             Self::TrivialSession => "trivial_session",
             Self::BudgetExceeded => "budget_exceeded",
+            Self::AlreadyReviewed => "already_reviewed",
+            Self::DigestOverBudget => "digest_over_budget",
         }
     }
 }
@@ -485,8 +522,46 @@ pub fn resolve_effective_review_model(cfg: &Config) -> Option<String> {
         .map(|m| m.to_string())
 }
 
+/// Deteksi sinyal belajar kelas-satu (koreksi eksplisit pengguna atau kegagalan terpulihkan)
+/// pada potongan pesan mulai dari `start_idx` (Masalah 2 v0.5.25).
+pub fn detect_first_class_signal_in_slice(
+    messages: &[Message],
+    start_idx: usize,
+) -> Option<&'static str> {
+    let idx = start_idx.min(messages.len());
+    let slice = &messages[idx..];
+    if slice.is_empty() {
+        return None;
+    }
+    if has_user_correction(slice) {
+        return Some("user_correction");
+    }
+    if has_recovered_failure(slice) {
+        return Some("recovered_failure");
+    }
+    None
+}
+
+/// Catat sinyal belajar kelas-satu secara persisten pada `store` apabila muncul sejak review terakhir
+/// yang selesai, sehingga cooldown hanya menunda eksekusi dan tidak pernah membuang sinyal (Masalah 2 v0.5.25).
+pub fn record_pending_signal_if_present(
+    store: &Store,
+    session_id: &str,
+    messages: &[Message],
+) {
+    let since_idx = store
+        .last_reviewed_msg_count(session_id)
+        .unwrap_or(0)
+        .min(messages.len());
+    if let Some(kind) = detect_first_class_signal_in_slice(messages, since_idx) {
+        let _ = store.record_pending_review_signal(session_id, kind, since_idx);
+    }
+}
+
 /// Cek semua prasyarat pemicu Selena improvement sebelum memanggil provider.
 /// Setiap alasan lewati dicatat ke `store` (`last_review_skip`) agar terdiagnosis di `/doctor` & `/review status`.
+/// Masalah 1 & 2 (v0.5.25): menolak snapshot yang sudah tercakup (`AlreadyReviewed`) dan selalu
+/// mempertahankan sinyal kelas-satu tertunda melewati masa cooldown.
 pub fn check_review_eligibility(
     cfg: &Config,
     store: &Store,
@@ -507,7 +582,23 @@ pub fn check_review_eligibility(
         );
         return Err(ReviewSkipReason::NoAuxModelConfigured);
     };
-    if !is_session_substantive(messages, cfg.review.min_tool_calls) {
+    let last_covered = store.last_reviewed_msg_count(session_id).unwrap_or(0);
+    if !messages.is_empty() && last_covered >= messages.len() {
+        let _ = store.set_last_review_skip(
+            ReviewSkipReason::AlreadyReviewed.as_str(),
+            &format!(
+                "snapshot sesi ({} pesan) sudah tercakup review sebelumnya",
+                messages.len()
+            ),
+        );
+        return Err(ReviewSkipReason::AlreadyReviewed);
+    }
+    // Selalu rekam sinyal kelas-satu SEBELUM cek cooldown agar tidak pernah hilang.
+    record_pending_signal_if_present(store, session_id, messages);
+    let pending_sig = store.get_pending_review_signal(session_id).ok().flatten();
+    let substantive =
+        pending_sig.is_some() || is_session_substantive(messages, cfg.review.min_tool_calls);
+    if !substantive {
         let _ = store.set_last_review_skip(
             ReviewSkipReason::TrivialSession.as_str(),
             "sesi trivial tanpa sinyal belajar (tanpa koreksi/kegagalan pulih/tool substantif)",
@@ -518,10 +609,17 @@ pub fn check_review_eligibility(
         .is_review_in_cooldown(session_id, cfg.review.cooldown_mins)
         .unwrap_or(false)
     {
-        let _ = store.set_last_review_skip(
-            ReviewSkipReason::CooldownActive.as_str(),
-            &format!("cooldown {} menit masih aktif untuk sesi ini", cfg.review.cooldown_mins),
-        );
+        let detail = match &pending_sig {
+            Some(sig) => format!(
+                "cooldown {} menit masih aktif — sinyal tertunda ({}) disimpan untuk ditindaklanjuti pasca-cooldown",
+                cfg.review.cooldown_mins, sig.signal_kind
+            ),
+            None => format!(
+                "cooldown {} menit masih aktif untuk sesi ini",
+                cfg.review.cooldown_mins
+            ),
+        };
+        let _ = store.set_last_review_skip(ReviewSkipReason::CooldownActive.as_str(), &detail);
         return Err(ReviewSkipReason::CooldownActive);
     }
     Ok(model)
@@ -562,9 +660,55 @@ fn strip_frontmatter(raw: &str) -> &str {
     text
 }
 
+/// Hitung taksiran token konservatif atas TOTAL request review yang benar-benar dikirim ke provider
+/// (awalan system prompt beku + seluruh pesan user/digest + skema tool bila ada + overhead framing JSON).
+/// Dikalibrasi agar tidak pernah meremehkan tokenizer Gemini/OpenAI/Anthropic pada teks campuran
+/// Bahasa Indonesia + Markdown + JSON (Masalah 3 v0.5.25).
+pub fn estimate_review_request_tokens(messages: &[Message], tools: &[ToolSpec]) -> u64 {
+    fn estimate_str_tokens(s: &str) -> u64 {
+        let chars = s.chars().count() as u64;
+        let bytes = s.len() as u64;
+        let by_chars = chars.saturating_mul(10).div_ceil(28);
+        let by_bytes = bytes.saturating_mul(10).div_ceil(30);
+        by_chars.max(by_bytes)
+    }
+
+    let mut total: u64 = 24; // envelope JSON request (`model`, `stream`, `messages`, dsb.)
+    for m in messages {
+        total = total.saturating_add(16); // framing per pesan (`role`, `content`)
+        for b in &m.content {
+            match b {
+                Block::Text(t) => total = total.saturating_add(estimate_str_tokens(t)),
+                Block::Image { media_type, .. } => {
+                    total = total.saturating_add(estimate_str_tokens(media_type).saturating_add(80))
+                }
+                Block::ToolUse { name, args, .. } => {
+                    total = total
+                        .saturating_add(estimate_str_tokens(name))
+                        .saturating_add(estimate_str_tokens(&args.to_string()))
+                        .saturating_add(16);
+                }
+                Block::ToolResult { content, .. } => {
+                    total = total
+                        .saturating_add(estimate_str_tokens(content))
+                        .saturating_add(12);
+                }
+            }
+        }
+    }
+    for t in tools {
+        total = total
+            .saturating_add(estimate_str_tokens(&t.name))
+            .saturating_add(estimate_str_tokens(&t.description))
+            .saturating_add(estimate_str_tokens(&t.parameters.to_string()))
+            .saturating_add(24);
+    }
+    total
+}
+
 /// Rakit masukan review yang hemat token, teredaksi, & sadar-cache:
 /// - Awalan `Role::System` memakai `FROZEN_REVIEW_SYSTEM_PROMPT` (byte-identik lintas sesi agar hit cache).
-/// - Ekor `Role::User` dibatasi agar total panggilan selalu tunduk pada `min(max_tokens, 5.000)` token/panggilan.
+/// - Ekor `Role::User` dipangkas progresif sampai TOTAL request tunduk pada `min(max_tokens, 5.000)` token/panggilan.
 /// - Mengembalikan `(system_prompt, user_prompt)` (kompatibel API lama).
 pub fn build_pruned_review_prompt(
     cwd: &Path,
@@ -584,26 +728,98 @@ pub fn build_pruned_review_prompt_with_reads(
     messages: &[Message],
     max_tokens: u64,
 ) -> (String, String, HashSet<PathBuf>) {
-    let mut pruned = messages.to_vec();
+    build_pruned_review_prompt_with_reads_for_session(cwd, store, None, messages, max_tokens)
+}
+
+struct TranscriptItem {
+    line: String,
+    priority: bool,
+    is_tool_result: bool,
+}
+
+/// Rakit masukan review untuk `session_id` tertentu (Masalah 2 & 3 v0.5.25):
+/// - Mencakup SEMUA giliran sejak review terakhir yang selesai (termasuk koreksi yang tertunda cooldown).
+/// - Mempertahankan giliran koreksi pengguna & kegagalan-terpulihkan pada prioritas tertinggi saat pemangkasan.
+/// - Menjamin ukuran TOTAL request (system beku + ekor dinamis) diukur utuh dan dipangkas progresif
+///   sampai muat dalam pagu `min(max_tokens, MAX_REVIEW_CALL_INPUT_TOKENS)`.
+pub fn build_pruned_review_prompt_with_reads_for_session(
+    cwd: &Path,
+    store: &Store,
+    session_id: Option<&str>,
+    messages: &[Message],
+    max_tokens: u64,
+) -> (String, String, HashSet<PathBuf>) {
+    // Tentukan indeks awal transkrip sejak review terakhir yang selesai (atau sejak sinyal tertunda pertama).
+    let start_idx = if let Some(sid) = session_id {
+        let mut idx = store.last_reviewed_msg_count(sid).unwrap_or(0);
+        if let Ok(Some(sig)) = store.get_pending_review_signal(sid) {
+            idx = idx.min(sig.first_msg_idx);
+        }
+        if idx > 0 && idx < messages.len() {
+            idx
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let mut pruned = messages[start_idx..].to_vec();
     let _ = prune_old_tool_results(&mut pruned, 2);
 
-    // Pagu input per panggilan tunduk pada min(max_tokens - 400, MAX_REVIEW_CALL_INPUT_TOKENS - 300)
-    // sehingga total input panggilan review tidak pernah melewati 5.000 token/panggilan.
-    let call_input_cap = max_tokens
-        .saturating_sub(400)
-        .min(MAX_REVIEW_CALL_INPUT_TOKENS.saturating_sub(300))
-        .max(1_000) as usize;
-    let sys_est_tokens = FROZEN_REVIEW_SYSTEM_PROMPT.chars().count().div_ceil(3);
-    let user_token_budget = call_input_cap.saturating_sub(sys_est_tokens).max(600);
-    let total_char_budget = user_token_budget.saturating_mul(3).clamp(1_600, 10_500);
-    let transcript_budget = total_char_budget * 55 / 100;
-    let skills_budget = total_char_budget * 28 / 100;
-    let mem_budget = total_char_budget * 17 / 100;
+    // Kumpulkan indeks pesan prioritas (koreksi eksplisit pengguna & rangkaian kegagalan terpulihkan)
+    // agar tidak pernah terbuang lebih dulu saat pemangkasan anggaran token.
+    let mut priority_msg_idxs: HashSet<usize> = HashSet::new();
+    let mut saw_error_recently = false;
+    for (i, m) in pruned.iter().enumerate() {
+        if m.role == Role::User && has_user_correction(std::slice::from_ref(m)) {
+            priority_msg_idxs.insert(i);
+            if i > 0 {
+                priority_msg_idxs.insert(i - 1);
+            }
+            if i + 1 < pruned.len() {
+                priority_msg_idxs.insert(i + 1);
+            }
+        }
+        for b in &m.content {
+            if let Block::ToolResult { is_error, .. } = b {
+                if *is_error {
+                    saw_error_recently = true;
+                    priority_msg_idxs.insert(i);
+                    if i > 0 {
+                        priority_msg_idxs.insert(i - 1);
+                    }
+                } else if saw_error_recently {
+                    priority_msg_idxs.insert(i);
+                    if i > 0 {
+                        priority_msg_idxs.insert(i - 1);
+                    }
+                    if i + 1 < pruned.len() {
+                        priority_msg_idxs.insert(i + 1);
+                    }
+                    saw_error_recently = false;
+                }
+            }
+        }
+    }
 
-    let mut read_skill_paths: HashSet<PathBuf> = HashSet::new();
-    let mut transcript = String::new();
     let mut mentioned_skills: HashSet<String> = HashSet::new();
-    for m in &pruned {
+    // Pindai juga seluruh `messages` untuk skill yang pernah dibuka di giliran awal sesi (sebelum start_idx)
+    // agar skill termuat di giliran 1 tetap dibaca segar saat koreksi datang di giliran 2+!
+    for m in messages {
+        for b in &m.content {
+            if let Block::ToolUse { name, args, .. } = b {
+                if name == "skill_view" || name == "skill_edit" || name == "manage_skill" {
+                    if let Some(sname) = args.get("name").and_then(|v| v.as_str()) {
+                        mentioned_skills.insert(sname.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut items: Vec<TranscriptItem> = Vec::new();
+    for (i, m) in pruned.iter().enumerate() {
         if m.role == Role::System {
             continue;
         }
@@ -613,21 +829,23 @@ pub fn build_pruned_review_prompt_with_reads(
             Role::Tool => "TOOL",
             Role::System => continue,
         };
+        let is_prio = priority_msg_idxs.contains(&i);
         for b in &m.content {
-            let raw_line = match b {
+            let (raw_line, is_res) = match b {
                 Block::Text(t) => {
-                    let s: String = t.chars().take(480).collect();
-                    format!("[{role}] {s}\n")
+                    let cap = if is_prio { 420 } else { 300 };
+                    let s: String = t.chars().take(cap).collect();
+                    (format!("[{role}] {s}\n"), false)
                 }
-                Block::Image { media_type, .. } => format!("[{role}] [image:{media_type}]\n"),
+                Block::Image { media_type, .. } => (format!("[{role}] [image:{media_type}]\n"), false),
                 Block::ToolUse { name, args, .. } => {
                     if name == "skill_view" || name == "skill_edit" || name == "manage_skill" {
                         if let Some(sname) = args.get("name").and_then(|v| v.as_str()) {
                             mentioned_skills.insert(sname.to_ascii_lowercase());
                         }
                     }
-                    let a: String = args.to_string().chars().take(220).collect();
-                    format!("[CALL] {name} {a}\n")
+                    let a: String = args.to_string().chars().take(180).collect();
+                    (format!("[CALL] {name} {a}\n"), false)
                 }
                 Block::ToolResult {
                     content, is_error, ..
@@ -638,46 +856,45 @@ pub fn build_pruned_review_prompt_with_reads(
                         .collect::<Vec<_>>()
                         .join(" | ")
                         .chars()
-                        .take(200)
+                        .take(160)
                         .collect();
                     let tag = if *is_error { "ERR" } else { "OK" };
-                    format!("[RESULT {tag}] {first_two}\n")
+                    (format!("[RESULT {tag}] {first_two}\n"), true)
                 }
             };
-            let safe_line = redact_secrets(&raw_line);
-            if transcript.chars().count() + safe_line.chars().count() > transcript_budget {
-                break;
-            }
-            transcript.push_str(&safe_line);
+            items.push(TranscriptItem {
+                line: redact_secrets(&raw_line),
+                priority: is_prio,
+                is_tool_result: is_res,
+            });
         }
     }
 
-    let transcript_lower = transcript.to_ascii_lowercase();
+    let full_transcript_lower: String = items
+        .iter()
+        .map(|it| it.line.as_str())
+        .collect::<Vec<_>>()
+        .join("")
+        .to_ascii_lowercase();
+
     let scan = scan_skills_with_warnings(cwd);
-    let mut skills_section = if scan.skills.is_empty() {
+    let raw_index = if scan.skills.is_empty() {
         "(belum ada skill)".to_string()
     } else {
-        let mut idx_txt = redact_secrets(&format_skills_index(&scan.skills));
-        if idx_txt.chars().count() > skills_budget / 2 {
-            idx_txt = idx_txt.chars().take(skills_budget / 2).collect();
-        }
-        idx_txt
+        redact_secrets(&format_skills_index(&scan.skills))
     };
 
-    // Tambahkan isi skill relevan (yang dibuka atau disebut di transkrip, maks 3 skill)
-    // sekaligus menandai path-nya sebagai baru dibaca segar (read-before-write).
-    let mut relevant_bodies = String::new();
-    let mut loaded = 0usize;
+    // Baca segar hingga 3 skill paling relevan (prioritaskan skill yang eksplisit dibuka lewat skill_view).
+    let mut read_skill_paths: HashSet<PathBuf> = HashSet::new();
+    let mut relevant_skill_blocks: Vec<(bool, String, String, String)> = Vec::new();
     for s in &scan.skills {
-        if loaded >= 3 {
-            break;
-        }
         let sname_low = s.name.to_ascii_lowercase();
-        let is_relevant = mentioned_skills.contains(&sname_low)
-            || transcript_lower.contains(&sname_low)
+        let explicit = mentioned_skills.contains(&sname_low);
+        let is_relevant = explicit
+            || full_transcript_lower.contains(&sname_low)
             || s.tags
                 .iter()
-                .any(|t| t.len() >= 3 && transcript_lower.contains(&t.to_ascii_lowercase()));
+                .any(|t| t.len() >= 3 && full_transcript_lower.contains(&t.to_ascii_lowercase()));
         if !is_relevant {
             continue;
         }
@@ -686,69 +903,184 @@ pub fn build_pruned_review_prompt_with_reads(
             read_skill_paths.insert(canon);
             read_skill_paths.insert(s.path.clone());
             let safe = redact_secrets(&raw);
-            let cut: String = safe.chars().take(1200).collect();
             let origin_tag = if s.is_improvement_skill() {
-                "selena-improvement"
+                "selena-improvement".to_string()
             } else {
-                s.scope
+                s.scope.to_string()
             };
-            let block = format!("\n--- SKILL `{}` ({origin_tag}) ---\n{}\n", s.name, cut);
-            if skills_section.chars().count() + relevant_bodies.chars().count() + block.chars().count()
-                <= skills_budget + 800
-            {
-                relevant_bodies.push_str(&block);
-                loaded += 1;
-            }
+            relevant_skill_blocks.push((explicit, s.name.clone(), origin_tag, safe));
         }
     }
-    if !relevant_bodies.is_empty() {
-        skills_section.push_str("\nIsi skill relevan:");
-        skills_section.push_str(&relevant_bodies);
-    }
+    relevant_skill_blocks.sort_by_key(|(explicit, _, _, _)| if *explicit { 0u8 } else { 1u8 });
+    relevant_skill_blocks.truncate(3);
 
+    // Kumpulkan daftar memori.
     let cwd_str = cwd.to_string_lossy().to_string();
     let mem_dir = crate::user_memory::user_memory_dir();
     let persistent_mems = crate::user_memory::load_entries_from(
         &mem_dir,
         crate::user_memory::MemoryStoreKind::Memory,
     );
-    let legacy_mems = store.list_memories(&cwd_str, 30).unwrap_or_default();
-    let mut mem_section = String::new();
-    if persistent_mems.is_empty() && legacy_mems.is_empty() {
-        mem_section.push_str("(belum ada catatan memory)");
+    let legacy_mems = store.list_memories(&cwd_str, 20).unwrap_or_default();
+    let mut mem_lines: Vec<String> = Vec::new();
+    for (idx, content) in persistent_mems.iter().enumerate() {
+        mem_lines.push(redact_secrets(&format!("- #{} [memory] {}\n", idx + 1, content)));
+    }
+    for m in &legacy_mems {
+        let scope = if m.scope == "global" { "global" } else { "project" };
+        mem_lines.push(redact_secrets(&format!(
+            "- #{} [{} | {}] {}\n",
+            m.id, m.category, scope, m.content
+        )));
+    }
+
+    let call_cap = max_tokens.min(MAX_REVIEW_CALL_INPUT_TOKENS);
+    // Target internal dengan margin aman terhadap tokenizer provider agar `review_runs.input_tokens`
+    // selalu <= 5.000 token pada model Gemini/OpenAI/Claude.
+    let target_budget = if call_cap >= 1_500 {
+        call_cap.saturating_sub(200)
     } else {
-        for (idx, content) in persistent_mems.iter().enumerate() {
-            let line = redact_secrets(&format!("- #{} [memory] {}\n", idx + 1, content));
-            if mem_section.chars().count() + line.chars().count() > mem_budget {
-                break;
-            }
-            mem_section.push_str(&line);
+        call_cap
+    };
+
+    let render_user = |idx_cap: usize,
+                       skill_body_cap: usize,
+                       max_skills: usize,
+                       mem_cap: usize,
+                       transcript_cap: usize,
+                       drop_non_prio_results: bool,
+                       only_prio_and_tail: bool|
+     -> String {
+        let mut skills_section: String = raw_index.chars().take(idx_cap).collect();
+        let mut bodies = String::new();
+        for (_, name, origin_tag, safe) in relevant_skill_blocks.iter().take(max_skills) {
+            let cut: String = safe.chars().take(skill_body_cap).collect();
+            bodies.push_str(&format!("\n--- SKILL `{name}` ({origin_tag}) ---\n{cut}\n"));
         }
-        for m in &legacy_mems {
-            let scope = if m.scope == "global" {
-                "global"
-            } else {
-                "project"
-            };
-            let line = redact_secrets(&format!(
-                "- #{} [{} | {}] {}\n",
-                m.id, m.category, scope, m.content
-            ));
-            if mem_section.chars().count() + line.chars().count() > mem_budget {
-                break;
+        if !bodies.is_empty() {
+            skills_section.push_str("\nIsi skill relevan:");
+            skills_section.push_str(&bodies);
+        }
+
+        let mut mem_section = String::new();
+        if mem_lines.is_empty() || mem_cap == 0 {
+            mem_section.push_str("(belum ada catatan memory)");
+        } else {
+            for line in &mem_lines {
+                if mem_section.chars().count() + line.chars().count() > mem_cap {
+                    break;
+                }
+                mem_section.push_str(line);
             }
-            mem_section.push_str(&line);
+            if mem_section.is_empty() {
+                mem_section.push_str("(ringkas karena pagu token)");
+            }
+        }
+
+        // Seleksi baris transkrip: selalu pertahankan item prioritas (koreksi & kegagalan pulih),
+        // lalu isi sisa kuota dari item terbaru ke terlama agar konteks akhir & koreksi utuh.
+        let filtered: Vec<(usize, &TranscriptItem)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| {
+                if only_prio_and_tail {
+                    it.priority
+                } else if drop_non_prio_results && it.is_tool_result && !it.priority {
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        let mut chosen_idxs: HashSet<usize> = HashSet::new();
+        let mut used_chars = 0usize;
+        // Pass 1: semua item prioritas lebih dulu.
+        for &(orig_idx, it) in &filtered {
+            if it.priority {
+                let len = it.line.chars().count();
+                if used_chars + len <= transcript_cap {
+                    chosen_idxs.insert(orig_idx);
+                    used_chars += len;
+                }
+            }
+        }
+        // Pass 2: item non-prioritas dari terbaru ke terlama (buang keluaran lama lebih dulu!).
+        if !only_prio_and_tail {
+            for &(orig_idx, it) in filtered.iter().rev() {
+                if chosen_idxs.contains(&orig_idx) {
+                    continue;
+                }
+                let len = it.line.chars().count();
+                if used_chars + len <= transcript_cap {
+                    chosen_idxs.insert(orig_idx);
+                    used_chars += len;
+                }
+            }
+        }
+        let mut transcript = String::new();
+        for (orig_idx, it) in items.iter().enumerate() {
+            if chosen_idxs.contains(&orig_idx) {
+                transcript.push_str(&it.line);
+            }
+        }
+        if transcript.is_empty() && !items.is_empty() {
+            // Minimal ambil item prioritas terakhir (atau item terakhir) dipotong ke transcript_cap.
+            let fallback = items
+                .iter()
+                .rev()
+                .find(|it| it.priority)
+                .or_else(|| items.last());
+            if let Some(it) = fallback {
+                transcript = it.line.chars().take(transcript_cap.max(160)).collect();
+            }
+        }
+
+        format!(
+            "=== INDEKS & SKILL RELEVAN ===\n{skills_section}\n\n\
+             === CATATAN MEMORY SAAT INI ===\n{mem_section}\n\n\
+             === TRANSKRIP SESI (PRUNED) ===\n{transcript}\n\n\
+             Analisa sesi ini dan kembalikan HANYA JSON {{\"actions\":[...]}}."
+        )
+    };
+
+    // Tahapan pemangkasan progresif sampai TOTAL request (System beku + User) <= target_budget.
+    let stages: &[(usize, usize, usize, usize, usize, bool, bool)] = &[
+        (900, 1200, 3, 700, 2600, false, false),
+        (750, 1100, 2, 550, 2100, true, false),
+        (600, 1000, 2, 400, 1650, true, false),
+        (450, 900, 1, 250, 1250, true, false),
+        (350, 800, 1, 150, 950, true, true),
+        (220, 650, 1, 0, 600, true, true),
+    ];
+
+    let mut chosen_user = String::new();
+    for &(idx_cap, skill_cap, max_sk, mem_cap, tr_cap, drop_res, only_prio) in stages {
+        let candidate = render_user(
+            idx_cap,
+            skill_cap,
+            max_sk,
+            mem_cap,
+            tr_cap,
+            drop_res,
+            only_prio,
+        );
+        let probe_msgs = [
+            Message::text(Role::System, FROZEN_REVIEW_SYSTEM_PROMPT),
+            Message::text(Role::User, candidate.as_str()),
+        ];
+        let est = estimate_review_request_tokens(&probe_msgs, &[]);
+        chosen_user = candidate;
+        if est <= target_budget {
+            break;
         }
     }
 
-    let user = format!(
-        "=== INDEKS & SKILL RELEVAN ===\n{skills_section}\n\n\
-         === CATATAN MEMORY SAAT INI ===\n{mem_section}\n\n\
-         === TRANSKRIP SESI (PRUNED) ===\n{transcript}\n\n\
-         Analisa sesi ini dan kembalikan HANYA JSON {{\"actions\":[...]}}."
-    );
-
-    (FROZEN_REVIEW_SYSTEM_PROMPT.to_string(), user, read_skill_paths)
+    (
+        FROZEN_REVIEW_SYSTEM_PROMPT.to_string(),
+        chosen_user,
+        read_skill_paths,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -775,9 +1107,9 @@ enum ReviewAction {
     PatchSkill {
         #[serde(alias = "name")]
         skill: String,
-        #[serde(default)]
+        #[serde(default, alias = "old_text")]
         old_snippet: Option<String>,
-        #[serde(default)]
+        #[serde(default, alias = "new_text")]
         new_snippet: Option<String>,
         #[serde(default)]
         append_section: Option<String>,
@@ -897,12 +1229,77 @@ fn validate_safe_ref_path(raw_ref: &str) -> Result<String> {
     Ok(norm)
 }
 
-/// Jalankan Selena Improvement (v0.5.24) secara aman, sadar-cache, & non-blocking.
-/// - Tidak pernah mengembalikan error fatal ke pengguna.
-/// - Memakai awalan system prompt beku (`FROZEN_REVIEW_SYSTEM_PROMPT`) + mencatat `cache_read_tokens`.
-/// - Skill BARU lahir di `<user_skills_dir>/improvement/<nama>/SKILL.md` dengan `origin: selena-improvement`.
-/// - Hanya skill milik Selena improvement yang boleh ditambal langsung (wajib read-before-write + backup putar balik).
-/// - Setiap perubahan atas skill karya pengguna (tambal/timpa/hapus) SELALU ditahan ke staging `review_proposals`.
+/// Ganti potongan lama DI TEMPATNYA (exact match dulu, lalu fallback cocok-baris ter-trim whitespace).
+/// Tidak pernah menempelkan di akhir berkas — mengembalikan `None` bila teks lama tidak ditemukan
+/// (Masalah 5 v0.5.25).
+fn replace_snippet_in_place(old_body: &str, old_sn: &str, new_sn: &str) -> Option<String> {
+    if old_body.contains(old_sn) {
+        return Some(old_body.replacen(old_sn, new_sn, 1));
+    }
+    let needle_lines: Vec<&str> = old_sn
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if needle_lines.is_empty() {
+        return None;
+    }
+    let body_lines: Vec<&str> = old_body.lines().collect();
+    if needle_lines.len() > body_lines.len() {
+        return None;
+    }
+    for start in 0..=body_lines.len() - needle_lines.len() {
+        let mut matched = true;
+        for (offset, nl) in needle_lines.iter().enumerate() {
+            if body_lines[start + offset].trim() != *nl {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            let mut out: Vec<String> = Vec::with_capacity(body_lines.len());
+            for l in &body_lines[..start] {
+                out.push((*l).to_string());
+            }
+            out.push(new_sn.to_string());
+            for l in &body_lines[start + needle_lines.len()..] {
+                out.push((*l).to_string());
+            }
+            return Some(out.join("\n"));
+        }
+    }
+    None
+}
+
+fn reason_looks_like_correction(reason: &str) -> bool {
+    let low = reason.to_ascii_lowercase();
+    [
+        "koreksi",
+        "ganti",
+        "perbaiki",
+        "ubah",
+        "salah",
+        "keliru",
+        "bukan",
+        "usang",
+        "replace",
+        "fix",
+        "correct",
+        "wrong",
+        "update rule",
+        "aturan",
+    ]
+    .iter()
+    .any(|kw| low.contains(kw))
+}
+
+/// Jalankan Selena Improvement (v0.5.25) secara aman, idempoten, sadar-cache, & non-blocking.
+/// - Penjaga slot eksklusif in-process + `covered_msg_count` di DB mencegah tembak ganda (Masalah 1).
+/// - Sinyal kelas-satu tertunda tidak pernah ditelan cooldown & dibersihkan sesudah tercakup (Masalah 2).
+/// - Pagu total request diukur utuh <= `min(max_tokens, 5.000)`; bila minimal pun tak muat -> `digest_over_budget` (Masalah 3).
+/// - Memakai awalan system prompt beku (`FROZEN_REVIEW_SYSTEM_PROMPT` >= 2.048 token) + mencatat `cache_read_tokens` (Masalah 4).
+/// - Patch koreksi wajib mengganti teks lama di tempatnya (tolak + retry 1x / staging bila murni tempel di akhir, Masalah 5).
+/// - Skill BARU lahir di `<user_skills_dir>/improvement/<nama>/SKILL.md` dengan `origin: selena-improvement` (Masalah 6).
 pub async fn run_background_review(
     provider: Arc<dyn Provider>,
     cfg: &Config,
@@ -912,28 +1309,42 @@ pub async fn run_background_review(
     messages: &[Message],
     mark_delivered: bool,
 ) -> Result<Option<BgReviewOutcome>> {
+    // Masalah 1: penjaga idempotensi serentak untuk `(session_id, messages.len())`.
+    let covered_msg_count = messages.len();
+    let Some(_in_flight_guard) = store.acquire_review_slot(session_id, covered_msg_count) else {
+        return Ok(None);
+    };
+
     if check_review_eligibility(cfg, store, session_id, messages).is_err() {
         return Ok(None);
     }
 
     let max_tokens = cfg.review.max_tokens.max(1000);
-    let (sys, user, read_skill_paths) =
-        build_pruned_review_prompt_with_reads(cwd, store, messages, max_tokens);
+    let call_cap = max_tokens.min(MAX_REVIEW_CALL_INPUT_TOKENS);
+    let (sys, user, read_skill_paths) = build_pruned_review_prompt_with_reads_for_session(
+        cwd,
+        store,
+        Some(session_id),
+        messages,
+        max_tokens,
+    );
     let review_msgs = vec![
         Message::text(Role::System, sys),
         Message::text(Role::User, user),
     ];
 
-    // Guard anggaran token sebelum memanggil provider: patuhi pagu per-review DAN 5.000 token/panggilan.
-    let est = analyze_token_breakdown(&review_msgs, &[], 0).total_tokens() as u64;
-    let call_cap = max_tokens.min(MAX_REVIEW_CALL_INPUT_TOKENS);
-    if est > call_cap || est.saturating_add(200) > max_tokens {
+    // Masalah 3: ukur ukuran TOTAL request sebelum mengirim — jika bahkan digest minimal melampaui pagu,
+    // lewati dengan alasan eksplisit `digest_over_budget` (DILARANG kirim melanggar pagu!).
+    let est = estimate_review_request_tokens(&review_msgs, &[]);
+    if est > call_cap {
         let _ = store.set_last_review_skip(
-            ReviewSkipReason::BudgetExceeded.as_str(),
-            &format!("estimasi input {est} > pagu {call_cap} (max_tokens={max_tokens})"),
+            ReviewSkipReason::DigestOverBudget.as_str(),
+            &format!(
+                "total request minimal ({est} token) melampaui pagu {call_cap} token/panggilan"
+            ),
         );
         eprintln!(
-            "[selena-improvement] dilewati: estimasi input ({est}) melampaui pagu ({call_cap})"
+            "[selena-improvement] dilewati (digest_over_budget): estimasi total ({est}) > pagu ({call_cap})"
         );
         return Ok(None);
     }
@@ -954,7 +1365,7 @@ pub async fn run_background_review(
         cache_read_tokens: 0,
         cache_write_tokens: 0,
     });
-    let (in_tok, out_tok, cache_read, cache_write) = (
+    let (mut in_tok, mut out_tok, mut cache_read, mut cache_write) = (
         usage.input_tokens,
         usage.output_tokens,
         usage.cache_read_tokens,
@@ -964,15 +1375,15 @@ pub async fn run_background_review(
     // Catat biaya review TERPISAH di tabel `usage` (`kind='review'`, `session_id="review:<sid>"`) lengkap dengan cache!
     let _ = store.record_review_usage_full(session_id, &model_name, usage);
 
-    // Jika total token aktual melewati anggaran keras (> 125% max_tokens), catat run & berhenti diam-diam.
     let cwd_str = cwd.to_string_lossy().to_string();
+    // Jika total token aktual melewati anggaran keras (> 125% max_tokens), catat run & berhenti diam-diam.
     if in_tok.saturating_add(out_tok) > max_tokens.saturating_mul(5) / 4 {
         eprintln!(
             "[selena-improvement] anggaran token terlampaui ({} > {}), menghentikan evaluasi diam-diam",
             in_tok + out_tok,
             max_tokens
         );
-        let _ = store.record_review_run_full(
+        let _ = store.record_review_run_with_coverage(
             session_id,
             &cwd_str,
             &model_name,
@@ -982,13 +1393,15 @@ pub async fn run_background_review(
             out_tok,
             cache_read,
             cache_write,
+            covered_msg_count,
         );
+        let _ = store.clear_pending_review_signal(session_id);
         return Ok(None);
     }
 
     let Some(json_str) = extract_json_object(&reply.text) else {
         eprintln!("[selena-improvement] output model bukan JSON valid (diam)");
-        let _ = store.record_review_run_full(
+        let _ = store.record_review_run_with_coverage(
             session_id,
             &cwd_str,
             &model_name,
@@ -998,7 +1411,9 @@ pub async fn run_background_review(
             out_tok,
             cache_read,
             cache_write,
+            covered_msg_count,
         );
+        let _ = store.clear_pending_review_signal(session_id);
         return Ok(None);
     };
 
@@ -1006,7 +1421,7 @@ pub async fn run_background_review(
         Ok(p) => p,
         Err(e) => {
             eprintln!("[selena-improvement] gagal parse JSON review (diam): {e}");
-            let _ = store.record_review_run_full(
+            let _ = store.record_review_run_with_coverage(
                 session_id,
                 &cwd_str,
                 &model_name,
@@ -1016,7 +1431,9 @@ pub async fn run_background_review(
                 out_tok,
                 cache_read,
                 cache_write,
+                covered_msg_count,
             );
+            let _ = store.clear_pending_review_signal(session_id);
             return Ok(None);
         }
     };
@@ -1026,6 +1443,8 @@ pub async fn run_background_review(
     let mut staged_kinds: Vec<String> = Vec::new();
     let mut backup_ids: Vec<i64> = Vec::new();
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let session_has_correction = has_user_correction(messages);
+    let mut correction_retry_used = false;
 
     for action in parsed.actions.into_iter().take(6) {
         match action {
@@ -1214,14 +1633,31 @@ pub async fn run_background_review(
 
                 let mut patched_body: Option<String> = None;
                 let mut destructive_overwrite = false;
+                let mut is_append_only_patch = false;
 
-                if let (Some(old_sn), Some(new_sn)) = (
-                    old_snippet.as_deref().map(str::trim).filter(|s| !s.is_empty()),
-                    new_snippet.as_deref().map(str::trim),
-                ) {
-                    if old_body.contains(old_sn) {
-                        let safe_new = redact_secrets(new_sn);
-                        let candidate = old_body.replacen(old_sn, &safe_new, 1);
+                let old_sn_opt = old_snippet
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let new_sn_opt = new_snippet
+                    .as_deref()
+                    .map(str::trim)
+                    .map(|s| s.to_string());
+                let app_opt = append_section
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let is_correction_ctx = session_has_correction
+                    || reason_looks_like_correction(&reason)
+                    || old_sn_opt.is_some();
+
+                if let (Some(old_sn), Some(new_sn)) = (old_sn_opt.as_deref(), new_sn_opt.as_deref())
+                {
+                    let safe_new = redact_secrets(new_sn);
+                    if let Some(candidate) = replace_snippet_in_place(&old_body, old_sn, &safe_new)
+                    {
                         let old_lines = old_body.lines().count().max(1);
                         let new_lines = candidate.lines().count();
                         // Guard: menghapus >50% baris isi skill lama dianggap timpa/destruktif -> STAGING!
@@ -1231,29 +1667,113 @@ pub async fn run_background_review(
                         } else if candidate != old_body {
                             patched_body = Some(candidate);
                         }
-                    } else if !new_sn.is_empty() {
-                        if append_section
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .is_none()
-                        {
-                            let safe_append = redact_secrets(new_sn);
-                            patched_body = Some(format!("{old_body}\n\n{safe_append}"));
+                    }
+                    // Masalah 5 (v0.5.25): DILARANG jatuh diam-diam ke append di akhir berkas ketika
+                    // `old_snippet` tidak cocok — itu menyebabkan aturan keliru tetap utuh & kontradiktif!
+                }
+
+                if patched_body.is_none() {
+                    if let Some(app) = app_opt.as_deref() {
+                        let safe_app = redact_secrets(app);
+                        if !old_body.contains(&safe_app) {
+                            patched_body = Some(format!("{old_body}\n\n{safe_app}"));
+                            is_append_only_patch = true;
+                        }
+                    } else if let Some(new_sn) = new_sn_opt.as_deref().filter(|s| !s.is_empty()) {
+                        let safe_app = redact_secrets(new_sn);
+                        if !old_body.contains(&safe_app) {
+                            patched_body = Some(format!("{old_body}\n\n{safe_app}"));
+                            is_append_only_patch = true;
                         }
                     }
                 }
 
-                if patched_body.is_none() {
-                    if let Some(app) = append_section
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    {
-                        let safe_app = redact_secrets(app);
-                        if !old_body.contains(&safe_app) {
-                            patched_body = Some(format!("{old_body}\n\n{safe_app}"));
+                // Masalah 5 (v0.5.25): untuk pelajaran KOREKSI pada skill improvement, patch murni
+                // penambahan di akhir berkas DITOLAK -> coba ulang 1x dengan isi persis SKILL.md
+                // agar model menunjuk `old_snippet` yang diganti di tempatnya; jika tetap gagal,
+                // paksa masuk STAGING (tidak pernah menulis skill kontradiktif langsung ke disk!).
+                let mut force_stage_unanchored_correction = false;
+                if is_append_only_patch && is_correction_ctx && info.is_improvement_skill() {
+                    let mut repaired = false;
+                    if !correction_retry_used {
+                        correction_retry_used = true;
+                        let proposed_text = new_sn_opt
+                            .as_deref()
+                            .or(app_opt.as_deref())
+                            .unwrap_or("")
+                            .to_string();
+                        let repair_user = format!(
+                            "=== PERBAIKAN PATCH KOREKSI (WAJIB GANTI DI TEMPATNYA) ===\n\
+                             Patch sebelumnya untuk skill `{clean_name}` DITOLAK karena hanya menempel teks baru \
+                             di akhir berkas tanpa mengganti kalimat keliru yang sudah ada.\n\
+                             Alasan koreksi: {reason}\n\
+                             Usulan teks baru sebelumnya: {proposed_text}\n\n\
+                             Isi PERSIS `SKILL.md` `{clean_name}` saat ini:\n\
+                             ```markdown\n\
+                             {old_body}\n\
+                             ```\n\n\
+                             Kembalikan HANYA JSON `patch_skill` dengan `old_snippet` yang DISALIN PERSIS dari isi di atas \
+                             (mencakup baris/nomor aturan keliru yang harus diganti) dan `new_snippet` penggantinya yang bersih:\n\
+                             {{\"actions\":[{{\"action\":\"patch_skill\",\"skill\":\"{clean_name}\",\"old_snippet\":\"...\",\"new_snippet\":\"...\",\"reason\":\"...\"}}]}}"
+                        );
+                        let retry_msgs = vec![
+                            Message::text(Role::System, FROZEN_REVIEW_SYSTEM_PROMPT),
+                            Message::text(Role::User, repair_user),
+                        ];
+                        let retry_est = estimate_review_request_tokens(&retry_msgs, &[]);
+                        if retry_est <= call_cap {
+                            let (rtx, _rrx) = mpsc::channel::<StreamEvent>(16);
+                            if let Ok(r_reply) = provider.stream_chat(&retry_msgs, &[], rtx).await {
+                                if let Some(ru) = r_reply.usage {
+                                    in_tok = in_tok.saturating_add(ru.input_tokens);
+                                    out_tok = out_tok.saturating_add(ru.output_tokens);
+                                    cache_read = cache_read.saturating_add(ru.cache_read_tokens);
+                                    cache_write = cache_write.saturating_add(ru.cache_write_tokens);
+                                    let _ = store.record_review_usage_full(
+                                        session_id,
+                                        &model_name,
+                                        ru,
+                                    );
+                                }
+                                if let Some(r_json) = extract_json_object(&r_reply.text) {
+                                    if let Ok(r_plan) =
+                                        serde_json::from_str::<ReviewPlanResponse>(r_json)
+                                    {
+                                        for r_act in r_plan.actions {
+                                            if let ReviewAction::PatchSkill {
+                                                old_snippet: Some(ro),
+                                                new_snippet: Some(rn),
+                                                ..
+                                            } = r_act
+                                            {
+                                                let ro_t = ro.trim();
+                                                let rn_t = redact_secrets(rn.trim());
+                                                if !ro_t.is_empty() {
+                                                    if let Some(cand) = replace_snippet_in_place(
+                                                        &old_body, ro_t, &rn_t,
+                                                    ) {
+                                                        if cand != old_body {
+                                                            let old_l =
+                                                                old_body.lines().count().max(1);
+                                                            let new_l = cand.lines().count();
+                                                            destructive_overwrite =
+                                                                new_l * 2 < old_l;
+                                                            patched_body = Some(cand);
+                                                            is_append_only_patch = false;
+                                                            repaired = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
+                    }
+                    if !repaired {
+                        force_stage_unanchored_correction = true;
                     }
                 }
 
@@ -1292,11 +1812,13 @@ pub async fn run_background_review(
                 let diff = build_unified_diff(&rel_display, &old_raw, &new_md);
                 let rsn = short_reason(&reason, "perbaikan dari sesi");
 
-                // Perlindungan skill karya pengguna (3.4 #2) + read-before-write:
+                // Perlindungan skill karya pengguna (3.4 #2) + read-before-write + anti-kontradiksi (Masalah 5):
                 // - Skill BUKAN milik `selena-improvement` -> SELALU tahan ke staging `/review approve`!
-                // - Skill belum dibaca segar di review ini atau destruktif (>50% hilang) -> tahan ke staging!
-                let must_stage =
-                    !info.is_improvement_skill() || destructive_overwrite || !was_freshly_read;
+                // - Skill belum dibaca segar, destruktif (>50% hilang), atau koreksi tanpa `old_snippet` cocok -> STAGING!
+                let must_stage = !info.is_improvement_skill()
+                    || destructive_overwrite
+                    || !was_freshly_read
+                    || force_stage_unanchored_correction;
                 if must_stage {
                     let payload = serde_json::json!({
                         "skill": clean_name,
@@ -1306,10 +1828,13 @@ pub async fn run_background_review(
                         "reason": rsn,
                         "read_before_write": was_freshly_read,
                         "user_owned": !info.is_improvement_skill(),
+                        "unanchored_correction": force_stage_unanchored_correction,
                     })
                     .to_string();
                     let label = if !info.is_improvement_skill() {
                         format!("Perbarui skill pengguna '{clean_name}' ({rsn})")
+                    } else if force_stage_unanchored_correction {
+                        format!("Tinjau koreksi skill '{clean_name}' tanpa old_snippet persis ({rsn})")
                     } else {
                         format!("Timpa skill '{clean_name}' ({rsn})")
                     };
@@ -1620,7 +2145,7 @@ pub async fn run_background_review(
 
     let report_message = format_review_report(&applied, &staged_ids, &staged_kinds);
     let run_id = store
-        .record_review_run_full(
+        .record_review_run_with_coverage(
             session_id,
             &cwd_str,
             &model_name,
@@ -1630,8 +2155,11 @@ pub async fn run_background_review(
             out_tok,
             cache_read,
             cache_write,
+            covered_msg_count,
         )
         .ok();
+    // Sinyal tertunda pada sesi ini sudah resmi ditindaklanjuti oleh review tuntas.
+    let _ = store.clear_pending_review_signal(session_id);
 
     if report_message.is_none() {
         return Ok(None);

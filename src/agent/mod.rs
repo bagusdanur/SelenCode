@@ -9,9 +9,10 @@ pub mod ui;
 pub mod run;
 
 pub use review::{
-    apply_staged_proposal, check_review_eligibility, discard_staged_proposal,
-    has_recovered_failure, has_skill_activity, has_valuable_review_signal,
-    is_session_substantive, rollback_direct_review_patch, run_background_review,
+    apply_staged_proposal, check_review_eligibility, detect_first_class_signal_in_slice,
+    discard_staged_proposal, estimate_review_request_tokens, has_recovered_failure,
+    has_skill_activity, has_valuable_review_signal, is_session_substantive,
+    record_pending_signal_if_present, rollback_direct_review_patch, run_background_review,
     run_self_improvement_review, BgReviewOutcome, ReviewSkipReason, FROZEN_REVIEW_SYSTEM_PROMPT,
 };
 pub use run::{

@@ -45,8 +45,11 @@ pub(crate) struct Session {
     pub(crate) setup_reason: Option<String>,
     /// Telemetri latensi, biaya, retry, fallback, & error Dynamic Model Routing (Tahap 3).
     pub(crate) router_telemetry: Arc<std::sync::Mutex<RouterTelemetry>>,
-    /// Jumlah giliran tuntas sejak background review terakhir pada sesi ini (pemicu tiap 15 giliran).
+    /// Jumlah giliran tuntas sejak background review terakhir pada sesi ini.
     pub(crate) turns_since_review: usize,
+    /// Panjang `messages` tertinggi yang sudah dijadwalkan ke review latar pada sesi ini
+    /// (penjaga anti-tembak ganda di akhir sesi, Masalah 1 v0.5.25).
+    pub(crate) last_scheduled_review_msg_len: usize,
 }
 
 /// Snapshot ringan yang siap dijalankan di task latar (`tokio::spawn`) untuk Background Review v0.5.1.
@@ -411,6 +414,8 @@ impl Session {
         for tool in selencode::mcp::build_mcp_tools(&cfg).await {
             registry = registry.register(tool);
         }
+        let last_scheduled_review_msg_len =
+            store.last_reviewed_msg_count(&session_id).unwrap_or(0);
         Ok(Session {
             cfg,
             provider_name: name,
@@ -429,6 +434,7 @@ impl Session {
             setup_reason,
             router_telemetry,
             turns_since_review: 0,
+            last_scheduled_review_msg_len,
         })
     }
 
@@ -1035,29 +1041,58 @@ impl Session {
         ));
         self.messages.clear();
         self.turns_since_review = 0;
+        self.last_scheduled_review_msg_len = 0;
         if let Ok(mut plan) = self.ctx.plan_state.lock() {
             plan.clear();
         }
         Ok(new_id)
     }
 
-    /// Siapkan pekerjaan Selena Improvement (v0.5.24) bila memenuhi pemicu bernilai & pagar anggaran:
+    /// Siapkan pekerjaan Selena Improvement (v0.5.25) bila memenuhi pemicu bernilai & pagar anggaran:
     /// - `end_of_session = true`: dipicu saat sesi berakhir (`/exit`, `/new`, `selen run` selesai).
-    /// - `end_of_session = false`: dipicu sesudah giliran selesai bila mencapai `cfg.review.turns_interval`
-    ///   ATAU muncul sinyal bernilai tinggi (koreksi pengguna, kegagalan terpulihkan, atau pemakaian skill).
+    /// - `end_of_session = false`: dipicu sesudah giliran selesai bila mencapai `cfg.review.turns_interval`,
+    ///   muncul sinyal bernilai tinggi, ATAU ada sinyal kelas-satu tertunda pasca-cooldown.
+    /// - Idempoten: menolak snapshot `(session_id, messages.len())` yang sudah pernah dijadwalkan/selesai.
     /// - Memakai `[aux] review_model` / `compression_model` bila terisi, atau model utama sesi secara bawaan.
     pub(crate) fn prepare_bg_review_job(&mut self, end_of_session: bool) -> Option<BgReviewJob> {
         if self.needs_setup {
             return None;
         }
+        let cur_len = self.messages.len();
+        if cur_len == 0 || cur_len <= self.last_scheduled_review_msg_len {
+            return None;
+        }
+        // Masalah 2 (v0.5.25): rekam sinyal kelas-satu secara persisten SEBELUM gerbang cooldown/interval
+        // sehingga koreksi pengguna atau kegagalan terpulihkan tidak pernah ditelan cooldown.
+        selencode::agent::record_pending_signal_if_present(
+            &self.store,
+            &self.session_id,
+            &self.messages,
+        );
+        let has_pending_signal = self
+            .store
+            .get_pending_review_signal(&self.session_id)
+            .ok()
+            .flatten()
+            .is_some();
         if !end_of_session {
             let interval = self.cfg.review.turns_interval;
             let periodic_due = interval > 0 && self.turns_since_review >= interval;
+            let since_idx = self
+                .store
+                .last_reviewed_msg_count(&self.session_id)
+                .unwrap_or(0)
+                .min(cur_len);
+            let slice = if since_idx > 0 && since_idx < cur_len {
+                &self.messages[since_idx..]
+            } else {
+                &self.messages[..]
+            };
             let signal_due = selencode::agent::has_valuable_review_signal(
-                &self.messages,
+                slice,
                 self.cfg.review.min_tool_calls,
             );
-            if !periodic_due && !signal_due {
+            if !periodic_due && !signal_due && !has_pending_signal {
                 return None;
             }
         }
@@ -1078,6 +1113,7 @@ impl Session {
             self.provider.clone(),
         )?;
         self.turns_since_review = 0;
+        self.last_scheduled_review_msg_len = cur_len;
         Some(BgReviewJob {
             provider: rev_prov,
             cfg: self.cfg.clone(),
@@ -1103,6 +1139,10 @@ impl Session {
         self.ctx.session_id = Some(info.id.clone());
         self.ctx.is_resumed_session = true;
         self.messages = msgs;
+        self.last_scheduled_review_msg_len = self
+            .store
+            .last_reviewed_msg_count(&info.id)
+            .unwrap_or(0);
         if let Ok(mut plan) = self.ctx.plan_state.lock() {
             plan.clear();
         }

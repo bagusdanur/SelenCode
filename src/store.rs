@@ -2,9 +2,9 @@ use crate::providers::{Block, Message, Role};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 struct PendingSessionMeta {
@@ -12,6 +12,31 @@ struct PendingSessionMeta {
     provider: String,
     model: String,
     title: String,
+}
+
+/// Penjaga RAII in-process untuk mencegah 2 job review latar menembak serentak pada snapshot
+/// `(session_id, covered_msg_count)` yang sama (Masalah 1 v0.5.25).
+pub struct ReviewInFlightGuard {
+    key: (String, usize),
+    set: Arc<Mutex<HashSet<(String, usize)>>>,
+}
+
+impl Drop for ReviewInFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.set.lock() {
+            guard.remove(&self.key);
+        }
+    }
+}
+
+/// Sinyal belajar kelas-satu yang tertahan oleh cooldown sehingga wajib ditindaklanjuti
+/// pada titik kelayakan pertama sesudah cooldown berakhir (Masalah 2 v0.5.25).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingReviewSignal {
+    pub signal_kind: String,
+    pub first_msg_idx: usize,
+    pub latest_msg_idx: usize,
+    pub created_at: String,
 }
 
 /// Penyimpanan sesi SQLite (Fase 3, Blueprint Bagian 9).
@@ -24,6 +49,8 @@ pub struct Store {
     /// Metadata sesi interaktif baru yang belum memiliki pesan (lazy persistence:
     /// baru ditulis ke SQLite saat pesan/usage pertama benar-benar disimpan).
     pending_sessions: Mutex<HashMap<String, PendingSessionMeta>>,
+    /// Kunci `(session_id, covered_msg_count)` review latar yang sedang aktif di proses ini.
+    in_flight_reviews: Arc<Mutex<HashSet<(String, usize)>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +303,7 @@ pub struct ReviewRunRecord {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub covered_msg_count: usize,
     pub created_at: String,
 }
 
@@ -390,6 +418,7 @@ CREATE TABLE IF NOT EXISTS review_runs (id INTEGER PRIMARY KEY, session_id TEXT 
                     delivered INTEGER NOT NULL DEFAULT 0,
                     input_tokens INT NOT NULL DEFAULT 0, output_tokens INT NOT NULL DEFAULT 0,
                     cache_read_tokens INT NOT NULL DEFAULT 0, cache_write_tokens INT NOT NULL DEFAULT 0,
+                    covered_msg_count INT NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS review_backups (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
                     cwd TEXT NOT NULL, skill_name TEXT NOT NULL, file_path TEXT NOT NULL,
@@ -532,6 +561,7 @@ impl Store {
         Ok(Self {
             conn: Mutex::new(conn),
             pending_sessions: Mutex::new(HashMap::new()),
+            in_flight_reviews: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -1534,6 +1564,101 @@ impl Store {
         )
     }
 
+    /// Pesan slot eksklusif in-process untuk `(session_id, covered_msg_count)` agar 2 jalur tidak
+    /// menembakkan review ganda pada snapshot akhir sesi yang sama (Masalah 1 v0.5.25).
+    pub fn acquire_review_slot(
+        &self,
+        session_id: &str,
+        covered_msg_count: usize,
+    ) -> Option<ReviewInFlightGuard> {
+        let key = (session_id.to_string(), covered_msg_count);
+        let mut set = self.in_flight_reviews.lock().ok()?;
+        if set.contains(&key) {
+            return None;
+        }
+        set.insert(key.clone());
+        Some(ReviewInFlightGuard {
+            key,
+            set: Arc::clone(&self.in_flight_reviews),
+        })
+    }
+
+    /// Jumlah pesan tertinggi yang sudah dicakup oleh review selesai pada sesi ini (Masalah 1 & 2 v0.5.25).
+    pub fn last_reviewed_msg_count(&self, session_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        let max_cnt: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(covered_msg_count), 0) FROM review_runs WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Ok(max_cnt.max(0) as usize)
+    }
+
+    /// Catat sinyal belajar kelas-satu (koreksi pengguna / kegagalan pulih) secara persisten per sesi
+    /// sehingga tidak pernah ditelan oleh cooldown (Masalah 2 v0.5.25).
+    pub fn record_pending_review_signal(
+        &self,
+        session_id: &str,
+        signal_kind: &str,
+        msg_idx: usize,
+    ) -> Result<()> {
+        let key = format!("pending_review_signal:{session_id}");
+        let existing = self.get_pending_review_signal(session_id).ok().flatten();
+        let merged = match existing {
+            Some(mut prev) => {
+                if !prev
+                    .signal_kind
+                    .split(',')
+                    .any(|s| s.trim() == signal_kind.trim())
+                {
+                    if !prev.signal_kind.is_empty() {
+                        prev.signal_kind.push(',');
+                    }
+                    prev.signal_kind.push_str(signal_kind.trim());
+                }
+                prev.first_msg_idx = prev.first_msg_idx.min(msg_idx);
+                prev.latest_msg_idx = prev.latest_msg_idx.max(msg_idx);
+                prev
+            }
+            None => PendingReviewSignal {
+                signal_kind: signal_kind.trim().to_string(),
+                first_msg_idx: msg_idx,
+                latest_msg_idx: msg_idx,
+                created_at: now(),
+            },
+        };
+        let payload = serde_json::to_string(&merged)?;
+        self.set_gateway_state(&key, &payload)
+    }
+
+    /// Baca sinyal belajar tertunda untuk sesi tertentu (Masalah 2 v0.5.25).
+    pub fn get_pending_review_signal(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<PendingReviewSignal>> {
+        let key = format!("pending_review_signal:{session_id}");
+        let Some((raw, _)) = self.get_gateway_state(&key)? else {
+            return Ok(None);
+        };
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_str::<PendingReviewSignal>(&raw).ok())
+    }
+
+    /// Bersihkan sinyal belajar tertunda sesudah review benar-benar menindaklanjutinya.
+    pub fn clear_pending_review_signal(&self, session_id: &str) -> Result<()> {
+        let key = format!("pending_review_signal:{session_id}");
+        let conn = self.conn.lock().expect("mutex store poisoned");
+        conn.execute(
+            "DELETE FROM gateway_state WHERE key = ?1",
+            rusqlite::params![key],
+        )?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_review_run_full(
         &self,
@@ -1547,12 +1672,40 @@ impl Store {
         cache_read_tokens: u64,
         cache_write_tokens: u64,
     ) -> Result<i64> {
+        self.record_review_run_with_coverage(
+            session_id,
+            cwd,
+            model,
+            report_text,
+            delivered,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_review_run_with_coverage(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        model: &str,
+        report_text: &str,
+        delivered: bool,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        covered_msg_count: usize,
+    ) -> Result<i64> {
         let safe_report = crate::security::redact_secrets(report_text.trim());
         let del_int: i64 = if delivered || safe_report.is_empty() { 1 } else { 0 };
         let conn = self.conn.lock().expect("mutex store poisoned");
         conn.execute(
-            "INSERT INTO review_runs (session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO review_runs (session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, covered_msg_count, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 session_id,
                 cwd,
@@ -1563,6 +1716,7 @@ impl Store {
                 output_tokens as i64,
                 cache_read_tokens as i64,
                 cache_write_tokens as i64,
+                covered_msg_count as i64,
                 now()
             ],
         )?;
@@ -1728,7 +1882,7 @@ impl Store {
     pub fn list_recent_review_runs(&self, cwd: &str, limit: usize) -> Result<Vec<ReviewRunRecord>> {
         let conn = self.conn.lock().expect("mutex store poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at \
+            "SELECT id, session_id, cwd, model, report_text, delivered, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, covered_msg_count, created_at \
              FROM review_runs WHERE cwd = ?1 ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![cwd, limit as i64], |r| {
@@ -1743,7 +1897,8 @@ impl Store {
                 output_tokens: r.get::<_, i64>(7).unwrap_or(0).max(0) as u64,
                 cache_read_tokens: r.get::<_, i64>(8).unwrap_or(0).max(0) as u64,
                 cache_write_tokens: r.get::<_, i64>(9).unwrap_or(0).max(0) as u64,
-                created_at: r.get(10)?,
+                covered_msg_count: r.get::<_, i64>(10).unwrap_or(0).max(0) as usize,
+                created_at: r.get(11)?,
             })
         })?;
         let mut out = Vec::new();
@@ -2887,6 +3042,13 @@ fn migrate_review_schema(conn: &Connection) -> Result<()> {
             [],
         )
         .context("gagal migrasi kolom cache_write_tokens pada tabel review_runs")?;
+    }
+    if !cols.iter().any(|c| c == "covered_msg_count") {
+        conn.execute(
+            "ALTER TABLE review_runs ADD COLUMN covered_msg_count INT NOT NULL DEFAULT 0",
+            [],
+        )
+        .context("gagal migrasi kolom covered_msg_count pada tabel review_runs")?;
     }
     Ok(())
 }
