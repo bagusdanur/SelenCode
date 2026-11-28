@@ -2087,6 +2087,30 @@ pub fn extract_tg_voice_or_audio(msg: &TgMessage) -> Option<TgAudioAttachment> {
     None
 }
 
+fn encode_base64_std(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 /// Transkripsikan byte audio (`voice`/`audio` Telegram) menggunakan provider aktif:
 /// - `openai`: `POST {base_url}/audio/transcriptions` (multipart `whisper-1`)
 /// - `gemini`: `POST {base_url}/v1beta/models/{model}:generateContent` (`inlineData` base64)
@@ -2155,13 +2179,12 @@ pub async fn transcribe_audio_bytes(
             Ok(clean.to_string())
         }
         "gemini" => {
-            use base64::Engine;
             let base = base_url
                 .map(|s| s.trim_end_matches('/'))
                 .filter(|s| !s.is_empty())
                 .unwrap_or(crate::providers::gemini::DEFAULT_BASE_URL);
             let url = format!("{base}/v1beta/models/{model}:generateContent");
-            let b64 = base64::engine::general_purpose::STANDARD.encode(audio_bytes);
+            let b64 = encode_base64_std(audio_bytes);
             let body = json!({
                 "contents": [{
                     "role": "user",
