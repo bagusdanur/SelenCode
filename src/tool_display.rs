@@ -80,6 +80,8 @@ fn extract_primary_arg(tool_name: &str, args: &Value) -> Option<String> {
                 .filter(|s| !s.is_empty())
         }),
         "fetch_url" => get_str("url"),
+        "web_search" => get_str("query"),
+        "manage_cron" => get_str("name").or_else(|| get_str("action")),
         "ask_user" => get_str("question"),
         "session_search" => get_str("query"),
         "watch_job" => get_str("label")

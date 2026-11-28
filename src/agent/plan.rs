@@ -31,6 +31,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "git_status",
     "git_diff",
     "fetch_url",
+    "web_search",
     "skills_list",
     "skill_view",
     "session_search",

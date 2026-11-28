@@ -1,5 +1,6 @@
 pub mod ask;
 pub mod bg;
+pub mod cron;
 pub mod delegate;
 pub mod file;
 pub mod git;
@@ -100,6 +101,8 @@ pub struct Ctx {
     pub api_max_retries: usize,
     /// Basis jeda jittered exponential backoff dalam milidetik sebelum retry API (terstruktur `retry_utils.py`, default 2000ms).
     pub api_retry_base_delay_ms: u64,
+    /// Konfigurasi riset web opsional (`[web]` untuk `fetch_url` & `web_search`, v0.5.28).
+    pub web_cfg: crate::config::WebCfg,
 }
 
 impl Ctx {
@@ -138,7 +141,12 @@ impl Ctx {
             tool_preview_length: crate::tool_display::DEFAULT_TOOL_PREVIEW_LENGTH,
             api_max_retries: 3,
             api_retry_base_delay_ms: 2_000,
+            web_cfg: crate::config::WebCfg::default(),
         }
+    }
+    pub fn with_web_cfg(mut self, cfg: crate::config::WebCfg) -> Self {
+        self.web_cfg = cfg;
+        self
     }
     pub fn with_api_retry(mut self, max_retries: usize, base_delay_ms: u64) -> Self {
         self.api_max_retries = max_retries;
@@ -418,6 +426,8 @@ pub fn default_registry_with_shell(shell_cfg: &ShellCfg) -> Registry {
         .register(Arc::new(git::GitDiff))
         .register(Arc::new(git::GitCommit))
         .register(Arc::new(web::FetchUrl))
+        .register(Arc::new(web::WebSearch))
+        .register(Arc::new(cron::ManageCron))
         .register(Arc::new(plan::UpdatePlan))
         .register(Arc::new(skill::SkillsList))
         .register(Arc::new(skill::SkillView))
@@ -468,6 +478,7 @@ pub fn read_only_registry() -> Registry {
         .register(Arc::new(git::GitStatus))
         .register(Arc::new(git::GitDiff))
         .register(Arc::new(web::FetchUrl))
+        .register(Arc::new(web::WebSearch))
         .register(Arc::new(skill::SkillsList))
         .register(Arc::new(skill::SkillView))
         .register(Arc::new(session_search::SessionSearch))

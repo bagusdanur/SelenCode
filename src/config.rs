@@ -77,12 +77,65 @@ pub struct Config {
     /// Konfigurasi tenggat waktu panggilan provider (`[timeouts]`, v0.5.10 Perbaikan 1).
     #[serde(default, skip_serializing_if = "ProviderTimeoutsCfg::is_default")]
     pub timeouts: ProviderTimeoutsCfg,
+    /// Konfigurasi riset web opsional (`[web]` untuk `fetch_url` & `web_search`, v0.5.28).
+    #[serde(default, skip_serializing_if = "WebCfg::is_default")]
+    pub web: WebCfg,
     /// Sumber nilai efektif `agent.max_steps` (tidak diserialisasi ke TOML, v0.5.17).
     #[serde(skip)]
     pub max_steps_source: MaxStepsSource,
     /// Pemberitahuan startup penting dari loader config (mis. pembebasan pagu warisan `max_steps = 25`).
     #[serde(skip)]
     pub startup_notices: Vec<String>,
+}
+
+/// Konfigurasi riset web opsional (`[web]` untuk `fetch_url` & `web_search`, v0.5.28).
+/// Default berjalan lokal tanpa API key (`direct` + `auto`); backend eksternal sepenuhnya opsional.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebCfg {
+    /// Backend ekstraksi `fetch_url`: `"direct"` (default, lokal anti-SSRF), `"jina"`, atau `"firecrawl"`.
+    #[serde(default = "default_web_extract_backend")]
+    pub extract_backend: String,
+    /// Backend pencarian `web_search`: `"auto"` (default tanpa key: DDG/GitHub/HN/Wikipedia),
+    /// `"ddg"`, `"searxng"`, `"tavily"`, `"brave"`, atau `"firecrawl"`.
+    #[serde(default = "default_web_search_backend")]
+    pub search_backend: String,
+    /// URL instance SearXNG pribadi bila `search_backend = "searxng"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searxng_url: Option<String>,
+    /// Nama env var API key opsional untuk backend terdaftar (mis. `TAVILY_API_KEY`, `BRAVE_API_KEY`, `FIRECRAWL_API_KEY`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Pagu karakter default keluaran langsung `fetch_url` sebelum spill ke `.selencode/web_cache/` (default 15.000).
+    #[serde(default = "default_web_max_extract_chars")]
+    pub max_extract_chars: usize,
+}
+
+fn default_web_extract_backend() -> String {
+    "direct".to_string()
+}
+fn default_web_search_backend() -> String {
+    "auto".to_string()
+}
+fn default_web_max_extract_chars() -> usize {
+    15_000
+}
+
+impl Default for WebCfg {
+    fn default() -> Self {
+        Self {
+            extract_backend: default_web_extract_backend(),
+            search_backend: default_web_search_backend(),
+            searxng_url: None,
+            api_key_env: None,
+            max_extract_chars: default_web_max_extract_chars(),
+        }
+    }
+}
+
+impl WebCfg {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Konfigurasi tenggat waktu panggilan HTTP/streaming ke provider (`[timeouts]`, v0.5.10 Perbaikan 1).
@@ -1492,6 +1545,7 @@ impl Config {
             context: ContextCfg::default(),
             display: DisplayCfg::default(),
             timeouts: ProviderTimeoutsCfg::default(),
+            web: WebCfg::default(),
             max_steps_source: MaxStepsSource::DefaultUnbounded,
             startup_notices: Vec::new(),
         }

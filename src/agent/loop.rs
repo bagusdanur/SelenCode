@@ -1929,6 +1929,7 @@ async fn run_turn_inner(
         // jalankan secara KONKUREN (desain internal SelenCode), lalu proses
         // seluruh hasil secara deterministik dalam urutan asli `reply.tool_calls`!
         let mut results: Vec<Block> = Vec::new();
+        let mut read_file_images: Vec<(String, Block)> = Vec::new();
         let mut step_had_search = false;
         let mut step_had_progress = false;
         let mut step_asked_user = false;
@@ -2433,9 +2434,17 @@ async fn run_turn_inner(
                 step_had_progress = true;
             } else if matches!(
                 call.name.as_str(),
-                "search_text" | "list_files" | "run_shell" | "fetch_url"
+                "search_text" | "list_files" | "run_shell" | "fetch_url" | "web_search"
             ) {
                 step_had_search = true;
+            }
+            if call.name == "read_file" && !is_error && read_file_images.len() < 4 {
+                if let Some(rel) = call.args.get("path").and_then(|v| v.as_str()) {
+                    if let Some(pair) = crate::tools::file::load_read_file_image_block(&ctx.cwd, rel)
+                    {
+                        read_file_images.push(pair);
+                    }
+                }
             }
             if let Some(tx) = &ui {
                 let _ = tx
@@ -2620,6 +2629,26 @@ async fn run_turn_inner(
         };
         persist_message(ctx, &tool_msg);
         messages.push(tool_msg);
+
+        // Multimodal `read_file` gambar (v0.5.28): lampirkan `Block::Image` lewat pesan `Role::User`
+        // sesudah `Role::Tool` agar kompatibel 100% di OpenAI/9Router, Anthropic, maupun Gemini.
+        if !read_file_images.is_empty() {
+            let names: Vec<String> = read_file_images.iter().map(|(n, _)| n.clone()).collect();
+            let mut img_blocks: Vec<Block> = Vec::with_capacity(read_file_images.len() + 1);
+            img_blocks.push(Block::Text(format!(
+                "[Lampiran gambar dari read_file: {}]",
+                names.join(", ")
+            )));
+            for (_, blk) in read_file_images {
+                img_blocks.push(blk);
+            }
+            let img_msg = Message {
+                role: Role::User,
+                content: img_blocks,
+            };
+            persist_message(ctx, &img_msg);
+            messages.push(img_msg);
+        }
 
         // Masalah 4 (v0.5.18 — terinspirasi gerbang post-tool SelenCode `agent/turn_preflight.py`:
         // `compress_after_tool_results` & pengecualian pending-round `agent/context_compressor.py` #61932):

@@ -62,6 +62,15 @@ response_secs = 60                               # batas menunggu header respons
 stream_idle_secs = 180                           # batas diam antar-potongan streaming (detik; dasar 180s)
 total_secs = 600                                 # batas keras total 1 panggilan provider (detik)
 
+# Riset web opsional (`fetch_url` & `web_search`, v0.5.28).
+# Default berjalan lokal tanpa API key (`direct` + `auto`); aktifkan backend eksternal hanya bila perlu.
+# [web]
+# extract_backend = "direct"                     # direct (default, 0 key) | jina | firecrawl
+# search_backend = "auto"                        # auto/ddg (default, 0 key) | searxng | tavily | brave | firecrawl
+# searxng_url = "http://127.0.0.1:8080"          # khusus bila search_backend = "searxng"
+# api_key_env = "TAVILY_API_KEY"                 # nama env API key bila memakai tavily / brave / firecrawl
+# max_extract_chars = 15000                      # pagu char fetch_url sebelum spill ke .selencode/web_cache/
+
 # Telegram Bot Gateway (`selen telegram`) — opsional.
 # [telegram]
 # bot_token_env = "SELENCODE_TELEGRAM_TOKEN"

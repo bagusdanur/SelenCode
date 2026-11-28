@@ -66,7 +66,8 @@ pub const EXTENDED_TOOLSETS: &[(&str, &str, &[&str])] = &[
         "proses latar (server/watcher)",
         &["bg_start", "bg_output", "bg_status", "bg_stop"],
     ),
-    ("web", "ambil URL", &["fetch_url"]),
+    ("web", "ambil URL & cari web", &["fetch_url", "web_search"]),
+    ("cron", "jadwal otomatis persisten", &["manage_cron"]),
     ("plan", "rencana & task panjang", &["update_plan", "manage_task"]),
     ("skills_view", "muat isi skill", &["skill_view"]),
     (
@@ -96,7 +97,7 @@ pub const EXTENDED_TOOLSETS: &[(&str, &str, &[&str])] = &[
 pub fn activate_toolset_spec() -> ToolSpec {
     ToolSpec {
         name: ACTIVATE_TOOLSET_NAME.to_string(),
-        description: "Aktifkan toolset opsional: fs_list, git_read, verify, git_write, code_nav, lsp, bg, web, plan, skills_view, skills_mem, multi_agent, clarify, history, watch, tg_files, mcp.".to_string(),
+        description: "Aktifkan toolset opsional: fs_list, git_read, verify, git_write, code_nav, lsp, bg, web, cron, plan, skills_view, skills_mem, multi_agent, clarify, history, watch, tg_files, mcp.".to_string(),
         parameters: schema(
             json!({
                 "toolsets": {
@@ -206,11 +207,41 @@ pub fn select_initial_toolsets(
         set.insert("bg".to_string());
     }
 
-    if ["http://", "https://", "fetch_url", "buka url", "ambil halaman", "website"]
-        .iter()
-        .any(|kw| lower.contains(kw))
+    if [
+        "http://",
+        "https://",
+        "fetch_url",
+        "web_search",
+        "buka url",
+        "ambil halaman",
+        "website",
+        "cari di web",
+        "cari online",
+        "search web",
+        "googling",
+        "dokumentasi terbaru",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
     {
         set.insert("web".to_string());
+    }
+
+    if [
+        "cron",
+        "manage_cron",
+        "jadwalkan",
+        "jadwal rutin",
+        "tiap jam",
+        "setiap hari",
+        "setiap pagi",
+        "pengingat rutin",
+        "schedule",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+    {
+        set.insert("cron".to_string());
     }
 
     if [
