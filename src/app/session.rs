@@ -1,10 +1,10 @@
 use super::{make_review_provider, make_routed_provider};
 use anyhow::Result;
 use selencode::agent::context::{
-    compact_messages, estimate_tokens, format_context_compact, format_context_tokens_exact,
-    infer_model_context_limit, sanitize_interrupted_messages,
+    compact_messages, compact_messages_with_llm, estimate_tokens, format_context_compact,
+    format_context_tokens_exact, infer_model_context_limit, sanitize_interrupted_messages,
 };
-use selencode::agent::ui::ModelPickerData;
+use selencode::agent::ui::{ModelPickerData, ResumePickerData, ResumePickerItem};
 use selencode::config::{self, Config, ProviderCfg};
 use selencode::providers::anthropic;
 use selencode::providers::gemini;
@@ -1213,7 +1213,36 @@ impl Session {
         })
     }
 
-    /// Compaction konteks manual (/compact).
+    /// Compaction konteks manual (`/compact`): memakai ringkasan terstruktur berbantuan LLM
+    /// dengan fallback deterministik aman bila panggilan LLM gagal/timeout.
+    pub(crate) async fn compact_now_smart(&mut self) -> String {
+        let before_msgs = self.messages.len();
+        let before_tok = estimate_tokens(&self.messages);
+        let (compacted, used_llm) = compact_messages_with_llm(&self.provider, &self.messages).await;
+        let after_msgs = compacted.len();
+        let after_tok = estimate_tokens(&compacted);
+        self.messages = compacted;
+        if after_msgs == before_msgs {
+            format!(
+                "# Compaction Konteks\n\
+                 ! Riwayat masih pendek ({before_msgs} pesan, ~{before_tok} token) — belum perlu diringkas."
+            )
+        } else {
+            let mode = if used_llm {
+                "ringkasan cerdas LLM"
+            } else {
+                "ringkasan terstruktur deterministik"
+            };
+            format!(
+                "# Compaction Konteks Selesai\n\
+                 * pesan | {before_msgs} → {after_msgs} | estimasi ~{before_tok} → ~{after_tok} token\n\
+                 > metode | {mode} | prefix system prompt tetap utuh"
+            )
+        }
+    }
+
+    /// Compaction konteks deterministik sinkron (fallback internal).
+    #[allow(dead_code)]
     pub(crate) fn compact_now(&mut self) -> String {
         let before_msgs = self.messages.len();
         let before_tok = estimate_tokens(&self.messages);
@@ -1232,6 +1261,91 @@ impl Session {
                  * pesan | {before_msgs} → {after_msgs} | estimasi ~{before_tok} → ~{after_tok} token"
             )
         }
+    }
+
+    /// Ganti folder kerja aktif (`/cd [folder]`) tanpa restart (berlaku di Telegram, TUI, & Plain REPL).
+    pub(crate) fn handle_cd(&mut self, arg: Option<&str>) -> Result<String> {
+        let Some(raw) = arg.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(format!(
+                "# Folder Kerja Aktif (/cd)\n\
+                 * folder | {} | aktif sekarang\n\
+                 ! Pindah folder: /cd <path_relatif_atau_absolut>",
+                self.ctx.cwd.display()
+            ));
+        };
+        let expanded = if raw == "~" {
+            dirs::home_dir().unwrap_or_else(|| self.ctx.cwd.clone())
+        } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+            dirs::home_dir()
+                .map(|h| h.join(rest))
+                .unwrap_or_else(|| self.ctx.cwd.join(raw))
+        } else {
+            let p = std::path::Path::new(raw);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                self.ctx.cwd.join(p)
+            }
+        };
+        let canon = std::fs::canonicalize(&expanded)
+            .map_err(|e| anyhow::anyhow!("folder '{}' tidak ditemukan: {e}", expanded.display()))?;
+        if !canon.is_dir() {
+            anyhow::bail!("'{}' bukan direktori.", canon.display());
+        }
+        let prev = self.ctx.cwd.display().to_string();
+        self.ctx.cwd = canon.clone();
+        Ok(format!(
+            "# Folder Kerja Diperbarui (/cd)\n\
+             * folder | {} | aktif sekarang\n\
+             > sebelumnya | {prev} | seluruh tool & sandbox mengikuti folder baru",
+            canon.display()
+        ))
+    }
+
+    /// Snapshot daftar sesi tersimpan untuk modal `/resume` interaktif di TUI.
+    pub(crate) fn resume_picker_data(&self, status: Option<String>) -> Result<ResumePickerData> {
+        let cwd_str = self.ctx.cwd.to_string_lossy().to_string();
+        let _ = self.store.prune_empty_sessions(&cwd_str, &self.session_id);
+        let list = self.store.list_sessions(&cwd_str, 20)?;
+        let items = list
+            .into_iter()
+            .map(|s| {
+                let msg_count = self.store.count_messages(&s.id).unwrap_or(0);
+                let is_active = s.id == self.session_id;
+                ResumePickerItem {
+                    id: s.id,
+                    title: s.title,
+                    created_at: s.created_at,
+                    model: s.model,
+                    msg_count,
+                    is_active,
+                }
+            })
+            .collect();
+        Ok(ResumePickerData {
+            cwd: cwd_str,
+            active_session_id: self.session_id.clone(),
+            items,
+            status,
+        })
+    }
+
+    /// Periksa apakah model aktif perlu auto-probe kapasitas konteks di latar saat startup:
+    /// hanya berjalan bila tidak ada override `[providers].context_limit` dan model belum ada di cache SQLite.
+    pub(crate) fn background_context_probe_params(
+        &self,
+    ) -> Option<(String, Option<String>, String, Arc<Store>)> {
+        if self.needs_setup || self.pcfg.context_limit.filter(|&n| n > 0).is_some() {
+            return None;
+        }
+        if self.model_context_cache.contains_key(&self.pcfg.model) {
+            return None;
+        }
+        if !matches!(self.pcfg.kind.as_str(), "openai" | "gemini" | "anthropic") {
+            return None;
+        }
+        let (_, pcfg, api_key) = self.cfg.resolve_provider(Some(&self.provider_name)).ok()?;
+        Some((pcfg.kind, pcfg.base_url, api_key, self.store.clone()))
     }
 
     /// Ringkasan token sesi + estimasi biaya bila harga dikonfigurasi.

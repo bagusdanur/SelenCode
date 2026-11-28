@@ -20,6 +20,26 @@ pub struct ModelPickerData {
     pub status: Option<String>,
 }
 
+/// Satu baris sesi untuk modal pemilih `/resume` interaktif di TUI (`v0.5.30`).
+#[derive(Debug, Clone)]
+pub struct ResumePickerItem {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub model: String,
+    pub msg_count: usize,
+    pub is_active: bool,
+}
+
+/// Snapshot data untuk modal pemilih `/resume` interaktif di TUI (`v0.5.30`).
+#[derive(Debug, Clone)]
+pub struct ResumePickerData {
+    pub cwd: String,
+    pub active_session_id: String,
+    pub items: Vec<ResumePickerItem>,
+    pub status: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     /// Potongan teks jawaban assistant yang sedang streaming.
@@ -63,6 +83,10 @@ pub enum UiEvent {
     Menu(String),
     /// Buka atau perbarui modal pemilih model interaktif di TUI.
     ModelPicker(ModelPickerData),
+    /// Buka atau perbarui modal pemilih sesi `/resume` interaktif di TUI (`v0.5.30`).
+    ResumePicker(ResumePickerData),
+    /// Folder kerja aktif berubah lewat `/cd` (`v0.5.30`).
+    CwdChanged(String),
     /// Sesi baru dimulai (/new): bersihkan transkrip & reset statistik sesi.
     SessionReset {
         session_id: String,

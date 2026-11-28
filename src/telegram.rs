@@ -164,6 +164,10 @@ pub enum TgModelCallback {
     ModelPage { provider_idx: usize, page: usize },
     /// Aktifkan model ke-`model_idx` pada provider ke-`provider_idx` (`mdl:s:<pidx>:<midx>`).
     SelectModel { provider_idx: usize, model_idx: usize },
+    /// Tarik/tampilkan Katalog API provider ke-`provider_idx` halaman `page` (`mdl:c:<pidx>:<page>`).
+    CatalogPage { provider_idx: usize, page: usize },
+    /// Tambahkan & langsung aktifkan model indeks `remote_idx` dari katalog API (`mdl:a:<pidx>:<ridx>`).
+    AddAndSelectCatalog { provider_idx: usize, remote_idx: usize },
     /// Tutup pemilih model (`mdl:x`).
     Close,
     /// Tombol indikator halaman yang tidak mengubah state (`mdl:noop`).
@@ -171,7 +175,7 @@ pub enum TgModelCallback {
 }
 
 /// Parse payload `callback_data` pemilih `/model` (`mdl:p:<page>`, `mdl:m:<pidx>:<page>`,
-/// `mdl:s:<pidx>:<midx>`, `mdl:x`, `mdl:noop`).
+/// `mdl:s:<pidx>:<midx>`, `mdl:c:<pidx>:<page>`, `mdl:a:<pidx>:<ridx>`, `mdl:x`, `mdl:noop`).
 pub fn parse_callback_model(data: &str) -> Option<TgModelCallback> {
     let mut parts = data.trim().split(':');
     if parts.next()? != "mdl" {
@@ -216,6 +220,163 @@ pub fn parse_callback_model(data: &str) -> Option<TgModelCallback> {
                 model_idx,
             })
         }
+        "c" => {
+            let provider_idx = parts.next()?.parse::<usize>().ok()?;
+            let page = parts.next()?.parse::<usize>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(TgModelCallback::CatalogPage { provider_idx, page })
+        }
+        "a" => {
+            let provider_idx = parts.next()?.parse::<usize>().ok()?;
+            let remote_idx = parts.next()?.parse::<usize>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(TgModelCallback::AddAndSelectCatalog {
+                provider_idx,
+                remote_idx,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Callback inline `/resume` & `/sessions` (`res:s:<1based>`, `res:new`, `res:x`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TgResumeCallback {
+    Select(usize),
+    NewSession,
+    Close,
+}
+
+pub fn parse_callback_resume(data: &str) -> Option<TgResumeCallback> {
+    let mut parts = data.trim().split(':');
+    if parts.next()? != "res" {
+        return None;
+    }
+    match parts.next()? {
+        "new" if parts.next().is_none() => Some(TgResumeCallback::NewSession),
+        "x" if parts.next().is_none() => Some(TgResumeCallback::Close),
+        "s" => {
+            let idx = parts.next()?.parse::<usize>().ok()?;
+            if parts.next().is_some() || idx == 0 {
+                return None;
+            }
+            Some(TgResumeCallback::Select(idx))
+        }
+        _ => None,
+    }
+}
+
+/// Callback inline pengaturan cepat `/approve` & `/sandbox` (`cfg:ap:<mode>`, `cfg:sb:<mode>`, `cfg:x`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TgConfigCallback {
+    SetApprove(String),
+    SetSandbox(String),
+    Close,
+}
+
+pub fn parse_callback_config(data: &str) -> Option<TgConfigCallback> {
+    let mut parts = data.trim().split(':');
+    if parts.next()? != "cfg" {
+        return None;
+    }
+    match parts.next()? {
+        "x" if parts.next().is_none() => Some(TgConfigCallback::Close),
+        "ap" => {
+            let mode = parts.next()?;
+            if parts.next().is_some() || !matches!(mode, "ask" | "edits" | "auto") {
+                return None;
+            }
+            Some(TgConfigCallback::SetApprove(mode.to_string()))
+        }
+        "sb" => {
+            let mode = match parts.next()? {
+                "ro" => "read-only",
+                "ww" => "workspace-write",
+                "un" => "unrestricted",
+                _ => return None,
+            };
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(TgConfigCallback::SetSandbox(mode.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Callback inline `/cron` (`crn:t:<id>`, `crn:d:<id>`, `crn:x`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TgCronCallback {
+    Toggle(i64),
+    Delete(i64),
+    Close,
+}
+
+pub fn parse_callback_cron(data: &str) -> Option<TgCronCallback> {
+    let mut parts = data.trim().split(':');
+    if parts.next()? != "crn" {
+        return None;
+    }
+    match parts.next()? {
+        "x" if parts.next().is_none() => Some(TgCronCallback::Close),
+        "t" => {
+            let id = parts.next()?.parse::<i64>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(TgCronCallback::Toggle(id))
+        }
+        "d" => {
+            let id = parts.next()?.parse::<i64>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(TgCronCallback::Delete(id))
+        }
+        _ => None,
+    }
+}
+
+/// Callback inline `/skills` (`skl:v:<idx>`, `skl:x`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TgSkillCallback {
+    View(usize),
+    Close,
+}
+
+pub fn parse_callback_skill(data: &str) -> Option<TgSkillCallback> {
+    let mut parts = data.trim().split(':');
+    if parts.next()? != "skl" {
+        return None;
+    }
+    match parts.next()? {
+        "x" if parts.next().is_none() => Some(TgSkillCallback::Close),
+        "v" => {
+            let idx = parts.next()?.parse::<usize>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(TgSkillCallback::View(idx))
+        }
+        _ => None,
+    }
+}
+
+/// Callback inline persetujuan rencana `/plan` di Telegram (`pln:run`, `pln:x`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TgPlanCallback {
+    Execute,
+    Cancel,
+}
+
+pub fn parse_callback_plan(data: &str) -> Option<TgPlanCallback> {
+    match data.trim() {
+        "pln:run" => Some(TgPlanCallback::Execute),
+        "pln:x" => Some(TgPlanCallback::Cancel),
         _ => None,
     }
 }
@@ -378,6 +539,12 @@ pub fn build_tg_model_picker_card(
     }
 
     let mut footer = Vec::new();
+    if matches!(viewing_provider_kind, "openai" | "gemini" | "anthropic") {
+        footer.push((
+            "📡 Katalog API".to_string(),
+            format!("mdl:c:{viewing_provider_idx}:0"),
+        ));
+    }
     if total_providers > 1 {
         footer.push((
             format!("🔄 Provider ({total_providers})"),
@@ -387,6 +554,299 @@ pub fn build_tg_model_picker_card(
     footer.push(("✕ Tutup".to_string(), "mdl:x".to_string()));
     rows.push(footer);
 
+    TgInlineCard { html, plain, rows }
+}
+
+/// Bangun kartu paginasi Katalog API (`/models`) di Telegram: tap 1 model langsung menambahkan
+/// ke daftar & mengaktifkannya tanpa perlu mengetik `/model add`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_tg_catalog_picker_card(
+    active_provider: &str,
+    active_model: &str,
+    viewing_provider_idx: usize,
+    viewing_provider: &str,
+    viewing_provider_kind: &str,
+    models: &[TgModelEntry],
+    page: usize,
+) -> TgInlineCard {
+    const PAGE_SIZE: usize = 8;
+    let total = models.len();
+    let total_pages = total.max(1).div_ceil(PAGE_SIZE);
+    let cur_page = page.min(total_pages.saturating_sub(1));
+    let start = cur_page * PAGE_SIZE;
+    let end = (start + PAGE_SIZE).min(total);
+    let slice = if start < total {
+        &models[start..end]
+    } else {
+        &[]
+    };
+    let range_text = if total == 0 {
+        format!("Katalog API {viewing_provider} kosong.")
+    } else {
+        format!(
+            "Tap untuk simpan & aktifkan ({}–{} dari {total}):",
+            start + 1,
+            end
+        )
+    };
+    let html = format!(
+        "📡 <i>Katalog API · {}</i> ({})\n\n\
+         <b>Aktif sekarang:</b> <code>{}</code> ({})\n\
+         {}",
+        escape_telegram_html(viewing_provider),
+        escape_telegram_html(viewing_provider_kind),
+        escape_telegram_html(active_model),
+        escape_telegram_html(active_provider),
+        escape_telegram_html(&range_text),
+    );
+    let plain = format!(
+        "Katalog API {viewing_provider} ({viewing_provider_kind})\n\
+         Aktif sekarang: {active_model} ({active_provider})\n\
+         {range_text}"
+    );
+    let mut rows: Vec<Vec<(String, String)>> = Vec::new();
+    for (offset, m) in slice.iter().enumerate() {
+        let global_idx = start + offset;
+        let ctx_tag = crate::agent::context::format_context_compact(m.context_limit);
+        let label = if m.is_active {
+            format!("✓ {} · {ctx_tag}", clip_tg_btn_label(&m.id, 30))
+        } else {
+            format!("+ {} · {ctx_tag}", clip_tg_btn_label(&m.id, 30))
+        };
+        rows.push(vec![(
+            label,
+            format!("mdl:a:{viewing_provider_idx}:{global_idx}"),
+        )]);
+    }
+    if total_pages > 1 {
+        let mut nav = Vec::new();
+        if cur_page > 0 {
+            nav.push((
+                "◀ Prev".to_string(),
+                format!("mdl:c:{viewing_provider_idx}:{}", cur_page - 1),
+            ));
+        }
+        nav.push((
+            format!("{}/{}", cur_page + 1, total_pages),
+            "mdl:noop".to_string(),
+        ));
+        if cur_page + 1 < total_pages {
+            nav.push((
+                "Next ▶".to_string(),
+                format!("mdl:c:{viewing_provider_idx}:{}", cur_page + 1),
+            ));
+        }
+        rows.push(nav);
+    }
+    rows.push(vec![
+        (
+            "◀ Model Saya".to_string(),
+            format!("mdl:m:{viewing_provider_idx}:0"),
+        ),
+        ("✕ Tutup".to_string(), "mdl:x".to_string()),
+    ]);
+    TgInlineCard { html, plain, rows }
+}
+
+/// Ringkasan satu sesi tersimpan untuk pemilih inline `/resume` Telegram.
+#[derive(Debug, Clone)]
+pub struct TgResumeItem {
+    pub num: usize,
+    pub id_short: String,
+    pub title: String,
+    pub msg_count: usize,
+    pub model: String,
+    pub is_active: bool,
+}
+
+/// Bangun kartu pemilih sesi `/resume` interaktif Telegram (`res:s:<num>`, `res:new`, `res:x`).
+pub fn build_tg_resume_picker_card(cwd: &str, items: &[TgResumeItem]) -> TgInlineCard {
+    let mut html = format!(
+        "🗂 <b>Sesi Tersimpan</b> ({})\n<i>{}</i>\n",
+        items.len(),
+        escape_telegram_html(cwd)
+    );
+    let mut plain = format!("Sesi Tersimpan ({}) — {cwd}\n", items.len());
+    let mut rows: Vec<Vec<(String, String)>> = Vec::new();
+    if items.is_empty() {
+        html.push_str("\nBelum ada sesi tersimpan untuk folder ini.");
+        plain.push_str("\nBelum ada sesi tersimpan untuk folder ini.");
+    } else {
+        html.push_str("\nTap sesi untuk langsung melanjutkan:");
+        for item in items.iter().take(10) {
+            let prefix = if item.is_active { "✓ " } else { "" };
+            let btn = format!(
+                "{prefix}#{} · {} ({} msg)",
+                item.num,
+                clip_tg_btn_label(&item.title, 24),
+                item.msg_count
+            );
+            rows.push(vec![(btn, format!("res:s:{}", item.num))]);
+            plain.push_str(&format!(
+                "\n#{} {} ({} msg · {})",
+                item.num, item.title, item.msg_count, item.model
+            ));
+        }
+    }
+    rows.push(vec![
+        ("✨ Sesi Baru".to_string(), "res:new".to_string()),
+        ("✕ Tutup".to_string(), "res:x".to_string()),
+    ]);
+    TgInlineCard { html, plain, rows }
+}
+
+/// Bangun kartu saklar 1-tap `/approve` Telegram (`cfg:ap:ask|edits|auto`).
+pub fn build_tg_approve_picker_card(current_mode: &str, session_cats: &str) -> TgInlineCard {
+    let html = format!(
+        "🛡 <b>Mode Persetujuan Tool (/approve)</b>\n\n\
+         <b>Aktif:</b> <code>{}</code>\n\
+         <b>Izin sesi:</b> {}\n\n\
+         Pilih mode izin untuk sesi chat ini:",
+        escape_telegram_html(current_mode),
+        escape_telegram_html(session_cats),
+    );
+    let plain = format!(
+        "Mode Persetujuan Tool: {current_mode}\nIzin sesi: {session_cats}"
+    );
+    let low = current_mode.to_ascii_lowercase();
+    let lbl = |key: &str, title: &str| {
+        if low.contains(key) {
+            format!("✓ {title}")
+        } else {
+            title.to_string()
+        }
+    };
+    let rows = vec![
+        vec![
+            (lbl("ask", "Tanya (ask)"), "cfg:ap:ask".to_string()),
+            (lbl("edit", "Auto Edit (edits)"), "cfg:ap:edits".to_string()),
+            (lbl("auto", "Auto Semua (auto)"), "cfg:ap:auto".to_string()),
+        ],
+        vec![("✕ Tutup".to_string(), "cfg:x".to_string())],
+    ];
+    TgInlineCard { html, plain, rows }
+}
+
+/// Bangun kartu saklar 1-tap `/sandbox` Telegram (`cfg:sb:ro|ww|un`).
+pub fn build_tg_sandbox_picker_card(current_mode: &str, backend: &str) -> TgInlineCard {
+    let html = format!(
+        "🔒 <b>Mode Sandbox (/sandbox)</b>\n\n\
+         <b>Aktif:</b> <code>{}</code>\n\
+         <b>Backend:</b> {}\n\n\
+         Pilih tingkat isolasi workspace:",
+        escape_telegram_html(current_mode),
+        escape_telegram_html(backend),
+    );
+    let plain = format!("Mode Sandbox: {current_mode}\nBackend: {backend}");
+    let lbl = |m: &str, title: &str| {
+        if current_mode.eq_ignore_ascii_case(m) {
+            format!("✓ {title}")
+        } else {
+            title.to_string()
+        }
+    };
+    let rows = vec![
+        vec![
+            (lbl("read-only", "Read-Only"), "cfg:sb:ro".to_string()),
+            (
+                lbl("workspace-write", "Workspace"),
+                "cfg:sb:ww".to_string(),
+            ),
+            (
+                lbl("unrestricted", "Unrestricted"),
+                "cfg:sb:un".to_string(),
+            ),
+        ],
+        vec![("✕ Tutup".to_string(), "cfg:x".to_string())],
+    ];
+    TgInlineCard { html, plain, rows }
+}
+
+/// Ringkasan 1 cron job untuk tombol cepat `/cron` Telegram.
+#[derive(Debug, Clone)]
+pub struct TgCronItem {
+    pub id: i64,
+    pub name: String,
+    pub schedule_human: String,
+    pub enabled: bool,
+}
+
+/// Bangun kartu daftar `/cron` Telegram dengan tombol `▶/⏸` & `🗑 Hapus`.
+pub fn build_tg_cron_picker_card(items: &[TgCronItem]) -> TgInlineCard {
+    let mut html = format!("⏰ <b>Tugas Terjadwal (/cron)</b> ({})\n", items.len());
+    let mut plain = format!("Tugas Terjadwal ({})\n", items.len());
+    let mut rows: Vec<Vec<(String, String)>> = Vec::new();
+    if items.is_empty() {
+        html.push_str("\nBelum ada cron job.\n<i>Tambah: /cron add &lt;nama&gt; &lt;5m|08:30&gt; &lt;prompt&gt;</i>");
+        plain.push_str("\nBelum ada cron job.");
+    } else {
+        for j in items.iter().take(6) {
+            let st = if j.enabled { "aktif" } else { "dijeda" };
+            html.push_str(&format!(
+                "\n• <b>#{} {}</b> — {} (<i>{st}</i>)",
+                j.id,
+                escape_telegram_html(&j.name),
+                escape_telegram_html(&j.schedule_human),
+            ));
+            plain.push_str(&format!(
+                "\n#{} {} — {} ({st})",
+                j.id, j.name, j.schedule_human
+            ));
+            let toggle_lbl = if j.enabled {
+                format!("⏸ Jeda #{}", j.id)
+            } else {
+                format!("▶ Aktifkan #{}", j.id)
+            };
+            rows.push(vec![
+                (toggle_lbl, format!("crn:t:{}", j.id)),
+                (format!("🗑 Hapus #{}", j.id), format!("crn:d:{}", j.id)),
+            ]);
+        }
+    }
+    rows.push(vec![("✕ Tutup".to_string(), "crn:x".to_string())]);
+    TgInlineCard { html, plain, rows }
+}
+
+/// Ringkasan 1 skill untuk tombol cepat `/skills` Telegram.
+#[derive(Debug, Clone)]
+pub struct TgSkillItem {
+    pub name: String,
+    pub scope: String,
+}
+
+/// Bangun kartu ringkas `/skills` Telegram dengan tombol lihat detail 2-kolom (`skl:v:<idx>`).
+pub fn build_tg_skills_picker_card(menu_markup: &str, items: &[TgSkillItem]) -> TgInlineCard {
+    let html = menu_markup_to_telegram_html(menu_markup);
+    let plain = crate::repl::strip_menu_markup(menu_markup);
+    let mut rows: Vec<Vec<(String, String)>> = Vec::new();
+    let shown: Vec<(usize, &TgSkillItem)> = items.iter().enumerate().take(8).collect();
+    for pair in shown.chunks(2) {
+        let row = pair
+            .iter()
+            .map(|(idx, sk)| {
+                (
+                    format!("📖 {}", clip_tg_btn_label(&sk.name, 16)),
+                    format!("skl:v:{idx}"),
+                )
+            })
+            .collect();
+        rows.push(row);
+    }
+    rows.push(vec![("✕ Tutup".to_string(), "skl:x".to_string())]);
+    TgInlineCard { html, plain, rows }
+}
+
+/// Bangun kartu konfirmasi rencana `/plan` di Telegram dengan tombol `[ ✅ Jalankan Rencana ]` / `[ ✕ Batalkan ]`.
+pub fn build_tg_plan_confirm_card(plan_markdown: &str) -> TgInlineCard {
+    let body_html = markdown_to_telegram_html(plan_markdown);
+    let html = format!(
+        "📋 <b>Rencana Siap Dieksekusi</b>\n\n{body_html}\n\n<i>Pilih tombol di bawah untuk menjalankan atau membatalkan rencana ini.</i>"
+    );
+    let plain = format!("Rencana Siap Dieksekusi:\n\n{plan_markdown}");
+    let rows = vec![vec![
+        ("✅ Jalankan Rencana".to_string(), "pln:run".to_string()),
+        ("✕ Batalkan".to_string(), "pln:x".to_string()),
+    ]];
     TgInlineCard { html, plain, rows }
 }
 
@@ -1555,6 +2015,205 @@ pub enum TgIngressClassification {
         reply: String,
     },
     Ignore,
+}
+
+/// Lampiran pesan suara (`voice`) atau berkas `audio` Telegram untuk transkripsi otomatis (`v0.5.30`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TgAudioAttachment {
+    pub file_id: String,
+    pub message_id: i64,
+    pub is_voice: bool,
+    pub file_name: String,
+    pub mime_type: String,
+    pub file_size: Option<u64>,
+    pub duration_secs: Option<u64>,
+    pub caption: String,
+}
+
+/// Ekstrak metadata `voice` atau `audio` dari `TgMessage` (tanpa mengubah perilaku `classify_tg_message`
+/// sehingga kompatibilitas penuh dengan uji `v0.5.26` tetap terjaga).
+pub fn extract_tg_voice_or_audio(msg: &TgMessage) -> Option<TgAudioAttachment> {
+    let caption = msg
+        .caption
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    if let Some(v) = &msg.voice {
+        let file_id = v["file_id"].as_str()?.trim().to_string();
+        if file_id.is_empty() {
+            return None;
+        }
+        let mime_type = v["mime_type"]
+            .as_str()
+            .unwrap_or("audio/ogg")
+            .to_string();
+        return Some(TgAudioAttachment {
+            file_id,
+            message_id: msg.message_id,
+            is_voice: true,
+            file_name: format!("voice_{}.ogg", msg.message_id),
+            mime_type,
+            file_size: v["file_size"].as_u64(),
+            duration_secs: v["duration"].as_u64(),
+            caption,
+        });
+    }
+    if let Some(a) = &msg.audio {
+        let file_id = a["file_id"].as_str()?.trim().to_string();
+        if file_id.is_empty() {
+            return None;
+        }
+        let mime_type = a["mime_type"]
+            .as_str()
+            .unwrap_or("audio/mpeg")
+            .to_string();
+        let file_name = a["file_name"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("audio_{}.mp3", msg.message_id));
+        return Some(TgAudioAttachment {
+            file_id,
+            message_id: msg.message_id,
+            is_voice: false,
+            file_name,
+            mime_type,
+            file_size: a["file_size"].as_u64(),
+            duration_secs: a["duration"].as_u64(),
+            caption,
+        });
+    }
+    None
+}
+
+/// Transkripsikan byte audio (`voice`/`audio` Telegram) menggunakan provider aktif:
+/// - `openai`: `POST {base_url}/audio/transcriptions` (multipart `whisper-1`)
+/// - `gemini`: `POST {base_url}/v1beta/models/{model}:generateContent` (`inlineData` base64)
+pub async fn transcribe_audio_bytes(
+    provider_kind: &str,
+    base_url: Option<&str>,
+    api_key: &str,
+    model: &str,
+    audio_bytes: &[u8],
+    file_name: &str,
+    mime_type: &str,
+) -> Result<String> {
+    if audio_bytes.is_empty() {
+        anyhow::bail!("berkas audio kosong.");
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    match provider_kind {
+        "openai" => {
+            let base = base_url
+                .map(|s| s.trim_end_matches('/'))
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("base_url kosong untuk transkripsi audio OpenAI-compatible"))?;
+            let url = format!("{base}/audio/transcriptions");
+            let part = reqwest::multipart::Part::bytes(audio_bytes.to_vec())
+                .file_name(file_name.to_string())
+                .mime_str(mime_type)
+                .unwrap_or_else(|_| {
+                    reqwest::multipart::Part::bytes(audio_bytes.to_vec())
+                        .file_name(file_name.to_string())
+                });
+            let form = reqwest::multipart::Form::new()
+                .text("model", "whisper-1")
+                .part("file", part);
+            let resp = client
+                .post(&url)
+                .bearer_auth(api_key)
+                .multipart(form)
+                .send()
+                .await
+                .with_context(|| format!("gagal menghubungi {url}"))?;
+            let status = resp.status();
+            let raw = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                anyhow::bail!(
+                    "endpoint transkripsi audio ({url}) membalas {status}: {}",
+                    raw.chars().take(200).collect::<String>()
+                );
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                if let Some(txt) = v["text"].as_str() {
+                    let clean = txt.trim();
+                    if !clean.is_empty() {
+                        return Ok(clean.to_string());
+                    }
+                }
+            }
+            let clean = raw.trim();
+            if clean.is_empty() {
+                anyhow::bail!("hasil transkripsi audio kosong.");
+            }
+            Ok(clean.to_string())
+        }
+        "gemini" => {
+            use base64::Engine;
+            let base = base_url
+                .map(|s| s.trim_end_matches('/'))
+                .filter(|s| !s.is_empty())
+                .unwrap_or(crate::providers::gemini::DEFAULT_BASE_URL);
+            let url = format!("{base}/v1beta/models/{model}:generateContent");
+            let b64 = base64::engine::general_purpose::STANDARD.encode(audio_bytes);
+            let body = json!({
+                "contents": [{
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": "Transkripsikan pesan suara ini secara akurat dalam bahasa aslinya. Kembalikan HANYA teks transkripsinya tanpa penjelasan tambahan."
+                        },
+                        {
+                            "inlineData": {
+                                "mimeType": mime_type,
+                                "data": b64
+                            }
+                        }
+                    ]
+                }]
+            });
+            let resp = client
+                .post(&url)
+                .header("x-goog-api-key", api_key)
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| format!("gagal menghubungi Gemini audio {url}"))?;
+            let status = resp.status();
+            let raw = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                anyhow::bail!(
+                    "Gemini audio membalas {status}: {}",
+                    raw.chars().take(200).collect::<String>()
+                );
+            }
+            let v: Value = serde_json::from_str(&raw).context("respons Gemini audio bukan JSON")?;
+            let mut text = String::new();
+            if let Some(parts) = v["candidates"][0]["content"]["parts"].as_array() {
+                for p in parts {
+                    if let Some(t) = p["text"].as_str() {
+                        text.push_str(t);
+                    }
+                }
+            }
+            let clean = text.trim();
+            if clean.is_empty() {
+                anyhow::bail!("Gemini mengembalikan transkripsi kosong.");
+            }
+            Ok(clean.to_string())
+        }
+        other => {
+            anyhow::bail!(
+                "provider kind '{other}' belum mendukung transkripsi audio langsung (gunakan provider OpenAI-compatible dengan /audio/transcriptions atau Gemini)."
+            )
+        }
+    }
 }
 
 /// Cek apakah dokumen Telegram adalah berkas gambar (mis. screenshot dikirim sebagai file

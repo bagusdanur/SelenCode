@@ -4,6 +4,7 @@ pub mod commands;
 pub mod plain_runner;
 pub mod session;
 pub mod telegram_runner;
+pub mod telegram_ui;
 pub mod tui_runner;
 
 use anyhow::Result;

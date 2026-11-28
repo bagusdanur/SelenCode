@@ -11,7 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use selencode::agent::run_turn;
 use selencode::providers::{
-    AssistantReply, Block, Message, Provider, Role, StreamEvent, ToolCall, ToolSpec,
+    AssistantReply, Block, Message, Provider, StreamEvent, ToolCall, ToolSpec,
 };
 use selencode::telegram::{
     classify_tg_message, format_tg_document_too_large_reply, format_tg_document_turn_prompt,

@@ -12,7 +12,7 @@ use selencode::providers::{
 use selencode::repl::{parse_slash_command, SlashCommand};
 use selencode::tools::undo::{FileSnapshot, UndoStack};
 use selencode::tools::verify::{detect_project_plan, parse_diagnostics, ProjectKind};
-use selencode::tools::{default_registry, Ctx, Tool};
+use selencode::tools::{default_registry, Ctx};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -739,8 +739,66 @@ async fn tui_worker(
                 }
             }
             TuiCommand::CompactContext => {
-                let card = s.compact_now();
+                let card = s.compact_now_smart().await;
+                let _ = ui_tx
+                    .send(UiEvent::ContextInfo {
+                        used_tokens: estimate_tokens(&s.messages),
+                        limit_tokens: s.ctx.context_limit_tokens,
+                    })
+                    .await;
                 let _ = ui_tx.send(UiEvent::Menu(card)).await;
+            }
+            TuiCommand::Cd(arg) => match s.handle_cd(arg.as_deref()) {
+                Ok(card) => {
+                    let new_cwd = s.ctx.cwd.clone();
+                    let _ = ui_tx
+                        .send(UiEvent::CwdChanged(new_cwd.to_string_lossy().to_string()))
+                        .await;
+                    let _ = ui_tx.send(UiEvent::Menu(card)).await;
+                    let ui_scan = ui_tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(files) = tokio::task::spawn_blocking(move || {
+                            collect_workspace_files(&new_cwd, 1500)
+                        })
+                        .await
+                        {
+                            let _ = ui_scan.send(UiEvent::WorkspaceFilesLoaded(files)).await;
+                        }
+                    });
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::OpenResumePicker => match s.resume_picker_data(None) {
+                Ok(data) => {
+                    let _ = ui_tx.send(UiEvent::ResumePicker(data)).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                }
+            },
+            TuiCommand::DeleteSession(target_id) => {
+                let status_msg = if target_id == s.session_id {
+                    "Tidak bisa menghapus sesi yang sedang aktif.".to_string()
+                } else {
+                    match s.store.delete_session(&target_id) {
+                        Ok(true) => format!(
+                            "Sesi {} dihapus.",
+                            target_id.chars().take(10).collect::<String>()
+                        ),
+                        Ok(false) => "Sesi tidak ditemukan.".to_string(),
+                        Err(e) => format!("Gagal hapus: {e}"),
+                    }
+                };
+                match s.resume_picker_data(Some(status_msg)) {
+                    Ok(data) => {
+                        let _ = ui_tx.send(UiEvent::ResumePicker(data)).await;
+                    }
+                    Err(e) => {
+                        let _ = ui_tx.send(UiEvent::Error(format!("{e}"))).await;
+                    }
+                }
             }
             TuiCommand::ShowSessions => match s.sessions_menu() {
                 Ok(t) => {
@@ -885,6 +943,51 @@ pub(crate) async fn interactive_tui(
             let _ = ui_tx_scan.send(UiEvent::WorkspaceFilesLoaded(files)).await;
         }
     });
+    // Auto-probe latar kapasitas context window model dari API (sekali per model belum ter-cache, 0ms cold start).
+    if let Some((kind, base_url, api_key, st)) = s.background_context_probe_params() {
+        let ui_tx_probe = ui_tx.clone();
+        tokio::spawn(async move {
+            let res = tokio::time::timeout(Duration::from_secs(8), async move {
+                match kind.as_str() {
+                    "openai" => {
+                        let u = base_url.as_deref()?;
+                        selencode::providers::openai::fetch_models_with_context(u, &api_key)
+                            .await
+                            .ok()
+                    }
+                    "gemini" => {
+                        let u = base_url
+                            .as_deref()
+                            .unwrap_or(selencode::providers::gemini::DEFAULT_BASE_URL);
+                        selencode::providers::gemini::fetch_models_with_context(u, &api_key)
+                            .await
+                            .ok()
+                    }
+                    "anthropic" => {
+                        let u = base_url
+                            .as_deref()
+                            .unwrap_or(selencode::providers::anthropic::DEFAULT_BASE_URL);
+                        selencode::providers::anthropic::fetch_models_with_context(u, &api_key)
+                            .await
+                            .ok()
+                    }
+                    _ => None,
+                }
+            })
+            .await;
+            if let Ok(Some(items)) = res {
+                let discovered: Vec<(String, usize)> = items
+                    .into_iter()
+                    .filter_map(|(id, lim)| lim.map(|n| (id, n)))
+                    .collect();
+                if !discovered.is_empty() {
+                    if let Ok(merged) = st.upsert_model_context_cache(&discovered) {
+                        let _ = ui_tx_probe.send(UiEvent::ModelContexts(merged)).await;
+                    }
+                }
+            }
+        });
+    }
     let cancel = Arc::new(tokio::sync::Notify::new());
     let interrupt_pending = Arc::new(AtomicBool::new(false));
     let worker = tokio::spawn(tui_worker(

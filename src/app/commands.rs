@@ -1,6 +1,9 @@
 use super::session::{ResumedSessionData, Session};
 use anyhow::Result;
-use selencode::agent::context::{calc_context_pct, estimate_tokens, format_context_compact};
+use selencode::agent::context::{
+    calc_context_pct, estimate_tokens, format_context_compact, format_context_tokens_exact,
+    render_progress_bar,
+};
 use selencode::agent::run_self_improvement_review;
 use selencode::config;
 use selencode::providers::router::TaskKind;
@@ -2411,6 +2414,11 @@ impl Session {
         let est = bd.total_tokens();
         let lim = self.ctx.context_limit_tokens;
         let pct = calc_context_pct(est, lim);
+        let bar = render_progress_bar(pct, 10);
+        let cache_note = match self.store.total_cache_usage(&self.session_id) {
+            Ok((cr, cw)) if cr > 0 || cw > 0 => format!(" · cache read {cr} / write {cw}"),
+            _ => String::new(),
+        };
         let metrics_line = match self.store.session_token_metrics(&self.session_id) {
             Ok(m) if m.calls > 0 => format!(
                 "\n> metrik | {} call · avg sys ~{} / tools ~{} / chat ~{} / res ~{} | pruned {} · dedup {}",
@@ -2426,9 +2434,10 @@ impl Session {
         };
         format!(
             "# Info Sesi Aktif\n\
-             * sesi | {} | {}\n\
+             * sesi | {} | {}{cache_note}\n\
              > provider | {} | model {} (kind {})\n\
-             > konteks | {} / {} ({pct}%) | sys ~{} · tools ~{} ({}/{}) · chat ~{} · tool_res ~{}{metrics_line}\n\
+             > konteks | {bar} {pct}% ({} / {}) | kapasitas {}\n\
+             > rincian | sys ~{} · tools ~{} ({}/{}) · chat ~{} · tool_res ~{}{metrics_line}\n\
              > folder | {} | {} pesan di memori",
             self.session_id.chars().take(12).collect::<String>(),
             self.usage_line(),
@@ -2437,6 +2446,7 @@ impl Session {
             self.pcfg.kind,
             format_context_compact(est),
             format_context_compact(lim),
+            format_context_tokens_exact(lim),
             bd.system_tokens,
             bd.tools_tokens,
             bd.active_tools,

@@ -121,6 +121,48 @@ pub(crate) async fn interactive_plain(
     for notice in &s.cfg.startup_notices {
         println!("[selen] {notice}");
     }
+    // Auto-probe latar context window model (non-blocking, simpan ke SQLite untuk giliran & restart berikutnya).
+    if let Some((kind, base_url, api_key, st)) = s.background_context_probe_params() {
+        tokio::spawn(async move {
+            let res = tokio::time::timeout(std::time::Duration::from_secs(8), async move {
+                match kind.as_str() {
+                    "openai" => {
+                        let u = base_url.as_deref()?;
+                        selencode::providers::openai::fetch_models_with_context(u, &api_key)
+                            .await
+                            .ok()
+                    }
+                    "gemini" => {
+                        let u = base_url
+                            .as_deref()
+                            .unwrap_or(selencode::providers::gemini::DEFAULT_BASE_URL);
+                        selencode::providers::gemini::fetch_models_with_context(u, &api_key)
+                            .await
+                            .ok()
+                    }
+                    "anthropic" => {
+                        let u = base_url
+                            .as_deref()
+                            .unwrap_or(selencode::providers::anthropic::DEFAULT_BASE_URL);
+                        selencode::providers::anthropic::fetch_models_with_context(u, &api_key)
+                            .await
+                            .ok()
+                    }
+                    _ => None,
+                }
+            })
+            .await;
+            if let Ok(Some(items)) = res {
+                let discovered: Vec<(String, usize)> = items
+                    .into_iter()
+                    .filter_map(|(id, lim)| lim.map(|n| (id, n)))
+                    .collect();
+                if !discovered.is_empty() {
+                    let _ = st.upsert_model_context_cache(&discovered);
+                }
+            }
+        });
+    }
     println!(
         "{}",
         selencode::tui::moonlit::plain_banner_with_context(
@@ -315,6 +357,10 @@ pub(crate) async fn interactive_plain(
                 Ok(card) => println!("{}", strip_menu_markup(&card)),
                 Err(e) => eprintln!("[error] {e}"),
             },
+            SlashCommand::Cd(arg) => match s.handle_cd(arg.as_deref()) {
+                Ok(card) => println!("{}", strip_menu_markup(&card)),
+                Err(e) => eprintln!("[error] {e}"),
+            },
             SlashCommand::Details => {
                 println!("Perintah /details hanya berlaku pada mode TUI.");
             }
@@ -353,7 +399,7 @@ pub(crate) async fn interactive_plain(
                 }
             }
             SlashCommand::Compact => {
-                println!("{}", strip_menu_markup(&s.compact_now()));
+                println!("{}", strip_menu_markup(&s.compact_now_smart().await));
             }
             SlashCommand::Stop => {
                 plan_next = false;

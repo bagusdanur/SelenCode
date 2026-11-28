@@ -826,6 +826,15 @@ pub fn calc_context_pct(tokens: usize, limit: usize) -> u8 {
     ((tokens.saturating_mul(100) + limit - 1) / limit).min(100) as u8
 }
 
+/// Render bilah progres Unicode ringkas (mis. `██████░░░░` untuk 60%) bagi `/status` & `/usage`.
+pub fn render_progress_bar(pct: u8, width: usize) -> String {
+    let w = width.clamp(4, 24);
+    let filled = ((pct.min(100) as usize * w) + 50) / 100;
+    let filled = filled.min(w);
+    let empty = w.saturating_sub(filled);
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
 /// Pastikan riwayat `messages` tetap valid setelah giliran diinterupsi/dibatalkan
 /// di tengah eksekusi tool: bila pesan terakhir adalah `Assistant` dengan
 /// `ToolUse` yang belum punya `ToolResult`, sisipkan `ToolResult` sintetis
@@ -1728,6 +1737,143 @@ pub fn compact_messages_structured(messages: &[Message]) -> Vec<Message> {
     out.push(Message::text(Role::User, summary));
     out.extend_from_slice(tail);
     out
+}
+
+/// Compaction terstruktur berbantuan LLM (`v0.5.30`):
+/// meringkas giliran-giliran lama menjadi checkpoint terstruktur (`Tujuan`, `File Diubah`,
+/// `Keputusan Teknis`, `Langkah Tersisa`) menggunakan provider aktif dengan tenggat keras 15 detik,
+/// menjaga pasangan `ToolUse`/`ToolResult` tetap utuh dan jatuh aman ke `compact_messages_structured`
+/// bila panggilan LLM gagal/timeout atau riwayat masih pendek.
+/// Mengembalikan `(messages_baru, used_llm_summary)`.
+pub async fn compact_messages_with_llm(
+    provider: &std::sync::Arc<dyn crate::providers::Provider>,
+    messages: &[Message],
+) -> (Vec<Message>, bool) {
+    const KEEP_HEAD: usize = 2;
+    const KEEP_TAIL: usize = 6;
+    if messages.len() <= KEEP_HEAD + KEEP_TAIL {
+        return (messages.to_vec(), false);
+    }
+    let mut head_end = KEEP_HEAD.min(messages.len());
+    while head_end < messages.len() && messages[head_end].role == Role::Tool {
+        head_end += 1;
+    }
+    let mut tail_start = messages.len().saturating_sub(KEEP_TAIL);
+    while tail_start > head_end && messages[tail_start].role == Role::Tool {
+        tail_start -= 1;
+    }
+    if tail_start <= head_end {
+        return (messages.to_vec(), false);
+    }
+    let head = &messages[..head_end];
+    let middle = &messages[head_end..tail_start];
+    let tail = &messages[tail_start..];
+
+    // Bangun transkrip ringkas potongan tengah (maks ~12.000 karakter) untuk diringkas LLM.
+    let mut transcript = String::new();
+    for m in middle {
+        let role_lbl = match m.role {
+            Role::System => "SYSTEM",
+            Role::User => "USER",
+            Role::Assistant => "ASSISTANT",
+            Role::Tool => "TOOL",
+        };
+        let mut snippet = String::new();
+        for b in &m.content {
+            match b {
+                Block::Text(t) if !t.trim().is_empty() => {
+                    if !snippet.is_empty() {
+                        snippet.push(' ');
+                    }
+                    snippet.push_str(t.trim());
+                }
+                Block::ToolUse { name, args, .. } => {
+                    if !snippet.is_empty() {
+                        snippet.push(' ');
+                    }
+                    let a = args.to_string();
+                    let short_a: String = a.chars().take(120).collect();
+                    snippet.push_str(&format!("[tool:{name} {short_a}]"));
+                }
+                Block::ToolResult { content, is_error, .. } => {
+                    if !snippet.is_empty() {
+                        snippet.push(' ');
+                    }
+                    let short_r: String = content.trim().chars().take(160).collect();
+                    let tag = if *is_error { "err" } else { "ok" };
+                    snippet.push_str(&format!("[hasil:{tag} {short_r}]"));
+                }
+                Block::Image { media_type, .. } => {
+                    snippet.push_str(&format!("[gambar:{media_type}]"));
+                }
+                _ => {}
+            }
+        }
+        if snippet.is_empty() {
+            continue;
+        }
+        let clipped: String = snippet.chars().take(600).collect();
+        let line = format!("{role_lbl}: {clipped}\n");
+        if transcript.chars().count() + line.chars().count() > 12_000 {
+            transcript.push_str("...(dipotong)\n");
+            break;
+        }
+        transcript.push_str(&line);
+    }
+
+    let prompt_msgs = vec![
+        Message::text(
+            Role::System,
+            "Kamu adalah penyusun ringkasan konteks kerja coding SelenCode. \
+             Buat ringkasan padat, faktual, dan terstruktur dalam Bahasa Indonesia tanpa basa-basi.",
+        ),
+        Message::text(
+            Role::User,
+            format!(
+                "Ringkas riwayat percakapan berikut menjadi tepat 4 bagian singkat (maks 1.200 karakter total):\n\
+                 1. Tujuan\n\
+                 2. File Diubah & Temuan Utama\n\
+                 3. Keputusan Teknis\n\
+                 4. Langkah Tersisa\n\n\
+                 Riwayat:\n{transcript}"
+            ),
+        ),
+    ];
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let drain = tokio::spawn(async move {
+        while rx.recv().await.is_some() {}
+    });
+    let llm_res = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        provider.stream_chat(&prompt_msgs, &[], tx),
+    )
+    .await;
+    let _ = drain.await;
+
+    if let Ok(Ok(reply)) = llm_res {
+        let body = reply.text.trim();
+        if body.chars().count() >= 40 {
+            let summary_text = format!(
+                "{STRUCTURED_SUMMARY_MARKER} (LLM)\n\
+                 ({} pesan lama diringkas cerdas)\n\n{body}",
+                middle.len()
+            );
+            let mut out = Vec::with_capacity(head.len() + 1 + tail.len());
+            out.extend_from_slice(head);
+            out.push(Message::text(Role::User, summary_text));
+            out.extend_from_slice(tail);
+            return (out, true);
+        }
+    }
+
+    // Fallback deterministik aman bila panggilan LLM gagal/timeout/terlalu pendek.
+    let fallback = compact_messages_structured(messages);
+    if fallback.len() < messages.len() {
+        (fallback, false)
+    } else {
+        (compact_messages(messages), false)
+    }
 }
 
 /// Cooldown bertingkat model aux kompresi (60 -> 300 -> 900 detik) setelah kegagalan (Tahap 5).

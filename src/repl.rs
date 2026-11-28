@@ -71,6 +71,8 @@ pub enum SlashCommand {
     Approve(Option<String>),
     /// /sandbox [read-only | workspace-write | unrestricted | isolate ... | audit] — Security Sandbox v2.
     Sandbox(Option<String>),
+    /// /cd [folder] — lihat atau pindah folder kerja aktif tanpa restart.
+    Cd(Option<String>),
     /// /details — toggle tampilan ringkas vs detail pada baris tool di TUI.
     Details,
     /// /sessions
@@ -337,6 +339,12 @@ pub const COMMANDS: &[CommandDef] = &[
         takes_args: false,
     },
     CommandDef {
+        cmd: "/cd",
+        args: "[folder]",
+        desc: "lihat atau pindah folder kerja aktif tanpa restart",
+        takes_args: true,
+    },
+    CommandDef {
         cmd: "/exit",
         args: "",
         desc: "keluar dari SelenCode",
@@ -408,6 +416,7 @@ pub fn parse_slash_command(line: &str) -> SlashCommand {
         "/export" => SlashCommand::Export(rest),
         "/approve" => SlashCommand::Approve(rest),
         "/sandbox" => SlashCommand::Sandbox(rest),
+        "/cd" | "/cwd" => SlashCommand::Cd(rest),
         "/details" => SlashCommand::Details,
         "/sessions" => SlashCommand::Sessions,
         "/resume" => SlashCommand::Resume(rest),

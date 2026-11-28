@@ -12,6 +12,7 @@ pub mod app;
 pub mod diff_view;
 pub mod markdown;
 pub mod moonlit;
+pub mod resume_modal;
 
 use crate::agent::UiEvent;
 use crate::repl::{filter_commands, help_menu_markup, parse_slash_command, SlashCommand};
@@ -113,11 +114,17 @@ pub enum TuiCommand {
     SetApproval(Option<String>),
     /// /sandbox [read-only | workspace-write | unrestricted | isolate ... | audit]
     Sandbox(Option<String>),
+    /// /cd [folder]: lihat atau pindah folder kerja aktif tanpa restart.
+    Cd(Option<String>),
     /// /new: mulai sesi baru yang bersih.
     NewSession,
-    /// /compact: ringkas riwayat konteks secara manual.
+    /// /compact: ringkas riwayat konteks secara manual (LLM summary + fallback aman).
     CompactContext,
     ShowSessions,
+    /// Buka modal pemilih `/resume` interaktif di TUI.
+    OpenResumePicker,
+    /// Hapus 1 sesi tersimpan dari modal `/resume`.
+    DeleteSession(String),
     Resume(Option<String>),
     Shutdown,
 }
@@ -1654,6 +1661,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
 
+    // Modal Pemilih Sesi `/resume` Interaktif (v0.5.30)
+    if let Some(rp) = &app.resume_picker {
+        resume_modal::render_resume_modal(frame, area, rp);
+    }
+
     // Modal Persetujuan Moonlit Ungu (modern, scrollable, dengan opsi [a] selalu sesi ini)
     if let Some(p) = &app.approval {
         let pct_x = if area.width < 90 { 92 } else { 78 };
@@ -2048,6 +2060,9 @@ fn submit(
         SlashCommand::Sandbox(arg) => {
             send_cmd(app, cmd_tx, TuiCommand::Sandbox(arg));
         }
+        SlashCommand::Cd(arg) => {
+            send_cmd(app, cmd_tx, TuiCommand::Cd(arg));
+        }
         SlashCommand::Details => {
             app.show_tool_details = !app.show_tool_details;
             let mode = if app.show_tool_details {
@@ -2076,18 +2091,22 @@ fn submit(
         SlashCommand::Sessions => {
             send_cmd(app, cmd_tx, TuiCommand::ShowSessions);
         }
-        SlashCommand::Resume(arg) => {
-            let is_switch = arg
-                .as_deref()
-                .map(|s| {
-                    let t = s.trim();
-                    !t.is_empty() && !t.eq_ignore_ascii_case("info") && !t.starts_with("rename ")
-                })
-                .unwrap_or(false);
+        SlashCommand::Resume(None) => {
+            send_cmd(app, cmd_tx, TuiCommand::OpenResumePicker);
+        }
+        SlashCommand::Resume(Some(arg)) => {
+            let t = arg.trim();
+            let is_switch = !t.is_empty()
+                && !t.eq_ignore_ascii_case("info")
+                && !t.eq_ignore_ascii_case("status")
+                && !t.eq_ignore_ascii_case("list")
+                && !t.eq_ignore_ascii_case("ls")
+                && !t.starts_with("rename ")
+                && !t.starts_with("rm ");
             if is_switch && app.busy {
                 app.error("Tunggu giliran saat ini selesai atau gunakan /stop sebelum pindah sesi.");
             } else {
-                send_cmd(app, cmd_tx, TuiCommand::Resume(arg));
+                send_cmd(app, cmd_tx, TuiCommand::Resume(Some(arg)));
             }
         }
         SlashCommand::Plan => {
@@ -2346,6 +2365,11 @@ fn handle_key(
             }
             _ => {}
         }
+        return;
+    }
+    // Modal pemilih `/resume` interaktif menangkap tombol navigasi & pencarian live.
+    if app.resume_picker.is_some() {
+        resume_modal::handle_resume_picker_key(app, key, cmd_tx);
         return;
     }
     // Modal Pemilih Model Interaktif (`/model`) menangkap keyboard saat terbuka.

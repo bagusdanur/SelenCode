@@ -7,7 +7,7 @@ use selencode::lsp::{
 };
 use selencode::repl::{parse_slash_command, SlashCommand, COMMANDS};
 use selencode::tools::undo::UndoStack;
-use selencode::tools::{default_registry, read_only_registry, Ctx, Tool};
+use selencode::tools::{default_registry, read_only_registry, Ctx};
 use serde_json::json;
 use std::io::Cursor;
 use std::path::PathBuf;

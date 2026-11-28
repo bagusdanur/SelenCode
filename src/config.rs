@@ -108,6 +108,9 @@ pub struct WebCfg {
     /// Pagu karakter default keluaran langsung `fetch_url` sebelum spill ke `.selencode/web_cache/` (default 15.000).
     #[serde(default = "default_web_max_extract_chars")]
     pub max_extract_chars: usize,
+    /// Aktifkan fallback otomatis headless Chrome/Chromium untuk halaman SPA JavaScript-only (default: false).
+    #[serde(default)]
+    pub headless_browser: bool,
 }
 
 fn default_web_extract_backend() -> String {
@@ -128,6 +131,7 @@ impl Default for WebCfg {
             searxng_url: None,
             api_key_env: None,
             max_extract_chars: default_web_max_extract_chars(),
+            headless_browser: false,
         }
     }
 }
@@ -730,6 +734,9 @@ pub struct TelegramCfg {
     /// Ambang keras kegagalan/kemacetan polling Telegram sebelum gateway keluar non-nol untuk restart supervisor (default: 300 detik, v0.5.10).
     #[serde(default = "default_tg_poll_watchdog_secs")]
     pub poll_watchdog_secs: u64,
+    /// Aktifkan transkripsi otomatis pesan suara / audio Telegram (default: true, v0.5.30).
+    #[serde(default = "default_tg_voice_transcription")]
+    pub voice_transcription: bool,
 }
 
 fn default_tg_approval_timeout_mins() -> u64 {
@@ -744,6 +751,9 @@ fn default_tg_stall_notice_secs() -> u64 {
 fn default_tg_poll_watchdog_secs() -> u64 {
     300
 }
+fn default_tg_voice_transcription() -> bool {
+    true
+}
 
 impl Default for TelegramCfg {
     fn default() -> Self {
@@ -756,6 +766,7 @@ impl Default for TelegramCfg {
             turn_timeout_secs: default_tg_turn_timeout_secs(),
             stall_notice_secs: default_tg_stall_notice_secs(),
             poll_watchdog_secs: default_tg_poll_watchdog_secs(),
+            voice_transcription: default_tg_voice_transcription(),
         }
     }
 }
@@ -770,6 +781,7 @@ impl TelegramCfg {
             && self.turn_timeout_secs == default_tg_turn_timeout_secs()
             && self.stall_notice_secs == default_tg_stall_notice_secs()
             && self.poll_watchdog_secs == default_tg_poll_watchdog_secs()
+            && self.voice_transcription == default_tg_voice_transcription()
     }
 
     /// Ambil token bot Telegram (prioritas: env var `bot_token_env` -> `SELENCODE_TELEGRAM_TOKEN` -> `bot_token`).

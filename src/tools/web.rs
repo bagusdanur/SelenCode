@@ -779,13 +779,112 @@ async fn try_optional_extract_backend(
     }
 }
 
+/// Deteksi apakah dokumen HTML adalah shell SPA (React/Vue/Next/Nuxt/Angular) yang hampir
+/// kosong tanpa eksekusi JavaScript (sehingga layak dicoba dengan fallback headless Chrome).
+pub fn detect_spa_shell(html: &str) -> bool {
+    let low = html.to_ascii_lowercase();
+    let has_spa_marker = low.contains("id=\"root\"")
+        || low.contains("id='root'")
+        || low.contains("id=\"app\"")
+        || low.contains("id='app'")
+        || low.contains("id=\"__next\"")
+        || low.contains("id=\"__nuxt\"")
+        || low.contains("enable javascript")
+        || low.contains("javascript is required")
+        || low.contains("need to enable javascript");
+    if !has_spa_marker {
+        return false;
+    }
+    let visible = html_to_markdown(html);
+    visible.trim().chars().count() < 180
+}
+
+/// Temukan binary browser Chromium/Chrome/Edge lokal untuk rendering JS opsional (`fetch_url`).
+pub fn find_headless_chrome_binary() -> Option<String> {
+    let candidates: &[&str] = if cfg!(windows) {
+        &[
+            "chrome.exe",
+            "msedge.exe",
+            "chromium.exe",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]
+    } else {
+        &[
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ]
+    };
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let path_dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path_var).collect();
+    for cand in candidates {
+        let p = std::path::Path::new(cand);
+        if p.is_absolute() && p.is_file() {
+            return Some((*cand).to_string());
+        }
+        for dir in &path_dirs {
+            let full = dir.join(cand);
+            if full.is_file() {
+                return Some(full.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Render halaman SPA via browser lokal headless (`--headless=new --dump-dom`, batas waktu 15 detik).
+/// WAJIB hanya dipanggil SESUDAH URL lulus `check_url_allowed` (anti-SSRF).
+async fn fetch_via_headless_chrome(url: &str) -> Option<String> {
+    let bin = find_headless_chrome_binary()?;
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("--headless=new")
+        .arg("--disable-gpu")
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--virtual-time-budget=4500")
+        .arg("--dump-dom")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    let dom = String::from_utf8_lossy(&out.stdout).into_owned();
+    let md = html_to_markdown(&dom);
+    if md.trim().chars().count() > 60 {
+        Some(md)
+    } else {
+        None
+    }
+}
+
 async fn fetch_single_url_markdown(
     client: &reqwest::Client,
     url: reqwest::Url,
     ctx: &Ctx,
     want_raw: bool,
+    js_render: bool,
 ) -> Result<String> {
+    let url_str = url.to_string();
     if !want_raw {
+        if js_render {
+            if let Some(rendered) = fetch_via_headless_chrome(&url_str).await {
+                return Ok(rendered);
+            }
+        }
         if let Some(fp) = detect_fast_path(&url) {
             if let Ok(fast) = try_fast_path_extract(client, &fp).await {
                 if !fast.trim().is_empty() {
@@ -817,6 +916,11 @@ async fn fetch_single_url_markdown(
     let is_html = content_type.to_lowercase().contains("html")
         || body.trim_start().starts_with('<');
     if is_html {
+        if (js_render || ctx.web_cfg.headless_browser) && detect_spa_shell(&body) {
+            if let Some(rendered) = fetch_via_headless_chrome(&url_str).await {
+                return Ok(rendered);
+            }
+        }
         Ok(html_to_markdown(&body))
     } else {
         Ok(body)
@@ -831,13 +935,14 @@ impl Tool for FetchUrl {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fetch_url".into(),
-            description: "Ambil isi bersih (Markdown/API GitHub/Wikipedia/HN/RSS) dari 1–4 URL http/https. Anti-SSRF, pagu default 15.000 char (sisa di-cache ke .selencode/web_cache/).".into(),
+            description: "Ambil isi bersih (Markdown/API GitHub/Wikipedia/HN/RSS, plus fallback opsional headless Chrome untuk SPA) dari 1–4 URL http/https. Anti-SSRF, pagu default 15.000 char (sisa di-cache ke .selencode/web_cache/).".into(),
             parameters: schema(
                 json!({
                     "url": {"type": "string", "description": "URL http/https lengkap"},
                     "urls": {"type": "array", "items": {"type": "string"}, "description": "Opsional: daftar 1-4 URL sekaligus"},
                     "max_chars": {"type": "integer", "description": "Opsional: pagu karakter keluaran (default 15000)"},
-                    "raw": {"type": "boolean", "description": "Opsional: kembalikan teks mentah tanpa konversi Markdown"}
+                    "raw": {"type": "boolean", "description": "Opsional: kembalikan teks mentah tanpa konversi Markdown"},
+                    "js_render": {"type": "boolean", "description": "Opsional: render halaman SPA memakai Chrome/Chromium headless lokal bila tersedia (default: false)"}
                 }),
                 &[],
             ),
@@ -886,6 +991,10 @@ impl Tool for FetchUrl {
         }
 
         let want_raw = args.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
+        let js_render = args
+            .get("js_render")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let base_budget = args
             .get("max_chars")
             .and_then(|v| v.as_u64())
@@ -902,7 +1011,7 @@ impl Tool for FetchUrl {
         if validated.len() == 1 {
             let url = validated.remove(0);
             let url_str = url.to_string();
-            let extracted = fetch_single_url_markdown(&client, url, ctx, want_raw).await?;
+            let extracted = fetch_single_url_markdown(&client, url, ctx, want_raw, js_render).await?;
             return Ok(spill_web_output_if_needed(
                 &ctx.cwd,
                 &url_str,
@@ -914,7 +1023,7 @@ impl Tool for FetchUrl {
         let mut sections: Vec<String> = Vec::new();
         for url in validated {
             let url_str = url.to_string();
-            match fetch_single_url_markdown(&client, url, ctx, want_raw).await {
+            match fetch_single_url_markdown(&client, url, ctx, want_raw, js_render).await {
                 Ok(extracted) => {
                     let body = spill_web_output_if_needed(
                         &ctx.cwd,

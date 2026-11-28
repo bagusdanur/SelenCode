@@ -5,7 +5,7 @@ use selencode::mcp::client::{
     validate_tool_args, McpClient, SUPPORTED_MCP_FEATURES, UNSUPPORTED_MCP_FEATURES,
 };
 use selencode::mcp::connect_server;
-use selencode::tools::{Ctx, Tool};
+use selencode::tools::Ctx;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -3,7 +3,7 @@
 //! meneruskan input keyboard ke sini.
 
 use crate::agent::context::{calc_context_pct, infer_model_context_limit};
-use crate::agent::ui::ModelPickerData;
+use crate::agent::ui::{ModelPickerData, ResumePickerData, ResumePickerItem};
 use crate::agent::UiEvent;
 use crate::security::{tool_category_from_title, ApprovalPolicy, ApprovalRequest};
 use crate::tui::moonlit::{self, WelcomeInfo};
@@ -563,6 +563,61 @@ impl ModelPickerState {
     }
 }
 
+/// State modal pemilih sesi `/resume` interaktif di TUI (`v0.5.30`).
+#[derive(Debug, Clone)]
+pub struct ResumePickerState {
+    pub cwd: String,
+    pub active_session_id: String,
+    pub items: Vec<ResumePickerItem>,
+    pub selected: usize,
+    pub filter_input: String,
+    pub status: Option<String>,
+}
+
+impl ResumePickerState {
+    pub fn from_data(d: ResumePickerData) -> Self {
+        let active_idx = d.items.iter().position(|it| it.is_active).unwrap_or(0);
+        Self {
+            cwd: d.cwd,
+            active_session_id: d.active_session_id,
+            items: d.items,
+            selected: active_idx,
+            filter_input: String::new(),
+            status: d.status,
+        }
+    }
+
+    pub fn update_from(&mut self, d: ResumePickerData) {
+        self.cwd = d.cwd;
+        self.active_session_id = d.active_session_id;
+        self.items = d.items;
+        self.status = d.status;
+        self.clamp_selection();
+    }
+
+    pub fn filtered_items(&self) -> Vec<&ResumePickerItem> {
+        let needle = self.filter_input.trim().to_ascii_lowercase();
+        self.items
+            .iter()
+            .filter(|it| {
+                needle.is_empty()
+                    || it.title.to_ascii_lowercase().contains(&needle)
+                    || it.id.to_ascii_lowercase().contains(&needle)
+                    || it.model.to_ascii_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    pub fn clamp_selection(&mut self) {
+        let len = self.filtered_items().len();
+        if len == 0 {
+            self.selected = 0;
+        } else if self.selected >= len {
+            self.selected = len - 1;
+        }
+    }
+}
+
 /// State modal pertanyaan klarifikasi `ask_user` di TUI (v0.5.6 Bagian 2 — bukan approval!).
 pub struct PendingAsk {
     pub question: String,
@@ -606,6 +661,8 @@ pub struct App {
     pub pending_ask: Option<PendingAsk>,
     /// Modal pemilih model interaktif (`/model` di TUI).
     pub model_picker: Option<ModelPickerState>,
+    /// Modal pemilih sesi interaktif (`/resume` di TUI, v0.5.30).
+    pub resume_picker: Option<ResumePickerState>,
     /// Modal Wizard Setup Provider interaktif (otomatis saat belum ada provider/key, atau via `/setup`).
     pub setup_wizard: Option<SetupWizardState>,
     pub should_quit: bool,
@@ -752,6 +809,7 @@ impl App {
             approval_policy: None,
             pending_ask: None,
             model_picker: None,
+            resume_picker: None,
             setup_wizard: None,
             should_quit: false,
             pending_plan: None,
@@ -1030,6 +1088,13 @@ impl App {
                 Some(mp) => mp.update_from(data),
                 None => self.model_picker = Some(ModelPickerState::from_data(data)),
             },
+            UiEvent::ResumePicker(data) => match &mut self.resume_picker {
+                Some(rp) => rp.update_from(data),
+                None => self.resume_picker = Some(ResumePickerState::from_data(data)),
+            },
+            UiEvent::CwdChanged(new_cwd) => {
+                self.cwd = new_cwd;
+            }
             UiEvent::SessionReset {
                 session_id,
                 provider,

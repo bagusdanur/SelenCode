@@ -6,7 +6,7 @@ use selencode::outline::{extract_imports, extract_symbols};
 use selencode::repl::{parse_slash_command, SlashCommand, COMMANDS};
 use selencode::security::contains_secret;
 use selencode::store::{normalize_memory_category, Store};
-use selencode::tools::{default_registry, read_only_registry, Ctx, Tool};
+use selencode::tools::{default_registry, read_only_registry, Ctx};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;

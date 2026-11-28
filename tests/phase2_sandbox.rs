@@ -5,7 +5,7 @@ use selencode::repl::{parse_slash_command, SlashCommand, COMMANDS};
 use selencode::sandbox::{
     is_sensitive_env_key, OsIsolationPolicy, SandboxBackend, SandboxController, SandboxMode,
 };
-use selencode::tools::{default_registry, Ctx, Tool};
+use selencode::tools::{default_registry, Ctx};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
