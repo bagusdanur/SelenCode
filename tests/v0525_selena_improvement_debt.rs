@@ -529,7 +529,7 @@ async fn masalah5_correction_patch_rejects_append_only_retries_in_place_or_stage
                         "action": "patch_skill",
                         "skill": "deploy-helper",
                         "old_snippet": "2. Kirim berkas ke `/tmp/staging` memakai rsync.",
-                        "new_snippet": "2. Kirim berkas ke `/var/lib/releases` memakai rsync karena `/tmp/staging` hilang saat reboot.",
+                        "new_snippet": "2. Kirim berkas ke `/var/lib/releases` memakai rsync karena direktori temporer hilang saat reboot.",
                         "reason": "ganti path staging di tempatnya"
                     }]
                 })

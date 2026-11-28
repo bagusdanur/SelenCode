@@ -710,8 +710,6 @@ pub fn is_setup_or_scaffold_shell_cmd(cmd: &str) -> bool {
             | "cat"
             | "head"
             | "tail"
-            | "curl"
-            | "wget"
             | "which"
             | "where"
             | "env"
@@ -720,6 +718,9 @@ pub fn is_setup_or_scaffold_shell_cmd(cmd: &str) -> bool {
             | "git"
     ) {
         return true;
+    }
+    if matches!(head, "curl" | "wget") {
+        return !is_local_http_verification_cmd(trimmed);
     }
     if matches!(head, "npm" | "pnpm" | "yarn" | "bun") {
         if matches!(
