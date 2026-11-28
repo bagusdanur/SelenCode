@@ -947,8 +947,8 @@ pub(crate) async fn handle_tg_skill_callback(
                     let html = format!(
                         "📖 <b>Skill: <code>{}</code></b> ({})\n<i>{}</i>\n\n<pre>{}</pre>",
                         escape_telegram_html(&info.name),
-                        escape_telegram_html(&info.scope.to_string()),
-                        escape_telegram_html(&info.description),
+                        escape_telegram_html(info.scope),
+                        escape_telegram_html(&info.summary),
                         escape_telegram_html(&preview),
                     );
                     let plain = format!("Skill {} ({}):\n\n{preview}", info.name, info.scope);
