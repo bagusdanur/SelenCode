@@ -118,7 +118,8 @@ async fn masalah1_skill_edit_and_review_write_back_to_user_origin_without_projec
 
     // Tanam skill improvement di store PENGGUNA dengan aturan keliru (`/tmp/staging`).
     let user_skill_dir = data_root
-        .join("selencode/skills")
+        .join("selencode")
+        .join("skills")
         .join(IMPROVEMENT_SKILLS_SUBDIR)
         .join("deploy-helper");
     std::fs::create_dir_all(&user_skill_dir).unwrap();
@@ -268,7 +269,8 @@ async fn masalah1_explicit_project_override_shadow_visibility_and_review_project
     unsafe { std::env::set_var("SELENCODE_DATA_DIR", &data_root) };
 
     let user_skill_dir = data_root
-        .join("selencode/skills")
+        .join("selencode")
+        .join("skills")
         .join(IMPROVEMENT_SKILLS_SUBDIR)
         .join("deploy-helper");
     std::fs::create_dir_all(&user_skill_dir).unwrap();
@@ -403,7 +405,8 @@ async fn masalah2_multi_call_review_records_each_call_individually_under_budget(
     unsafe { std::env::set_var("SELENCODE_DATA_DIR", &data_root) };
 
     let skill_dir = data_root
-        .join("selencode/skills")
+        .join("selencode")
+        .join("skills")
         .join(IMPROVEMENT_SKILLS_SUBDIR)
         .join("deploy-retry");
     std::fs::create_dir_all(&skill_dir).unwrap();
