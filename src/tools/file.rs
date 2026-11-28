@@ -1186,10 +1186,14 @@ impl Tool for EditFile {
             });
         }
         if ops.len() > 1 {
-            Ok(format!(
-                "OK: {rel} diedit ({} patch / {total_replacements} penggantian diterapkan).",
-                ops.len()
-            ))
+            if total_replacements > ops.len() {
+                Ok(format!(
+                    "OK: {rel} diedit ({} patch diterapkan, {total_replacements} penggantian).",
+                    ops.len()
+                ))
+            } else {
+                Ok(format!("OK: {rel} diedit ({} patch diterapkan).", ops.len()))
+            }
         } else if ops[0].2 {
             Ok(format!(
                 "OK: {rel} diedit ({total_replacements} penggantian via {}).",
